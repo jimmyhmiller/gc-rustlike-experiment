@@ -163,8 +163,11 @@ fn checked_sub_i64(a: i64, b: i64) -> Option<i64> {
 
 // `a * b` overflows iff dividing the wrapping product back doesn't recover `a`.
 fn checked_mul_i64(a: i64, b: i64) -> Option<i64> {
+    let minimum = 0 - 9223372036854775807 - 1;
     if a == 0 || b == 0 {
         Option::Some(0)
+    } else if (a == minimum && b == 0 - 1) || (b == minimum && a == 0 - 1) {
+        Option::None
     } else {
         let p = a * b;                      // wrapping
         if p / b == a {

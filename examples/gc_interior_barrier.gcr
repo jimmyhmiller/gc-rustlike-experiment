@@ -1,4 +1,4 @@
-// Regression for the interior-reference write barrier (FUTURE_WORK P0 history).
+// Regression for the interior-reference write barrier (see docs/gc.md).
 //
 // `Holder` is a heap struct carrying a flattened `#[value] Slot` that embeds a
 // reference (`Box`). We promote a Holder to the tenured generation, then mutate

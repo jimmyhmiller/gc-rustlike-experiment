@@ -1,11 +1,7 @@
-//! FFI tests (Phase A): `extern "C" fn` declarations calling real C symbols.
-//!
-//! Phase A permits only scalar types across the boundary (no managed GC
-//! pointers), so these are correct without pinning, roots, or a thread
-//! transition. We verify: (1) the JIT resolves libm/libc symbols against the
-//! host process and calls them correctly; (2) the AOT linker resolves them; and
-//! (3) the blittable-only rule rejects a non-scalar parameter at compile time.
-//! See `docs/ffi.md`.
+//! C interoperability tests: scalars, value structs, native buffers, callbacks,
+//! and rejection of representations that cannot cross the boundary. JIT and AOT
+//! cases call real libc/libm symbols; aggregate tests compare against C helpers.
+//! Native transitions publish roots and park the mutator. See `docs/ffi.md`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -229,17 +225,10 @@ fn extern_rejects_non_scalar_return() {
 
 // --- AOT: the system linker resolves the C symbols against libc/libm ---
 
+mod support;
+
 fn ensure_runtime_lib() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "gcrust-rt"])
-        .current_dir(&manifest)
-        .status()
-        .expect("failed to run cargo build -p gcrust-rt");
-    assert!(status.success(), "building gcrust-rt staticlib failed");
-    let lib = manifest.join("target").join("debug").join("libgcrust_rt.a");
-    assert!(lib.exists(), "libgcrust_rt.a not found at {}", lib.display());
-    lib
+    support::runtime_staticlib()
 }
 
 fn run_exit_code(bin: &Path) -> i32 {

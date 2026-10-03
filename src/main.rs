@@ -87,7 +87,10 @@ fn main() -> ExitCode {
             }
         } else {
             // Bare source file — discover a project manifest (link config only).
-            manifest = gcrust::manifest::Manifest::discover(p);
+            manifest = match gcrust::manifest::Manifest::discover(p) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("gcr: {}", e.0); return ExitCode::FAILURE; }
+            };
             project_mode = false;
             arg_path.clone()
         }
@@ -96,13 +99,14 @@ fn main() -> ExitCode {
             // No path argument — discover a project `gcr.toml` from the cwd.
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             match gcrust::manifest::Manifest::discover(&cwd) {
-                Some(m) => {
+                Err(e) => { eprintln!("gcr: {}", e.0); return ExitCode::FAILURE; }
+                Ok(Some(m)) => {
                     let entry = m.entry_path().to_string_lossy().into_owned();
                     manifest = Some(m);
                     project_mode = true;
                     entry
                 }
-                None => {
+                Ok(None) => {
                     eprintln!(
                         "gcr: no file given and no `gcr.toml` found in {} — \
                          pass a `.gcr` file or run inside a project (try `gcr new <name>`)",
@@ -242,7 +246,11 @@ fn main() -> ExitCode {
                     eprintln!("gcr: build error: {}", e.0);
                     return ExitCode::FAILURE;
                 }
-                match std::process::Command::new(&out).status() {
+                let mut command = std::process::Command::new(&out);
+                if args.iter().any(|a| a == "--gc-stress") {
+                    command.env("GCR_GC_STRESS", "1");
+                }
+                match command.status() {
                     Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
                     Err(e) => {
                         eprintln!("gcr: failed to run {}: {}", out.display(), e);
@@ -253,7 +261,8 @@ fn main() -> ExitCode {
                 // Bare-file run: JIT execute and print the result.
                 // `--gc-stress` forces a collection at every allocation — the
                 // strongest test that the precise relocating GC keeps roots correct.
-                let stress = args.iter().any(|a| a == "--gc-stress");
+                let stress = args.iter().any(|a| a == "--gc-stress")
+                    || gcrust::runtime::configured_gc_stress();
                 let result = if stress { jit_run_i64_gc(&prog, true) } else { jit_run_i64(&prog) };
                 match result {
                     Ok(v) => {

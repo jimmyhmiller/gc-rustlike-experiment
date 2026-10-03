@@ -335,7 +335,7 @@ impl<'a, 'ctx> DiTypeBuilder<'a, 'ctx> {
             // enumeration type (tag value → variant name), so `frame variable e`
             // shows `{ tag = Node }` — the active variant. Per-variant PAYLOAD
             // isn't rendered (needs DWARF variant parts, absent from the C API,
-            // or a reflection synthetic provider — see DEBUGGER_P3_PLAN.md).
+            // or a reflection synthetic provider — see docs/reflection.md).
             Kind::Enum(tag_offset, variants) => {
                 let enumerators: Vec<_> = variants
                     .iter()
@@ -899,6 +899,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             },
             Repr::Value(_) => opaque(d),
         }
+    }
+
+    /// Fixed-size temporary storage belongs in the entry block. An alloca at
+    /// an expression's insertion point executes again on every loop iteration
+    /// and retains that stack space until the function returns.
+    fn entry_alloca<T: BasicType<'ctx>>(&self, ty: T, name: &str) -> PointerValue<'ctx> {
+        let func = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry = func.get_first_basic_block().unwrap();
+        let builder = self.ctx.create_builder();
+        match entry.get_first_instruction() {
+            Some(first) => builder.position_before(&first),
+            None => builder.position_at_end(entry),
+        }
+        builder.build_alloca(ty, name).unwrap()
     }
 
     fn define_fn(&mut self, id: FuncId, f: &CoreFn) -> Result<(), CodegenError> {
@@ -1517,7 +1531,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 self.builder.build_call(cin, &[fcx.thread.into(), sv.into(), buf.into(), byte_len.into()], "").unwrap();
                 if *copy_out {
                     // Queue a write-back; gen_call replays it after the extern call.
-                    fcx.pending_copy_outs.push((sv, buf, byte_len));
+                    fcx.pending_copy_outs.push((src.as_ref().clone(), buf, byte_len));
                 }
                 Ok(Some(buf.into()))
             }
@@ -1873,6 +1887,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let f = self.module.add_function(
                 "ai_bounds_fail",
                 self.ctx.void_type().fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
+                Some(inkwell::module::Linkage::External),
+            );
+            use inkwell::attributes::AttributeLoc;
+            for name in ["noreturn", "cold"] {
+                let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+                f.add_attribute(AttributeLoc::Function, self.ctx.create_enum_attribute(kind, 0));
+            }
+        }
+        {
+            let f = self.module.add_function(
+                "ai_arithmetic_fail",
+                self.ctx.void_type().fn_type(&[ptr.into(), i32t.into()], false),
                 Some(inkwell::module::Linkage::External),
             );
             use inkwell::attributes::AttributeLoc;
@@ -2307,7 +2333,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let max_ptrs = crate::core::value_enum_max_ptrs(
             self.prog.values[value as usize].variants.as_ref().unwrap(),
         ) as u32;
-        let slot = self.builder.build_alloca(sty, "ve").unwrap();
+        let slot = self.entry_alloca(sty, "ve");
         self.builder.build_store(slot, sty.const_zero()).unwrap();
 
         if max_ptrs == 0 {
@@ -2877,7 +2903,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         ) as u32;
         let agg = self.gen_expr(fcx, scrutinee)?.unwrap().into_struct_value();
         // Spill the aggregate so we can address its payload bytes for binds.
-        let scrut_slot = self.builder.build_alloca(scrut_ty, "vm.scrut").unwrap();
+        let scrut_slot = self.entry_alloca(scrut_ty, "vm.scrut");
         self.builder.build_store(scrut_slot, agg).unwrap();
         // Compact layout: tag is field 0, payload bytes field 1. Pointers-first:
         // tag is field 1, the ptr-slot array field 0, the raw bytes field 2.
@@ -2894,7 +2920,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let tag = self.builder.build_extract_value(agg, tag_idx, "vetag").unwrap().into_int_value();
         let func = fcx.func;
         let cont_bb = self.ctx.append_basic_block(func, "vm.cont");
-        let result_slot = self.llvm_ty(repr).map(|t| self.builder.build_alloca(t, "vm.res").unwrap());
+        let result_slot = self.llvm_ty(repr).map(|t| self.entry_alloca(t, "vm.res"));
 
         let mut default_bb = None;
         let mut cases = Vec::new();
@@ -2981,8 +3007,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let cont_bb = self.ctx.append_basic_block(func, "match.cont");
         // Result slot (if non-unit).
         let result_slot = self.llvm_ty(repr).map(|t| {
-            // alloca in entry-ish position; here is fine for v0.
-            self.builder.build_alloca(t, "match.res").unwrap()
+            self.entry_alloca(t, "match.res")
         });
 
         // Build arm blocks. A wildcard (tag u32::MAX) becomes the default.
@@ -3156,21 +3181,19 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             BinOp::Add => b.build_int_add(li, ri, "add").unwrap().into(),
             BinOp::Sub => b.build_int_sub(li, ri, "sub").unwrap().into(),
             BinOp::Mul => b.build_int_mul(li, ri, "mul").unwrap().into(),
-            BinOp::Div => if signed {
-                b.build_int_signed_div(li, ri, "sdiv").unwrap().into()
-            } else {
-                b.build_int_unsigned_div(li, ri, "udiv").unwrap().into()
-            },
-            BinOp::Rem => if signed {
-                b.build_int_signed_rem(li, ri, "srem").unwrap().into()
-            } else {
-                b.build_int_unsigned_rem(li, ri, "urem").unwrap().into()
-            },
+            BinOp::Div | BinOp::Rem => self.gen_integer_division(fcx, op, li, ri, signed).into(),
             BinOp::BitAnd => b.build_and(li, ri, "and").unwrap().into(),
             BinOp::BitOr => b.build_or(li, ri, "or").unwrap().into(),
             BinOp::BitXor => b.build_xor(li, ri, "xor").unwrap().into(),
-            BinOp::Shl => b.build_left_shift(li, ri, "shl").unwrap().into(),
-            BinOp::Shr => b.build_right_shift(li, ri, signed, "shr").unwrap().into(),
+            BinOp::Shl | BinOp::Shr => {
+                let mask = ri.get_type().const_int((li.get_type().get_bit_width() - 1) as u64, false);
+                let count = b.build_and(ri, mask, "shift.count").unwrap();
+                if op == BinOp::Shl {
+                    b.build_left_shift(li, count, "shl").unwrap().into()
+                } else {
+                    b.build_right_shift(li, count, signed, "shr").unwrap().into()
+                }
+            }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let pred = int_pred(op, signed);
                 b.build_int_compare(pred, li, ri, "icmp").unwrap().into()
@@ -3178,6 +3201,41 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             BinOp::And | BinOp::Or => unreachable!(),
         };
         Ok(Some(v))
+    }
+
+    fn gen_integer_division(
+        &self, fcx: &FnCtx<'ctx>, op: BinOp, lhs: IntValue<'ctx>,
+        rhs: IntValue<'ctx>, signed: bool,
+    ) -> IntValue<'ctx> {
+        let ty = lhs.get_type();
+        let zero = self.builder.build_int_compare(IntPredicate::EQ, rhs, ty.const_zero(), "div.zero").unwrap();
+        let fail = self.ctx.append_basic_block(fcx.func, "div.fail");
+        let valid = self.ctx.append_basic_block(fcx.func, "div.valid");
+        self.builder.build_conditional_branch(zero, fail, valid).unwrap();
+        self.builder.position_at_end(fail);
+        let abort = self.module.get_function("ai_arithmetic_fail").unwrap();
+        let reason = self.ctx.i32_type().const_int((op == BinOp::Rem) as u64, false);
+        self.builder.build_call(abort, &[fcx.thread.into(), reason.into()], "").unwrap();
+        self.builder.build_unreachable().unwrap();
+        self.builder.position_at_end(valid);
+
+        // MIN / -1 wraps to MIN and MIN % -1 is zero. Substitute +1 before
+        // emitting LLVM division so neither instruction ever receives poison
+        // operands, even if later optimization speculates the calculation.
+        let rhs = if signed {
+            let minimum = ty.const_int(1u64 << (ty.get_bit_width() - 1), false);
+            let is_min = self.builder.build_int_compare(IntPredicate::EQ, lhs, minimum, "div.min").unwrap();
+            let is_minus_one = self.builder.build_int_compare(IntPredicate::EQ, rhs, ty.const_all_ones(), "div.minus1").unwrap();
+            let overflow = self.builder.build_and(is_min, is_minus_one, "div.overflow").unwrap();
+            self.builder.build_select(overflow, ty.const_int(1, false), rhs, "div.denominator").unwrap().into_int_value()
+        } else { rhs };
+        match (op, signed) {
+            (BinOp::Div, true) => self.builder.build_int_signed_div(lhs, rhs, "sdiv").unwrap(),
+            (BinOp::Div, false) => self.builder.build_int_unsigned_div(lhs, rhs, "udiv").unwrap(),
+            (BinOp::Rem, true) => self.builder.build_int_signed_rem(lhs, rhs, "srem").unwrap(),
+            (BinOp::Rem, false) => self.builder.build_int_unsigned_rem(lhs, rhs, "urem").unwrap(),
+            _ => unreachable!(),
+        }
     }
 
     fn gen_logical(
@@ -3332,6 +3390,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let callee = self.funcs[&fid];
         // Foreign `extern "C"` callees take no leading Thread* — they're plain C.
         let is_extern = self.prog.funcs[fid as usize].is_extern;
+        // Dynamic foreign buffers live only through this call and its copy-out.
+        // Restore the stack before returning to a loop that may call again.
+        let stack_token = if is_extern {
+            let intrinsic = inkwell::intrinsics::Intrinsic::find("llvm.stacksave").unwrap();
+            let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
+            let overloads = if intrinsic.is_overloaded() { &types[..] } else { &[] };
+            let save = intrinsic.get_declaration(&self.module, overloads).unwrap();
+            Some(call_result(self.builder.build_call(save, &[], "ffi.stack").unwrap()))
+        } else { None };
         let mut cargs: Vec<inkwell::values::BasicMetadataValueEnum> =
             if is_extern { vec![] } else { vec![fcx.thread.into()] };
         let param_reprs = self.prog.funcs[fid as usize].params.clone();
@@ -3367,7 +3434,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         Some(coerce_ty) => {
                             if let Some(v) = self.gen_expr(fcx, a)? {
                                 let slot =
-                                    self.builder.build_alloca(coerce_ty, "ffi.coerce").unwrap();
+                                    self.entry_alloca(coerce_ty, "ffi.coerce");
                                 self.builder.build_store(slot, v).unwrap();
                                 let loaded =
                                     self.builder.build_load(coerce_ty, slot, "ffi.arg").unwrap();
@@ -3387,7 +3454,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                             }
                             if let Some(v) = self.gen_expr(fcx, a)? {
                                 let slot =
-                                    self.builder.build_alloca(v.get_type(), "ffi.arg").unwrap();
+                                    self.entry_alloca(v.get_type(), "ffi.arg");
                                 self.builder.build_store(slot, v).unwrap();
                                 cargs.push(slot.into());
                             }
@@ -3435,7 +3502,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         if fcx.pending_copy_outs.len() > copy_out_base {
             let cout = self.module.get_function("ai_buf_copy_out").unwrap();
             let pending: Vec<_> = fcx.pending_copy_outs.drain(copy_out_base..).collect();
-            for (obj, buf, byte_len) in pending {
+            for (src, buf, byte_len) in pending {
+                // Native callbacks or another mutator may have moved the array.
+                let obj = self.gen_expr(fcx, &src)?.unwrap().into_pointer_value();
                 self.builder.build_call(
                     cout,
                     &[fcx.thread.into(), obj.into(), buf.into(), byte_len.into()],
@@ -3443,7 +3512,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 ).unwrap();
             }
         }
-        let ret_val = match cs.try_as_basic_value() {
+        let mut ret_val = match cs.try_as_basic_value() {
             inkwell::values::ValueKind::Basic(v) => Some(v),
             inkwell::values::ValueKind::Instruction(_) => None,
         };
@@ -3456,13 +3525,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     (self.abi_coerce(vid, true), ret_val)
                 {
                     let struct_ty = self.value_struct_ty(vid);
-                    let slot = self.builder.build_alloca(coerce_ty, "ffi.ret").unwrap();
+                    let slot = self.entry_alloca(coerce_ty, "ffi.ret");
                     self.builder.build_store(slot, coerced).unwrap();
                     let sval =
                         self.builder.build_load(struct_ty, slot, "ffi.retval").unwrap();
-                    return Ok(Some(sval));
+                    ret_val = Some(sval);
                 }
             }
+        }
+        if let Some(token) = stack_token {
+            let intrinsic = inkwell::intrinsics::Intrinsic::find("llvm.stackrestore").unwrap();
+            let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
+            let overloads = if intrinsic.is_overloaded() { &types[..] } else { &[] };
+            let restore = intrinsic.get_declaration(&self.module, overloads).unwrap();
+            self.builder.build_call(restore, &[token.into()], "").unwrap();
         }
         Ok(ret_val)
     }
@@ -3584,7 +3660,7 @@ struct FnCtx<'ctx> {
     /// FFI copy-out buffers awaiting write-back: `(heap object, stack buffer,
     /// byte length)`. Filled by an `AsCBytes { copy_out: true }` argument and
     /// drained by `gen_call` AFTER the extern call returns. See `docs/ffi.md`.
-    pending_copy_outs: Vec<(PointerValue<'ctx>, PointerValue<'ctx>, IntValue<'ctx>)>,
+    pending_copy_outs: Vec<(CoreExpr, PointerValue<'ctx>, IntValue<'ctx>)>,
     /// This function's DWARF `DISubprogram` scope (debugger P2) — `Some` only when
     /// emitting debug info. Debug locations for the function's nodes use it as
     /// their scope (one function = one source, so scope/file stay consistent).
@@ -3909,6 +3985,7 @@ pub fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, Code
         ("ai_atomic_i64_compare_and_set", runtime::ai_atomic_i64_compare_and_set as *const () as usize),
         ("ai_gc_write_barrier", runtime::ai_gc_write_barrier as *const () as usize),
         ("ai_bounds_fail", runtime::ai_bounds_fail as *const () as usize),
+        ("ai_arithmetic_fail", runtime::ai_arithmetic_fail as *const () as usize),
     ] {
         if let Some(f) = compiled.module.get_function(name) {
             ee.add_global_mapping(&f, addr);
@@ -4306,11 +4383,9 @@ pub fn build_executable_level(
 /// Locate the gc-rust runtime staticlib for AOT linking.
 ///
 /// The path is baked in at build time by `build.rs` via the `GCRUST_RT_STATICLIB`
-/// env var: the build script copies the `gcrust-rt` staticlib (built in the SAME
-/// cargo profile as this `gcr`) into `OUT_DIR/libgcrust_rt_aot.a` and records its
-/// path. This guarantees a profile-matched runtime (a debug `gcr` links the debug
-/// runtime, a release `gcr` the release one) with no path-sniffing or runtime
-/// `cargo` calls. `$GCRUST_RUNTIME_LIB` still overrides it for special cases.
+/// env var: the build script records the profile directory's runtime archive.
+/// Development checkouts refresh it through Cargo when runtime sources are
+/// newer. `$GCRUST_RUNTIME_LIB` overrides the path for special cases.
 fn locate_runtime_staticlib() -> Result<std::path::PathBuf, CodegenError> {
     use std::path::PathBuf;
     if let Ok(p) = std::env::var("GCRUST_RUNTIME_LIB") {

@@ -18,7 +18,7 @@
 //! per-commit gate runs **6 iters in release with the detector armed**
 //! (`GCR_GC_VERIFY=1 GCR_STRESS_ITERS=6 cargo test --release --test
 //! concurrency_stress`); the full 50+ soak is an occasional/nightly run. The
-//! coverage is reduced for speed, not dropped — see docs/FUTURE_WORK.md (P3).
+//! coverage is reduced for speed, not dropped — see docs/PRODUCTION.md (Gate 1).
 
 use gcrust::codegen::jit_run_i64_gc;
 use gcrust::compile::parse_with_prelude;

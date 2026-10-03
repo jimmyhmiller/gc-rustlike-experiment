@@ -1,6 +1,6 @@
 // gcr_heap.ft — the gc-rust HEAP EXPLORER (Instrument 2 of the dev-tooling set).
 //
-// Runs a gc-rust program via `gcr heap <file> --out <tmp>`, which emits a JSON
+// Runs a gc-rust program via `gcr heap <file> --series <tmp>`, which emits a JSON
 // heap snapshot (type histogram, retained-size dominator tree, real GC roots,
 // per-object reflected render + outgoing refs), and renders it interactively:
 //
@@ -11,15 +11,15 @@
 //     its outgoing refs, and jump to the objects that retain it (incoming refs).
 //
 // The snapshot prefers a mid-execution `heap_snapshot()` call (live stack roots)
-// and falls back to the program-end dump. See docs/HEAP_EXPLORER_DESIGN.md.
+// and falls back to the program-end dump. See docs/reflection.md.
 //
 // params: { gcr: "<abs gcr binary>", file: "<abs .gcr program to run>" }
 import "host"
 import { col_text, col_muted, col_accent, col_panel, col_axis, col_err, series_color, trunc } from "df"
 
 fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
-fn gcr_bin()  = param("gcr",  "/Users/jimmyhmiller/Documents/Code/PlayGround/claude-experiments/gc-rust/target/release/gcr")
-fn prog_file() = param("file", "/Users/jimmyhmiller/Documents/Code/PlayGround/claude-experiments/gc-rust/examples/heap_demo.gcr")
+fn gcr_bin()  = param("gcr",  "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/release/gcr")
+fn prog_file() = param("file", "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/examples/heap_demo.gcr")
 fn out_path() = "/tmp/gcr_heap_" + str(my_id()) + ".json"
 
 fn c_ok()  = "#a6df99"

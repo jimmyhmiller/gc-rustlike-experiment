@@ -10,7 +10,7 @@ import "host"
 import { col_text, col_muted, col_accent, col_panel } from "df"
 
 fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
-fn gcr_bin()  = param("gcr", "/Users/jimmyhmiller/Documents/Code/PlayGround/claude-experiments/gc-rust/target/debug/gcr")
+fn gcr_bin()  = param("gcr", "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/debug/gcr")
 fn session()  = param("session", "default")
 fn srctopic() = "gcr/src/" + session()
 

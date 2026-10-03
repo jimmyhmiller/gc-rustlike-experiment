@@ -550,8 +550,8 @@ pub extern "C" fn ai_chan_new(_thread: *mut Thread, cap: i64) -> *mut ChanCtrl {
 /// # Safety
 /// `ctrl` must be a live channel control block.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_chan_sender_clone(_thread: *mut Thread, ctrl: *const ChanCtrl) {
-    unsafe { (*ctrl).state.lock().unwrap().senders += 1; }
+pub unsafe extern "C" fn ai_chan_sender_clone(thread: *mut Thread, ctrl: *const ChanCtrl) {
+    unsafe { blocking_region(thread, || (*ctrl).state.lock().unwrap()).senders += 1; }
 }
 
 /// Drop a Sender; when the last one goes, close the channel and wake receivers.
@@ -559,10 +559,10 @@ pub unsafe extern "C" fn ai_chan_sender_clone(_thread: *mut Thread, ctrl: *const
 /// # Safety
 /// As [`ai_chan_sender_clone`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_chan_sender_drop(_thread: *mut Thread, ctrl: *const ChanCtrl) {
+pub unsafe extern "C" fn ai_chan_sender_drop(thread: *mut Thread, ctrl: *const ChanCtrl) {
     unsafe {
         let c = &*ctrl;
-        let mut st = c.state.lock().unwrap();
+        let mut st = blocking_region(thread, || c.state.lock().unwrap());
         st.senders -= 1;
         if st.senders == 0 {
             st.closed = true;
@@ -590,7 +590,7 @@ pub unsafe extern "C" fn ai_chan_send(thread: *mut Thread, buf: *mut u8, ctrl: *
         let mark = dyna.scratch_mark();
         let vslot = dyna.push_scratch(value as *const u8);
         let bslot = dyna.push_scratch(buf as *const u8);
-        let mut st = c.state.lock().unwrap();
+        let mut st = blocking_region(thread, || c.state.lock().unwrap());
         // Block while full. Publish our frame + go BLOCKED so a GC can run while
         // we park.
         while st.count == st.cap && !st.closed {
@@ -633,7 +633,7 @@ pub unsafe extern "C" fn ai_chan_recv(thread: *mut Thread, buf: *mut u8, ctrl: *
         let heap = &*t.heap;
         let mark = dyna.scratch_mark();
         let bslot = dyna.push_scratch(buf as *const u8);
-        let mut st = c.state.lock().unwrap();
+        let mut st = blocking_region(thread, || c.state.lock().unwrap());
         while st.count == 0 && !st.closed {
             dyna.set_parked_jit_fp(t.top_frame as *const u8);
             dyna.enter_blocked();
@@ -773,14 +773,38 @@ pub struct AotLayout {
 /// major GC fires, which is the AOT large-object cliff this fixes.
 pub fn configured_heap_sizes() -> (usize, usize) {
     fn mb_env(key: &str, default_mb: usize) -> usize {
-        let mb = std::env::var(key)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&m| m > 0)
-            .unwrap_or(default_mb);
-        mb << 20
+        heap_setting_bytes(std::env::var(key).ok().as_deref(), default_mb)
     }
     (mb_env("GCR_NURSERY_MB", 16), mb_env("GCR_TENURED_MB", 256))
+}
+
+fn heap_setting_bytes(value: Option<&str>, default_mb: usize) -> usize {
+    value.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .and_then(|mb| mb.checked_mul(1 << 20))
+        .unwrap_or(default_mb * (1 << 20))
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::heap_setting_bytes;
+
+    #[test]
+    fn heap_size_settings_reject_overflow_instead_of_wrapping() {
+        for value in [None, Some("0"), Some("invalid"), Some("-1"), Some("18446744073709551615")] {
+            assert_eq!(heap_setting_bytes(value, 16), 16 << 20);
+        }
+        assert_eq!(heap_setting_bytes(Some(" 32 "), 16), 32 << 20);
+        let overflow = (usize::MAX / (1 << 20) + 1).to_string();
+        assert_eq!(heap_setting_bytes(Some(&overflow), 16), 16 << 20);
+    }
+}
+
+/// The native driver and JIT use the same opt-in stress selection.
+pub fn configured_gc_stress() -> bool {
+    std::env::var_os("GCR_GC_STRESS")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
 }
 
 /// AOT program entry, called from the native `main` emitted into the object
@@ -867,7 +891,13 @@ pub unsafe extern "C" fn gcr_runtime_main(
     // traced slot only ever holds a pointer-or-null; the collector arms a
     // precise-layout detector under debug / --gc-stress / GCR_GC_VERIFY=1.
     let (nursery, tenured) = configured_heap_sizes();
-    let mut rt = RuntimeContext::new_generational(nursery, tenured, type_table);
+    let mut rt = if configured_gc_stress() {
+        let rt = RuntimeContext::new(8 << 20, type_table);
+        rt.heap().set_gc_every_alloc(true);
+        rt
+    } else {
+        RuntimeContext::new_generational(nursery, tenured, type_table)
+    };
     // Install the reflection metadata decoded above (type/field names + types)
     // so heap-exploration tooling and in-language reflection have nominal info.
     if !meta_types.is_empty() || !meta_values.is_empty() {
@@ -1280,21 +1310,22 @@ pub unsafe extern "C" fn ai_ffi_enter(thread: *mut Thread) {
         let t = &*thread;
         let dyna = &*t.dyna_thread;
         dyna.set_parked_jit_fp(t.top_frame as *const u8);
+        dyna.enter_blocked();
     }
 }
 
 /// FFI boundary: leave a foreign call (the "native → managed" transition).
-/// Clears the published frame pointer set by [`ai_ffi_enter`]. In a future
-/// multi-threaded runtime this is also where a thread returning from native code
-/// blocks until an in-progress stop-the-world collection completes; today, with
-/// a single mutator, the clear is sufficient.
+/// Waits for any active collection before marking the thread as running and
+/// clearing the published frame pointer set by [`ai_ffi_enter`].
 ///
 /// # Safety
 /// As [`ai_ffi_enter`]; must be paired with a preceding `ai_ffi_enter`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ai_ffi_leave(thread: *mut Thread) {
     unsafe {
-        let dyna = &*(*thread).dyna_thread;
+        let t = &*thread;
+        let dyna = &*t.dyna_thread;
+        dyna.exit_blocked(&*t.heap);
         dyna.clear_parked_jit_fp();
     }
 }
@@ -1302,7 +1333,7 @@ pub unsafe extern "C" fn ai_ffi_leave(thread: *mut Thread) {
 /// Callback boundary: the inverse transition, for a gc-rust function invoked as a
 /// C **callback** while the thread is parked "in native" (inside an outer
 /// `extern` call). The callback re-enters managed code and may allocate, so it
-/// must re-acquire managed state — clear the published frame pointer — on entry
+/// must re-acquire managed state and clear the published frame pointer on entry
 /// ([`ai_ffi_reenter`]) and re-publish it on exit ([`ai_ffi_exit`]) since control
 /// returns to the foreign caller. A callback trampoline brackets the real
 /// gc-rust call with this pair. See `docs/ffi.md`.
@@ -1312,7 +1343,9 @@ pub unsafe extern "C" fn ai_ffi_leave(thread: *mut Thread) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ai_ffi_reenter(thread: *mut Thread) {
     unsafe {
-        let dyna = &*(*thread).dyna_thread;
+        let t = &*thread;
+        let dyna = &*t.dyna_thread;
+        dyna.exit_blocked(&*t.heap);
         dyna.clear_parked_jit_fp();
     }
 }
@@ -1328,6 +1361,7 @@ pub unsafe extern "C" fn ai_ffi_exit(thread: *mut Thread) {
         let t = &*thread;
         let dyna = &*t.dyna_thread;
         dyna.set_parked_jit_fp(t.top_frame as *const u8);
+        dyna.enter_blocked();
     }
 }
 
@@ -1431,6 +1465,13 @@ pub extern "C" fn ai_bounds_fail(_thread: *mut Thread, index: i64, len: i64) -> 
         "gc-rust: array index out of bounds: the index is {} but the length is {}",
         index, len
     );
+    std::process::abort();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ai_arithmetic_fail(_thread: *mut Thread, remainder: i32) -> ! {
+    let operation = if remainder == 0 { "division" } else { "remainder" };
+    eprintln!("gc-rust: integer {operation} by zero");
     std::process::abort();
 }
 

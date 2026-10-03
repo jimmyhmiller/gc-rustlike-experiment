@@ -49,17 +49,10 @@ fn alloc_calls_carry_site_id_in_ir() {
 
 // ─── End-to-end AOT profile ──────────────────────────────────────────
 
+mod support;
+
 fn ensure_runtime_lib() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "gcrust-rt"])
-        .current_dir(&manifest)
-        .status()
-        .expect("failed to run cargo build -p gcrust-rt");
-    assert!(status.success(), "building gcrust-rt staticlib failed");
-    let lib = manifest.join("target").join("debug").join("libgcrust_rt.a");
-    assert!(lib.exists(), "libgcrust_rt.a not found at {}", lib.display());
-    lib
+    support::runtime_staticlib()
 }
 
 // Serialize AOT builds: `GCRUST_RUNTIME_LIB` is a process-global env var and the

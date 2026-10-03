@@ -11,12 +11,11 @@
 //! Cons(makeA(), makeB())   // makeA()'s result is live across makeB()'s alloc
 //! ```
 //!
-//! This pass rewrites every function body into administrative-normal form for GC
-//! values: every non-atomic subexpression whose result is a GC value (a `Ref`,
-//! or a flattened `#[value]` aggregate that transitively holds a ref) is
-//! let-bound to a fresh local before use. After this, no GC value is ever live in
-//! a temporary across a safepoint — they are all locals, and the prologue roots
-//! them. Scalars are left alone.
+//! This pass evaluates non-atomic eager operands into locals before their
+//! enclosing operation. Scalar-returning expressions can allocate and relocate
+//! a sibling GC operand too. Reference locals and value locals containing
+//! references are rooted by codegen; scalar locals preserve evaluation order.
+//! Foreign buffer conversions remain inside their enclosing native call.
 //!
 //! Evaluation order is preserved: hoisted bindings are emitted left-to-right in
 //! the statement sequence that contains the expression, matching codegen's
@@ -28,41 +27,20 @@ use crate::core::*;
 
 /// Normalize every function in the program for GC-temporary safety.
 pub fn anf_program(prog: &mut CoreProgram) {
-    // Precompute, per ValueId, whether the value aggregate transitively holds a
-    // GC reference (so a flattened value temp also needs rooting). Done up front
-    // to avoid borrowing `prog.values` while mutating `prog.funcs`.
-    let gc_value: Vec<bool> = (0..prog.values.len() as u32)
-        .map(|v| value_has_ref(&prog.values, v))
-        .collect();
-
+    let externs: Vec<bool> = prog.funcs.iter().map(|f| f.is_extern).collect();
     for f in &mut prog.funcs {
         if f.is_extern {
             continue;
         }
         let body = std::mem::replace(&mut f.body, CoreBlock { stmts: Vec::new(), tail: None });
-        let mut anf = Anf { gc_value: &gc_value, locals: &mut f.locals };
+        let mut anf = Anf { locals: &mut f.locals, externs: &externs };
         f.body = anf.block(body);
     }
 }
 
-/// Whether value type `vid` (transitively) holds a GC reference.
-fn value_has_ref(values: &[ValueLayout], vid: u32) -> bool {
-    let vl = &values[vid as usize];
-    let mut all: Vec<&Repr> = Vec::new();
-    match &vl.variants {
-        Some(variants) => variants.iter().for_each(|v| all.extend(v.fields.iter())),
-        None => all.extend(vl.fields.iter()),
-    }
-    all.iter().any(|f| match f {
-        Repr::Ref(_) => true,
-        Repr::Value(s) => value_has_ref(values, *s),
-        _ => false,
-    })
-}
-
 struct Anf<'a> {
-    gc_value: &'a [bool],
     locals: &'a mut Vec<Repr>,
+    externs: &'a [bool],
 }
 
 impl<'a> Anf<'a> {
@@ -72,24 +50,13 @@ impl<'a> Anf<'a> {
         id
     }
 
-    /// A GC value the collector must be able to find: a heap reference, or a
-    /// flattened value aggregate holding one.
-    fn is_gc(&self, repr: &Repr) -> bool {
-        match repr {
-            Repr::Ref(_) => true,
-            Repr::Value(v) => self.gc_value[*v as usize],
-            _ => false,
-        }
-    }
-
-    /// An expression that needs no binding to be a safe operand: already a local,
-    /// or a constant with no allocation. (`ConstStr` allocates a String, so it is
-    /// NOT atomic.)
+    /// Constants need no binding. Locals are snapshotted because a later
+    /// operand can assign to them; reference snapshots also get their own root.
+    /// `ConstStr` allocates a String, so it is not atomic.
     fn is_atomic(e: &CoreExpr) -> bool {
         matches!(
             *e.kind,
-            CoreExprKind::Local(_)
-                | CoreExprKind::Unit
+            CoreExprKind::Unit
                 | CoreExprKind::ConstInt(..)
                 | CoreExprKind::ConstFloat(..)
                 | CoreExprKind::ConstBool(_)
@@ -146,12 +113,13 @@ impl<'a> Anf<'a> {
         }
     }
 
-    /// Normalize an eager operand and, if its result is a non-atomic GC value,
-    /// hoist it to a fresh local (rooted by the prologue) so it survives any later
-    /// safepoint. Scalars and atoms pass through unchanged.
+    /// Finish evaluating each eager operand before codegen loads its siblings.
+    /// Scalar/value operands can allocate too: `cell.v = Some(f())` must not
+    /// load `cell` before `f()` relocates it. Foreign buffer conversion remains
+    /// inside its call so its native storage has exactly the call's lifetime.
     fn operand(&mut self, e: CoreExpr, pending: &mut Vec<CoreStmt>) -> CoreExpr {
         let e2 = self.expr(e, pending);
-        if self.is_gc(&e2.repr) && !Self::is_atomic(&e2) {
+        if !Self::is_atomic(&e2) && !matches!(*e2.kind, CoreExprKind::AsCBytes { .. }) {
             let repr = e2.repr.clone();
             let id = self.fresh(repr.clone());
             pending.push(CoreStmt::Let(id, e2));
@@ -257,6 +225,11 @@ impl<'a> Anf<'a> {
             }
 
             // Two eager operands.
+            CoreExprKind::Bin(op @ (crate::ast::BinOp::And | crate::ast::BinOp::Or), a, b) => {
+                let a = self.boxed(a, pending);
+                let b = Box::new(self.context(*b));
+                CoreExprKind::Bin(op, a, b)
+            }
             CoreExprKind::Bin(op, a, b) => {
                 let a = self.boxed(a, pending);
                 let b = self.boxed(b, pending);
@@ -330,7 +303,16 @@ impl<'a> Anf<'a> {
             }
 
             // Operand lists.
-            CoreExprKind::Call(id, args) => CoreExprKind::Call(id, self.list(args, pending)),
+            CoreExprKind::Call(id, args) => {
+                // Native buffers must be copied in argument order and remain
+                // within the call's stack-save/restore region. Each argument
+                // is normalized locally, so a later allocating argument cannot
+                // run before an earlier buffer conversion.
+                let args = if self.externs[id as usize] {
+                    args.into_iter().map(|arg| self.context(arg)).collect()
+                } else { self.list(args, pending) };
+                CoreExprKind::Call(id, args)
+            },
             CoreExprKind::RuntimeCall { func, args, ret } => {
                 CoreExprKind::RuntimeCall { func, args: self.list(args, pending), ret }
             }

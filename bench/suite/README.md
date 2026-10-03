@@ -1,53 +1,25 @@
-# gc-rust benchmark suite — gc-rust vs Rust, Go, JVM
+# Comparative benchmark sources
 
-Four classic benchmarks, one algorithm each, implemented in all four languages
-and **verified to produce identical numeric output** before timing. The point is
-an honest, apples-to-apples measurement of gc-rust's codegen and garbage
-collector against mature toolchains.
+Directories contain gc-rust, Rust, Go, and Java sources for nbody, spectralnorm,
+fannkuchredux, and binarytrees. `bench/run_suite.py` compiles them, compares numeric
+output, and invokes hyperfine; `bench/gen_report.py` renders its saved results.
 
-## Layout
-
-```
-suite/<bench>/<bench>.rs    Rust   (taken from a public benchmark suite, credited)
-suite/<bench>/<bench>.go    Go     (")
-suite/<bench>/<bench>.java  Java   (")
-suite/<bench>/<bench>.gcr   gc-rust (faithful port of the same algorithm)
+```sh
+python3 bench/run_suite.py
+python3 bench/gen_report.py
 ```
 
-Benchmarks: `nbody`, `spectralnorm`, `fannkuchredux`, `binarytrees`.
+The harness needs the relevant native/compiler tools plus hyperfine. This
+assessment did not rerun it. Read [measurement requirements](../RESULTS.md) before
+publishing a ratio. Inputs for gc-rust are hardcoded; other versions receive the
+harness's configured arguments.
 
-## Credits — competitor sources are NOT written by us
+## Attribution
 
-The Rust / Go / Java programs are taken **verbatim** (single-threaded,
-standard-library variants) from public benchmark suites, with their original
-attribution headers preserved in each file:
-
-- **Programming-Language-Benchmarks** (https://github.com/hanabi1224/Programming-Language-Benchmarks),
-  MIT-licensed — source of most of the Rust/Go/Java files here.
-- **The Computer Language Benchmarks Game**
-  (https://salsa.debian.org/benchmarksgame-team/benchmarksgame/), BSD-3-Clause —
-  source of the single-threaded Java spectral-norm / fannkuch-redux and the
-  underlying algorithms (n-body by Christoph Bauer; fannkuch-redux by Oleg
-  Mazurov; spectral-norm; binary-trees).
-
-The `.gcr` files are faithful gc-rust ports of those same algorithms, written for
-this comparison.
-
-## Fairness notes
-
-- **Single-threaded.** Only single-threaded, std-only variants are used, so the
-  numbers reflect core codegen + GC, not thread-scaling.
-- **One documented edit:** Go's fannkuch-redux is goroutine-parallel in every
-  published version, so it is pinned to one OS thread via `GOMAXPROCS(1)`
-  (a one-line change, commented in the file). No algorithm was modified.
-- **gc-rust args are hardcoded** in each `.gcr` to match the CLI `N` the harness
-  passes to the other three languages (gc-rust `main()` takes no argv).
-- **JVM times include process startup + partial HotSpot warmup** — the real cost
-  of running Java.
-
-## Running
-
-```
-python3 bench/run_suite.py     # compile all, verify outputs match, hyperfine -> bench/results.json
-python3 bench/gen_report.py     # bench/results.json -> bench/report.html (interactive)
-```
+Retain the attribution/license headers in the competitor sources. Existing
+credits identify Programming-Language-Benchmarks
+(https://github.com/hanabi1224/Programming-Language-Benchmarks, MIT) and the
+Computer Language Benchmarks Game
+(https://salsa.debian.org/benchmarksgame-team/benchmarksgame/, BSD-3-Clause).
+Individual source headers are the reference for authorship and terms. This
+assessment does not claim that each file remains an unmodified upstream copy.

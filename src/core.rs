@@ -251,7 +251,7 @@ pub enum CoreStmt {
 /// (0 = [`NO_SPAN`], no location). Keeps the Core IR lean — nodes carry a `u32`,
 /// not a full `Span` — while an interned side table holds the real spans
 /// (consulted only at DWARF emission / alloc-site labeling, not in hot passes).
-/// This is the debugger's span-threading foundation (docs/DEBUGGER_DESIGN.md).
+/// This is the debugger's span-threading foundation (docs/core-ir.md).
 pub type SpanId = u32;
 
 /// Sentinel `SpanId` meaning "no source location attached".

@@ -1,4 +1,4 @@
-//! `gcr.toml` project manifest — a tiny, dependency-free reader for the handful
+//! `gcr.toml` project manifest — a typed TOML reader for the handful
 //! of keys gc-rust needs. A project is a directory containing `gcr.toml`; the
 //! manifest names the package and points at its entry source file.
 //!
@@ -9,10 +9,7 @@
 //! entry = "src/main.gcr"      # optional; defaults to "src/main.gcr"
 //! ```
 //!
-//! We parse only `key = "value"` lines under a `[package]` section. This is a
-//! strict subset of TOML — enough for v1, and it avoids pulling in a TOML crate
-//! for what is a dozen lines of config.
-
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -37,7 +34,8 @@ pub struct Manifest {
 /// frameworks = ["Cocoa", "OpenGL"]         # macOS: -framework <name>
 /// args = ["-Wl,-rpath,/opt/homebrew/lib"]  # raw, passed through verbatim
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct LinkConfig {
     pub libs: Vec<String>,
     pub lib_paths: Vec<String>,
@@ -88,111 +86,85 @@ impl Manifest {
 
     /// Find a `gcr.toml` by walking up from `start` to the filesystem root.
     /// Returns `None` if no manifest is found (a bare-file build is still valid).
-    pub fn discover(start: &Path) -> Option<Manifest> {
-        let mut dir = if start.is_dir() { start.to_path_buf() } else { start.parent()?.to_path_buf() };
+    pub fn discover(start: &Path) -> Result<Option<Manifest>, ManifestError> {
+        // Relative paths must still search ancestors above the current directory.
+        let start = if start.is_absolute() {
+            start.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| ManifestError(format!("cannot determine project directory: {e}")))?
+                .join(start)
+        };
+        let mut dir = if start.is_dir() {
+            start.to_path_buf()
+        } else if let Some(parent) = start.parent() {
+            parent.to_path_buf()
+        } else {
+            return Ok(None);
+        };
         loop {
             if dir.join("gcr.toml").exists() {
-                return Manifest::load(&dir).ok();
+                return Manifest::load(&dir).map(Some);
             }
             if !dir.pop() {
-                return None;
+                return Ok(None);
             }
         }
     }
 
     fn parse(text: &str, dir: &Path) -> Result<Manifest, ManifestError> {
-        let mut name: Option<String> = None;
-        let mut version: Option<String> = None;
-        let mut entry: Option<String> = None;
-        let mut link = LinkConfig::default();
-        let mut section = "";
-
-        for (lineno, raw) in text.lines().enumerate() {
-            let line = raw.split('#').next().unwrap().trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('[') {
-                section = match line {
-                    "[package]" => "package",
-                    "[link]" => "link",
-                    other => {
-                        return Err(ManifestError(format!(
-                            "gcr.toml:{}: unknown section `{}`",
-                            lineno + 1,
-                            other
-                        )))
-                    }
-                };
-                continue;
-            }
-            let Some((key, val)) = line.split_once('=') else {
-                return Err(ManifestError(format!("gcr.toml:{}: expected `key = value`", lineno + 1)));
-            };
-            let key = key.trim();
-            let val = val.trim();
-            match (section, key) {
-                ("package", "name") => name = Some(unquote(val)),
-                ("package", "version") => version = Some(unquote(val)),
-                ("package", "entry") => entry = Some(unquote(val)),
-                ("link", "libs") => link.libs = parse_array(val),
-                ("link", "lib-paths") => link.lib_paths = parse_array(val),
-                ("link", "frameworks") => link.frameworks = parse_array(val),
-                ("link", "args") => link.args = parse_array(val),
-                (sec, other) => {
-                    return Err(ManifestError(format!(
-                        "gcr.toml:{}: unknown key `{}` in [{}]",
-                        lineno + 1,
-                        other,
-                        if sec.is_empty() { "<top-level>" } else { sec }
-                    )))
-                }
-            }
+        let parsed: ManifestFile =
+            toml::from_str(text).map_err(|e| ManifestError(format!("gcr.toml: {e}")))?;
+        let package = parsed.package;
+        if package.name.is_empty()
+            || Path::new(&package.name).components().count() != 1
+            || !matches!(
+                Path::new(&package.name).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(ManifestError(
+                "gcr.toml: package name must be a nonempty file name".into(),
+            ));
         }
-
-        let name = name.ok_or_else(|| ManifestError("gcr.toml: missing `name`".into()))?;
+        if package.entry.as_os_str().is_empty() {
+            return Err(ManifestError(
+                "gcr.toml: entry must be a nonempty path".into(),
+            ));
+        }
         Ok(Manifest {
-            name,
-            version: version.unwrap_or_else(|| "0.0.0".into()),
-            entry: PathBuf::from(entry.unwrap_or_else(|| "src/main.gcr".into())),
+            name: package.name,
+            version: package.version,
+            entry: package.entry,
             dir: dir.to_path_buf(),
-            link,
+            link: parsed.link,
         })
     }
 }
 
-/// Strip surrounding double quotes (and whitespace) from a scalar TOML value.
-fn unquote(val: &str) -> String {
-    val.trim().trim_matches('"').to_string()
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestFile {
+    package: Package,
+    #[serde(default)]
+    link: LinkConfig,
 }
 
-/// Parse a TOML string array `["a", "b"]` into its elements. Splits on commas
-/// OUTSIDE double quotes, so an element may itself contain commas (e.g. a raw
-/// linker arg `"-Wl,-rpath,/x"`). Lenient about trailing commas + whitespace.
-/// (Single-line arrays only — enough for link config.)
-fn parse_array(val: &str) -> Vec<String> {
-    let inner = val.trim().trim_start_matches('[').trim_end_matches(']');
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    for c in inner.chars() {
-        match c {
-            '"' => in_quote = !in_quote,
-            ',' if !in_quote => {
-                let e = cur.trim().to_string();
-                if !e.is_empty() {
-                    out.push(e);
-                }
-                cur.clear();
-            }
-            _ => cur.push(c),
-        }
-    }
-    let e = cur.trim().to_string();
-    if !e.is_empty() {
-        out.push(e);
-    }
-    out
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Package {
+    name: String,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default = "default_entry")]
+    entry: PathBuf,
+}
+
+fn default_version() -> String {
+    "0.0.0".into()
+}
+fn default_entry() -> PathBuf {
+    "src/main.gcr".into()
 }
 
 #[cfg(test)]
@@ -262,5 +234,53 @@ mod tests {
     fn unknown_key_errors() {
         let src = "[package]\nname = \"x\"\nbogus = \"y\"\n";
         assert!(Manifest::parse(src, Path::new("/p")).is_err());
+    }
+    #[test]
+    fn rejects_malformed_types_duplicates_and_syntax() {
+        for text in [
+            "[package]\nname = bare",
+            "[package]\nname = 42",
+            "[package]\nname = \"x\"\nname = \"y\"",
+            "[package]\nname = \"x\"\n[link]\nlibs = \"m\"",
+            "[package]\nname = \"x\"\n[link]\nlibs = [1]",
+            "[package]\nname = \"x\"\n[link]\nlibs = [\"m\"",
+            "[package]\nname = \"\"",
+            "[package]\nname = \"../x\"",
+        ] {
+            assert!(
+                Manifest::parse(text, Path::new("/p")).is_err(),
+                "accepted {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_multiline_arrays_escapes_and_hashes_in_strings() {
+        let m = Manifest::parse(
+            r#"
+            [package]
+            name = "hash#app"
+            [link]
+            args = [
+                "-Wl,-rpath,/a#b", # a comment
+                "quoted\"argument",
+            ]
+        "#,
+            Path::new("/p"),
+        )
+        .unwrap();
+        assert_eq!(m.name, "hash#app");
+        assert_eq!(m.link.args, ["-Wl,-rpath,/a#b", "quoted\"argument"]);
+    }
+
+    #[test]
+    fn discovery_reports_malformed_parent_manifest() {
+        let dir = std::env::temp_dir().join(format!("gcr-manifest-invalid-{}", std::process::id()));
+        let nested = dir.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("gcr.toml"), "[package]\nname = 123").unwrap();
+        let result = Manifest::discover(&nested);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
     }
 }

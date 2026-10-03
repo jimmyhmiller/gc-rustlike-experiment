@@ -14,7 +14,7 @@ import { gv, has, series_color, load_doc, normalize, metric_keys, metric_def,
 import { col_text, col_muted, col_accent, col_panel, col_err, col_warn } from "df"
 
 fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
-fn results_path() = param("file", "/Users/jimmyhmiller/Documents/Code/PlayGround/claude-experiments/gc-rust/bench/results.json")
+fn results_path() = param("file", "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/results.json")
 fn topic() = param("metric_topic", metric_topic())
 
 fn init_state() = { norm: {}, loaded: false, status: "loading…", metric: "" }

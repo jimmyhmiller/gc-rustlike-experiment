@@ -11,7 +11,7 @@ use serde::Serialize;
 /// (user) source is `0`; the injected prelude and each `mod` file get their own
 /// id (assigned in `compile.rs`), so spans from sources lexed in separate
 /// offset spaces resolve against the RIGHT text — the debugger's multi-source
-/// foundation (see docs/DEBUGGER_SOURCEID_HANDOFF.md). Resolved via the
+/// foundation (see docs/core-ir.md). Resolved via the
 /// `CoreProgram` SourceMap.
 pub type SourceId = u16;
 

@@ -14,21 +14,11 @@ use gcrust::lower::lower_program;
 use gcrust::parser::parse_module;
 use gcrust::resolve::resolve_module;
 
-/// Ensure the runtime staticlib (`libgcrust_rt.a`) exists so the AOT link can
-/// find it. It is a `staticlib` artifact of the `gcrust-rt` crate, which a bare
-/// `cargo test` of the main package does not build automatically — so build it
-/// here and point the linker at it via `$GCRUST_RUNTIME_LIB`.
+/// Build the profile-matched fixture runtime in its isolated target directory.
+mod support;
+
 fn ensure_runtime_lib() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "gcrust-rt"])
-        .current_dir(&manifest)
-        .status()
-        .expect("failed to run cargo build -p gcrust-rt");
-    assert!(status.success(), "building gcrust-rt staticlib failed");
-    let lib = manifest.join("target").join("debug").join("libgcrust_rt.a");
-    assert!(lib.exists(), "libgcrust_rt.a not found at {}", lib.display());
-    lib
+    support::runtime_staticlib()
 }
 
 /// Compile `src` to a native executable at `out`, returning nothing on success.
@@ -46,7 +36,9 @@ fn build(src: &str, out: &Path, runtime_lib: &Path) {
 
 /// Run an executable and return its process exit code.
 fn run_exit_code(bin: &Path) -> i32 {
-    let status = Command::new(bin).status().expect("failed to run AOT binary");
+    let status = Command::new(bin)
+        .status()
+        .expect("failed to run AOT binary");
     status.code().expect("AOT binary terminated by signal")
 }
 
@@ -85,5 +77,23 @@ fn aot_binary_trees_gc_under_load() {
     // checksum 5242840; low byte = 216. Proves the GC runs under load in the
     // AOT-linked binary without crashing.
     assert_eq!(run_exit_code(&out), 5242840 & 0xFF);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn aot_arithmetic_edges_match_jit_contract() {
+    let lib = ensure_runtime_lib();
+    let out = tmp("arithmetic");
+    build(
+        r#"
+        fn check(min: i64, neg: i64, count: i64) -> i64 {
+            if min / neg == min && min % neg == 0 && 1 << count == 1 && 1 << neg == min { 42 } else { 0 }
+        }
+        fn main() -> i64 { check(0 - 9223372036854775807 - 1, 0 - 1, 64) }
+    "#,
+        &out,
+        &lib,
+    );
+    assert_eq!(run_exit_code(&out), 42);
     let _ = std::fs::remove_file(&out);
 }

@@ -239,15 +239,10 @@ fn nested_concurrent_spawns() {
 
 // --- AOT: the spawned threads run in a standalone binary too ---
 
+mod support;
+
 fn ensure_runtime_lib() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "gcrust-rt"])
-        .current_dir(&manifest)
-        .status()
-        .expect("failed to run cargo build -p gcrust-rt");
-    assert!(status.success(), "building gcrust-rt staticlib failed");
-    manifest.join("target").join("debug").join("libgcrust_rt.a")
+    support::runtime_staticlib()
 }
 
 fn run_exit_code(bin: &Path) -> i32 {
