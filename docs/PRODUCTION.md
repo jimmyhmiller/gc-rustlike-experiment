@@ -57,6 +57,13 @@ retirement, and diagnostics/snapshots. Check every path that can delay a stop-th
 world pause, including allocation-free recursion and native blocking calls.
 Audit aliasing/capture rules for supported shared types and channels.
 
+The target sharing and execution contract is [concurrency.md](concurrency.md).
+Current capture checks can be bypassed through aliases and higher-order calls,
+while ordinary heap codegen is not race-safe. Implement managed memory ordering,
+aggregate coherence and GC/barrier coordination before removing Sync restrictions.
+Repair raw thread-handle ownership: repeated or concurrent join must never reuse a
+freed native handle. Structured outcomes, cancellation and async remain required.
+
 Acceptance:
 
 - Each supported operation has defined behavior on boundary inputs, with tests
@@ -123,9 +130,10 @@ Acceptance: satisfy the budgets agreed for the release target and publish enough
 raw evidence to reproduce the result. No fixed Rust-performance ratio constitutes
 production readiness across workloads.
 
-## First work item
+## Next work
 
-The known reproduced defects have been repaired and tested locally. Next choose
-the first application/platform and numeric resource budgets, then automate the
-correctness gates and audit the safety boundary. Remaining gates guide design
-and review; they do not require every proposed feature for a narrow first release.
+Follow the ordered [implementation plan](PLAN.md): repair execution-handle
+ownership and closure inference, implement managed race safety, then add structured
+outcomes, cancellation and async. The search application exercises the evolving
+standard library. Numeric release budgets and declared platform support remain
+open; the production gates above are not signed off.

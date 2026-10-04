@@ -780,17 +780,7 @@ fn str_replace_byte(s: String, from: i64, to: String) -> String {
 
 // Join the strings in `parts` with `sep` between them.
 fn str_join(parts: Vec<String>, sep: String) -> String {
-    let n = vec_len(parts);
-    let mut out = "";
-    let mut i = 0;
-    while i < n {
-        if i > 0 {
-            out = str_concat(out, sep);
-        }
-        out = str_concat(out, array_get_unchecked(parts.data, i));
-        i = i + 1;
-    }
-    out
+    str_join_array(parts.data, parts.len, sep)
 }
 
 // ---- MapStr<V> — a String-keyed hash map ----------------------------------
@@ -918,11 +908,16 @@ fn str_contains(h: String, n: String) -> i64 {
     0
 }
 
-// Command-line arguments. Under the Rust seed these are stubs (the seed-built
-// compiler reads its target a different way); the self-hosted compiler's C runtime
-// (gcr_rt.c) provides the real argv-backed versions.
-fn arg_count() -> i64 { 0 }
-fn arg_str(i: i64) -> String { "" }
+// Legacy argument conveniences. Use process_args() when encoding errors matter.
+fn arg_count() -> i64 {
+    match process_args() { Result::Ok(args) => array_len(args), Result::Err(e) => 0 }
+}
+fn arg_str(i: i64) -> String {
+    match process_args() {
+        Result::Ok(args) => match array_get(args, i) { Option::Some(s) => s, Option::None => "" },
+        Result::Err(e) => ""
+    }
+}
 
 fn mapstr_keys<V>(m: MapStr<V>) -> Vec<String> {
     let mut ks: Vec<String> = vec_new();

@@ -1,0 +1,23 @@
+// Bounded, ordered parallel map. A batch is joined completely before the next
+// batch starts. No worker outlives the call; input/output order is preserved.
+fn vec_parallel_map<T: Sync, U: Sync>(items: Vec<T>, workers: i64, f: fn(T) -> U) -> Result<Vec<U>, String> {
+    if workers < 1 || workers > 64 { return Result::Err("worker count must be between 1 and 64"); }
+    let mut output: Vec<U> = vec_new();
+    let mut start = 0;
+    while start < vec_len(items) {
+        let mut handles: Vec<Thread<U>> = vec_new();
+        let mut end = start;
+        while end < vec_len(items) && end - start < workers {
+            let item = vec_at(items, end);
+            handles = vec_push(handles, Thread::spawn(|| f(item)));
+            end = end + 1;
+        }
+        let mut i = 0;
+        while i < vec_len(handles) {
+            output = vec_push(output, vec_at(handles, i).join());
+            i = i + 1;
+        }
+        start = end;
+    }
+    Result::Ok(output)
+}

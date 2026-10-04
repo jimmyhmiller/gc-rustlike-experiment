@@ -29,13 +29,20 @@ that library. `GCRUST_RUNTIME_LIB` overrides its location.
 
 A bare-file `run` without a discovered manifest JIT-executes and prints the
 integer result. A project `run` builds a native executable and forwards its exit
-status. The result of native `main` becomes the process exit status, rather than
+status. `run <project> --jit -- <args>` explicitly selects JIT with matching
+arguments, stdout, and exit-status behavior. The result of native `main` becomes the process exit status, rather than
 the extra result line printed by the JIT driver.
 
 ```sh
 ./target/debug/gcr run examples/project
 ./target/debug/gcr build examples/project -o /tmp/gcr-calculator
 ```
+
+## Application
+
+[gcr-search](apps/gcr-search/README.md) is a gc-rust CLI that saves a text snapshot
+of a directory and runs literal queries against it. It exercises checked host
+I/O, strings, collections, serialization, native execution, and moving GC.
 
 ## Documentation
 
@@ -44,6 +51,7 @@ the extra result line printed by the JIT driver.
 - [Implemented language surface](docs/language.md)
 - [Compiler IR and pipeline](docs/core-ir.md)
 - [GC/runtime](docs/gc.md), [threads](docs/threads.md), [FFI](docs/ffi.md)
+- [Checked I/O and application APIs](docs/io.md)
 - [Modules](docs/modules.md), [mutability](docs/mutability.md), [arithmetic](docs/overflow.md)
 - [Debugging, reflection, and heap tools](docs/reflection.md)
 - [Runnable examples](docs/tour.md)
@@ -52,3 +60,9 @@ the extra result line printed by the JIT driver.
 `cargo test --workspace` passes on the assessed macOS ARM64 host. The docs
 distinguish inspected code, observed tests, and proposed work; they make no
 blanket performance or memory-safety claim.
+
+The proposed shared-memory, thread, task and async semantics are in
+[the concurrency contract](docs/concurrency.md), with an implementation ledger
+and required conformance cases.
+
+Remaining work and acceptance criteria are recorded in [the implementation plan](docs/PLAN.md).

@@ -4,7 +4,7 @@
 modules resolve under the module's directory. It records each loaded file in the
 source map and injects prelude declarations unless the user declares the same
 name. `src/resolve.rs` resolves module paths, visibility, and use aliases.
-Seven module integration tests passed in the local assessment.
+Eight module integration tests passed in the local assessment.
 
 `gcr.toml` names a project and its entry:
 
@@ -28,3 +28,12 @@ invalid parent manifest is not silently ignored. Multiline arrays, escaped quote
 and `#` inside quoted strings follow TOML syntax.
 It does not resolve managed dependencies or maintain a package lockfile. Examples:
 `examples/project` and `examples/raylib`.
+
+Project `run` forwards program arguments after `--`, for example
+`gcr run apps/gcr-search -- query needle /tmp/gcr-search.index`.
+
+`gcr run <project> --jit -- <args>` explicitly executes a manifest project in JIT.
+It forwards arguments and the program's exit status like native project runs.
+Native link configuration is rejected in this mode. Bare-file JIT runs retain
+their historical printed-result behavior. `jit_run_i64_with_args` lets embeddings
+supply independent argv; child threads inherit that execution's argument context.

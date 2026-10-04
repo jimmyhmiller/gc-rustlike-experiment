@@ -36,3 +36,52 @@ pub fn runtime_staticlib() -> PathBuf {
     })
     .clone()
 }
+
+/// Drain stdout/stderr concurrently while enforcing a deadline. Killing and
+/// waiting on a timed-out child prevents a regression from leaving orphan work.
+#[allow(dead_code)]
+pub fn run_with_timeout(command: &mut Command, seconds: u64) -> std::process::Output {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let out = out_reader.join().unwrap();
+            let err = err_reader.join().unwrap();
+            panic!(
+                "command exceeded {seconds}s: {command:?}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap(),
+        stderr: err_reader.join().unwrap(),
+    }
+}

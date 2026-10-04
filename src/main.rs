@@ -16,7 +16,18 @@ use gcrust::parser::parse_module;
 use gcrust::resolve::resolve_module;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let separator = raw_args.iter().position(|arg| arg == "--").unwrap_or(raw_args.len());
+    let mut args = Vec::with_capacity(raw_args.len());
+    for (index, arg) in raw_args.iter().enumerate() {
+        if index > separator { args.push(arg.to_string_lossy().into_owned()); }
+        else {
+            match arg.clone().into_string() {
+                Ok(arg) => args.push(arg),
+                Err(_) => { eprintln!("gcr: compiler argument is not UTF-8"); return ExitCode::FAILURE; }
+            }
+        }
+    }
     if args.len() < 2 {
         eprintln!("usage: gcr <new|check|parse|run|build|emit|eval|heap|heap-diff> [file.gcr | project-dir]");
         return ExitCode::FAILURE;
@@ -57,11 +68,14 @@ fn main() -> ExitCode {
         return run_bench(&args);
     }
 
+    // Program arguments after `--` must never become compiler options.
+    let driver_args = &args[..args.iter().position(|a| a == "--").unwrap_or(args.len())];
+
     // Resolve the entry file and (when in a project) its manifest. The first
     // non-flag token after the subcommand is the path: a `.gcr` file, a project
     // directory, or a `gcr.toml`. With NO path, discover a `gcr.toml` upward from
     // the current directory (cargo-style `gcr build` / `gcr run`).
-    let arg_path = args.get(2).filter(|a| !a.starts_with('-'));
+    let arg_path = driver_args.get(2).filter(|a| !a.starts_with('-'));
     let manifest: Option<gcrust::manifest::Manifest>;
     // `project_mode` = the build is driven BY the manifest (entry + output name +
     // banner come from it). A bare-file build still *discovers* a manifest for its
@@ -229,12 +243,16 @@ fn main() -> ExitCode {
             // sites, and later DWARF). Cheap; only the driver has src+path.
             prog.sources = sources;
 
+            if driver_args.iter().any(|arg| arg == "--jit") && (manifest.as_ref().is_some_and(|m| !m.link_args().is_empty()) || !parse_link_args(driver_args).is_empty()) {
+                eprintln!("gcr: --jit does not support native link configuration; use native run/build");
+                return ExitCode::FAILURE;
+            }
             // Project mode (a `gcr.toml` was found): build a native executable —
             // linking the manifest's `[link]` libraries — and run it, forwarding
             // its exit code. This is the only way native FFI deps (raylib, …)
             // resolve; the JIT can't link them. Mirrors `cargo run`.
-            if let Some(m) = &manifest {
-                let mut link_args = parse_link_args(&args);
+            if let Some(m) = manifest.as_ref().filter(|_| !driver_args.iter().any(|a| a == "--jit")) {
+                let mut link_args = parse_link_args(driver_args);
                 link_args.extend(m.link_args());
                 let out = default_output(path, Some(m), project_mode);
                 if let Err(e) = build_executable_level(
@@ -247,7 +265,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 let mut command = std::process::Command::new(&out);
-                if args.iter().any(|a| a == "--gc-stress") {
+                if let Some(separator) = args.iter().position(|a| a == "--") {
+                    command.args(&raw_args[separator + 1..]);
+                }
+                if driver_args.iter().any(|a| a == "--gc-stress") {
                     command.env("GCR_GC_STRESS", "1");
                 }
                 match command.status() {
@@ -261,11 +282,17 @@ fn main() -> ExitCode {
                 // Bare-file run: JIT execute and print the result.
                 // `--gc-stress` forces a collection at every allocation — the
                 // strongest test that the precise relocating GC keeps roots correct.
-                let stress = args.iter().any(|a| a == "--gc-stress")
+                let stress = driver_args.iter().any(|a| a == "--gc-stress")
                     || gcrust::runtime::configured_gc_stress();
-                let result = if stress { jit_run_i64_gc(&prog, true) } else { jit_run_i64(&prog) };
+                let mut program_args = vec![std::ffi::OsString::from(path)];
+                if let Some(separator) = args.iter().position(|a| a == "--") {
+                    program_args.extend(raw_args[separator + 1..].iter().cloned());
+                }
+                let mode = if stress { gcrust::codegen::GcRunMode::Stress } else { gcrust::codegen::GcRunMode::Generational };
+                let result = gcrust::codegen::jit_run_i64_with_args(&prog, mode, program_args);
                 match result {
                     Ok(v) => {
+                        if manifest.is_some() { return ExitCode::from(v as u8); }
                         println!("{}", v);
                         ExitCode::SUCCESS
                     }
@@ -280,7 +307,7 @@ fn main() -> ExitCode {
             // Linker args: the project manifest's `[link]` section (libs / paths
             // / frameworks), plus any `--link-arg <arg>` (repeatable) from the CLI.
             // A project build needs no CLI link flags at all.
-            let mut link_args = parse_link_args(&args);
+            let mut link_args = parse_link_args(driver_args);
             if let Some(m) = &manifest {
                 if project_mode {
                     println!("gcr: building `{}` v{}", m.name, m.version);
@@ -289,7 +316,7 @@ fn main() -> ExitCode {
             }
             // Output path: `gcr build foo.gcr -o foo`. In a project it defaults to
             // `target/<name>`; for a bare file, the source stem.
-            let out = match parse_output_flag(&args) {
+            let out = match parse_output_flag(driver_args) {
                 Ok(o) => o,
                 Err(msg) => {
                     eprintln!("gcr: {}", msg);
@@ -321,7 +348,7 @@ fn main() -> ExitCode {
             // `--debug` → full DWARF (debugger P3): unoptimized + local-variable
             // DIEs, so `lldb`'s `frame variable` shows source names/values.
             // Default stays line-tables-only (P2: stepping/breakpoints under O2).
-            let level = if args.iter().any(|a| a == "--debug") {
+            let level = if driver_args.iter().any(|a| a == "--debug") {
                 gcrust::codegen::DebugLevel::Full
             } else {
                 gcrust::codegen::DebugLevel::LineTables
@@ -1296,17 +1323,20 @@ fn run_new(args: &[String]) -> ExitCode {
 /// vector. Returns `Ok(Some(path))` when present, `Ok(None)` when absent, and
 /// `Err` when `-o` is given without a following value.
 fn parse_output_flag(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
-    let mut it = args.iter().skip(3);
+    let mut it = args.iter().skip(2);
+    if it.clone().next().is_some_and(|arg| !arg.starts_with('-')) { it.next(); }
+    let mut output = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" | "--output" => {
-                let v = it
-                    .next()
-                    .ok_or_else(|| "`-o` requires an output path".to_string())?;
-                return Ok(Some(std::path::PathBuf::from(v)));
+                let value = it.next().ok_or_else(|| "`-o` requires an output path".to_string())?;
+                if output.is_some() { return Err("output path specified more than once".into()); }
+                output = Some(std::path::PathBuf::from(value));
             }
+            "--debug" => {},
+            "--link-arg" => { it.next().ok_or_else(|| "`--link-arg` requires a linker argument".to_string())?; }
             other => return Err(format!("unexpected argument `{}`", other)),
         }
     }
-    Ok(None)
+    Ok(output)
 }

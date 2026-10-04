@@ -633,7 +633,9 @@ impl Parser {
                 span: self.span(),
             });
         }
+        let saved_no_struct = std::mem::take(&mut self.no_struct);
         let r = self.block_inner();
+        self.no_struct = saved_no_struct;
         self.depth -= 1;
         r
     }
@@ -728,6 +730,15 @@ impl Parser {
     // ---- expressions (Pratt) ----------------------------------------------
     fn expr(&mut self) -> PResult<Expr> {
         self.expr_bp(0)
+    }
+
+    // Delimiters remove the ambiguity between an outer condition and its body.
+    // A no-struct restriction must not leak into call arguments or nested groups.
+    fn delimited_expr(&mut self) -> PResult<Expr> {
+        let saved = std::mem::take(&mut self.no_struct);
+        let result = self.expr();
+        self.no_struct = saved;
+        result
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> PResult<Expr> {
@@ -887,7 +898,7 @@ impl Parser {
                 }
                 TokKind::LBracket => {
                     self.bump();
-                    let index = self.expr()?;
+                    let index = self.delimited_expr()?;
                     self.expect(&TokKind::RBracket)?;
                     let span = start.to(self.prev_span());
                     e = Expr { kind: Box::new(ExprKind::Index { base: e, index }), span };
@@ -912,7 +923,7 @@ impl Parser {
     fn call_args(&mut self) -> PResult<Vec<Expr>> {
         let mut args = Vec::new();
         while !self.at(&TokKind::RParen) {
-            args.push(self.expr()?);
+            args.push(self.delimited_expr()?);
             if !self.eat(&TokKind::Comma) { break; }
         }
         self.expect(&TokKind::RParen)?;
@@ -952,12 +963,12 @@ impl Parser {
                     self.bump();
                     ExprKind::Unit
                 } else {
-                    let mut elems = vec![self.expr()?];
+                    let mut elems = vec![self.delimited_expr()?];
                     let mut is_tuple = false;
                     while self.eat(&TokKind::Comma) {
                         is_tuple = true;
                         if self.at(&TokKind::RParen) { break; }
-                        elems.push(self.expr()?);
+                        elems.push(self.delimited_expr()?);
                     }
                     self.expect(&TokKind::RParen)?;
                     if is_tuple { ExprKind::Tuple(elems) }
@@ -970,16 +981,16 @@ impl Parser {
                     self.bump();
                     ExprKind::Array(ArrayLit::Elems(Vec::new()))
                 } else {
-                    let first = self.expr()?;
+                    let first = self.delimited_expr()?;
                     if self.eat(&TokKind::Semi) {
-                        let count = self.expr()?;
+                        let count = self.delimited_expr()?;
                         self.expect(&TokKind::RBracket)?;
                         ExprKind::Array(ArrayLit::Repeat(Box::new(first), Box::new(count)))
                     } else {
                         let mut elems = vec![first];
                         while self.eat(&TokKind::Comma) {
                             if self.at(&TokKind::RBracket) { break; }
-                            elems.push(self.expr()?);
+                            elems.push(self.delimited_expr()?);
                         }
                         self.expect(&TokKind::RBracket)?;
                         ExprKind::Array(ArrayLit::Elems(elems))
@@ -1337,6 +1348,12 @@ mod tests {
         );
         let ItemKind::Fn(f) = &m.items[0].kind else { panic!() };
         assert!(matches!(&*f.body.tail.as_ref().unwrap().kind, ExprKind::Match { .. }));
+    }
+
+    #[test]
+    fn condition_restriction_does_not_leak_into_delimited_expressions() {
+        let source = "struct S { n: i64 } fn main() { if f(S { n: 1 }) {} while f({ let s = S { n: 2 }; s }) { break; } match f(|n: i64| S { n: n }) { _ => {} } if (S { n: 3 }).n == 3 {} }";
+        parse_module(&lex(source).unwrap()).unwrap();
     }
 
     #[test]

@@ -593,6 +593,7 @@ fn conv(e: crate::types::TypeError) -> LowerError {
 impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// Repr of a type, via the shared layout registry.
     fn repr_of(&mut self, ty: &Ty, span: Span) -> LResult<Repr> {
+        if is_never(ty) { return Ok(Repr::Unit); }
         self.reg.repr(ty).map_err(|e| LowerError { msg: e.0, span })
     }
 
@@ -687,6 +688,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn block_expected(&mut self, b: &Block, expected: Option<&Ty>) -> LResult<(CoreBlock, Ty)> {
         self.push_scope();
         let mut stmts = Vec::new();
+        let mut diverges = false;
         for s in &b.stmts {
             match s {
                 Stmt::Let { pattern, ty, init, span } => {
@@ -719,6 +721,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                             } else {
                                 init_expr
                             };
+                            diverges |= is_never(&init_ty);
                             let repr = init_expr.repr.clone();
                             let id = self.fresh_local(repr, init_ty.clone());
                             self.bind_mut(&name, id, init_ty, is_mut);
@@ -747,7 +750,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     }
                 }
                 Stmt::Expr(e) => {
-                    let (ce, _) = self.expr(e, None)?;
+                    let (ce, statement_ty) = self.expr(e, None)?;
+                    diverges |= is_never(&statement_ty);
                     let ce = if ce.span == NO_SPAN {
                         let sid = self.mono.intern_span(e.span);
                         ce.at(sid)
@@ -774,7 +778,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             None => (None, Ty::unit()),
         };
         self.pop_scope();
-        Ok((CoreBlock { stmts, tail }, ty))
+        Ok((CoreBlock { stmts, tail }, if diverges { never_ty() } else { ty }))
     }
 
     /// Check + lower an expression. `expected` guides literal defaulting.
@@ -811,6 +815,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 if let Some((id, ty)) = self.lookup(name) {
                     let repr = self.repr_of(&ty, e.span)?;
                     Ok((CoreExpr::new(CoreExprKind::Local(id), repr), ty))
+                } else if self.ctx.fns.contains_key(name) {
+                    self.function_value(path, expected, e.span)
                 } else if self.ctx.variants.contains_key(name) {
                     // An unqualified unit variant brought into scope (`None`).
                     self.variant_ctor(path, &[], expected, e.span)
@@ -854,7 +860,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let (tb, tt) = self.block_expected(then_branch, expected)?;
                 // The else branch is checked against the then branch's type (or
                 // the outer expectation if the then branch was itself inferred).
-                let else_exp = expected.or(Some(&tt));
+                let else_exp = expected.or_else(|| if is_never(&tt) { None } else { Some(&tt) });
                 let (eb, et) = match else_branch {
                     Some(e) => {
                         let (ce, t) = self.expr(e, else_exp)?;
@@ -862,11 +868,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     }
                     None => (CoreBlock { stmts: vec![], tail: None }, Ty::unit()),
                 };
-                check_assignable(&et, &tt, e.span)?;
-                let repr = self.repr_of(&tt, e.span)?;
+                let result = if is_never(&tt) { et.clone() } else { tt.clone() };
+                check_assignable(&et, &result, e.span)?;
+                let repr = self.repr_of(&result, e.span)?;
                 Ok((
                     CoreExpr::new(CoreExprKind::If(Box::new(cc), Box::new(tb), Box::new(eb)), repr),
-                    tt,
+                    result,
                 ))
             }
 
@@ -1064,7 +1071,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             ExprKind::Path(path) if !path.is_single() => {
                 // A qualified path that's a unit enum variant: `Color::Red`,
                 // `Option::None`.
-                self.variant_ctor(path, &[], expected, e.span)
+                if self.ctx.fns.contains_key(&path.segments.join("::")) {
+                    self.function_value(path, expected, e.span)
+                } else { self.variant_ctor(path, &[], expected, e.span) }
             }
 
             ExprKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, e.span),
@@ -1383,8 +1392,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             let (body, bty) = self.expr(&arm.body, result_ty.as_ref())?;
             match &result_ty {
-                Some(rt) => check_assignable(&bty, rt, arm.span)?,
-                None => result_ty = Some(bty),
+                Some(rt) if !is_never(rt) => check_assignable(&bty, rt, arm.span)?,
+                _ => result_ty = Some(bty),
             }
             carms.push(CoreArm { tag, binds, body });
             self.pop_scope();
@@ -1493,8 +1502,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let covers = irrefutable && arm.guard.is_none();
             let (body, bty) = self.expr(&arm.body, result_ty.as_ref())?;
             match &result_ty {
-                Some(rt) => check_assignable(&bty, rt, arm.span)?,
-                None => result_ty = Some(bty),
+                Some(rt) if !is_never(rt) => check_assignable(&bty, rt, arm.span)?,
+                _ => result_ty = Some(bty),
             }
             // Move bindings out for emission.
             let arm_binds = std::mem::take(&mut binds);
@@ -1696,7 +1705,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             _ => return err("array_new requires an expected `Array<T>` type (annotate the let binding)", span),
         };
         let elem = self.repr_of(&elem_ty, span)?;
-        let lid = self.reg.array_for(&elem);
+        let lid = self.reg.array_for(&elem).map_err(|e| LowerError { msg: e.0, span })?;
         let (clen, lt) = self.expr(len, Some(&Ty::i64()))?;
         check_assignable(&lt, &Ty::i64(), len.span)?;
         let ty = Ty::Named { name: "Array".into(), args: vec![elem_ty] };
@@ -2032,6 +2041,19 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok(())
     }
 
+    fn function_value(&mut self, path: &Path, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let key = path.segments.join("::");
+        let definition = self.ctx.fns.get(&key).cloned().ok_or_else(|| LowerError { msg: format!("unknown function `{key}`"), span })?;
+        let generic = !definition.generics.params.is_empty();
+        let params: Vec<ClosureParam> = definition.params.iter().map(|param| ClosureParam {
+            name: param.name.clone(), ty: if generic { None } else { Some(param.ty.clone()) }, span,
+        }).collect();
+        let args = params.iter().map(|param| Expr { kind: Box::new(ExprKind::Path(Path::single(param.name.clone(), span))), span }).collect();
+        let callee = Expr { kind: Box::new(ExprKind::Path(path.clone())), span };
+        let body = Expr { kind: Box::new(ExprKind::Call(callee, args)), span };
+        self.closure(&params, &if generic { None } else { definition.ret.clone() }, &body, expected, span)
+    }
+
     fn closure(
         &mut self,
         params: &[ClosureParam],
@@ -2077,7 +2099,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             cap_reprs.push(self.repr_of(ty, span)?);
         }
         let key = format!("closure@{}.{}", span.start, span.end);
-        let env_lid = self.reg.closure_env(&key, &cap_reprs);
+        let env_lid = self.reg.closure_env(&key, &cap_reprs).map_err(|e| LowerError { msg: e.0, span })?;
 
         // Build the capture value expressions (loads of the enclosing locals).
         let capture_exprs: Vec<CoreExpr> = captures.iter().zip(&cap_reprs)
@@ -2088,7 +2110,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let declared_ret = match ret {
             Some(t) => Some(ground_type(t, &self.subst.clone(), self.ctx)?),
             None => match expected {
-                Some(Ty::Fn { ret, .. }) if !ret.is_unit() => Some((**ret).clone()),
+                Some(Ty::Fn { ret, .. }) if !ret.is_unit() && !has_var(ret) => Some((**ret).clone()),
                 _ => None,
             },
         };
@@ -2722,6 +2744,57 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 _ => {}
             }
         }
+        if name == "panic" && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
+            if args.len() != 1 { return err("panic takes one String", span); }
+            let (message, actual) = self.expr(&args[0], Some(&Ty::Prim(Prim::Str)))?;
+            check_assignable(&actual, &Ty::Prim(Prim::Str), span)?;
+            return Ok((CoreExpr::new(CoreExprKind::Panic(Box::new(message)), Repr::Unit), never_ty()));
+        }
+        if name == "str_join_array" && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
+            if args.len() != 3 { return err("str_join_array takes array, count, separator", span); }
+            let str_ty = Ty::Prim(Prim::Str);
+            let array_ty = Ty::Named { name: "Array".into(), args: vec![str_ty.clone()] };
+            let mut lowered = Vec::new();
+            for (arg, ty) in args.iter().zip([array_ty, Ty::i64(), str_ty.clone()]) {
+                let (expr, actual) = self.expr(arg, Some(&ty))?;
+                check_assignable(&actual, &ty, arg.span)?;
+                lowered.push(expr);
+            }
+            let layout = self.string_layout_id(span)?;
+            return Ok((CoreExpr::new(CoreExprKind::StrJoin { layout, args: lowered }, Repr::Ref(layout)), str_ty));
+        }
+        if name == "host_io" && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
+            if args.len() != 4 { return err("host_io takes operation, path, text, and limit", span); }
+            let ExprKind::Int(op, _) = args[0].kind.as_ref() else {
+                return err("host_io operation must be a literal integer", span);
+            };
+            let op = u32::try_from(*op).map_err(|_| LowerError { msg: "invalid host operation".into(), span })?;
+            if op > crate::runtime::io::STDOUT { return err("unknown host operation", span); }
+            let str_ty = Ty::Prim(Prim::Str);
+            let array_ty = Ty::Named { name: "Array".into(), args: vec![str_ty.clone()] };
+            let response_ty = Ty::Named { name: "IoResponse".into(), args: vec![] };
+            let Some(def) = self.ctx.structs.get("IoResponse") else { return err("host_io requires standard IoResponse", span); };
+            let StructBody::Named(fields) = &def.body else { return err("invalid IoResponse representation", span); };
+            let expected_fields = [("text", str_ty.clone()), ("entries", array_ty.clone()), ("code", Ty::i64()), ("kind", Ty::i64())];
+            if def.is_value || !def.generics.params.is_empty() || fields.len() != 4 {
+                return err("invalid IoResponse representation", span);
+            }
+            for (field, (name, ty)) in fields.iter().zip(expected_fields) {
+                if field.name != name || lower_type(&field.ty, &[], self.ctx).map_err(conv)? != ty {
+                    return err("invalid IoResponse field layout", span);
+                }
+            }
+            let mut lowered = Vec::new();
+            for (arg, ty) in args[1..].iter().zip([str_ty.clone(), str_ty.clone(), Ty::i64()]) {
+                let (expr, actual) = self.expr(arg, Some(&ty))?;
+                check_assignable(&actual, &ty, arg.span)?;
+                lowered.push(expr);
+            }
+            let Repr::Ref(response) = self.repr_of(&response_ty, span)? else { unreachable!() };
+            let Repr::Ref(string) = self.repr_of(&str_ty, span)? else { unreachable!() };
+            let Repr::Ref(entries) = self.repr_of(&array_ty, span)? else { unreachable!() };
+            return Ok((CoreExpr::new(CoreExprKind::HostCall { op, response, string, entries, args: lowered }, Repr::Ref(response)), response_ty));
+        }
         // String intrinsics — built-in `String` ops backed by runtime externs.
         // Skipped if shadowed by a user-defined function of the same name.
         if !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
@@ -3083,7 +3156,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     continue;
                 }
             }
-            let (ca, at) = self.expr(a, hint(declared))?;
+            let hinted = apply_subst(declared, &targ);
+            let (ca, at) = self.expr(a, hint(&hinted))?;
             unify_infer(declared, &at, &mut targ);
             lowered[i] = Some((ca, at));
         }
@@ -3126,7 +3200,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         for (gp, conc) in f.generics.params.iter().zip(&inst_args) {
             for bound in &gp.bounds {
                 let trait_name = bound.path.last();
-                if !self.ctx.type_implements_trait(conc, trait_name) {
+                if !(if trait_name == "Sync" { self.ctx.is_sync(conc) } else { self.ctx.type_implements_trait(conc, trait_name) }) {
                     return err(
                         format!("the trait bound `{}: {}` is not satisfied (required by `{}`)",
                             ty_display(conc), trait_name, name),
@@ -3162,6 +3236,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 /// A `Some(ty)` hint only when the declared type is already concrete (no free
 /// type variables) — otherwise literal defaulting shouldn't be guided by `T`.
 fn hint(declared: &Ty) -> Option<&Ty> {
+    if let Ty::Fn { params, .. } = declared {
+        if params.iter().all(|param| !has_var(param)) { return Some(declared); }
+    }
     if has_var(declared) { None } else { Some(declared) }
 }
 

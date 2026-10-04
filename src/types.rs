@@ -180,7 +180,7 @@ impl TyCtx {
                     return true;
                 }
                 stack.push(name.clone());
-                let ok = self.struct_or_enum_fields_all_sync(base, args, stack);
+                let ok = self.struct_or_enum_fields_all_sync(name, args, stack);
                 stack.pop();
                 ok
             }
@@ -250,7 +250,7 @@ impl TyCtx {
                 // must itself be Sync (all-safe-slots, recursively).
                 if stack.iter().any(|s| s == name) { return true; }
                 stack.push(name.clone());
-                let ok = self.struct_or_enum_fields_all_sync(base, args, stack);
+                let ok = self.struct_or_enum_fields_all_sync(name, args, stack);
                 stack.pop();
                 ok
             }
@@ -317,7 +317,7 @@ pub fn type_base_name(t: &Type) -> String {
 /// Convert a surface `Type` (with generic params in scope) to a semantic `Ty`.
 /// Substitute type variables in `ty` per `subst` (used by `is_sync` to ground a
 /// generic field type at a concrete instantiation).
-fn subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -> Ty {
+pub(crate) fn subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Named { name, args } => Ty::Named {
@@ -353,7 +353,8 @@ pub fn lower_type(t: &Type, generics: &[String], ctx: &TyCtx) -> TResult<Ty> {
             if matches!(name, "Vec" | "Array" | "Option" | "Result") {
                 return Ok(Ty::Named { name: name.to_string(), args: targs });
             }
-            let canon = ctx.canon(name).unwrap_or_else(|| name.to_string());
+            let qualified = path.segments.join("::");
+            let canon = ctx.canon(&qualified).unwrap_or(qualified);
             Ok(Ty::Named { name: canon, args: targs })
         }
         TypeKind::Tuple(tys) => {

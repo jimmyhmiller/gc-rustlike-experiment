@@ -32,6 +32,8 @@
 //! `state`/`top_frame`/`heap`/`alloc_window` layout is load-bearing ABI; the
 //! `const _: ()` asserts below fail the build if it drifts.
 
+pub mod io;
+
 use crate::gc::{AllocWindow, Full, Heap, IdentityPtrPolicy, ThreadState, TypeInfo};
 use std::sync::Arc;
 use std::cell::Cell;
@@ -99,6 +101,8 @@ pub struct Thread {
     /// compiled inline fast path reads it; `limit == 0` (stress mode) closes it
     /// so every allocation takes the out-of-line slow path.
     pub alloc_window: *const AllocWindow,
+    /// Execution-local argv, shared immutably with child mutators.
+    pub arguments: Arc<Vec<std::ffi::OsString>>,
 }
 
 pub mod thread_offsets {
@@ -289,6 +293,7 @@ impl RuntimeContext {
                 heap: Arc::as_ptr(&heap) as *mut Heap,
                 dyna_thread: Arc::as_ptr(&dyna),
                 alloc_window,
+                arguments: Arc::new(std::env::args_os().collect()),
             }),
             heap,
             dyna,
@@ -303,6 +308,10 @@ impl RuntimeContext {
 
     /// Raw pointer to the mutator `Thread`, passed as the first argument of
     /// every compiled gc-rust function.
+    pub fn set_arguments(&mut self, args: Vec<std::ffi::OsString>) {
+        self.thread.arguments = Arc::new(args);
+    }
+
     pub fn thread_ptr(&mut self) -> *mut Thread {
         &mut *self.thread as *mut Thread
     }
@@ -379,6 +388,7 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
     let root_idx = heap.globals.add(env as u64);
     let code_bits = code as usize;
 
+    let arguments = unsafe { (*parent).arguments.clone() };
     let join = std::thread::spawn(move || -> u64 {
         // Register this child as a mutator thread on the shared heap.
         let (dyna, _id) = heap.register_thread();
@@ -390,6 +400,7 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
             heap: Arc::as_ptr(&heap) as *mut Heap,
             dyna_thread: Arc::as_ptr(&dyna),
             alloc_window,
+            arguments,
         });
         dyna.set_poll_flag(&mut thread.state as *mut u8);
         let tptr = &mut *thread as *mut Thread;
@@ -1590,6 +1601,35 @@ unsafe fn alloc_string_from_bytes(thread: *mut Thread, type_id: u32, bytes: &[u8
         *(obj.add(STR_COUNT_OFF) as *mut u64) = bytes.len() as u64;
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), obj.add(STR_DATA_OFF), bytes.len());
         obj
+    }
+}
+
+/// Abort after reporting an explicit language panic.
+/// # Safety
+/// `message` is a live String.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_panic(_thread: *mut Thread, message: *const u8) -> ! {
+    unsafe { eprintln!("gc-rust: panic: {}", String::from_utf8_lossy(str_bytes(message))); }
+    std::process::abort()
+}
+
+/// Join a prefix of Array<String> in linear time, with one managed allocation.
+/// Source bytes are copied before allocating so relocation cannot invalidate them.
+/// # Safety
+/// `array` and `separator` are live managed objects with the stated types.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_str_join(thread: *mut Thread, type_id: u32, array: *const u8, count: i64, separator: *const u8) -> *mut u8 {
+    unsafe {
+        let len = *(array.add(16) as *const u64);
+        if count < 0 || count as u64 > len { ai_bounds_fail(thread, count, len as i64); }
+        let sep = str_bytes(separator);
+        let mut bytes = Vec::new();
+        for index in 0..count as usize {
+            if index > 0 { bytes.extend_from_slice(sep); }
+            let string = *(array.add(STR_DATA_OFF + index * 8) as *const *const u8);
+            bytes.extend_from_slice(str_bytes(string));
+        }
+        alloc_string_from_bytes(thread, type_id, &bytes)
     }
 }
 

@@ -48,3 +48,6 @@ dist/
 .claude/settings.local.json
 /target/
 /build
+
+# Local code-search snapshots
+.gcr-search.index

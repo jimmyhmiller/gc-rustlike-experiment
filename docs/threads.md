@@ -21,3 +21,10 @@ store, and GC/channel lock deadlock. See STATUS.md for commands and scope.
 Production work must define worker failure, cancellation/shutdown, channel close,
 abandoned handles, and supported shared types, then verify GC coordination under
 pressure. Passing these tests does not establish deadlock freedom for all schedules.
+
+The target semantics are specified in [concurrency.md](concurrency.md): shared
+mutable managed objects, sequentially consistent access, structured execution and
+cooperative async cancellation. Current Sync checks are transitional. The runtime
+consumes a raw native join handle; repeated/concurrent joins through aliases are
+not safe to promise until ownership is repaired. The contract ledger distinguishes
+existing behavior from required implementation work.

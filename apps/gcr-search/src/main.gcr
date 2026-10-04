@@ -1,0 +1,30 @@
+mod index;
+mod search;
+
+fn fail(message: String) -> i64 { stderr_line(str_concat("gcr-search: ", message)); 1 }
+fn usage() -> i64 {
+    stderr_line("usage: gcr-search index <directory> [index-file]\n       gcr-search query <literal> [index-file]");
+    2
+}
+fn main() -> i64 {
+    let args = match process_args() { Result::Ok(a) => a, Result::Err(e) => { return fail(io_error_message(e)); } };
+    if array_len(args) < 3 || array_len(args) > 4 { return usage(); }
+    let command = match array_get(args, 1) { Option::Some(s) => s, Option::None => "" };
+    let value = match array_get(args, 2) { Option::Some(s) => s, Option::None => "" };
+    let output = if array_len(args) == 4 { match array_get(args, 3) { Option::Some(s) => s, Option::None => "" } } else { ".gcr-search.index" };
+    let destination = match path_absolute(output) { Result::Ok(p) => p, Result::Err(e) => { return fail(io_error_message(e)); } };
+    if str_eq(command, "index") {
+        let root = match path_absolute(value) { Result::Ok(p) => p, Result::Err(e) => { return fail(io_error_message(e)); } };
+        let result = match index::scan(root, destination) { Result::Ok(s) => s, Result::Err(e) => { return fail(e); } };
+        let encoded = index::encode(result.documents);
+        match fs_write_text_atomic(destination, encoded) {
+            Result::Ok(n) => { stderr_line(str_concat3("indexed ", to_string(vec_len(result.documents)), str_concat3(" files; skipped ", to_string(result.skipped), " files/links"))); 0 },
+            Result::Err(e) => fail(io_error_message(e))
+        }
+    } else if str_eq(command, "query") {
+        if str_is_empty(value) || str_contains_byte(value, 10) || str_contains_byte(value, 13) { return fail("query must be a nonempty single-line literal"); }
+        let text = match fs_read_text(destination, 67108864) { Result::Ok(s) => s, Result::Err(e) => { return fail(io_error_message(e)); } };
+        let docs = match index::decode(text) { Result::Ok(d) => d, Result::Err(e) => { return fail(e); } };
+        match search::query(docs, value) { Result::Ok(n) => 0, Result::Err(e) => fail(e) }
+    } else { usage() }
+}

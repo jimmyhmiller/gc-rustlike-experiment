@@ -173,6 +173,7 @@ impl<'a> Anf<'a> {
             CoreExprKind::FloatIntrinsic(op, a) => {
                 CoreExprKind::FloatIntrinsic(op, self.boxed(a, pending))
             }
+            CoreExprKind::Panic(a) => CoreExprKind::Panic(self.boxed(a, pending)),
             CoreExprKind::Print(a) => CoreExprKind::Print(self.boxed(a, pending)),
             CoreExprKind::PrintStr(a) => CoreExprKind::PrintStr(self.boxed(a, pending)),
             CoreExprKind::PrintStrRaw(a) => CoreExprKind::PrintStrRaw(self.boxed(a, pending)),
@@ -313,6 +314,10 @@ impl<'a> Anf<'a> {
                 } else { self.list(args, pending) };
                 CoreExprKind::Call(id, args)
             },
+            CoreExprKind::StrJoin { layout, args } => CoreExprKind::StrJoin { layout, args: self.list(args, pending) },
+            CoreExprKind::HostCall { op, response, string, entries, args } => {
+                CoreExprKind::HostCall { op, response, string, entries, args: self.list(args, pending) }
+            }
             CoreExprKind::RuntimeCall { func, args, ret } => {
                 CoreExprKind::RuntimeCall { func, args: self.list(args, pending), ret }
             }

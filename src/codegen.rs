@@ -537,14 +537,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     fn value_struct_ty(&self, vid: ValueId) -> inkwell::types::StructType<'ctx> {
         let v = &self.prog.values[vid as usize];
         if let Some(variants) = &v.variants {
-            let max_ptrs = crate::core::value_enum_max_ptrs(variants) as u32;
+            let max_ptrs = crate::core::value_enum_max_ptrs(variants, &self.prog.values) as u32;
             if max_ptrs == 0 {
                 // Compact value enum: `{ i32 tag, [payload bytes] }`.
-                let payload_bytes = v.size.saturating_sub(4) as u32;
+                let payload_bytes = v.size.saturating_sub(8) / 8;
                 return self.ctx.struct_type(
                     &[
                         self.ctx.i32_type().as_basic_type_enum(),
-                        self.ctx.i8_type().array_type(payload_bytes).as_basic_type_enum(),
+                        self.ctx.i64_type().array_type(payload_bytes).as_basic_type_enum(),
                     ],
                     false,
                 );
@@ -553,12 +553,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             // Ref payloads share the leading slots across variants (fixed offsets,
             // GC-traceable); scalars/POD-values go in the raw byte region.
             let ptr = self.ctx.ptr_type(AddressSpace::default());
-            let raw_bytes = v.size.saturating_sub(max_ptrs * 8 + 4) as u32;
+            let raw_bytes = v.size.saturating_sub(max_ptrs * 8 + 8) / 8;
             return self.ctx.struct_type(
                 &[
                     ptr.array_type(max_ptrs).as_basic_type_enum(),
                     self.ctx.i32_type().as_basic_type_enum(),
-                    self.ctx.i8_type().array_type(raw_bytes).as_basic_type_enum(),
+                    self.ctx.i64_type().array_type(raw_bytes).as_basic_type_enum(),
                 ],
                 false,
             );
@@ -1441,6 +1441,28 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 ).unwrap());
                 Ok(Some(r))
             }
+            CoreExprKind::StrJoin { layout, args } => {
+                let mut cargs = vec![fcx.thread.into(), self.ctx.i32_type().const_int(*layout as u64, false).into()];
+                for arg in args { cargs.push(self.gen_expr(fcx, arg)?.unwrap().into()); }
+                let func = self.module.get_function("ai_str_join").unwrap();
+                Ok(Some(call_result(self.builder.build_call(func, &cargs, "str.join").unwrap())))
+            }
+            CoreExprKind::Panic(message) => {
+                let message = self.gen_expr(fcx, message)?.unwrap();
+                let func = self.module.get_function("ai_panic").unwrap();
+                self.builder.build_call(func, &[fcx.thread.into(), message.into()], "").unwrap();
+                self.builder.build_unreachable().unwrap();
+                Ok(None)
+            }
+            CoreExprKind::HostCall { op, response, string, entries, args } => {
+                let mut cargs = vec![fcx.thread.into()];
+                for value in [*op, *response, *string, *entries] {
+                    cargs.push(self.ctx.i32_type().const_int(value as u64, false).into());
+                }
+                for arg in args { cargs.push(self.gen_expr(fcx, arg)?.unwrap().into()); }
+                let func = self.module.get_function("ai_host_call").unwrap();
+                Ok(Some(call_result(self.builder.build_call(func, &cargs, "host.io").unwrap())))
+            }
             CoreExprKind::ReadFile { layout, path } => {
                 let pv = self.gen_expr(fcx, path)?.unwrap().into_pointer_value();
                 let i32t = self.ctx.i32_type();
@@ -1990,6 +2012,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             ptr.fn_type(&[ptr.into(), i32t.into(), ptr.into(), i64t.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function(
+            "ai_host_call",
+            ptr.fn_type(&[ptr.into(), i32t.into(), i32t.into(), i32t.into(), i32t.into(), ptr.into(), ptr.into(), i64t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function("ai_str_join", ptr.fn_type(&[ptr.into(), i32t.into(), ptr.into(), i64t.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
+        let panic = self.module.add_function("ai_panic", self.ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
+        panic.add_attribute(inkwell::attributes::AttributeLoc::Function, self.ctx.create_enum_attribute(inkwell::attributes::Attribute::get_named_enum_kind_id("noreturn"), 0));
         // ptr ai_read_file(ptr thread, i32 type_id, ptr path)
         self.module.add_function(
             "ai_read_file",
@@ -2331,7 +2361,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let sty = self.value_struct_ty(value);
         let i32t = self.ctx.i32_type();
         let max_ptrs = crate::core::value_enum_max_ptrs(
-            self.prog.values[value as usize].variants.as_ref().unwrap(),
+            self.prog.values[value as usize].variants.as_ref().unwrap(), &self.prog.values,
         ) as u32;
         let slot = self.entry_alloca(sty, "ve");
         self.builder.build_store(slot, sty.const_zero()).unwrap();
@@ -2344,8 +2374,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let payload_addr = self.builder.build_struct_gep(sty, slot, 1, "ve.pl").unwrap();
                 let mut off = 0u64;
                 for (v, repr) in vals {
-                    let (sz, _) = Self::repr_size_align(repr);
-                    off = align_up64(off, sz);
+                    let (sz, align) = self.repr_size_align(repr);
+                    off = align_up64(off, align);
                     let field_addr = self.payload_field_addr(payload_addr, off);
                     self.builder.build_store(field_addr, *v).unwrap();
                     off += sz;
@@ -2378,11 +2408,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         self.builder.build_store(elem, *v).unwrap();
                     }
                     _ => {
-                        let (sz, _) = Self::repr_size_align(repr);
-                        raw_off = align_up64(raw_off, sz);
+                        let (sz, align) = self.repr_size_align(repr);
+                        raw_off = align_up64(raw_off, align);
                         let field_addr = self.payload_field_addr(raw_addr, raw_off);
                         raw_off += sz;
                         self.builder.build_store(field_addr, *v).unwrap();
+                        if let Repr::Value(id) = repr {
+                            let mut offsets = Vec::new();
+                            value_interior_offsets(&self.prog.values, *id, 0, &mut offsets);
+                            for offset in offsets {
+                                let source = self.payload_field_addr(field_addr, offset as u64);
+                                let reference = self.builder.build_load(ptr, source, "ve.nested.ref").unwrap();
+                                let target = self.payload_field_addr(ptr_arr, ptr_slot * 8);
+                                self.builder.build_store(target, reference).unwrap();
+                                self.builder.build_store(source, ptr.const_null()).unwrap();
+                                ptr_slot += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -2401,12 +2443,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     /// Byte size + alignment of a repr (for laying out value-enum payloads).
-    fn repr_size_align(repr: &Repr) -> (u64, u64) {
+    fn repr_size_align(&self, repr: &Repr) -> (u64, u64) {
         match repr {
             Repr::Unit => (0, 1),
             Repr::Scalar(s) => { let b = (s.bits().max(8) / 8) as u64; (b, b) }
             Repr::Ref(_) => (8, 8),
-            Repr::Value(_) => (8, 8), // nested value aggregates: conservative
+            Repr::Value(id) => { let layout = &self.prog.values[*id as usize]; (layout.size as u64, layout.align as u64) }
         }
     }
 
@@ -2437,7 +2479,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// (pointer/Values) array.
     fn elem_stride(elem: &Repr) -> (u64, bool) {
         match elem {
-            Repr::Ref(_) => (8, true),
+            Repr::Ref(_) | Repr::Value(_) => (8, true),
             Repr::Scalar(s) => ((s.bits().max(8) / 8) as u64, false),
             _ => (8, false),
         }
@@ -2607,6 +2649,30 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(Some(logical.into()))
     }
 
+    fn load_array_element(&mut self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, idx: IntValue<'ctx>, elem: &Repr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let (stride, _) = Self::elem_stride(elem);
+        let addr = self.array_elem_addr(obj, idx, stride);
+        let ty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
+        if let Repr::Value(_) = elem {
+            let pointer = self.ctx.ptr_type(AddressSpace::default());
+            let boxed = self.builder.build_load(pointer, addr, "element.box").unwrap().into_pointer_value();
+            let empty = self.ctx.append_basic_block(fcx.func, "element.zero");
+            let present = self.ctx.append_basic_block(fcx.func, "element.present");
+            let merge = self.ctx.append_basic_block(fcx.func, "element.merge");
+            let is_null = self.builder.build_is_null(boxed, "element.unset").unwrap();
+            self.builder.build_conditional_branch(is_null, empty, present).unwrap();
+            self.builder.position_at_end(empty);
+            self.builder.build_unconditional_branch(merge).unwrap();
+            self.builder.position_at_end(present);
+            let value = self.builder.build_load(ty, self.obj_addr(boxed, Self::HEADER), "element.value").unwrap();
+            self.builder.build_unconditional_branch(merge).unwrap();
+            self.builder.position_at_end(merge);
+            let phi = self.builder.build_phi(ty, "element").unwrap();
+            phi.add_incoming(&[(&ty.const_zero(), empty), (&value, present)]);
+            Ok(phi.as_basic_value())
+        } else { Ok(self.builder.build_load(ty, addr, "element").unwrap()) }
+    }
+
     /// `array_get(a, i)` yields `Option<T>`: `Some(a[i])` when in bounds, `None`
     /// when out of bounds (no abort — the absence of a value is signalled in the
     /// type). `result_repr` is the `Option<T>` value-enum repr assigned in
@@ -2643,10 +2709,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         // In bounds: load the element and wrap it in Some.
         self.builder.position_at_end(some_bb);
-        let (stride, _) = Self::elem_stride(elem);
-        let addr = self.array_elem_addr(obj, idx64, stride);
-        let lty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
-        let v = self.builder.build_load(lty, addr, "aget").unwrap();
+        let v = self.load_array_element(fcx, obj, idx64, elem)?;
         let some = self.build_value_variant(option_vid, OPTION_SOME_TAG, &[(v, elem.clone())]);
         let some_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge_bb).unwrap();
@@ -2676,10 +2739,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         let idx64 = self.idx_to_i64(idx);
-        let (stride, _) = Self::elem_stride(elem);
-        let addr = self.array_elem_addr(obj, idx64, stride);
-        let lty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
-        let v = self.builder.build_load(lty, addr, "aget.unchecked").unwrap();
+        let v = self.load_array_element(fcx, obj, idx64, elem)?;
         Ok(Some(v))
     }
 
@@ -2697,10 +2757,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let idx64 = self.idx_to_i64(idx);
         let len = self.array_logical_len(obj, &array.repr)?;
         self.emit_bounds_check(fcx, idx64, len);
-        let (stride, _) = Self::elem_stride(elem);
-        let addr = self.array_elem_addr(obj, idx64, stride);
-        let lty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
-        let v = self.builder.build_load(lty, addr, "aget.checked").unwrap();
+        let v = self.load_array_element(fcx, obj, idx64, elem)?;
         Ok(Some(v))
     }
 
@@ -2712,9 +2769,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         value: &CoreExpr,
         elem: &Repr,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
-        let val = self.gen_expr(fcx, value)?.unwrap();
+        // ANF has evaluated operands in source order. Boxing can collect, so
+        // allocate before reloading the destination from its relocated root.
+        let val = if matches!(elem, Repr::Value(_)) {
+            let lid = match array.repr { Repr::Ref(lid) => lid, _ => return Err(CodegenError("array destination is not a reference".into())) };
+            let boxed = self.prog.layouts[lid as usize].element_box.ok_or_else(|| CodegenError("value array has no element box layout".into()))?;
+            self.gen_alloc(fcx, boxed, None, std::slice::from_ref(value), crate::core::SpanId::default())?.unwrap()
+        } else { self.gen_expr(fcx, value)?.unwrap() };
+        let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx64 = self.idx_to_i64(idx);
         let len = self.array_logical_len(obj, &array.repr)?;
         self.emit_bounds_check(fcx, idx64, len);
@@ -2899,7 +2962,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let scrut_ty = self.llvm_ty(&scrutinee.repr).unwrap().into_struct_type();
         let vid = match &scrutinee.repr { Repr::Value(v) => *v, _ => unreachable!("value match on non-value") };
         let max_ptrs = crate::core::value_enum_max_ptrs(
-            self.prog.values[vid as usize].variants.as_ref().unwrap(),
+            self.prog.values[vid as usize].variants.as_ref().unwrap(), &self.prog.values,
         ) as u32;
         let agg = self.gen_expr(fcx, scrutinee)?.unwrap().into_struct_value();
         // Spill the aggregate so we can address its payload bytes for binds.
@@ -2960,13 +3023,28 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     ptr_slot += 1;
                     elem
                 } else {
-                    let (sz, _) = Self::repr_size_align(&lrepr);
-                    raw_off = align_up64(raw_off, sz);
+                    let (sz, align) = self.repr_size_align(&lrepr);
+                    raw_off = align_up64(raw_off, align);
                     let a = self.payload_field_addr(payload_ptr.unwrap(), raw_off);
                     raw_off += sz;
                     a
                 };
-                let v = self.builder.build_load(lty, faddr, "vm.bind").unwrap();
+                let mut v = self.builder.build_load(lty, faddr, "vm.bind").unwrap();
+                if let Repr::Value(id) = lrepr {
+                    let temporary = self.entry_alloca(lty, "vm.nested");
+                    self.builder.build_store(temporary, v).unwrap();
+                    let mut offsets = Vec::new();
+                    value_interior_offsets(&self.prog.values, id, 0, &mut offsets);
+                    for offset in offsets {
+                        let source = self.payload_field_addr(ptr_arr.unwrap(), ptr_slot * 8);
+                        let pointer = self.ctx.ptr_type(AddressSpace::default());
+                        let reference = self.builder.build_load(pointer, source, "vm.nested.ref").unwrap();
+                        let target = self.payload_field_addr(temporary, offset as u64);
+                        self.builder.build_store(target, reference).unwrap();
+                        ptr_slot += 1;
+                    }
+                    v = self.builder.build_load(lty, temporary, "vm.nested.value").unwrap();
+                }
                 if let Some(slot) = fcx.slots[local as usize] {
                     self.builder.build_store(slot, v).unwrap();
                 }
@@ -3818,7 +3896,7 @@ fn value_interior_offsets(values: &[crate::core::ValueLayout], vid: u32, base: u
     use crate::core::Repr;
     let vl = &values[vid as usize];
     if let Some(variants) = &vl.variants {
-        let max_ptrs = crate::core::value_enum_max_ptrs(variants);
+        let max_ptrs = crate::core::value_enum_max_ptrs(variants, values);
         for k in 0..max_ptrs {
             out.push(base + k * 8);
         }
@@ -3922,6 +4000,11 @@ pub fn jit_run_i64_gc(prog: &CoreProgram, stress: bool) -> Result<i64, CodegenEr
 
 /// JIT-run with an explicit GC heap mode (see [`GcRunMode`]).
 pub fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, CodegenError> {
+    jit_run_i64_with_args(prog, mode, std::env::args_os().collect())
+}
+
+/// Execute with independent argv; children inherit this execution's arguments.
+pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec<std::ffi::OsString>) -> Result<i64, CodegenError> {
     use crate::runtime::{self, RuntimeContext};
     let ctx = Context::create();
     let compiled = codegen(&ctx, prog)?;
@@ -3951,6 +4034,9 @@ pub fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, Code
         ("ai_str_len", runtime::ai_str_len as *const () as usize),
         ("ai_str_eq", runtime::ai_str_eq as *const () as usize),
         ("ai_str_concat", runtime::ai_str_concat as *const () as usize),
+        ("ai_panic", runtime::ai_panic as *const () as usize),
+        ("ai_str_join", runtime::ai_str_join as *const () as usize),
+        ("ai_host_call", runtime::io::ai_host_call as *const () as usize),
         ("ai_str_get", runtime::ai_str_get as *const () as usize),
         ("ai_str_substring", runtime::ai_str_substring as *const () as usize),
         ("ai_str_from_int", runtime::ai_str_from_int as *const () as usize),
@@ -4015,6 +4101,7 @@ pub fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, Code
             RuntimeContext::new_generational(nursery, tenured, tis)
         }
     };
+    rt.set_arguments(arguments);
     // Install reflection metadata so heap-exploration tooling and in-language
     // reflection can recover type/field names (the GC type table is nameless).
     rt.heap().set_type_meta(layouts_to_type_meta(prog));

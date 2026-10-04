@@ -75,7 +75,7 @@ impl<'a> LayoutRegistry<'a> {
             Ty::Array(elem, n) => {
                 // Fixed array → a reference object holding `n` inline elements.
                 let er = self.repr(elem)?;
-                Ok(Repr::Ref(self.array_layout(&er, *n)))
+                Ok(Repr::Ref(self.array_layout(&er, *n)?))
             }
             Ty::Tuple(elems) => {
                 // Tuples are value aggregates.
@@ -99,7 +99,7 @@ impl<'a> LayoutRegistry<'a> {
         match name {
             "Array" => {
                 let er = self.repr(&args[0])?;
-                return Ok(Repr::Ref(self.array_for(&er)));
+                return Ok(Repr::Ref(self.array_for(&er)?));
             }
             "Vec" => {
                 let er = self.repr(&args[0])?;
@@ -159,7 +159,7 @@ impl<'a> LayoutRegistry<'a> {
         self.ref_ids.insert(key.clone(), id);
         self.layouts.push(placeholder_layout(&key));
 
-        let field_tys = struct_field_tys(s, args)?;
+        let field_tys = struct_field_tys(s, args, self.ctx)?;
         let field_names = struct_field_names(s);
         let layout = self.build_ref_layout(&key, &field_names, &field_tys)?;
         self.layouts[id as usize] = layout;
@@ -184,7 +184,7 @@ impl<'a> LayoutRegistry<'a> {
         let mut max_ptrs = 0u16;
         let mut max_raw = 0u16;
         for v in &e.variants {
-            let payload_tys = variant_payload_tys(v, &e.generics, args)?;
+            let payload_tys = variant_payload_tys(v, &e.generics, args, self.ctx)?;
             let (ptrs, raw) = self.count_fields(&payload_tys)?;
             max_ptrs = max_ptrs.max(ptrs);
             max_raw = max_raw.max(raw);
@@ -195,7 +195,7 @@ impl<'a> LayoutRegistry<'a> {
         // field offsets matching codegen's placement. Tag = variant index.
         let mut variants_meta = Vec::with_capacity(e.variants.len());
         for (vtag, v) in e.variants.iter().enumerate() {
-            let payload_tys = variant_payload_tys(v, &e.generics, args)?;
+            let payload_tys = variant_payload_tys(v, &e.generics, args, self.ctx)?;
             let reprs: Vec<Repr> = payload_tys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
             let fnames = variant_field_names(v);
             let fields = self.enum_variant_fields(&reprs, &fnames, max_ptrs);
@@ -214,7 +214,7 @@ impl<'a> LayoutRegistry<'a> {
             // offset 0 and let codegen compute payload locations per variant.
             field_map: vec![FieldLoc::Raw { offset: 0, repr: ScalarRepr::U32 }],
             name: key,
-            elem_stride: 0,
+            elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
             meta,
         };
@@ -267,7 +267,7 @@ impl<'a> LayoutRegistry<'a> {
             varlen: VarLen::None,
             field_map: vec![FieldLoc::Raw { offset: 0, repr: ScalarRepr::U32 }],
             name: key,
-            elem_stride: 0,
+            elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
             meta,
         };
@@ -281,7 +281,7 @@ impl<'a> LayoutRegistry<'a> {
         if let Some(id) = self.value_ids.get(&key) {
             return Ok(*id);
         }
-        let field_tys = struct_field_tys(s, args)?;
+        let field_tys = struct_field_tys(s, args, self.ctx)?;
         let fields: Vec<Repr> = field_tys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
         let (size, align) = value_size_align(&fields, &self.values);
         let field_names = struct_field_names(s);
@@ -298,19 +298,19 @@ impl<'a> LayoutRegistry<'a> {
         }
         let mut variants = Vec::new();
         for v in &e.variants {
-            let ptys = variant_payload_tys(v, &e.generics, args)?;
+            let ptys = variant_payload_tys(v, &e.generics, args, self.ctx)?;
             let fields: Vec<Repr> = ptys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
             variants.push(ValueVariant { name: v.name.clone(), fields });
         }
         // Pointers-first layout (mirrors reference enums): `max_ptrs` leading GC
         // slots shared across variants, then the u32 tag, then the raw region
-        // (scalar + POD-value payloads). Embedded refs land at fixed offsets
+        // (scalar + value payloads with references split into the leading slots). Embedded refs land at fixed offsets
         // (`0, 8, …`) regardless of the active variant, so the GC can trace them
         // with a static interior-pointer list. `max_ptrs == 0` degenerates to the
-        // compact `{ tag, raw }` form — identical to before for ref-free enums.
-        let max_ptrs = value_enum_max_ptrs(&variants) as u32;
+        // compact `{ tag, padding, raw }` form. Raw payloads are 8-aligned.
+        let max_ptrs = value_enum_max_ptrs(&variants, &self.values) as u32;
         let mut max_raw = 0u32;
-        let mut align = if max_ptrs > 0 { 8 } else { 4 };
+        let mut align = 8;
         for vv in &variants {
             let mut raw = 0u32;
             for f in &vv.fields {
@@ -330,7 +330,7 @@ impl<'a> LayoutRegistry<'a> {
             }
             max_raw = max_raw.max(raw);
         }
-        let size = align_up(max_ptrs * 8 + 4 + max_raw, align);
+        let size = align_up(max_ptrs * 8 + 8 + max_raw, align);
         let id = self.values.len() as ValueId;
         self.values.push(ValueLayout { name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
         self.value_ids.insert(key, id);
@@ -354,7 +354,7 @@ impl<'a> LayoutRegistry<'a> {
     fn string_layout(&mut self) -> LayoutId {
         self.intern_ref("String", Layout {
             ptr_fields: 0, raw_bytes: 0, varlen: VarLen::Bytes,
-            field_map: vec![], name: "String".into(), elem_stride: 0,
+            field_map: vec![], name: "String".into(), elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
             meta: opaque_meta("String"),
         })
@@ -374,58 +374,51 @@ impl<'a> LayoutRegistry<'a> {
                 FieldLoc::Raw { offset: 8, repr: ScalarRepr::U64 },
             ],
             name: if traced { format!("{key}#traced") } else { key.clone() },
-            elem_stride: 0,
+            elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
             meta: opaque_meta(&key),
         })
     }
     /// A varlen array layout for the given element repr. Pointer elements use a
     /// traced `Values` tail; scalar elements use an untraced `Bytes` tail whose
-    /// element stride is the scalar's byte size (encoded via raw_bytes=stride).
-    pub fn array_for(&mut self, elem: &Repr) -> LayoutId {
-        let traced = matches!(elem, Repr::Ref(_));
-        let stride = match elem {
-            Repr::Ref(_) => 8u16,
-            Repr::Scalar(s) => (s.bits().max(8) / 8) as u16,
-            Repr::Value(vid) => self.values[*vid as usize].size as u16,
-            Repr::Unit => 8,
-        };
+    /// element stride is the scalar's byte size. Value elements use traced boxes.
+    pub fn array_for(&mut self, elem: &Repr) -> R<LayoutId> {
         let key = format!("Array<{}>", repr_key(elem));
-        if let Some(id) = self.ref_ids.get(&key) {
-            return *id;
-        }
+        if let Some(id) = self.ref_ids.get(&key) { return Ok(*id); }
+        let element_box = if let Repr::Value(vid) = elem {
+            let name = format!("<array-element:{}>", self.values[*vid as usize].name);
+            let size = self.values[*vid as usize].size;
+            if size > u16::MAX as u32 - HEADER as u32 { return Err(LayoutError("array value element exceeds pointer-offset limit".into())); }
+            let raw_bytes = u16::try_from(size).map_err(|_| LayoutError("array value element exceeds layout size limit".into()))?;
+            let mut interior_ptrs = Vec::new();
+            self.value_ref_offsets(*vid, HEADER, &mut interior_ptrs)?;
+            Some(self.intern_ref(&name, Layout {
+                ptr_fields: 0, raw_bytes, varlen: VarLen::None,
+                field_map: vec![FieldLoc::ValueAt { offset: 0, value: *vid }],
+                name: name.clone(), elem_stride: 0, element_box: None,
+                interior_ptrs, meta: opaque_meta(&name),
+            }))
+        } else { None };
+        let traced = matches!(elem, Repr::Ref(_) | Repr::Value(_));
+        let stride = match elem { Repr::Scalar(s) => (s.bits().max(8) / 8) as u16, _ => 8 };
         let id = self.layouts.len() as LayoutId;
         self.layouts.push(Layout {
-            ptr_fields: 0,
-            raw_bytes: 0,
-            // Reference elements → traced 8-byte `Values` tail (count = n).
-            // Scalar elements → untraced `Bytes` tail; codegen addresses by the
-            // element stride, count word = n * stride bytes.
+            ptr_fields: 0, raw_bytes: 0,
             varlen: if traced { VarLen::Values } else { VarLen::Bytes },
-            field_map: vec![],
-            name: key.clone(),
-            elem_stride: stride,
-            interior_ptrs: vec![],
-            meta: opaque_meta(&key),
+            field_map: vec![], name: key.clone(), elem_stride: stride,
+            element_box, interior_ptrs: vec![], meta: opaque_meta(&key),
         });
         self.ref_ids.insert(key, id);
-        id
+        Ok(id)
     }
 
-    fn array_layout(&mut self, elem: &Repr, n: u64) -> LayoutId {
+    fn array_layout(&mut self, elem: &Repr, n: u64) -> R<LayoutId> {
         let key = format!("[{};{}]", repr_key(elem), n);
-        let traced = matches!(elem, Repr::Ref(_));
-        let stride = match elem { Repr::Ref(_) => 8u16, Repr::Scalar(s) => (s.bits().max(8) / 8) as u16, Repr::Value(vid) => self.values[*vid as usize].size as u16, Repr::Unit => 8 };
-        self.intern_ref(&key, Layout {
-            ptr_fields: 0,
-            raw_bytes: 0,
-            varlen: if traced { VarLen::Values } else { VarLen::Bytes },
-            field_map: vec![],
-            name: key.clone(),
-            elem_stride: stride,
-            interior_ptrs: vec![],
-            meta: opaque_meta(&key),
-        })
+        let dynamic = self.array_for(elem)?;
+        let mut layout = self.layouts[dynamic as usize].clone();
+        layout.name = key.clone();
+        layout.meta = opaque_meta(&key);
+        Ok(self.intern_ref(&key, layout))
     }
     fn closure_placeholder(&mut self) -> LayoutId {
         // Filled per-closure during closure lowering; a generic env placeholder.
@@ -436,34 +429,32 @@ impl<'a> LayoutRegistry<'a> {
     /// then a raw section holding [code_ptr: u64][scalar captures...]. The
     /// returned layout's `field_map` is empty (codegen addresses by section
     /// offset using `capture_kinds`). `key` makes distinct closures distinct.
-    pub fn closure_env(&mut self, key: &str, captures: &[Repr]) -> LayoutId {
-        let mut ptr_fields = 0u16;
-        let mut raw_bytes = 8u16; // code pointer
-        for c in captures {
-            match c {
-                Repr::Ref(_) => ptr_fields += 1,
-                Repr::Scalar(s) => raw_bytes += (s.bits().max(8) / 8) as u16,
-                // Value aggregates are stored 8-aligned in the raw section (see
-                // lower_lifted / gen_make_closure), so reserve aligned space.
-                Repr::Value(vid) => {
-                    raw_bytes = align_up(raw_bytes as u32, 8) as u16;
-                    raw_bytes += self.values[*vid as usize].size as u16;
+    pub fn closure_env(&mut self, key: &str, captures: &[Repr]) -> R<LayoutId> {
+        let ptr_fields = captures.iter().filter(|repr| matches!(repr, Repr::Ref(_))).count() as u16;
+        let mut raw_bytes = 8u32;
+        let mut interior_ptrs = Vec::new();
+        for capture in captures {
+            match capture {
+                Repr::Scalar(s) => {
+                    let size = s.bits().max(8) / 8;
+                    raw_bytes = align_up(raw_bytes, size) + size;
                 }
-                Repr::Unit => {}
+                Repr::Value(id) => {
+                    raw_bytes = align_up(raw_bytes, 8);
+                    if HEADER as u32 + ptr_fields as u32 * 8 + raw_bytes + self.values[*id as usize].size > u16::MAX as u32 { return Err(LayoutError("closure capture exceeds pointer-offset limit".into())); }
+                    let base = u16::try_from(HEADER as u32 + ptr_fields as u32 * 8 + raw_bytes).map_err(|_| LayoutError("closure capture exceeds layout size limit".into()))?;
+                    self.value_ref_offsets(*id, base, &mut interior_ptrs)?;
+                    raw_bytes += self.values[*id as usize].size;
+                }
+                _ => {}
             }
         }
+        let raw_bytes = u16::try_from(align_up(raw_bytes, 8)).map_err(|_| LayoutError("closure captures exceed layout size limit".into()))?;
         let id = self.layouts.len() as LayoutId;
-        self.layouts.push(Layout {
-            ptr_fields,
-            raw_bytes: align_up(raw_bytes as u32, 8) as u16,
-            varlen: VarLen::None,
-            field_map: vec![],
-            name: key.to_string(),
-            elem_stride: 0,
-            interior_ptrs: vec![],
-            meta: opaque_meta(key),
-        });
-        id
+        self.layouts.push(Layout { ptr_fields, raw_bytes, varlen: VarLen::None,
+            field_map: vec![], name: key.to_string(), elem_stride: 0, element_box: None,
+            interior_ptrs, meta: opaque_meta(key) });
+        Ok(id)
     }
 
     fn intern_ref(&mut self, key: &str, layout: Layout) -> LayoutId {
@@ -560,8 +551,7 @@ impl<'a> LayoutRegistry<'a> {
             kind: TypeKind::Struct { fields: meta_fields },
         };
         // Interior pointers: GC refs embedded in flattened value fields, at
-        // absolute offsets, so `gc::scan_object` traces them. Errors here if a
-        // value field is a ref-carrying value enum (unsupported union).
+        // absolute offsets, so `gc::scan_object` traces them. Nested enum references use the shared leading pointer slots.
         let mut interior_ptrs = Vec::new();
         for (i, r) in reprs.iter().enumerate() {
             if let (Repr::Value(vid), FieldLoc::ValueAt { offset, .. }) = (r, &field_map[i]) {
@@ -575,35 +565,10 @@ impl<'a> LayoutRegistry<'a> {
             varlen: VarLen::None,
             field_map,
             name: name.to_string(),
-            elem_stride: 0,
+            elem_stride: 0, element_box: None,
             interior_ptrs,
             meta,
         })
-    }
-
-    /// Whether value type `vid` (transitively) contains a GC reference. Used to
-    /// gate flattening a value aggregate into a heap object's raw region (unsound
-    /// until interior-pointer rooting lands). Value types can't be recursive by
-    /// value, so this terminates.
-    fn value_contains_ref(&self, vid: ValueId) -> bool {
-        let vl = &self.values[vid as usize];
-        let mut reprs: Vec<&Repr> = Vec::new();
-        match &vl.variants {
-            Some(variants) => for v in variants { reprs.extend(v.fields.iter()) },
-            None => reprs.extend(vl.fields.iter()),
-        }
-        for r in reprs {
-            match r {
-                Repr::Ref(_) => return true,
-                Repr::Value(v) => {
-                    if self.value_contains_ref(*v) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
     }
 
     /// Collect byte offsets of GC references inside a flattened value aggregate
@@ -611,32 +576,12 @@ impl<'a> LayoutRegistry<'a> {
     /// value structs, mirroring `value_size_align`'s (and thus the LLVM struct's)
     /// field placement so the offsets match where codegen actually stores the refs.
     ///
-    /// Errors on a value **enum** that carries a reference: its payload is a union,
-    /// so a ref's offset depends on the runtime tag — which a static interior-pointer
-    /// list can't express. (Ref-free value enums are fine and contribute nothing.)
+    /// Value enums split direct and nested references into shared leading slots,
+    /// so their offsets remain independent of the active variant.
     fn value_ref_offsets(&self, vid: ValueId, base: u16, out: &mut Vec<u16>) -> R<()> {
         let vl = &self.values[vid as usize];
         if let Some(variants) = &vl.variants {
-            // Pointers-first value enum: every variant's `Ref` payloads share the
-            // leading slots at fixed offsets `0, 8, …`, so the embedded refs are
-            // expressible as a static interior-pointer list (trace all `max_ptrs`
-            // slots; an inactive variant simply leaves trailing slots null). A
-            // *nested* value-with-reference payload can't be flattened (its refs
-            // sit at tag-dependent sub-offsets in the raw union) — reject those.
-            for v in variants {
-                for f in &v.fields {
-                    if let Repr::Value(sub) = f {
-                        if self.value_contains_ref(*sub) {
-                            return Err(LayoutError(format!(
-                                "value enum `{}` has a variant whose payload is a value-with-reference; \
-                                 flattening it into a heap object isn't supported. Use a reference type.",
-                                vl.name
-                            )));
-                        }
-                    }
-                }
-            }
-            let max_ptrs = crate::core::value_enum_max_ptrs(variants);
+            let max_ptrs = crate::core::value_enum_max_ptrs(variants, &self.values);
             for k in 0..max_ptrs {
                 out.push(base + k * 8);
             }
@@ -704,7 +649,7 @@ impl<'a> LayoutRegistry<'a> {
 // ---- free helpers ----------------------------------------------------------
 
 fn placeholder_layout(name: &str) -> Layout {
-    Layout { ptr_fields: 0, raw_bytes: 0, varlen: VarLen::None, field_map: vec![], name: name.to_string(), elem_stride: 0, interior_ptrs: vec![], meta: opaque_meta(name) }
+    Layout { ptr_fields: 0, raw_bytes: 0, varlen: VarLen::None, field_map: vec![], name: name.to_string(), elem_stride: 0, element_box: None, interior_ptrs: vec![], meta: opaque_meta(name) }
 }
 
 /// Source-order field names of a struct, for reflection metadata. Tuple structs
@@ -727,23 +672,23 @@ fn variant_field_names(v: &crate::ast::VariantDef) -> Vec<String> {
     }
 }
 
-fn struct_field_tys(s: &crate::ast::StructDef, args: &[Ty]) -> R<Vec<Ty>> {
+fn struct_field_tys(s: &crate::ast::StructDef, args: &[Ty], ctx: &TyCtx) -> R<Vec<Ty>> {
     let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
     let subst = build_subst(&gparams, args);
     match &s.body {
-        StructBody::Named(fields) => fields.iter().map(|f| surface_to_ground(&f.ty, &subst)).collect(),
-        StructBody::Tuple(tys) => tys.iter().map(|t| surface_to_ground(t, &subst)).collect(),
+        StructBody::Named(fields) => fields.iter().map(|f| surface_to_ground(&f.ty, &subst, ctx)).collect(),
+        StructBody::Tuple(tys) => tys.iter().map(|t| surface_to_ground(t, &subst, ctx)).collect(),
         StructBody::Unit => Ok(vec![]),
     }
 }
 
-fn variant_payload_tys(v: &crate::ast::VariantDef, generics: &crate::ast::Generics, args: &[Ty]) -> R<Vec<Ty>> {
+fn variant_payload_tys(v: &crate::ast::VariantDef, generics: &crate::ast::Generics, args: &[Ty], ctx: &TyCtx) -> R<Vec<Ty>> {
     let gparams: Vec<String> = generics.params.iter().map(|p| p.name.clone()).collect();
     let subst = build_subst(&gparams, args);
     match &v.payload {
         VariantPayload::None => Ok(vec![]),
-        VariantPayload::Tuple(tys) => tys.iter().map(|t| surface_to_ground(t, &subst)).collect(),
-        VariantPayload::Named(fields) => fields.iter().map(|f| surface_to_ground(&f.ty, &subst)).collect(),
+        VariantPayload::Tuple(tys) => tys.iter().map(|t| surface_to_ground(t, &subst, ctx)).collect(),
+        VariantPayload::Named(fields) => fields.iter().map(|f| surface_to_ground(&f.ty, &subst, ctx)).collect(),
     }
 }
 
@@ -751,66 +696,13 @@ fn build_subst(params: &[String], args: &[Ty]) -> HashMap<String, Ty> {
     params.iter().cloned().zip(args.iter().cloned()).collect()
 }
 
-/// Convert a surface type to a ground `Ty`, substituting generic params.
-/// (A light reimplementation of `types::lower_type` that also applies a subst —
-/// the monomorphizer will supersede this with a proper instantiation pass.)
-fn surface_to_ground(t: &crate::ast::Type, subst: &HashMap<String, Ty>) -> R<Ty> {
-    use crate::ast::TypeKind;
-    match &t.kind {
-        TypeKind::Path(path, targs) => {
-            let name = path.last();
-            if let Some(sub) = subst.get(name) {
-                return Ok(sub.clone());
-            }
-            if let Some(p) = prim_of(name) {
-                return Ok(Ty::Prim(p));
-            }
-            let gargs: Vec<Ty> = targs.iter().map(|a| surface_to_ground(a, subst)).collect::<R<_>>()?;
-            Ok(Ty::Named { name: name.to_string(), args: gargs })
-        }
-        TypeKind::Tuple(tys) => {
-            if tys.is_empty() {
-                Ok(Ty::Prim(Prim::Unit))
-            } else {
-                Ok(Ty::Tuple(tys.iter().map(|t| surface_to_ground(t, subst)).collect::<R<_>>()?))
-            }
-        }
-        TypeKind::Array(elem, count) => {
-            let n = match &*count.kind {
-                crate::ast::ExprKind::Int(n, _) => *n,
-                _ => return Err(LayoutError("array length must be a literal".into())),
-            };
-            Ok(Ty::Array(Box::new(surface_to_ground(elem, subst)?), n))
-        }
-        TypeKind::Fn(params, ret) => {
-            let ps = params.iter().map(|p| surface_to_ground(p, subst)).collect::<R<_>>()?;
-            let r = match ret {
-                Some(r) => surface_to_ground(r, subst)?,
-                None => Ty::Prim(Prim::Unit),
-            };
-            Ok(Ty::Fn { params: ps, ret: Box::new(r) })
-        }
-        TypeKind::ExternFn(params, ret) => {
-            let ps = params.iter().map(|p| surface_to_ground(p, subst)).collect::<R<_>>()?;
-            let r = match ret {
-                Some(r) => surface_to_ground(r, subst)?,
-                None => Ty::Prim(Prim::Unit),
-            };
-            Ok(Ty::ExternFn { params: ps, ret: Box::new(r) })
-        }
-        TypeKind::SelfType => subst.get("Self").cloned().ok_or_else(|| LayoutError("Self outside impl".into())),
-    }
-}
-
-fn prim_of(name: &str) -> Option<Prim> {
-    Some(match name {
-        "i8" => Prim::I8, "i16" => Prim::I16, "i32" => Prim::I32, "i64" => Prim::I64,
-        "u8" => Prim::U8, "u16" => Prim::U16, "u32" => Prim::U32, "u64" => Prim::U64,
-        "f32" => Prim::F32, "f64" => Prim::F64,
-        "bool" => Prim::Bool, "char" => Prim::Char, "String" => Prim::Str,
-        "RawPtr" => Prim::RawPtr,
-        _ => return None,
-    })
+/// Use the type checker's canonical name resolution before substitution, so
+/// module-qualified fields and container elements receive the same layouts as
+/// their checked types.
+fn surface_to_ground(t: &crate::ast::Type, subst: &HashMap<String, Ty>, ctx: &TyCtx) -> R<Ty> {
+    let params: Vec<String> = subst.keys().cloned().collect();
+    let ty = crate::types::lower_type(t, &params, ctx).map_err(|e| LayoutError(e.msg))?;
+    Ok(crate::types::subst_ty(&ty, subst))
 }
 
 fn scalar_of(p: Prim) -> Option<ScalarRepr> {

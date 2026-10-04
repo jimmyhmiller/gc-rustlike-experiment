@@ -1,0 +1,100 @@
+// Managed syscall response ABI; applications use the typed wrappers below.
+struct IoResponse { text: String, entries: Array<String>, code: i64, kind: i64 }
+// kind: 1 not found, 2 permission denied, 3 invalid data/input, 4 other I/O.
+struct IoError { operation: String, path: String, kind: i64, message: String }
+fn io_error(r: IoResponse, operation: String, path: String) -> IoError {
+    IoError { operation: operation, path: path, kind: r.code, message: r.text }
+}
+fn io_error_message(e: IoError) -> String {
+    str_concat3(str_concat3(e.operation, " ", e.path), ": ", e.message)
+}
+fn fs_read_text(path: String, max_bytes: i64) -> Result<String, IoError> {
+    let r = host_io(1, path, "", max_bytes);
+    if r.code == 0 { Result::Ok(r.text) } else { Result::Err(io_error(r, "read", path)) }
+}
+fn fs_read_dir(path: String) -> Result<Array<String>, IoError> {
+    let r = host_io(2, path, "", 100000);
+    if r.code == 0 { Result::Ok(r.entries) } else { Result::Err(io_error(r, "list", path)) }
+}
+// Does not follow symlinks: 1 regular file, 2 directory, 3 symlink, 4 other.
+fn fs_kind(path: String) -> Result<i64, IoError> {
+    let r = host_io(3, path, "", 0);
+    if r.code == 0 { Result::Ok(r.kind) } else { Result::Err(io_error(r, "stat", path)) }
+}
+fn path_absolute(path: String) -> Result<String, IoError> {
+    let r = host_io(4, path, "", 0);
+    if r.code == 0 { Result::Ok(r.text) } else { Result::Err(io_error(r, "resolve", path)) }
+}
+fn path_join(parent: String, name: String) -> String {
+    if str_starts_with(name, "/") { name }
+    else if str_ends_with(parent, "/") || str_is_empty(parent) { str_concat(parent, name) }
+    else { str_concat3(parent, "/", name) }
+}
+fn fs_write_text_atomic(path: String, text: String) -> Result<i64, IoError> {
+    let r = host_io(5, path, text, 0);
+    if r.code == 0 { Result::Ok(0) } else { Result::Err(io_error(r, "write", path)) }
+}
+fn process_args() -> Result<Array<String>, IoError> {
+    let r = host_io(0, "", "", 0);
+    if r.code == 0 { Result::Ok(r.entries) } else { Result::Err(io_error(r, "arguments", "")) }
+}
+fn stdout_line(text: String) -> Result<i64, IoError> {
+    let r = host_io(7, "", text, 0);
+    if r.code == 0 { Result::Ok(0) } else { Result::Err(io_error(r, "stdout", "")) }
+}
+fn stderr_line(text: String) -> i64 { let r = host_io(6, "", text, 0); r.code }
+
+// Literal byte search without allocating a substring at every candidate.
+// Search only within [from, end), returning an absolute byte offset.
+// Negative bounds clamp to zero; end clamps to text length. Reversed ranges
+// and starts beyond the string have no match, including for empty needles.
+fn str_find_range(text: String, needle: String, from: i64, end: i64) -> i64 {
+    let n = str_len(needle);
+    let len = str_len(text);
+    let stop = if end < 0 { 0 } else if end > len { len } else { end };
+    let mut i = if from < 0 { 0 } else { from };
+    if i > stop { return 0 - 1; }
+    while n <= stop - i {
+        let mut j = 0;
+        while j < n && str_get(text, i + j) == str_get(needle, j) { j = j + 1; }
+        if j == n { return i; }
+        i = i + 1;
+    }
+    0 - 1
+}
+fn str_find_from(text: String, needle: String, from: i64) -> i64 {
+    str_find_range(text, needle, from, str_len(text))
+}
+
+// JSON string encoding preserves UTF-8 and escapes every ASCII control byte.
+fn json_quote(text: String) -> String {
+    let mut parts: Vec<String> = vec_new();
+    parts = vec_push(parts, "\"");
+    let mut start = 0;
+    let mut i = 0;
+    let hex = "0123456789abcdef";
+    while i < str_len(text) {
+        let b = str_get(text, i);
+        if b < 32 || b == 34 || b == 92 {
+            parts = vec_push(parts, str_substring(text, start, i));
+            if b == 34 { parts = vec_push(parts, "\\\""); }
+            else if b == 92 { parts = vec_push(parts, "\\\\"); }
+            else {
+                parts = vec_push(parts, str_concat3("\\u00", str_substring(hex, b / 16, b / 16 + 1), str_substring(hex, b % 16, b % 16 + 1)));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    parts = vec_push(parts, str_substring(text, start, i));
+    parts = vec_push(parts, "\"");
+    str_join(parts, "")
+}
+
+// Explicitly checked extraction for callers whose invariants require a value.
+fn opt_expect<T>(value: Option<T>, message: String) -> T {
+    match value { Option::Some(v) => v, Option::None => panic(message) }
+}
+fn vec_at<T>(value: Vec<T>, index: i64) -> T {
+    opt_expect(vec_get(value, index), "Vec index out of bounds")
+}

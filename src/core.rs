@@ -79,6 +79,8 @@ pub struct Layout {
     /// For array layouts: the element stride in bytes (codegen-only; does not
     /// affect the GC `TypeInfo`). 0 for non-array layouts.
     pub elem_stride: u16,
+    /// Value elements are stored in individually traced boxes.
+    pub element_box: Option<LayoutId>,
     /// Absolute byte offsets (header included) of GC pointers embedded in the raw
     /// region — i.e. references inside flattened `#[value]` fields. These become
     /// `gc::TypeInfo::interior_ptrs` so the collector traces them. Empty for the
@@ -136,18 +138,25 @@ pub struct ValueVariant {
 }
 
 /// The number of leading GC-pointer slots a flattened value enum reserves —
-/// the max over its variants of their `Ref` payload count. Pointer payloads of
+/// the max over its variants of their direct and nested reference count. Pointer payloads of
 /// every variant share these leading slots (at fixed offsets `0, 8, …`), exactly
 /// like a reference enum's heap layout, so an embedded ref's offset does not
 /// depend on the runtime tag. The single source of truth for layout, codegen,
 /// and GC interior-pointer offsets. `0` means no ref payloads (the value enum
 /// keeps its compact `{ tag, raw }` form).
-pub fn value_enum_max_ptrs(variants: &[ValueVariant]) -> u16 {
-    variants
-        .iter()
-        .map(|v| v.fields.iter().filter(|f| matches!(f, Repr::Ref(_))).count() as u16)
-        .max()
-        .unwrap_or(0)
+pub fn value_enum_max_ptrs(variants: &[ValueVariant], values: &[ValueLayout]) -> u16 {
+    fn count(repr: &Repr, values: &[ValueLayout]) -> u16 {
+        match repr {
+            Repr::Ref(_) => 1,
+            Repr::Value(id) => {
+                let value = &values[*id as usize];
+                if let Some(variants) = &value.variants { value_enum_max_ptrs(variants, values) }
+                else { value.fields.iter().map(|field| count(field, values)).sum() }
+            }
+            _ => 0,
+        }
+    }
+    variants.iter().map(|variant| variant.fields.iter().map(|field| count(field, values)).sum()).max().unwrap_or(0)
 }
 
 // ============================================================================
@@ -303,6 +312,7 @@ pub enum CoreExprKind {
     StrConcat { layout: LayoutId, a: Box<CoreExpr>, b: Box<CoreExpr> },
     /// `str_get(s, i)` → i64 byte (or -1 out of range).
     StrGet(Box<CoreExpr>, Box<CoreExpr>),
+    StrJoin { layout: LayoutId, args: Vec<CoreExpr> },
     /// `str_substring(s, start, end)` → a fresh `String`.
     StrSubstring { layout: LayoutId, s: Box<CoreExpr>, start: Box<CoreExpr>, end: Box<CoreExpr> },
     /// `to_string(v)` → a fresh `String` (int or float rendering). `is_float`
@@ -314,6 +324,8 @@ pub enum CoreExprKind {
     /// `read_file(path)` → a fresh `String` with the file's bytes (empty if the
     /// file can't be read). Lets a self-hosted compiler driver read source files.
     ReadFile { layout: LayoutId, path: Box<CoreExpr> },
+    /// Checked host I/O, with a validated managed response layout.
+    HostCall { op: u32, response: LayoutId, string: LayoutId, entries: LayoutId, args: Vec<CoreExpr> },
     /// `str_to_float(s)` → f64 (0.0 on malformed input).
     StrToFloat(Box<CoreExpr>),
     /// `float_bits(f)` → i64 reinterpreting the f64's bit pattern (bitcast). Lets a
@@ -413,6 +425,7 @@ pub enum CoreExprKind {
     /// callback read through the C pointers it is handed (e.g. a `qsort`
     /// comparator). See `docs/ffi.md`.
     PtrReadI64(Box<CoreExpr>),
+    Panic(Box<CoreExpr>),
     /// FFI callback: a `RawPtr` (`Scalar(Ptr)`) to a C-ABI trampoline that
     /// invokes gc-rust function `FuncId`. Codegen synthesizes one trampoline per
     /// referenced function (re-entering managed state, calling the function with

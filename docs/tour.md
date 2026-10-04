@@ -17,6 +17,7 @@ on macOS ARM64. The raylib graphics example has not been launched.
 | examples/ffi*.gcr | C calls, structs, buffers, callbacks |
 | examples/project | Manifest and multiple files |
 | examples/raylib | Native graphics example |
+| apps/gcr-search | Checked I/O, persisted text snapshots, literal queries |
 
 `--gc-stress` selects collect-on-allocation execution for both JIT and project
 runs. `scripts/run_examples.sh` supports the Bash 3.2 bundled with macOS and

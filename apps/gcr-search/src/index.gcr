@@ -1,0 +1,122 @@
+#[value]
+pub struct Document { path: String, text: String }
+struct Task { path: String, relative: String, depth: i64 }
+pub struct Scan { documents: Vec<Document>, skipped: i64, bytes: i64 }
+
+fn excluded(name: String) -> bool {
+    str_eq(name, ".git") || str_eq(name, "target") || str_eq(name, ".worktrees") || str_eq(name, "node_modules") || str_eq(name, ".gcr-search.index")
+}
+
+pub fn scan(root: String, destination: String) -> Result<Scan, String> {
+    let mut pending: Vec<Task> = vec_new();
+    pending = vec_push(pending, Task { path: root, relative: "", depth: 0 });
+    let mut docs: Vec<Document> = vec_new();
+    let mut skipped = 0;
+    let mut bytes = 0;
+    let mut visited = 0;
+    while vec_len(pending) > 0 {
+        visited = visited + 1;
+        if visited > 100000 { return Result::Err("scan exceeds 100000 path limit"); }
+        let task = vec_at(pending, vec_len(pending) - 1);
+        pending = vec_pop(pending);
+        if task.depth > 128 { return Result::Err(str_concat("directory depth limit: ", task.path)); }
+        let kind = match fs_kind(task.path) { Result::Ok(k) => k, Result::Err(e) => { return Result::Err(io_error_message(e)); } };
+        if task.depth == 0 && kind != 2 { return Result::Err("index root must be a directory"); }
+        if kind == 2 {
+            let entries = match fs_read_dir(task.path) { Result::Ok(es) => es, Result::Err(e) => { return Result::Err(io_error_message(e)); } };
+            let mut i = array_len(entries) - 1;
+            while i >= 0 {
+                let name = match array_get(entries, i) { Option::Some(n) => n, Option::None => "" };
+                if !excluded(name) {
+                    let path = path_join(task.path, name);
+                    if !str_eq(path, destination) {
+                        if vec_len(pending) >= 10000 { return Result::Err("scan exceeds 10000 queued path limit"); }
+                        pending = vec_push(pending, Task { path: path, relative: path_join(task.relative, name), depth: task.depth + 1 });
+                    }
+                }
+                i = i - 1;
+            }
+        } else if kind == 1 {
+            match fs_read_text(task.path, 1048576) {
+                Result::Ok(text) => {
+                    if str_contains_byte(text, 0) { skipped = skipped + 1; }
+                    else {
+                        bytes = bytes + str_len(text);
+                        if bytes > 16777216 || vec_len(docs) >= 10000 { return Result::Err("index exceeds 16 MiB or 10000 document limit"); }
+                        docs = vec_push(docs, Document { path: task.relative, text: text });
+                    }
+                },
+                Result::Err(e) => {
+                    if e.kind == 3 { skipped = skipped + 1; }
+                    else { return Result::Err(io_error_message(e)); }
+                }
+            }
+        } else { skipped = skipped + 1; }
+    }
+    Result::Ok(Scan { documents: docs, skipped: skipped, bytes: bytes })
+}
+
+// Versioned length framing, in UTF-8 bytes. Names/text may contain newlines,
+// NULs, colons, and Unicode without confusing the framing.
+pub fn encode(docs: Vec<Document>) -> String {
+    let mut parts: Vec<String> = vec_new();
+    parts = vec_push(parts, "GCRSEARCH1\n");
+    parts = vec_push(parts, to_string(vec_len(docs)));
+    parts = vec_push(parts, "\n");
+    let mut i = 0;
+    while i < vec_len(docs) {
+        let doc = vec_at(docs, i);
+        parts = vec_push(parts, to_string(str_len(doc.path)));
+        parts = vec_push(parts, "\n");
+        parts = vec_push(parts, doc.path);
+        parts = vec_push(parts, to_string(str_len(doc.text)));
+        parts = vec_push(parts, "\n");
+        parts = vec_push(parts, doc.text);
+        i = i + 1;
+    }
+    str_join(parts, "")
+}
+
+struct Cursor { offset: i64 }
+fn number(text: String, mut cursor: Cursor) -> Result<i64, String> {
+    let mut value = 0;
+    let mut digits = 0;
+    while cursor.offset < str_len(text) {
+        let b = str_get(text, cursor.offset);
+        cursor.offset = cursor.offset + 1;
+        if b == 10 {
+            if digits == 0 { return Result::Err("empty index length"); }
+            return Result::Ok(value);
+        }
+        if b < 48 || b > 57 { return Result::Err("invalid index length"); }
+        let digit = b - 48;
+        if value > (9223372036854775807 - digit) / 10 { return Result::Err("index length overflow"); }
+        value = value * 10 + digit;
+        digits = digits + 1;
+    }
+    Result::Err("truncated index length")
+}
+fn framed(text: String, mut cursor: Cursor) -> Result<String, String> {
+    let size = match number(text, cursor) { Result::Ok(n) => n, Result::Err(e) => { return Result::Err(e); } };
+    if size > str_len(text) - cursor.offset { return Result::Err("truncated index record"); }
+    let out = str_substring(text, cursor.offset, cursor.offset + size);
+    cursor.offset = cursor.offset + size;
+    Result::Ok(out)
+}
+pub fn decode(text: String) -> Result<Vec<Document>, String> {
+    if !str_starts_with(text, "GCRSEARCH1\n") { return Result::Err("unsupported index format"); }
+    let cursor = Cursor { offset: 11 };
+    let count = match number(text, cursor) { Result::Ok(n) => n, Result::Err(e) => { return Result::Err(e); } };
+    if count > 10000 || count > str_len(text) / 4 { return Result::Err("invalid document count"); }
+    let mut docs: Vec<Document> = vec_new();
+    let mut i = 0;
+    while i < count {
+        let path = match framed(text, cursor) { Result::Ok(s) => s, Result::Err(e) => { return Result::Err(e); } };
+        let body = match framed(text, cursor) { Result::Ok(s) => s, Result::Err(e) => { return Result::Err(e); } };
+        if str_is_empty(path) || str_starts_with(path, "/") { return Result::Err("invalid document path"); }
+        docs = vec_push(docs, Document { path: path, text: body });
+        i = i + 1;
+    }
+    if cursor.offset != str_len(text) { return Result::Err("trailing data in index"); }
+    Result::Ok(docs)
+}
