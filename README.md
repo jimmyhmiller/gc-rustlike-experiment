@@ -25,7 +25,11 @@ cargo gcr-build
 
 `cargo gcr-build` builds the compiler and runtime static library in the same
 profile. `cargo gcr-release` does the same in release mode. Native builds link
-that library. `GCRUST_RUNTIME_LIB` overrides its location.
+a profile-matched runtime. In a development checkout, native builds ask Cargo
+for a dedicated `target/gcr-aot-runtime` archive and hold its lock through linking;
+custom compiler target directories have their own cache. `GCRUST_RUNTIME_LIB`
+overrides this with a caller-owned archive for packaging or sanitizer builds.
+Runtime build failures stop compilation.
 
 A bare-file `run` without a discovered manifest JIT-executes and prints the
 integer result. A project `run` builds a native executable and forwards its exit
@@ -48,6 +52,12 @@ I/O, strings, collections, serialization, native execution, and moving GC.
 atomic work claiming and immutable CAS-published summaries. It exercises a fixed
 worker set, checked parallel I/O, atomics and moving-GC contention.
 
+[gcr-csvreport](apps/gcr-csvreport/README.md) groups integer CSV data with a fixed
+worker set and bounded completion channels. [gcr-buildplan](apps/gcr-buildplan/README.md)
+schedules dependency graphs, and [gcr-routes](apps/gcr-routes/README.md) finds cheapest
+directed routes. All three validate input and emit JSON to stdout or an atomic
+output file; generated reference-model tests cover native/JIT and moving GC.
+
 ## Documentation
 
 - [Verified state and open defects](docs/STATUS.md)
@@ -55,7 +65,7 @@ worker set, checked parallel I/O, atomics and moving-GC contention.
 - [Implemented language surface](docs/language.md)
 - [Compiler IR and pipeline](docs/core-ir.md)
 - [GC/runtime](docs/gc.md), [threads](docs/threads.md), [FFI](docs/ffi.md)
-- [Checked I/O and application APIs](docs/io.md)
+- [Checked I/O and application APIs](docs/io.md), [CSV and minimum heaps](docs/csv-heap.md)
 - [Modules](docs/modules.md), [mutability](docs/mutability.md), [arithmetic](docs/overflow.md)
 - [Debugging, reflection, and heap tools](docs/reflection.md)
 - [Runnable examples](docs/tour.md)

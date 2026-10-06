@@ -4662,7 +4662,7 @@ pub fn build_executable_level(
         .arg("-o")
         .arg(out_path)
         .arg(&obj_path)
-        .arg(&staticlib)
+        .arg(&staticlib.path)
         .args(["-lpthread", "-ldl", "-lm"])
         .args(extra_link_args)
         .status()
@@ -4696,117 +4696,180 @@ pub fn build_executable_level(
     Ok(())
 }
 
-/// Locate the gc-rust runtime staticlib for AOT linking.
-///
-/// The path is baked in at build time by `build.rs` via the `GCRUST_RT_STATICLIB`
-/// env var: the build script records the profile directory's runtime archive.
-/// Development checkouts refresh it through Cargo when runtime sources are
-/// newer. `$GCRUST_RUNTIME_LIB` overrides the path for special cases.
-fn locate_runtime_staticlib() -> Result<std::path::PathBuf, CodegenError> {
+/// Keep ownership of the development archive through linking and debug-symbol
+/// extraction. Cargo's own target lock ends when its subprocess exits; another
+/// native build must not replace the archive while a linker is reading it.
+struct RuntimeArchive {
+    path: std::path::PathBuf,
+    _lock: Option<std::fs::File>,
+}
+
+fn locate_runtime_staticlib() -> Result<RuntimeArchive, CodegenError> {
     use std::path::PathBuf;
-    if let Ok(p) = std::env::var("GCRUST_RUNTIME_LIB") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Ok(p);
+    if let Some(path) = std::env::var_os("GCRUST_RUNTIME_LIB") {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(CodegenError(format!(
+                "GCRUST_RUNTIME_LIB={} is not a file",
+                path.display()
+            )));
+        }
+        // Explicit archives (including sanitizer/packaged builds) are owned by
+        // the caller. No development build or implicit replacement is performed.
+        return Ok(RuntimeArchive { path, _lock: None });
+    }
+    let baked = PathBuf::from(env!("GCRUST_RT_STATICLIB"));
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !manifest.join("crates/gcrust-rt/Cargo.toml").is_file() {
+        if baked.is_file() {
+            return Ok(RuntimeArchive {
+                path: baked,
+                _lock: None,
+            });
         }
         return Err(CodegenError(format!(
-            "GCRUST_RUNTIME_LIB={} does not exist",
-            p.display()
+            "gc-rust runtime archive is missing at {}; set GCRUST_RUNTIME_LIB to the packaged archive",
+            baked.display()
         )));
     }
-    // Baked in by build.rs — always matches this binary's build profile.
-    let baked = PathBuf::from(env!("GCRUST_RT_STATICLIB"));
-    // Auto-refresh stale staticlibs. Cargo rebuilds the gcrust-rt *rlib* on every
-    // `cargo build`/`run`/`test` (it's a dependency of `gcr`), but NOT the
-    // *staticlib* AOT links — only `-p gcrust-rt` does. So after a runtime change
-    // the `.a` goes stale and AOT binaries crash from an ABI mismatch. Here, in a
-    // dev tree, we detect that (the always-fresh rlib being newer than the `.a`)
-    // and rebuild the staticlib once, so `gcr build` is always correct without the
-    // caller remembering `cargo build -p gcrust-rt`.
-    refresh_staticlib_if_stale(&baked);
-    if baked.exists() {
-        return Ok(baked);
+
+    // An AOT-owned Cargo target prevents ordinary workspace/dependency builds
+    // from replacing our archive. Always ask Cargo to check all inputs rather
+    // than guessing freshness from mtimes (which misses lockfiles/configuration).
+    let (cache, profile, target) = runtime_cache_location(&baked)?;
+    std::fs::create_dir_all(&cache).map_err(|e| {
+        CodegenError(format!(
+            "cannot create runtime cache {}: {e}",
+            cache.display()
+        ))
+    })?;
+    let lock_path = cache.join("archive.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            CodegenError(format!(
+                "cannot open runtime archive lock {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+    lock.lock().map_err(|e| {
+        CodegenError(format!(
+            "cannot lock runtime archive {}: {e}",
+            lock_path.display()
+        ))
+    })?;
+    let mut command =
+        std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command
+        .current_dir(manifest)
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "gcrust-rt",
+            "--profile",
+            if profile == "debug" { "dev" } else { &profile },
+            "--target-dir",
+        ])
+        .arg(&cache);
+    if let Some(target) = &target {
+        command.arg("--target").arg(target);
     }
-    Err(CodegenError(format!(
-        "gc-rust runtime staticlib not found at {} (set by build.rs). \
-         Rebuild gcr (`cargo build [--release]`), or set $GCRUST_RUNTIME_LIB.",
-        baked.display()
-    )))
+    let output = command
+        .output()
+        .map_err(|e| CodegenError(format!("cannot build native runtime: {e}")))?;
+    if !output.status.success() {
+        return Err(CodegenError(format!(
+            "native runtime build failed with {}:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let root = target
+        .as_ref()
+        .map_or_else(|| cache.clone(), |target| cache.join(target));
+    let path = root.join(profile).join("libgcrust_rt.a");
+    if !path.is_file() {
+        return Err(CodegenError(format!(
+            "Cargo did not produce runtime archive {}",
+            path.display()
+        )));
+    }
+    Ok(RuntimeArchive {
+        path,
+        _lock: Some(lock),
+    })
 }
 
-/// Rebuild the gcrust-rt staticlib via `cargo` if it is missing or older than the
-/// runtime's own sources. No-op outside a dev tree — for an installed `gcr` the
-/// source tree is absent, so the baked staticlib is used as-is.
-///
-/// Staleness is measured against the *sources* (newest `.rs`/`Cargo.toml` under
-/// `crates/gcrust-rt`), not against the sibling top-level rlib: that rlib, like
-/// the staticlib, is only refreshed by `-p gcrust-rt`/`--workspace`, so the two
-/// move in lockstep and never reveal staleness. (The genuinely-fresh rlib a
-/// normal `cargo build` produces lives hashed under `target/<p>/deps/`.) Source
-/// mtime directly answers the real question: "was the `.a` built after the last
-/// runtime edit?"
-fn refresh_staticlib_if_stale(staticlib: &std::path::Path) {
-    use std::fs;
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let rt_dir = manifest.join("crates").join("gcrust-rt");
-    // Outside a dev checkout (installed gcr) there is nothing to rebuild from.
-    if !rt_dir.exists() {
-        return;
-    }
-    let mtime = |p: &std::path::Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-    let a_time = mtime(staticlib);
-    let newest_src = newest_mtime_under(&rt_dir.join("src"))
-        .into_iter()
-        .chain(mtime(&rt_dir.join("Cargo.toml")))
-        .max();
-    let stale = match (a_time, newest_src) {
-        (None, _) => true,                 // missing/cleaned → build it
-        (Some(a), Some(src)) => src > a,    // a runtime source is newer than the .a
-        (Some(_), None) => false,           // no sources found (shouldn't happen)
+/// Preserve custom target directories, explicit triples, and profile names from
+/// the compiler's baked archive path. The explicit target-dir overrides a caller
+/// CARGO_TARGET_DIR, so the producer and consumer always agree on the path.
+fn runtime_cache_location(
+    baked: &std::path::Path,
+) -> Result<(std::path::PathBuf, String, Option<String>), CodegenError> {
+    let profile_dir = baked
+        .parent()
+        .ok_or_else(|| CodegenError("runtime archive has no profile directory".into()))?;
+    let profile = profile_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| CodegenError("runtime archive has no valid profile name".into()))?
+        .to_owned();
+    let parent = profile_dir
+        .parent()
+        .ok_or_else(|| CodegenError("runtime archive has no target directory".into()))?;
+    // TARGET is exported by build.rs; matching the actual directory avoids
+    // guessing whether an arbitrary custom directory name is a target triple.
+    let (target_root, target) = if parent
+        .file_name()
+        .is_some_and(|name| name == env!("GCRUST_BUILD_TARGET"))
+    {
+        (
+            parent
+                .parent()
+                .ok_or_else(|| CodegenError("runtime target triple has no parent".into()))?,
+            Some(env!("GCRUST_BUILD_TARGET").to_owned()),
+        )
+    } else {
+        (parent, None)
     };
-    if !stale {
-        return;
-    }
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    eprintln!("gcr: gcrust-rt staticlib is stale — rebuilding (cargo build -p gcrust-rt)…");
-    let mut cmd = std::process::Command::new(cargo);
-    cmd.args(["build", "-p", "gcrust-rt"]).current_dir(manifest);
-    if !cfg!(debug_assertions) {
-        cmd.arg("--release");
-    }
-    match cmd.status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("gcr: warning: staticlib rebuild exited with {s} (linking the existing .a)"),
-        Err(e) => eprintln!("gcr: warning: could not run cargo to refresh staticlib: {e} (linking the existing .a)"),
-    }
-}
-
-/// Newest modification time of any file in `dir` (recursive), or `None` if the
-/// directory is empty/absent.
-fn newest_mtime_under(dir: &std::path::Path) -> Option<std::time::SystemTime> {
-    let mut newest: Option<std::time::SystemTime> = None;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => stack.push(path),
-                Ok(_) => {
-                    if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
-                        newest = Some(newest.map_or(m, |n| n.max(m)));
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-    newest
+    Ok((target_root.join("gcr-aot-runtime"), profile, target))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aot_runtime_cache_preserves_profile_and_target_root() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            runtime_cache_location(Path::new("/tmp/custom/debug/libgcrust_rt.a")).unwrap(),
+            (
+                PathBuf::from("/tmp/custom/gcr-aot-runtime"),
+                "debug".into(),
+                None
+            )
+        );
+        let triple = env!("GCRUST_BUILD_TARGET");
+        let baked = PathBuf::from("/tmp/custom")
+            .join(triple)
+            .join("release/libgcrust_rt.a");
+        assert_eq!(
+            runtime_cache_location(&baked).unwrap(),
+            (
+                PathBuf::from("/tmp/custom/gcr-aot-runtime"),
+                "release".into(),
+                Some(triple.into())
+            )
+        );
+        assert!(runtime_cache_location(Path::new("/")).is_err());
+    }
+
     use crate::lexer::lex;
     use crate::lower::lower_program;
     use crate::parser::parse_module;

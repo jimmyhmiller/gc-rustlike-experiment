@@ -12,7 +12,9 @@
 //! `OUT_DIR` and export it as `GCRUST_RT_STATICLIB`. Forcing the staticlib build
 //! from inside this script is avoided on purpose: a nested `cargo` under the
 //! parent build's target lock is unreliable. `$GCRUST_RUNTIME_LIB` overrides the
-//! baked path for unusual setups.
+//! baked path for unusual setups. Development AOT builds derive a separate
+//! runtime-cache location from this profile/target path and hold a file lock
+//! through production and linking; installed compilers use the packaged path.
 
 use std::path::PathBuf;
 
@@ -28,5 +30,9 @@ fn main() {
     let lib = profile_dir.join("libgcrust_rt.a");
 
     println!("cargo:rustc-env=GCRUST_RT_STATICLIB={}", lib.display());
+    println!(
+        "cargo:rustc-env=GCRUST_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap()
+    );
     println!("cargo:rerun-if-changed=build.rs");
 }

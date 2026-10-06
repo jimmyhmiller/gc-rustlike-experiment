@@ -5,6 +5,8 @@
 //! the "run any program, get any benchmark" data source for the bench toolkit.
 
 use std::process::Command;
+#[allow(dead_code)]
+mod support;
 
 fn bench(tag: &str, src: &str) -> serde_json::Value {
     let dir = std::env::temp_dir().join(format!("gcr_benchcmd_{}_{tag}", std::process::id()));
@@ -43,7 +45,10 @@ fn bench_emits_general_schema_with_all_metrics() {
     let s = &g["series"][0];
     assert_eq!(s["label"], "gc-rust");
     // wall_ms is a distribution; compile/size are scalars.
-    assert!(s["values"]["wall_ms"]["mean"].is_number());
+    assert!(
+        s["values"]["wall_ms"]["mean"].is_number(),
+        "benchmark result: {v}"
+    );
     assert!(s["values"]["binary_kb"].as_f64().unwrap() > 0.0);
 }
 
@@ -125,4 +130,104 @@ fn bench_runs_multiple_programs_as_groups() {
         .map(|g| g["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["a", "b"], "one group per program, in order");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bench_reports_build_errors_in_json_and_exit_status() {
+    let dir = std::env::temp_dir().join(format!("gcr-bench-error-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("invalid.gcr");
+    let json = dir.join("bench.json");
+    std::fs::write(&source, "fn main()->i64 { missing_function() }").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
+    command
+        .arg("bench")
+        .arg(&source)
+        .args(["--runs", "1", "--json"])
+        .arg(&json);
+    let output = support::run_with_timeout(&mut command, 30);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    assert_eq!(report["groups"][0]["error"], "build failed");
+    assert!(
+        report["groups"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing_function")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn bench_reports_aborted_programs_without_publishing_successful_timings() {
+    let dir = std::env::temp_dir().join(format!("gcr-bench-abort-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("abort.gcr");
+    let json = dir.join("bench.json");
+    std::fs::write(
+        &source,
+        "fn main()->i64 { panic(\"controlled benchmark abort\") }",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
+    command
+        .arg("bench")
+        .arg(&source)
+        .args(["--runs", "1", "--json"])
+        .arg(&json);
+    let output = support::run_with_timeout(&mut command, 30);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    assert!(
+        report["groups"][0]["series"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("controlled benchmark abort")
+    );
+    assert!(
+        report["groups"][0]["series"][0]["values"]
+            .get("wall_ms")
+            .is_none()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn bench_reports_missing_metrics_without_fabricating_zero_counters() {
+    let dir =
+        std::env::temp_dir().join(format!("gcr-bench-missing-metrics-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("no_metrics.gcr");
+    let json = dir.join("bench.json");
+    std::fs::write(&source,r#"extern "C" fn unsetenv(name:RawPtr)->i32; fn main()->i64 { unsetenv(as_c_bytes("GCR_METRICS_FILE")); 0 }"#).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
+    command
+        .arg("bench")
+        .arg(&source)
+        .args(["--runs", "1", "--json"])
+        .arg(&json);
+    let output = support::run_with_timeout(&mut command, 30);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    let series = &report["groups"][0]["series"][0];
+    assert!(
+        series["error"]
+            .as_str()
+            .unwrap()
+            .contains("metrics capture failed")
+    );
+    assert!(series["values"].get("alloc_objects").is_none());
+    std::fs::remove_dir_all(dir).unwrap();
 }

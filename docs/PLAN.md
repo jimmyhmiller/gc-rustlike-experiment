@@ -1,6 +1,6 @@
 # Implementation plan
 
-Updated 2026-10-05. Completed checkpoints are identified below; the remaining
+Updated 2026-10-06. Completed checkpoints are identified below; the remaining
 sections describe proposed work.
 The target semantics are in [concurrency.md](concurrency.md); verified behavior
 and open defects are in [STATUS.md](STATUS.md). Release gates are in
@@ -48,12 +48,16 @@ embedded references pass JIT/AOT, normal/stress GC. Optimized LLVM structural
 checks and the native ThreadSanitizer gate pass. Startup poll registration and
 pause-release/retirement handoffs have focused regressions.
 
-This is a partial checkpoint, not the section's exit criterion. Collection
-metadata may still be observed inconsistently during structural mutation;
-collection operation consistency and low-level owner/collector root APIs remain
-to audit and repair. Root registration/enumeration and GC transitions now have
+This is a partial checkpoint, not the section's exit criterion. Ordinary Vec/Map
+remain unsynchronized, following the JVM model: concurrent mutation requires
+external synchronization, including for backing-array aliases. Their operations
+need memory-safe boundaries, not automatic transactions or snapshot guarantees.
+Separate concurrent versions will have explicitly specified atomic operations and
+iteration semantics after the synchronization foundations exist. Root registration/enumeration and GC transitions now have
 explicit unsafe contracts; scratch storage is owner-checked and poll retirement
-detaches native storage before freeing it. The broader allocator API audit remains.
+detaches native storage before freeing it. Header/layout validation, exclusive type registration, raw heap allocation
+contracts and legacy collector alignment/forwarding repairs are implemented
+2026-10-06. Keep auditing caller obligations and generated allocation paths.
 Backing-array bounds and unwritten reference/value slots now
 produce defined diagnostic failures; array allocation arithmetic is checked.
 Transitional Sync capture checks remain in place. See STATUS.md for exact
@@ -62,7 +66,8 @@ coverage and sanitizer limits.
 Inventory every heap access, aggregate copy, reference publication and write
 barrier. Implement the proposed SC managed memory model and coherent aggregate
 snapshots, coordinating publication and relocation with the collector. Audit
-collection operations and define their behavior during structural mutation.
+collection boundaries for managed memory safety under unsynchronized mutation;
+do not add implicit locks or atomic operation guarantees to ordinary Vec/Map.
 Preserve reference identity and initialize every published representation.
 
 Run store-buffering, racing scalar/reference accesses, enum replacement and
@@ -89,7 +94,9 @@ FIFO, wakeups, close/send races, value preservation and JIT/AOT moving-GC behavi
 have bounded regressions and native sanitizer coverage. This does not finish the
 lock, typed execution-outcome or nested scope requirements below.
 
-Implement reentrant locks and condition waits, with lexical cleanup. Replace
+Implement reentrant locks and condition waits, with lexical cleanup. Build
+separate concurrent Vec/Map APIs with defined atomic operations and iteration
+semantics; ordinary collections retain external synchronization. Replace
 channel close with an explicit idempotent state transition, waking all waiters
 and returning unsent values. Define positive-capacity validation and FIFO
 linearization. Add typed success/failure/cancelled completion, fallible spawn,
@@ -118,6 +125,11 @@ blocking APIs. Await must free the worker to run another task.
 
 Exit criteria: continuation references survive moving GC while suspended; task
 migration preserves task locals; JIT and AOT produce the same observable outcomes.
+
+Development native archive production/link ownership is implemented: dedicated
+profile/target Cargo caches, a lock held through linking, fatal producer errors,
+concurrent-build regressions, and error-preserving benchmark output. Packaged ABI
+versioning and clean-machine delivery remain separate release requirements.
 
 ## 6. Extend the application and release evidence
 
@@ -160,7 +172,14 @@ passing through a synchronized subset does not certify arbitrary managed races.
    CAS. Serial differential checks cover JIT/native, normal/stress GC and I/O
    failures. Extend to streaming live monitoring after resource lifetimes and
    cancellation are defined; exercise blocked readers, queue close and shutdown.
-3. **Service acceptance**: sustained requests, refresh/monitor activity, client
+3. **gcr-csvreport / gcr-buildplan / gcr-routes**: implemented bounded CSV
+   grouping, dependency scheduling and directed cheapest routes. The reporter
+   uses fixed workers, local ordinary maps and a bounded completion channel;
+   schedulers/routes use owner-local minimum heaps. Independent grouping,
+   scan-scheduler and Bellman-Ford models exercise native/JIT and moving GC.
+   Continue growing these through streaming and cancellation once resource
+   lifetimes are defined; preserve explicit synchronization for concurrent APIs.
+4. **Service acceptance**: sustained requests, refresh/monitor activity, client
    disconnects and shutdown during GC. Add networking through real service needs,
    then bounded async request handling; require correctness and numeric memory,
    latency and shutdown budgets before declaring the service gate complete.

@@ -1,5 +1,16 @@
 # Verified state
 
+Latest checkpoint, 2026-10-06: **520 workspace tests passed**, zero failures,
+eight existing ignores; **46 selected optimized tests passed**. Native
+ThreadSanitizer passes all three new apps and four runtime/library fixtures in
+normal/stress modes. Three bounded CSV/graph applications are implemented;
+allocator/root contracts, enum payloads, integer parsing, native archive ownership
+and benchmark error reporting have repairs with regression coverage. Ordinary
+Vec/Map remain unsynchronized; separate concurrent collections remain planned.
+See the dated checkpoints at the end for commands, limits and remaining work.
+
+## Earlier assessment
+
 Assessment and application work: 2026-10-03. Repository HEAD: `5c29ee7`;
 the application and its supporting changes are in the working tree. Host: Darwin ARM64; Rust/Cargo 1.96.0. The committed baseline includes the prior widget,
 `.gitignore`, and benchmark-artifact changes.
@@ -831,3 +842,168 @@ pass**, zero failures; three benchmarks/five examples ignored. Five optimized
 allocator/layout regressions and eight optimized application/concurrency checks
 pass. Application checks include JIT/AOT serial-model comparisons under moving-GC
 stress. `git diff --check` is clean. Exact commands/logs are in the status pad.
+
+## Allocator/collector contracts and collection policy — 2026-10-06
+
+Ordinary Vec/Map/HashMap/MapStr remain unsynchronized collections. Shared mutation,
+including through backing-array aliases, requires external synchronization.
+Concurrent reads require safe publication and unchanged storage. Unsynchronized
+operations have no collection-level consistency guarantee; the managed-access
+and boundary checks still prevent native out-of-bounds access, fabricated
+references and torn aggregates. Concurrent versions are separate planned APIs
+following locks and structured lifetimes. PLAN/concurrency/language documentation
+and prelude comments now reflect this direction.
+
+Header initialization validates physical size, alignment, type-id offset and
+allocation layout before reservation. ObjHeader is an unsafe representation
+contract. Descriptor validation rejects malformed headers/interior-pointer
+slots, and heap allocation requires the registered descriptor. Invalid mutator
+requests return null before stress GC or TLAB publication. Zero-sized arenas
+are rejected before native allocation. Type registration uses exclusive &mut
+Heap access, validates layouts, assigns ids and checks exhaustion; mutation of a
+plain Vec through a shared reference is removed. Direct heap allocation, frame
+walker installation and allocation-window remapping now carry explicit unsafe
+coordination/storage contracts.
+
+The legacy collector scans exact object starts across alignment gaps and uses
+the first header word for forwarding. New cyclic-graph and Full-header regressions
+exercise these fixes through relocation. Dynamic root frames use actual Cell
+storage, rather than casting plain u64 storage to mutable cells. Escaping guards
+require unsafe lifetime management; callback registration keeps the guard
+private, rejects duplicate registrations and cleans up on unwind.
+
+Validation:
+
+- `cargo test --workspace`: **498 passed**, zero failures, eight existing ignores.
+  Log: `/tmp/gcr-contract-workspace.log`. A subsequent same-size/different-type-id-
+  offset header regression passes separately in debug and release. Its final
+  runtime-suite evidence is recorded in the project status pad.
+- Optimized JIT/AOT selection with four collector workers and heap verification:
+  **35 passed**, zero failures. Includes the full default concurrency workload,
+  channel/boundary/managed-memory/completion tests, FFI, search and logstats.
+  Log: `/tmp/gcr-contract-release.log`.
+- `scripts/check_thread_sanitizer.sh`: managed-memory/channel native fixtures
+  pass with normal/stress moving GC; six poll regressions and channel retirement
+  pass. AOT/runtime/std are instrumented; JIT sanitizer coverage is not claimed.
+  Log: `/tmp/gcr-contract-tsan.log`.
+- Changed Rust regions formatted; final `cargo check --workspace --tests` passes
+  with the six pre-existing compiler warnings. `git diff --check` is clean.
+
+This checkpoint does not complete the full PLAN or remove transitional Sync
+capture restrictions. Live shared-runtime type-table extension is not provided
+by the exclusive-registration API. Reentrant locks, separate concurrent
+collections, structured outcomes/scopes, cancellation, async and release/service
+gates remain work. At this checkpoint, mutable enum payload bindings and runtime archive build/link
+ownership remained separately recorded defects; the application checkpoint below
+resolves the payload-binding defect.
+
+
+## Application-driven compiler/library repairs — 2026-10-06
+
+Three additional gc-rust applications are implemented with runnable input samples:
+[gcr-csvreport](../apps/gcr-csvreport/README.md), a fixed-worker CSV aggregator;
+[gcr-buildplan](../apps/gcr-buildplan/README.md), a dependency scheduler;
+and [gcr-routes](../apps/gcr-routes/README.md), a directed cheapest-route planner.
+Each validates a bounded CSV schema, checks numeric arithmetic, and emits complete
+JSON to stdout or checked atomic file output. Ordinary collections remain
+unsynchronized; the reporter shares only immutable inputs, an atomic work
+counter, and a bounded completion channel. Separate concurrent collection APIs
+remain future work.
+
+Application development exposed and repaired:
+
+- Switch match lowering discarded mutable payload-binding flags.
+- Match branches and nested enum constructors lost contextual generic types.
+- Guarded inline-enum matches generated reference-enum reads and crashed codegen.
+- Reference-enum match bindings ignored inline values; payload sizing ignored
+  scalar alignment and nested references were not traced. Construction, shared
+  payload extraction, descriptor counting and sibling reflection offsets now
+  agree; nested references use shared leading pointer slots.
+- Decimal integer parsing silently wrapped out-of-range inputs. It now accepts
+  exactly the signed-64-bit range using checked negative accumulation.
+
+[CSV and heap APIs](csv-heap.md) are reusable standard-library implementations.
+CSV encoding quotes leading BOM field text, rejects zero-field records, and
+bounds escaped output. Minimum heaps handle both inline and reference elements.
+
+`tests/app_primitives.rs` and `tests/real_apps.rs` cover focused compiler/library
+regressions and independent grouping, scan-scheduler and Bellman-Ford models.
+The larger workloads use 4,800 rows across eight files, 512 dependency tasks,
+and 512 route nodes with 3,511 edges under a 1 MiB nursery. Native/JIT checks
+include every-allocation GC, four collector workers, malformed input, numeric
+endpoints/overflow, zero-duration tasks, zero-cost routes and output preservation.
+
+Verification at this checkpoint:
+
+- Full workspace: **513 passed**, zero failures, eight existing ignores before
+  the final unit-payload/CSV-boundary additions. Subsequent focused checks cover
+  those additions, including native/JIT every-allocation GC.
+- Optimized compiler/library/application/generational/reflection/channel/managed
+  selection: **36 passed**, zero failures.
+- Native ThreadSanitizer: managed-memory/channel/nested-payload fixtures and all
+  three apps pass in normal/stress modes; seven runtime poll/retirement checks
+  also pass. Rust runtime/std and generated AOT code are instrumented.
+- CSV tests accept the exact 1 MiB field and 16 MiB encoded-output limits and
+  reject one byte over, with checked diagnostic positions. `GCR_STRESS_HEAP_MB`
+  now configures the per-space stress heap for both JIT/native (default 8 MiB),
+  allowing these real limits to be checked with collection on every allocation.
+
+Final commands and follow-up results are recorded in the project status/app
+pads. Logs: `/tmp/gcr-apps-workspace.log`,
+`/tmp/gcr-apps-release.log`, `/tmp/gcr-apps-tsan.log`.
+
+Reflection still omits inline reference-enum payloads: contiguous ValueMeta
+cannot describe their split reference slots. Scalar/reference sibling metadata
+is correct and checked by regression. Extending projection metadata and renderers
+remains recorded work, alongside concurrent collections, structured lifetimes,
+cancellation and service gates. Runtime archive ownership is repaired below.
+
+
+## Native archive ownership and benchmark errors — 2026-10-06
+
+Development AOT runtime production now uses a dedicated Cargo cache derived from
+this compiler's baked target/profile path. Cargo checks all inputs with `--locked`;
+source mtime guesses are removed. A process-shared file lock remains held through
+Cargo production, native linking and debug-symbol extraction. Ordinary workspace
+builds cannot replace this owned archive. Runtime build failure stops compilation
+instead of linking a stale archive. Explicit `GCRUST_RUNTIME_LIB` overrides remain
+caller-owned, and installed compilers retain packaged-archive lookup.
+
+Regressions compile four native programs concurrently with an unrelated invalid
+`CARGO_TARGET_DIR`, then run each under moving-GC stress. A controlled failed Cargo
+producer proves that an existing native output is preserved and stale archives
+are not used. Unit coverage checks custom target/profile/triple cache paths.
+
+Benchmarks now return failure and preserve JSON diagnostics for build/launch
+failures, signals and missing/invalid runtime metrics. Variant metrics use distinct
+files and missing counters are not fabricated as zero. Bare-program nonzero
+integer return codes remain legitimate benchmark results. Regressions cover build
+errors, controlled aborts, missing metrics, and the existing metric/schema cases.
+
+One interim workspace rerun had an intermittent benchmark native-build failure;
+a retry passed. The old test discarded the build diagnostic, so the exact original
+linker cause cannot be established. Full results are now retained on failure;
+archive ownership defects are independently reproduced and tested. Final gate
+results are recorded below and in the project pads.
+
+
+Final validation for the combined checkpoint:
+
+- `cargo test --workspace`: **520 passed**, zero failures, eight existing ignores.
+  Log: `/tmp/gcr-apps-workspace-complete.log`.
+- `GCR_GC_WORKERS=4 GCR_GC_VERIFY=1 cargo test --release --test app_primitives
+  --test real_apps --test generational --test reflect --test channel_contract
+  --test managed_memory --test runtime_archive --test bench_cmd`: **46 passed**,
+  zero failures. Log: `/tmp/gcr-apps-release-complete.log`.
+- `scripts/check_thread_sanitizer.sh`: four native fixtures and three apps pass
+  in normal/stress modes (14 instrumented executions); seven instrumented runtime
+  poll/retirement checks pass. Log: `/tmp/gcr-apps-tsan-complete.log`.
+- A compiler built in `target/tsan-compiler` successfully builds the nested-payload
+  fixture without an archive override, using its own AOT cache, and the executable
+  passes four-worker verified GC stress. Log: `/tmp/gcr-custom-target-build.log`.
+- Final workspace build/check succeeds with five existing compiler warnings;
+  changed Rust regions are formatted and `git diff --check` passes.
+
+This is local macOS ARM64 evidence. Reflection projections, concurrent collection
+APIs, structured lifetimes, cancellation, async and declared release/service
+resource budgets remain open.

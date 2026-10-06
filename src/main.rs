@@ -705,11 +705,14 @@ fn run_bench(args: &[String]) -> ExitCode {
     ]);
 
     let mut groups: Vec<Value> = Vec::new();
+    let mut had_errors = false;
     for prog in &progs {
         let path = match resolve_entry(prog) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("gcr bench: {e}");
+                had_errors = true;
+                groups.push(json!({"name": prog, "error": e, "series": []}));
                 continue;
             }
         };
@@ -728,9 +731,10 @@ fn run_bench(args: &[String]) -> ExitCode {
         let compile_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let built_ok = matches!(&build, Ok(o) if o.status.success());
         if !built_ok {
+            had_errors = true;
             let err = build.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_default();
             eprintln!("gcr bench: {name}: build failed: {}", err.trim());
-            groups.push(json!({"name": name, "error": "build failed",
+            groups.push(json!({"name": name, "error": "build failed", "message": err.trim(),
                 "series": [{"label": "gc-rust", "values": {}}]}));
             continue;
         }
@@ -745,35 +749,57 @@ fn run_bench(args: &[String]) -> ExitCode {
         };
         let env_name = vary.as_ref().map(|(n, _)| n.clone());
         let mut series: Vec<Value> = Vec::new();
-        for variant in &variant_vals {
+        for (variant_index, variant) in variant_vals.iter().enumerate() {
             // Wall-clock runs (output suppressed so I/O doesn't skew timing).
             let mut times_ms: Vec<f64> = Vec::with_capacity(runs);
+            let mut run_error = None;
             for _ in 0..runs {
                 let mut cmd = std::process::Command::new(&bin);
-                if let (Some(n), Some(v)) = (&env_name, variant) {
-                    cmd.env(n, v);
-                }
+                if let (Some(n), Some(v)) = (&env_name, variant) { cmd.env(n, v); }
                 let t = std::time::Instant::now();
-                if cmd.output().is_err() {
-                    break;
+                match cmd.output() {
+                    // Bare-program integer results become exit statuses; their
+                    // nonzero codes are benchmark results, not launch failures.
+                    Ok(output) if output.status.code().is_some() => times_ms.push(t.elapsed().as_secs_f64() * 1000.0),
+                    Ok(output) => { run_error = Some(format!("program terminated with {}: {}", output.status, String::from_utf8_lossy(&output.stderr))); break; }
+                    Err(e) => { run_error = Some(format!("cannot launch program: {e}")); break; }
                 }
-                times_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            if let Some(message) = run_error {
+                eprintln!("gcr bench: {name}: {message}");
+                had_errors = true;
+                series.push(json!({"label": variant_label(&env_name, variant), "error": message, "values": {"compile_ms": compile_ms, "binary_kb": binary_kb}}));
+                continue;
             }
             let (mean, stddev, mn, mx) = wall_stats(&times_ms);
 
             // One extra run to capture the runtime-only metrics (GC/alloc/heap).
-            let mfile = tmp.join(format!("{name}.metrics.json"));
+            let mfile = tmp.join(format!("{name}-{variant_index}.metrics.json"));
             let mut mcmd = std::process::Command::new(&bin);
             mcmd.env("GCR_METRICS_FILE", &mfile);
             if let (Some(n), Some(v)) = (&env_name, variant) {
                 mcmd.env(n, v);
             }
-            let _ = mcmd.output();
-            let m: Value = std::fs::read_to_string(&mfile)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| json!({}));
-            let mv = |k: &str| m.get(k).cloned().unwrap_or(json!(0));
+            let captured = (|| -> Result<Value, String> {
+                let output = mcmd.output().map_err(|e| format!("cannot launch metrics run: {e}"))?;
+                if output.status.code().is_none() { return Err(format!("metrics run terminated with {}: {}", output.status, String::from_utf8_lossy(&output.stderr))); }
+                let bytes = std::fs::read(&mfile).map_err(|e| format!("metrics capture failed: {e}"))?;
+                let metrics: Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid runtime metrics: {e}"))?;
+                for key in ["gc_minor", "gc_major", "gc_pause_max_ms", "gc_pause_total_ms", "alloc_objects", "alloc_bytes", "peak_heap_bytes"] {
+                    if !metrics[key].is_number() { return Err(format!("missing numeric runtime metric `{key}`")); }
+                }
+                Ok(metrics)
+            })();
+            let m = match captured {
+                Ok(metrics) => metrics,
+                Err(message) => {
+                    eprintln!("gcr bench: {name}: {message}");
+                    had_errors = true;
+                    series.push(json!({"label": variant_label(&env_name, variant), "error": message, "values": {"compile_ms": compile_ms, "binary_kb": binary_kb}}));
+                    continue;
+                }
+            };
+            let mv = |key: &str| m[key].clone();
 
             let values = json!({
                 "wall_ms": {"mean": mean, "stddev": stddev, "min": mn, "max": mx},
@@ -815,7 +841,11 @@ fn run_bench(args: &[String]) -> ExitCode {
         }
         None => println!("{text}"),
     }
-    ExitCode::SUCCESS
+    if had_errors {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Parse the bench variant axis: `--vary ENV=v1,v2,…` → (ENV, [v1,v2,…]), or
