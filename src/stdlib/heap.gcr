@@ -1,0 +1,44 @@
+// Single-owner/external-synchronization minimum priority queue. Like ordinary
+// Vec/Map, this is not a concurrent collection. Elements compare through Ord.
+struct MinHeap<T> { items: Vec<T> }
+fn heap_new<T>() -> MinHeap<T> { MinHeap { items: vec_new() } }
+fn heap_len<T>(heap: MinHeap<T>) -> i64 { vec_len(heap.items) }
+fn heap_peek<T>(heap: MinHeap<T>) -> Option<T> { vec_first(heap.items) }
+fn heap_push<T: Ord>(mut heap: MinHeap<T>, item: T) -> i64 {
+    heap.items = vec_push(heap.items, item);
+    let mut index = vec_len(heap.items) - 1;
+    while index > 0 {
+        let parent = (index - 1) / 2;
+        let child_value = vec_at(heap.items, index);
+        let parent_value = vec_at(heap.items, parent);
+        if child_value.cmp(parent_value) >= 0 { break; }
+        heap.items = vec_set(heap.items, index, parent_value);
+        heap.items = vec_set(heap.items, parent, child_value);
+        index = parent;
+    }
+    vec_len(heap.items)
+}
+fn heap_pop<T: Ord>(mut heap: MinHeap<T>) -> Option<T> {
+    if vec_len(heap.items) == 0 { return Option::None; }
+    let result = vec_at(heap.items, 0);
+    let last = vec_at(heap.items, vec_len(heap.items) - 1);
+    heap.items = vec_pop(heap.items);
+    if vec_len(heap.items) > 0 {
+        heap.items = vec_set(heap.items, 0, last);
+        let mut index = 0;
+        loop {
+            let left = index * 2 + 1;
+            if left >= vec_len(heap.items) { break; }
+            let right = left + 1;
+            let mut child = left;
+            if right < vec_len(heap.items) && vec_at(heap.items, right).cmp(vec_at(heap.items, left)) < 0 { child = right; }
+            let current = vec_at(heap.items, index);
+            let next = vec_at(heap.items, child);
+            if current.cmp(next) <= 0 { break; }
+            heap.items = vec_set(heap.items, index, next);
+            heap.items = vec_set(heap.items, child, current);
+            index = child;
+        }
+    }
+    Option::Some(result)
+}

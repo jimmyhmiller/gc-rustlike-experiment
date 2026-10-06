@@ -1,0 +1,6 @@
+from,to,cost
+home,cafe,5
+home,park,1
+park,cafe,2
+cafe,work,4
+park,work,9

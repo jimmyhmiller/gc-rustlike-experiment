@@ -1,0 +1,5 @@
+task,duration,depends
+core,3,
+tests,2,core
+cli,5,core
+package,1,cli;tests

@@ -12,7 +12,17 @@ use crate::lexer::{lex, lex_with_source, SourceId};
 use crate::parser::{ParseError, parse_module};
 use std::path::{Path, PathBuf};
 
-const PRELUDE_SRC: &str = concat!(include_str!("prelude.gcr"), "\n", include_str!("stdlib/io.gcr"), "\n", include_str!("stdlib/parallel.gcr"));
+const PRELUDE_SRC: &str = concat!(
+    include_str!("prelude.gcr"),
+    "\n",
+    include_str!("stdlib/io.gcr"),
+    "\n",
+    include_str!("stdlib/parallel.gcr"),
+    "\n",
+    include_str!("stdlib/csv.gcr"),
+    "\n",
+    include_str!("stdlib/heap.gcr")
+);
 
 /// The SourceMap built during prelude/module merging: one [`SourceEntry`] per
 /// [`SourceId`] (0 = user, then `mod` files, then the prelude). Returned by the

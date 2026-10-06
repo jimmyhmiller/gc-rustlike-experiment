@@ -1,0 +1,132 @@
+// Strict, bounded UTF-8 CSV. Comma separators; LF, CRLF and CR record endings.
+// A quote is legal only at a field's start; doubled quotes escape a quote.
+struct CsvError { record: i64, byte: i64, message: String }
+struct CsvField { text: String, next: i64 }
+fn csv_error(record: i64, byte: i64, message: String) -> CsvError {
+    CsvError { record: record, byte: byte + 1, message: message }
+}
+fn csv_error_message(error: CsvError) -> String {
+    str_concat3(str_concat3("CSV record ", to_string(error.record), " at byte "),
+        to_string(error.byte), str_concat(": ", error.message))
+}
+fn csv_delimiter(byte: i64) -> bool { byte == 44 || byte == 10 || byte == 13 }
+fn csv_decode_field(text: String, start: i64, record: i64) -> Result<CsvField, CsvError> {
+    let length = str_len(text);
+    if str_get(text, start) != 34 {
+        let mut i = start;
+        while i < length && csv_delimiter(str_get(text, i)) == false {
+            if str_get(text, i) == 34 { return Result::Err(csv_error(record, i, "quote inside unquoted field")); }
+            i = i + 1;
+            if i - start > 1048576 { return Result::Err(csv_error(record, i, "field exceeds 1 MiB")); }
+        }
+        return Result::Ok(CsvField { text: str_substring(text, start, i), next: i });
+    }
+    let mut pieces: Vec<String> = vec_new();
+    let mut i = start + 1;
+    let mut segment = i;
+    let mut bytes = 0;
+    while i < length {
+        if str_get(text, i) == 34 {
+            bytes = bytes + i - segment;
+            if bytes > 1048576 { return Result::Err(csv_error(record, i, "field exceeds 1 MiB")); }
+            pieces = vec_push(pieces, str_substring(text, segment, i));
+            if i + 1 < length && str_get(text, i + 1) == 34 {
+                pieces = vec_push(pieces, "\"");
+                bytes = bytes + 1;
+                if bytes > 1048576 { return Result::Err(csv_error(record, i, "field exceeds 1 MiB")); }
+                i = i + 2;
+                segment = i;
+            } else {
+                i = i + 1;
+                if i < length && csv_delimiter(str_get(text, i)) == false {
+                    return Result::Err(csv_error(record, i, "characters after closing quote"));
+                }
+                return Result::Ok(CsvField { text: str_join(pieces, ""), next: i });
+            }
+        } else {
+            i = i + 1;
+            if bytes + i - segment > 1048576 { return Result::Err(csv_error(record, i, "field exceeds 1 MiB")); }
+        }
+    }
+    Result::Err(csv_error(record, length, "unterminated quoted field"))
+}
+fn csv_parse(text: String, max_records: i64, max_fields: i64) -> Result<Vec<Vec<String>>, CsvError> {
+    if max_records < 1 || max_fields < 1 {
+        return Result::Err(csv_error(1, 0, "CSV limits must be positive"));
+    }
+    if str_len(text) > 16777216 { return Result::Err(csv_error(1, 0, "CSV input exceeds 16 MiB")); }
+    let mut rows: Vec<Vec<String>> = vec_new();
+    let mut position = if str_starts_with(text, "\u{feff}") { 3 } else { 0 };
+    while position < str_len(text) {
+        let record = vec_len(rows) + 1;
+        if record > max_records { return Result::Err(csv_error(record, position, "record limit exceeded")); }
+        let mut row: Vec<String> = vec_new();
+        loop {
+            if vec_len(row) >= max_fields { return Result::Err(csv_error(record, position, "field count limit exceeded")); }
+            let field = match csv_decode_field(text, position, record) {
+                Result::Ok(f) => f,
+                Result::Err(e) => { return Result::Err(e); }
+            };
+            row = vec_push(row, field.text);
+            position = field.next;
+            if position == str_len(text) { break; }
+            let separator = str_get(text, position);
+            position = position + 1;
+            if separator != 44 {
+                if separator == 13 && str_get(text, position) == 10 { position = position + 1; }
+                break;
+            }
+        }
+        rows = vec_push(rows, row);
+    }
+    Result::Ok(rows)
+}
+fn csv_escape(text: String) -> String {
+    // Quote a leading BOM so the parser cannot mistake field text for a file BOM.
+    let mut quote = str_starts_with(text, "\u{feff}");
+    let mut i = 0;
+    while i < str_len(text) {
+        if csv_delimiter(str_get(text, i)) || str_get(text, i) == 34 { quote = true; }
+        i = i + 1;
+    }
+    if quote == false { return text; }
+    let mut pieces: Vec<String> = vec_new();
+    pieces = vec_push(pieces, "\"");
+    let mut start = 0;
+    i = 0;
+    while i < str_len(text) {
+        if str_get(text, i) == 34 {
+            pieces = vec_push(pieces, str_substring(text, start, i));
+            pieces = vec_push(pieces, "\"\"");
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    pieces = vec_push(pieces, str_substring(text, start, i));
+    pieces = vec_push(pieces, "\"");
+    str_join(pieces, "")
+}
+fn csv_encode(rows: Vec<Vec<String>>) -> Result<String, CsvError> {
+    let mut pieces: Vec<String> = vec_new();
+    let mut bytes = 0;
+    let mut r = 0;
+    while r < vec_len(rows) {
+        let row = vec_at(rows, r);
+        if vec_len(row) == 0 { return Result::Err(csv_error(r + 1, bytes, "cannot encode a zero-field record")); }
+        let mut c = 0;
+        while c < vec_len(row) {
+            let field = vec_at(row, c);
+            if str_len(field) > 1048576 { return Result::Err(csv_error(r + 1, bytes, "field exceeds 1 MiB")); }
+            let encoded = csv_escape(field);
+            bytes = bytes + str_len(encoded) + if c > 0 { 1 } else { 0 };
+            if bytes > 16777216 - 2 { return Result::Err(csv_error(r + 1, bytes, "CSV output exceeds 16 MiB")); }
+            if c > 0 { pieces = vec_push(pieces, ","); }
+            pieces = vec_push(pieces, encoded);
+            c = c + 1;
+        }
+        pieces = vec_push(pieces, "\r\n");
+        bytes = bytes + 2;
+        r = r + 1;
+    }
+    Result::Ok(str_join(pieces, ""))
+}

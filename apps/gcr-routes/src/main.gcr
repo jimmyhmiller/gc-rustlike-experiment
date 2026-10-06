@@ -1,0 +1,147 @@
+struct Edge { target: i64, cost: i64 }
+struct Node { name: String, edges: Vec<Edge> }
+struct Graph { nodes: Vec<Node>, names: MapStr<i64>, edges: i64 }
+struct Candidate { node: i64, distance: i64 }
+struct Route { reachable: bool, distance: i64, path: Vec<String> }
+impl Ord for Candidate {
+    fn cmp(self, other: Candidate) -> i64 {
+        if self.distance < other.distance { 0 - 1 } else if self.distance > other.distance { 1 }
+        else if self.node < other.node { 0 - 1 } else if self.node > other.node { 1 } else { 0 }
+    }
+}
+fn failure(message: String) -> i64 { stderr_line(str_concat("gcr-routes: ", message)); 1 }
+fn node(mut graph: Graph, name: String) -> Result<i64, String> {
+    match mapstr_get(graph.names, name) {
+        Option::Some(index) => Result::Ok(index),
+        Option::None => {
+            let index = vec_len(graph.nodes);
+            if index >= 5000 { return Result::Err("node count exceeds 5000"); }
+            graph.names = mapstr_insert(graph.names, name, index);
+            graph.nodes = vec_push(graph.nodes, Node { name: name, edges: vec_new() });
+            Result::Ok(index)
+        }
+    }
+}
+fn load(text: String) -> Result<Graph, String> {
+    let rows = match csv_parse(text, 10001, 3) { Result::Ok(r) => r, Result::Err(e) => { return Result::Err(csv_error_message(e)); } };
+    if vec_len(rows) == 0 { return Result::Err("missing from,to,cost header"); }
+    let header = vec_at(rows, 0);
+    if vec_len(header) != 3 || str_eq(vec_at(header, 0), "from") == false || str_eq(vec_at(header, 1), "to") == false || str_eq(vec_at(header, 2), "cost") == false { return Result::Err("expected from,to,cost header"); }
+    let mut graph = Graph { nodes: vec_new(), names: mapstr_new(), edges: 0 };
+    let mut i = 1;
+    while i < vec_len(rows) {
+        let row = vec_at(rows, i);
+        if vec_len(row) != 3 { return Result::Err(str_concat("wrong field count at record ", to_string(i + 1))); }
+        let from = vec_at(row, 0);
+        let to = vec_at(row, 1);
+        if str_len(from) == 0 || str_len(to) == 0 { return Result::Err("node names must be nonempty"); }
+        let cost = match parse_int(str_trim(vec_at(row, 2))) { Option::Some(n) => n, Option::None => { return Result::Err(str_concat("invalid cost at record ", to_string(i + 1))); } };
+        if cost < 0 { return Result::Err("edge costs must be nonnegative"); }
+        let source = node(graph, from)?;
+        let target = node(graph, to)?;
+        let mut source_node = vec_at(graph.nodes, source);
+        source_node.edges = vec_push(source_node.edges, Edge { target: target, cost: cost });
+        graph.edges = graph.edges + 1;
+        i = i + 1;
+    }
+    Result::Ok(graph)
+}
+fn connected(graph: Graph, from: i64, to: i64) -> bool {
+    let mut seen: Array<bool> = array_new(vec_len(graph.nodes));
+    let mut queue: Vec<i64> = vec_new();
+    queue = vec_push(queue, from);
+    array_set(seen, from, true);
+    let mut head = 0;
+    while head < vec_len(queue) {
+        let current = vec_at(queue, head);
+        if current == to { return true; }
+        let edges = vec_at(graph.nodes, current).edges;
+        let mut i = 0;
+        while i < vec_len(edges) {
+            let target = vec_at(edges, i).target;
+            if array_get_unchecked(seen, target) == false {
+                array_set(seen, target, true);
+                queue = vec_push(queue, target);
+            }
+            i = i + 1;
+        }
+        head = head + 1;
+    }
+    false
+}
+fn route(graph: Graph, from: String, to: String) -> Result<Route, String> {
+    let source = match mapstr_get(graph.names, from) { Option::Some(n) => n, Option::None => { return Result::Err(str_concat("unknown source: ", from)); } };
+    let target = match mapstr_get(graph.names, to) { Option::Some(n) => n, Option::None => { return Result::Err(str_concat("unknown destination: ", to)); } };
+    let mut distances: Array<i64> = array_new(vec_len(graph.nodes));
+    let mut reached: Array<bool> = array_new(vec_len(graph.nodes));
+    let mut previous: Array<i64> = array_new(vec_len(graph.nodes));
+    let mut queue: MinHeap<Candidate> = heap_new();
+    array_set(reached, source, true);
+    array_set(previous, source, 0 - 1);
+    heap_push(queue, Candidate { node: source, distance: 0 });
+    while heap_len(queue) > 0 {
+        let current = opt_expect(heap_pop(queue), "route queue invariant");
+        if current.distance != array_get_unchecked(distances, current.node) { continue; }
+        if current.node == target { break; }
+        let edges = vec_at(graph.nodes, current.node).edges;
+        let mut i = 0;
+        while i < vec_len(edges) {
+            let edge = vec_at(edges, i);
+            // Ignore candidates outside i64; a separate reachability check
+            // distinguishes an unreachable target from an unrepresentable path.
+            match checked_add_i64(current.distance, edge.cost) {
+                Option::Some(distance) => {
+                    if array_get_unchecked(reached, edge.target) == false || distance < array_get_unchecked(distances, edge.target) {
+                        array_set(reached, edge.target, true);
+                        array_set(distances, edge.target, distance);
+                        array_set(previous, edge.target, current.node);
+                        heap_push(queue, Candidate { node: edge.target, distance: distance });
+                    }
+                },
+                Option::None => {}
+            };
+            i = i + 1;
+        }
+    }
+    if array_get_unchecked(reached, target) == false {
+        if connected(graph, source, target) { return Result::Err("shortest route cost exceeds i64 range"); }
+        return Result::Ok(Route { reachable: false, distance: 0, path: vec_new() });
+    }
+    let mut reverse: Vec<String> = vec_new();
+    let mut index = target;
+    while index >= 0 {
+        if vec_len(reverse) >= vec_len(graph.nodes) { return Result::Err("predecessor cycle invariant"); }
+        reverse = vec_push(reverse, vec_at(graph.nodes, index).name);
+        index = array_get_unchecked(previous, index);
+    }
+    let mut path: Vec<String> = vec_new();
+    index = vec_len(reverse);
+    while index > 0 { index = index - 1; path = vec_push(path, vec_at(reverse, index)); }
+    Result::Ok(Route { reachable: true, distance: array_get_unchecked(distances, target), path: path })
+}
+fn render(result: Route, graph: Graph, from: String, to: String) -> String {
+    let mut parts: Vec<String> = vec_new();
+    parts = vec_push(parts, str_concat3("{\"from\":", json_quote(from), ",\"to\":"));
+    parts = vec_push(parts, json_quote(to));
+    parts = vec_push(parts, if result.reachable { ",\"reachable\":true,\"distance\":" } else { ",\"reachable\":false,\"distance\":" });
+    parts = vec_push(parts, if result.reachable { to_string(result.distance) } else { "null" });
+    parts = vec_push(parts, ",\"path\":[");
+    let mut i = 0;
+    while i < vec_len(result.path) { if i > 0 { parts = vec_push(parts, ","); } parts = vec_push(parts, json_quote(vec_at(result.path, i))); i = i + 1; }
+    parts = vec_push(parts, str_concat3("],\"nodes\":", to_string(vec_len(graph.nodes)), ",\"edges\":"));
+    parts = vec_push(parts, str_concat(to_string(graph.edges), "}"));
+    str_join(parts, "")
+}
+fn main() -> i64 {
+    let args = match process_args() { Result::Ok(a) => a, Result::Err(e) => { return failure(io_error_message(e)); } };
+    if array_len(args) != 5 { stderr_line("usage: gcr-routes <edges.csv> <from> <to> <output.json|->"); return 2; }
+    let text = match fs_read_text(array_get_unchecked(args, 1), 1048576) { Result::Ok(s) => s, Result::Err(e) => { return failure(io_error_message(e)); } };
+    let graph = match load(text) { Result::Ok(g) => g, Result::Err(e) => { return failure(e); } };
+    let from = array_get_unchecked(args, 2);
+    let to = array_get_unchecked(args, 3);
+    let result = match route(graph, from, to) { Result::Ok(r) => r, Result::Err(e) => { return failure(e); } };
+    let json = render(result, graph, from, to);
+    let output = array_get_unchecked(args, 4);
+    let written = if str_eq(output, "-") { stdout_line(json) } else { fs_write_text_atomic(output, str_concat(json, "\n")) };
+    match written { Result::Ok(_) => 0, Result::Err(e) => failure(io_error_message(e)) }
+}

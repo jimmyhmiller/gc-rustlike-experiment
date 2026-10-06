@@ -1096,7 +1096,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 } else { self.variant_ctor(path, &[], expected, e.span) }
             }
 
-            ExprKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, e.span),
+            ExprKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, expected, e.span),
 
             ExprKind::Try(inner) => self.try_op(inner, e.span),
 
@@ -1171,7 +1171,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// Construct an enum variant. `path` is `Enum::Variant`; `args` are payload
     /// values (empty for a unit variant). `expected` provides the enum's type
     /// args when they can't be inferred from the payload (e.g. `None`).
-    fn variant_ctor(&mut self, path: &Path, args: &[Expr], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+    fn variant_ctor(
+        &mut self,
+        path: &Path,
+        args: &[Expr],
+        expected: Option<&Ty>,
+        span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
         let key = path.segments.join("::");
         let last = path.last();
         let (enum_name, tag) = self.ctx.variants.get(&key)
@@ -1201,7 +1207,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let mut cargs = Vec::new();
         let mut actuals = Vec::new();
         for (a, decl) in args.iter().zip(&decl_payload) {
-            let (ca, at) = self.expr(a, hint(decl))?;
+            let payload_hint = apply_subst(decl, &targ);
+            let (ca, at) = self.expr(a, hint(&payload_hint))?;
             unify_infer(decl, &at, &mut targ);
             actuals.push((decl.clone(), at));
             cargs.push(ca);
@@ -1344,7 +1351,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok((CoreExpr::new(CoreExprKind::SetField { base: Box::new(cbase), loc, value: Box::new(new_val) }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
     }
 
-    fn match_expr(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> LResult<(CoreExpr, Ty)> {
+    fn match_expr(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        expected: Option<&Ty>,
+        span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
         let (cscrut, sty) = self.expr(scrutinee, None)?;
 
         // Dispatch: the fast tag-switch path handles a pure enum match with only
@@ -1364,7 +1377,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             _ => false,
         });
         if !is_enum || any_guard || !switchable {
-            return self.match_chain(cscrut, sty, arms, span);
+            return self.match_chain(cscrut, sty, arms, expected, span);
         }
 
         let Ty::Named { name: enum_name, args: enum_args } = &sty else {
@@ -1393,14 +1406,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     }
                     let mut binds = Vec::new();
                     for (p, pty) in payload.iter().zip(&ptys) {
-                        let bname = match &p.kind {
-                            PatternKind::Binding { name, .. } => name.clone(),
-                            PatternKind::Wildcard => "_".to_string(),
+                        let (bname, is_mut) = match &p.kind {
+                            PatternKind::Binding { name, is_mut } => (name.clone(), *is_mut),
+                            PatternKind::Wildcard => ("_".to_string(), false),
                             _ => return err("nested patterns not yet supported in v0", p.span),
                         };
                         let prepr = self.repr_of(pty, p.span)?;
                         let id = self.fresh_local(prepr, pty.clone());
-                        self.bind(&bname, id, pty.clone());
+                        self.bind_mut(&bname, id, pty.clone(), is_mut);
                         binds.push(id);
                     }
                     (tag, binds)
@@ -1410,7 +1423,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             if arm.guard.is_some() {
                 return err("match guards not yet supported in v0", arm.span);
             }
-            let (body, bty) = self.expr(&arm.body, result_ty.as_ref())?;
+            let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
             match &result_ty {
                 Some(rt) if !is_never(rt) => check_assignable(&bty, rt, arm.span)?,
                 _ => result_ty = Some(bty),
@@ -1456,7 +1469,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// string scrutinees, literal patterns, bare-binding catch-alls, and guards
     /// — anything the fast enum tag-switch can't. Built entirely from existing
     /// core primitives (`Let`, `If`, `Bin(Eq)`, `StrEq`), so no codegen changes.
-    fn match_chain(&mut self, cscrut: CoreExpr, sty: Ty, arms: &[MatchArm], span: Span) -> LResult<(CoreExpr, Ty)> {
+    fn match_chain(
+        &mut self,
+        cscrut: CoreExpr,
+        sty: Ty,
+        arms: &[MatchArm],
+        expected: Option<&Ty>,
+        span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
         // Bind the scrutinee to a fresh local so we evaluate it once and can test
         // it repeatedly.
         let srepr = cscrut.repr.clone();
@@ -1520,7 +1540,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             // An unguarded irrefutable pattern (wildcard/binding) makes coverage.
             let covers = irrefutable && arm.guard.is_none();
-            let (body, bty) = self.expr(&arm.body, result_ty.as_ref())?;
+            let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
             match &result_ty {
                 Some(rt) if !is_never(rt) => check_assignable(&bty, rt, arm.span)?,
                 _ => result_ty = Some(bty),

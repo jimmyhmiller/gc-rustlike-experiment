@@ -34,8 +34,7 @@ Negative bounds clamp to zero, end clamps to string length, and reversed ranges
 or starts beyond the string return -1. Empty needles match at a valid start.
 
 Value arrays now store each written value in a GC-traced box. Embedded references
-are traced, copying an element preserves value semantics, and unset elements read
-as zero-initialized values. This costs an allocation per value-element store.
+are traced, copying an element preserves value semantics, and unset reference/inline-value elements fail rather than fabricating values. This costs an allocation per value-element store.
 Nested value-enum references use shared leading pointer slots, with 8-aligned raw
 payloads; closure environments trace embedded captured-value references too.
 

@@ -1894,21 +1894,33 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             CoreExprKind::Match { scrutinee, arms } => self.gen_match(fcx, scrutinee, arms, &e.repr),
             CoreExprKind::EnumTag(scrut) => {
-                let obj = self.gen_expr(fcx, scrut)?.unwrap().into_pointer_value();
-                let lid = match &scrut.repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("EnumTag on non-ref enum".into())) };
-                let ptr_fields = self.prog.layouts[lid as usize].ptr_fields as u64;
-                let i32t = self.ctx.i32_type();
-                let tag_off = Self::HEADER + ptr_fields * 8;
-                let addr = self.obj_addr(obj, tag_off);
-                let tag = self.builder.build_load(i32t, addr, "etag").unwrap();
+                let value = self.gen_expr(fcx, scrut)?.unwrap();
+                let tag = match &scrut.repr {
+                    Repr::Value(id) => {
+                        let variants = self.prog.values[*id as usize].variants.as_ref()
+                            .ok_or_else(|| CodegenError("EnumTag on non-enum value".into()))?;
+                        let tag_index = if crate::core::value_enum_max_ptrs(variants, &self.prog.values) == 0 { 0 } else { 1 };
+                        self.builder.build_extract_value(value.into_struct_value(), tag_index, "vetag").unwrap()
+                    }
+                    Repr::Ref(lid) => {
+                        let tag_off = Self::HEADER + self.prog.layouts[*lid as usize].ptr_fields as u64 * 8;
+                        self.builder.build_load(self.ctx.i32_type(), self.obj_addr(value.into_pointer_value(), tag_off), "etag").unwrap()
+                    }
+                    _ => return Err(CodegenError("EnumTag on non-enum".into())),
+                };
                 Ok(Some(tag))
             }
             CoreExprKind::EnumPayload { scrutinee, field, repr, payload_reprs } => {
-                let obj = self.gen_expr(fcx, scrutinee)?.unwrap().into_pointer_value();
-                let lid = match &scrutinee.repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("EnumPayload on non-ref enum".into())) };
-                let ptr_fields = self.prog.layouts[lid as usize].ptr_fields as u64;
-                let tag_off = Self::HEADER + ptr_fields * 8;
-                let val = self.load_enum_payload(obj, tag_off, *field as usize, repr, payload_reprs);
+                let value = self.gen_expr(fcx, scrutinee)?.unwrap();
+                if matches!(repr, Repr::Unit) { return Ok(None); }
+                let val = match &scrutinee.repr {
+                    Repr::Value(id) => self.load_value_enum_payload(value, *id, *field as usize, payload_reprs)?,
+                    Repr::Ref(lid) => {
+                        let tag_off = Self::HEADER + self.prog.layouts[*lid as usize].ptr_fields as u64 * 8;
+                        self.load_enum_payload(value.into_pointer_value(), tag_off, *field as usize, payload_reprs)?
+                    }
+                    _ => return Err(CodegenError("EnumPayload on non-enum".into())),
+                };
                 Ok(Some(val))
             }
             CoreExprKind::ArrayNew { layout, len, elem } => self.gen_array_new(fcx, *layout, len, elem, e.span),
@@ -2400,18 +2412,26 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     }
                 }
                 Repr::Value(vid) => {
-                    // A flattened value aggregate: store the whole LLVM struct at
-                    // its inline byte offset. Offset progression mirrors
-                    // `build_ref_layout` (align to 8, advance by the value's
-                    // size), so loads via `FieldLoc::ValueAt` find it. Value types
-                    // reaching here are POD (no embedded GC refs — `build_ref_layout`
-                    // rejects ref-containing ones), so no write barrier is needed.
+                    // Structs keep nested references in their inline storage;
+                    // enums move them to leading slots shared by every variant.
                     let sz = self.prog.values[*vid as usize].size as u64;
                     raw_cursor = align_up64(raw_cursor, 8);
                     let addr = self.obj_addr(obj, raw_cursor);
                     raw_cursor += sz;
                     if let Some(v) = v {
                         self.builder.build_store(addr, *v).unwrap();
+                        if tag.is_some() {
+                            let mut offsets = Vec::new();
+                            value_interior_offsets(&self.prog.values, *vid, 0, &mut offsets);
+                            for offset in offsets {
+                                let source = self.obj_addr(obj, raw_cursor - sz + offset as u64);
+                                let reference = self.builder.build_load(ptr, source, "enum.nested.ref").unwrap();
+                                let target = self.obj_addr(obj, Self::HEADER + ptr_slot * 8);
+                                self.builder.build_store(target, reference).unwrap();
+                                self.builder.build_store(source, ptr.const_null()).unwrap();
+                                ptr_slot += 1;
+                            }
+                        }
                     }
                 }
                 Repr::Unit => {
@@ -3087,6 +3107,86 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(Some(v))
     }
 
+    // Read the same pointers-first or compact payload layout used by the
+    // constructor and switch matcher. Guarded matches use these reads too.
+    fn load_value_enum_payload(
+        &mut self,
+        aggregate: BasicValueEnum<'ctx>,
+        id: ValueId,
+        field: usize,
+        reprs: &[Repr],
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let descriptor = &self.prog.values[id as usize];
+        let variants = descriptor
+            .variants
+            .as_ref()
+            .ok_or_else(|| CodegenError("payload read on non-enum value".into()))?;
+        let max_ptrs = crate::core::value_enum_max_ptrs(variants, &self.prog.values) as u32;
+        let ty = aggregate.get_type().into_struct_type();
+        let slot = self.entry_alloca(ty, "vp.scrut");
+        self.builder.build_store(slot, aggregate).unwrap();
+        let pointers = if max_ptrs > 0 {
+            Some(
+                self.builder
+                    .build_struct_gep(ty, slot, 0, "vp.ptrs")
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let raw = self
+            .builder
+            .build_struct_gep(ty, slot, if max_ptrs > 0 { 2 } else { 1 }, "vp.raw")
+            .unwrap();
+        let mut raw_offset = 0;
+        let mut pointer_slot = 0;
+        for (index, repr) in reprs.iter().enumerate() {
+            let mut interiors = Vec::new();
+            if let Repr::Value(nested) = repr {
+                value_interior_offsets(&self.prog.values, *nested, 0, &mut interiors);
+            }
+            let addr = if matches!(repr, Repr::Ref(_)) {
+                let addr = self.payload_field_addr(
+                    pointers
+                        .ok_or_else(|| CodegenError("missing value enum pointer region".into()))?,
+                    pointer_slot * 8,
+                );
+                pointer_slot += 1;
+                addr
+            } else {
+                let (size, align) = self.repr_size_align(repr);
+                raw_offset = align_up64(raw_offset, align);
+                let addr = self.payload_field_addr(raw, raw_offset);
+                raw_offset += size;
+                addr
+            };
+            if index == field {
+                let ty = self
+                    .llvm_ty(repr)
+                    .ok_or_else(|| CodegenError("unit enum payload cannot be read".into()))?;
+                let value = self.builder.build_load(ty, addr, "vp.field").unwrap();
+                if interiors.is_empty() {
+                    return Ok(value);
+                }
+                let restored = self.entry_alloca(ty, "vp.nested");
+                self.builder.build_store(restored, value).unwrap();
+                for offset in interiors {
+                    let source = self.payload_field_addr(pointers.unwrap(), pointer_slot * 8);
+                    let reference = self
+                        .builder
+                        .build_load(self.ctx.ptr_type(AddressSpace::default()), source, "vp.ref")
+                        .unwrap();
+                    let target = self.payload_field_addr(restored, offset as u64);
+                    self.builder.build_store(target, reference).unwrap();
+                    pointer_slot += 1;
+                }
+                return Ok(self.builder.build_load(ty, restored, "vp.value").unwrap());
+            }
+            pointer_slot += interiors.len() as u64;
+        }
+        Err(CodegenError("enum payload index out of bounds".into()))
+    }
+
     fn gen_value_match(
         &mut self,
         fcx: &mut FnCtx<'ctx>,
@@ -3094,28 +3194,24 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         arms: &[CoreArm],
         repr: &Repr,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        let scrut_ty = self.llvm_ty(&scrutinee.repr).unwrap().into_struct_type();
-        let vid = match &scrutinee.repr { Repr::Value(v) => *v, _ => unreachable!("value match on non-value") };
-        let max_ptrs = crate::core::value_enum_max_ptrs(
-            self.prog.values[vid as usize].variants.as_ref().unwrap(), &self.prog.values,
-        ) as u32;
-        let agg = self.gen_expr(fcx, scrutinee)?.unwrap().into_struct_value();
-        // Spill the aggregate so we can address its payload bytes for binds.
-        let scrut_slot = self.entry_alloca(scrut_ty, "vm.scrut");
-        self.builder.build_store(scrut_slot, agg).unwrap();
-        // Compact layout: tag is field 0, payload bytes field 1. Pointers-first:
-        // tag is field 1, the ptr-slot array field 0, the raw bytes field 2.
-        let (tag_idx, ptr_arr, payload_ptr) = if max_ptrs == 0 {
-            let pl = if scrut_ty.count_fields() > 1 {
-                Some(self.builder.build_struct_gep(scrut_ty, scrut_slot, 1, "vm.pl").unwrap())
-            } else { None };
-            (0u32, None, pl)
-        } else {
-            let arr = self.builder.build_struct_gep(scrut_ty, scrut_slot, 0, "vm.ptrs").unwrap();
-            let raw = self.builder.build_struct_gep(scrut_ty, scrut_slot, 2, "vm.raw").unwrap();
-            (1u32, Some(arr), Some(raw))
+        let vid = match &scrutinee.repr {
+            Repr::Value(v) => *v,
+            _ => return Err(CodegenError("value match on non-value".into())),
         };
-        let tag = self.builder.build_extract_value(agg, tag_idx, "vetag").unwrap().into_int_value();
+        let max_ptrs = crate::core::value_enum_max_ptrs(
+            self.prog.values[vid as usize].variants.as_ref().unwrap(),
+            &self.prog.values,
+        );
+        let agg = self.gen_expr(fcx, scrutinee)?.unwrap();
+        let tag = self
+            .builder
+            .build_extract_value(
+                agg.into_struct_value(),
+                if max_ptrs == 0 { 0 } else { 1 },
+                "vetag",
+            )
+            .unwrap()
+            .into_int_value();
         let func = fcx.func;
         let cont_bb = self.ctx.append_basic_block(func, "vm.cont");
         let result_slot = self.llvm_ty(repr).map(|t| self.entry_alloca(t, "vm.res"));
@@ -3135,54 +3231,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(unreachable_bb);
         self.builder.build_unreachable().unwrap();
 
-        let ptr_arr_ty = self.ctx.ptr_type(AddressSpace::default()).array_type(max_ptrs);
         for (arm, bb) in arm_blocks {
             self.builder.position_at_end(bb);
-            // Bind payload fields. Compact: all binds come from the byte region at
-            // running offsets. Pointers-first: `Ref` binds come from the leading
-            // ptr-slot array, the rest from the raw byte region — the exact
-            // partition `gen_make_value_variant` used to store them.
-            let mut raw_off = 0u64;
-            let mut ptr_slot = 0u64;
-            for &local in &arm.binds {
-                let lrepr = fcx.local_reprs[local as usize].clone();
-                let Some(lty) = self.llvm_ty(&lrepr) else { continue };
-                let faddr = if max_ptrs > 0 && matches!(lrepr, Repr::Ref(_)) {
-                    let elem = unsafe {
-                        self.builder.build_in_bounds_gep(
-                            ptr_arr_ty, ptr_arr.unwrap(),
-                            &[i32t.const_zero(), i32t.const_int(ptr_slot, false)],
-                            "vm.pslot",
-                        ).unwrap()
-                    };
-                    ptr_slot += 1;
-                    elem
-                } else {
-                    let (sz, align) = self.repr_size_align(&lrepr);
-                    raw_off = align_up64(raw_off, align);
-                    let a = self.payload_field_addr(payload_ptr.unwrap(), raw_off);
-                    raw_off += sz;
-                    a
-                };
-                let mut v = self.builder.build_load(lty, faddr, "vm.bind").unwrap();
-                if let Repr::Value(id) = lrepr {
-                    let temporary = self.entry_alloca(lty, "vm.nested");
-                    self.builder.build_store(temporary, v).unwrap();
-                    let mut offsets = Vec::new();
-                    value_interior_offsets(&self.prog.values, id, 0, &mut offsets);
-                    for offset in offsets {
-                        let source = self.payload_field_addr(ptr_arr.unwrap(), ptr_slot * 8);
-                        let pointer = self.ctx.ptr_type(AddressSpace::default());
-                        let reference = self.builder.build_load(pointer, source, "vm.nested.ref").unwrap();
-                        let target = self.payload_field_addr(temporary, offset as u64);
-                        self.builder.build_store(target, reference).unwrap();
-                        ptr_slot += 1;
-                    }
-                    v = self.builder.build_load(lty, temporary, "vm.nested.value").unwrap();
-                }
-                if let Some(slot) = fcx.slots[local as usize] {
-                    self.builder.build_store(slot, v).unwrap();
-                }
+            let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
+            for (field, &local) in arm.binds.iter().enumerate() {
+                if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
+                let value = self.load_value_enum_payload(agg, vid, field, &payload_reprs)?;
+                if let Some(slot) = fcx.slots[local as usize] { self.builder.build_store(slot, value).unwrap(); }
             }
             let v = self.gen_expr(fcx, &arm.body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -3246,35 +3301,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         for (arm, bb) in arm_blocks {
             self.builder.position_at_end(bb);
-            // Bind payload fields into their (already-allocated) local slots.
-            // Payload layout: pointer payloads in pointer slots [0..], raw
-            // payloads after the tag word.
-            let mut ptr_slot = 0u64;
-            let mut raw_cursor = tag_off + 8;
-            for &local in &arm.binds {
-                let lrepr = fcx.local_reprs[local as usize].clone();
-                match &lrepr {
-                    Repr::Ref(_) => {
-                        let off = Self::HEADER + ptr_slot * 8;
-                        ptr_slot += 1;
-                        let addr = self.obj_addr(obj, off);
-                        let v = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), addr, "pl").unwrap();
-                        if let Some(slot) = fcx.slots[local as usize] {
-                            self.builder.build_store(slot, v).unwrap();
-                        }
-                    }
-                    Repr::Scalar(s) => {
-                        let sz = (s.bits().max(8) / 8) as u64;
-                        raw_cursor = align_up64(raw_cursor, sz);
-                        let addr = self.obj_addr(obj, raw_cursor);
-                        raw_cursor += sz;
-                        let v = self.builder.build_load(self.scalar_ty(*s), addr, "pl").unwrap();
-                        if let Some(slot) = fcx.slots[local as usize] {
-                            self.builder.build_store(slot, v).unwrap();
-                        }
-                    }
-                    _ => {}
-                }
+            let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
+            for (field, &local) in arm.binds.iter().enumerate() {
+                if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
+                let value = self.load_enum_payload(obj, tag_off, field, &payload_reprs)?;
+                if let Some(slot) = fcx.slots[local as usize] { self.builder.build_store(slot, value).unwrap(); }
             }
             let v = self.gen_expr(fcx, &arm.body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -3301,48 +3332,68 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// (aligned) after the tag word at `tag_off + 8`. `payload_reprs` is the full
     /// ordered payload list so we can find `field`'s slot.
     fn load_enum_payload(
-        &self,
+        &mut self,
         obj: PointerValue<'ctx>,
         tag_off: u64,
         field: usize,
-        repr: &Repr,
         payload_reprs: &[Repr],
-    ) -> BasicValueEnum<'ctx> {
-        let mut ptr_slot = 0u64;
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let mut pointer_slot = 0;
         let mut raw_cursor = tag_off + 8;
-        for (i, r) in payload_reprs.iter().enumerate() {
-            match r {
-                Repr::Ref(_) => {
-                    let off = Self::HEADER + ptr_slot * 8;
-                    ptr_slot += 1;
-                    if i == field {
-                        let addr = self.obj_addr(obj, off);
-                        return self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), addr, "pl").unwrap();
-                    }
-                }
-                Repr::Scalar(s) => {
-                    let sz = (s.bits().max(8) / 8) as u64;
-                    raw_cursor = align_up64(raw_cursor, sz);
-                    let off = raw_cursor;
-                    raw_cursor += sz;
-                    if i == field {
-                        let addr = self.obj_addr(obj, off);
-                        return self.builder.build_load(self.scalar_ty(*s), addr, "pl").unwrap();
-                    }
-                }
-                _ => {
-                    // Value payloads aren't bound through this path in v0.
-                    if i == field {
-                        // Fallback: load as a pointer (won't happen for scalar/ref).
-                        let addr = self.obj_addr(obj, Self::HEADER + ptr_slot * 8);
-                        return self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), addr, "pl").unwrap();
-                    }
-                }
+        for (index, repr) in payload_reprs.iter().enumerate() {
+            let mut interiors = Vec::new();
+            if let Repr::Value(id) = repr {
+                value_interior_offsets(&self.prog.values, *id, 0, &mut interiors);
             }
+            let addr = if matches!(repr, Repr::Ref(_)) {
+                let addr = self.obj_addr(obj, Self::HEADER + pointer_slot * 8);
+                pointer_slot += 1;
+                addr
+            } else {
+                let (size, align) = self.repr_size_align(repr);
+                // Reference enum value payloads have eight-byte alignment.
+                raw_cursor = align_up64(
+                    raw_cursor,
+                    if matches!(repr, Repr::Value(_)) {
+                        8
+                    } else {
+                        align
+                    },
+                );
+                let addr = self.obj_addr(obj, raw_cursor);
+                raw_cursor += size;
+                addr
+            };
+            if index == field {
+                let ty = self
+                    .llvm_ty(repr)
+                    .ok_or_else(|| CodegenError("unit enum payload cannot be read".into()))?;
+                let value = self.builder.build_load(ty, addr, "enum.payload").unwrap();
+                if interiors.is_empty() {
+                    return Ok(value);
+                }
+                let restored = self.entry_alloca(ty, "enum.nested");
+                self.builder.build_store(restored, value).unwrap();
+                for offset in interiors {
+                    let source = self.obj_addr(obj, Self::HEADER + pointer_slot * 8);
+                    let reference = self
+                        .builder
+                        .build_load(
+                            self.ctx.ptr_type(AddressSpace::default()),
+                            source,
+                            "enum.ref",
+                        )
+                        .unwrap();
+                    self.builder
+                        .build_store(self.payload_field_addr(restored, offset as u64), reference)
+                        .unwrap();
+                    pointer_slot += 1;
+                }
+                return Ok(self.builder.build_load(ty, restored, "enum.value").unwrap());
+            }
+            pointer_slot += interiors.len() as u64;
         }
-        // Unreachable if `field` is valid.
-        let _ = repr;
-        self.ctx.i64_type().const_zero().into()
+        Err(CodegenError("enum payload index out of bounds".into()))
     }
 
     fn gen_bin(
@@ -4151,7 +4202,11 @@ pub fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, Code
 }
 
 /// Execute with independent argv; children inherit this execution's arguments.
-pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec<std::ffi::OsString>) -> Result<i64, CodegenError> {
+pub fn jit_run_i64_with_args(
+    prog: &CoreProgram,
+    mode: GcRunMode,
+    arguments: Vec<std::ffi::OsString>,
+) -> Result<i64, CodegenError> {
     use crate::runtime::{self, RuntimeContext};
     let ctx = Context::create();
     let compiled = codegen(&ctx, prog)?;
@@ -4243,7 +4298,7 @@ pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec
     // semi-space collector, the collector it was designed to torture-test.
     let mut rt = match mode {
         GcRunMode::Stress => {
-            let rt = RuntimeContext::new(8 << 20, tis);
+            let rt = RuntimeContext::new(runtime::configured_stress_heap_size(), tis);
             rt.heap().set_gc_every_alloc(true);
             rt
         }

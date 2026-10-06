@@ -31,6 +31,22 @@ impl Ord for i64 {
 }
 
 impl Eq for String { fn eq(self, other: String) -> bool { str_eq(self, other) } }
+// Lexicographic UTF-8 byte ordering; no substring allocation at each comparison.
+fn str_compare(left: String, right: String) -> i64 {
+    let mut i = 0;
+    let count = min_i64(str_len(left), str_len(right));
+    while i < count {
+        let a = str_get(left, i);
+        let b = str_get(right, i);
+        if a < b { return 0 - 1; }
+        if a > b { return 1; }
+        i = i + 1;
+    }
+    if str_len(left) < str_len(right) { 0 - 1 }
+    else if str_len(left) > str_len(right) { 1 }
+    else { 0 }
+}
+impl Ord for String { fn cmp(self, other: String) -> i64 { str_compare(self, other) } }
 
 impl Eq for bool { fn eq(self, other: bool) -> bool { self == other } }
 
@@ -193,6 +209,8 @@ fn wrapping_mul_i64(a: i64, b: i64) -> i64 { a * b }
 //     v = vec_push(v, 10);
 //     vec_get(v, 0)
 
+// Unsynchronized collection: shared mutation (including backing-array aliases)
+// requires external synchronization. Concurrent collections use separate APIs.
 struct Vec<T> { data: Array<T>, len: i64, cap: i64 }
 
 fn vec_new<T>() -> Vec<T> {
@@ -716,41 +734,28 @@ fn str_split_byte(s: String, sep: i64) -> Vec<String> {
     out
 }
 
-// Parse a base-10 signed integer. Returns `Option::Some(n)` on success, or
-// `Option::None` if the string is empty or contains a non-digit (after an
-// optional leading `-`). ASCII digits are bytes 48..=57; '-' is 45.
+// Parse a base-10 signed integer with an optional leading minus.
+// Empty, malformed, and out-of-range strings return None. Accumulate negatively
+// so the asymmetric i64 minimum remains representable without overflowing.
 fn parse_int(s: String) -> Option<i64> {
     let n = str_len(s);
-    if n == 0 {
-        Option::None
-    } else {
-        let mut neg = false;
-        let mut i = 0;
-        if str_get(s, 0) == 45 {
-            neg = true;
-            i = 1;
-        }
-        // A lone "-" is not a number.
-        if i >= n {
-            Option::None
-        } else {
-            let mut acc = 0;
-            let mut ok = true;
-            while i < n {
-                let c = str_get(s, i);
-                if c < 48 || c > 57 {
-                    ok = false;
-                }
-                acc = acc * 10 + (c - 48);
-                i = i + 1;
-            }
-            if ok {
-                if neg { Option::Some(0 - acc) } else { Option::Some(acc) }
-            } else {
-                Option::None
-            }
-        }
+    if n == 0 { return Option::None; }
+    let neg = str_get(s, 0) == 45;
+    let mut i = if neg { 1 } else { 0 };
+    if i == n { return Option::None; }
+    let limit = if neg { 0 - 9223372036854775807 - 1 } else { 0 - 9223372036854775807 };
+    let mut acc = 0;
+    while i < n {
+        let c = str_get(s, i);
+        if c < 48 || c > 57 { return Option::None; }
+        let digit = c - 48;
+        if acc < limit / 10 { return Option::None; }
+        acc = acc * 10;
+        if acc < limit + digit { return Option::None; }
+        acc = acc - digit;
+        i = i + 1;
     }
+    Option::Some(if neg { acc } else { 0 - acc })
 }
 
 // Parse a float (runtime-backed; returns 0.0 on a malformed string). For a
@@ -792,6 +797,7 @@ fn str_join(parts: Vec<String>, sep: String) -> String {
 //   m = mapstr_insert(m, "a", 1);
 //   opt_unwrap_or(mapstr_get(m, "a"), 0)   // 1
 
+// Unsynchronized map: callers synchronize shared mutation and backing aliases.
 struct MapStr<V> { keys: Array<String>, vals: Array<V>, used: Array<i64>, len: i64, cap: i64 }
 
 fn mapstr_new<V>() -> MapStr<V> {

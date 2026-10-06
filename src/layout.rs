@@ -189,6 +189,9 @@ impl<'a> LayoutRegistry<'a> {
             max_ptrs = max_ptrs.max(ptrs);
             max_raw = max_raw.max(raw);
         }
+        if HEADER as u32 + max_ptrs as u32 * 8 + max_raw as u32 + 8 > u16::MAX as u32 {
+            return Err(LayoutError("enum payload exceeds layout size limit".into()));
+        }
         // tag occupies 4 bytes within the raw region; reserve 8 for alignment.
         let raw_bytes = max_raw + 8;
         // Reflection metadata: one VariantMeta per source variant, with payload
@@ -248,6 +251,9 @@ impl<'a> LayoutRegistry<'a> {
             let (ptrs, raw) = self.count_fields(vtys)?;
             max_ptrs = max_ptrs.max(ptrs);
             max_raw = max_raw.max(raw);
+        }
+        if HEADER as u32 + max_ptrs as u32 * 8 + max_raw as u32 + 8 > u16::MAX as u32 {
+            return Err(LayoutError("enum payload exceeds layout size limit".into()));
         }
         let mut variants_meta = Vec::with_capacity(variants.len());
         for (vtag, vtys) in variants.iter().enumerate() {
@@ -469,17 +475,31 @@ impl<'a> LayoutRegistry<'a> {
 
     // ---- field counting + layout building ---------------------------------
     fn count_fields(&mut self, tys: &[Ty]) -> R<(u16, u16)> {
-        let mut ptrs = 0u16;
-        let mut raw = 0u16;
+        let mut ptrs = 0u32;
+        let mut raw = 0u32;
         for t in tys {
             match self.repr(t)? {
                 Repr::Ref(_) => ptrs += 1,
-                Repr::Scalar(s) => raw += (s.bits().max(8) / 8) as u16,
-                Repr::Value(vid) => raw += self.values[vid as usize].size as u16,
+                Repr::Scalar(s) => {
+                    let size = s.bits().max(8) / 8;
+                    raw = align_up(raw, size) + size;
+                }
+                Repr::Value(id) => {
+                    let value = &self.values[id as usize];
+                    // Reference enum payloads use the same leading pointer
+                    // slots as value enums, including nested value references.
+                    let mut offsets = Vec::new();
+                    self.value_ref_offsets(id, 0, &mut offsets)?;
+                    ptrs += offsets.len() as u32;
+                    raw = align_up(raw, 8) + value.size;
+                }
                 Repr::Unit => {}
             }
+            if HEADER as u32 + ptrs * 8 + align_up(raw, 8) + 8 > u16::MAX as u32 {
+                return Err(LayoutError("enum payload exceeds layout size limit".into()));
+            }
         }
-        Ok((ptrs, align_up(raw as u32, 8) as u16))
+        Ok((ptrs as u16, align_up(raw, 8) as u16))
     }
 
     fn build_ref_layout(&mut self, name: &str, field_names: &[String], field_tys: &[Ty]) -> R<Layout> {
@@ -616,10 +636,16 @@ impl<'a> LayoutRegistry<'a> {
     /// payload placement (`gen_alloc` / `load_enum_payload`): pointer payloads
     /// fill the shared pointer region (slots `0..`) in declaration order; scalar
     /// payloads fill the raw region after the tag word (at `HEADER +
-    /// max_ptrs*8`). Offsets are absolute (header included). Value/Unit payloads
-    /// are omitted — codegen does not store them field-by-field (v0), so any
-    /// offset we recorded would be untrustworthy.
-    fn enum_variant_fields(&self, reprs: &[Repr], names: &[String], max_ptrs: u16) -> Vec<FieldMeta> {
+    /// max_ptrs*8`). Offsets are absolute (header included). Value payloads
+    /// advance both cursors but remain omitted from reflection: their nested
+    /// references live separately in leading slots, which a contiguous ValueMeta
+    /// cannot describe. Unit payloads have no storage and are also omitted.
+    fn enum_variant_fields(
+        &self,
+        reprs: &[Repr],
+        names: &[String],
+        max_ptrs: u16,
+    ) -> Vec<FieldMeta> {
         let tag_off = HEADER + max_ptrs * 8;
         let mut ptr_slot = 0u16;
         let mut raw_cursor = tag_off + 8;
@@ -639,7 +665,15 @@ impl<'a> LayoutRegistry<'a> {
                     raw_cursor += sz;
                     out.push(FieldMeta { name: fname, offset: off, ty: FieldTy::Scalar(scalar_kind(*s)) });
                 }
-                Repr::Value(_) | Repr::Unit => {}
+                Repr::Value(id) => {
+                    raw_cursor = align_up(raw_cursor as u32, 8) as u16;
+                    raw_cursor += self.values[*id as usize].size as u16;
+                    let mut offsets = Vec::new();
+                    // Already validated when the payload layout was built.
+                    self.value_ref_offsets(*id, 0, &mut offsets).expect("validated value layout");
+                    ptr_slot += offsets.len() as u16;
+                }
+                Repr::Unit => {}
             }
         }
         out

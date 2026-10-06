@@ -1,0 +1,163 @@
+struct Group { name: String, count: i64, sum: i64, minimum: i64, maximum: i64 }
+struct FileReport { rows: i64, bytes: i64, total: i64, groups: Vec<Group> }
+struct Completion { index: i64, report: Result<FileReport, String> }
+impl Ord for Group { fn cmp(self, other: Group) -> i64 { str_compare(self.name, other.name) } }
+fn failure(message: String) -> i64 { stderr_line(str_concat("gcr-csvreport: ", message)); 1 }
+fn column(header: Vec<String>, name: String) -> Option<i64> {
+    let mut i = 0;
+    while i < vec_len(header) { if str_eq(vec_at(header, i), name) { return Option::Some(i); } i = i + 1; }
+    Option::None
+}
+fn report(text: String, group_column: String, value_column: String) -> Result<FileReport, String> {
+    let rows = match csv_parse(text, 20001, 256) {
+        Result::Ok(r) => r,
+        Result::Err(e) => { return Result::Err(csv_error_message(e)); }
+    };
+    if vec_len(rows) == 0 { return Result::Err("missing CSV header"); }
+    let header = vec_at(rows, 0);
+    let mut names: MapStr<bool> = mapstr_new();
+    let mut c = 0;
+    while c < vec_len(header) {
+        let name = vec_at(header, c);
+        if str_len(name) == 0 || mapstr_contains(names, name) { return Result::Err("CSV headers must be nonempty and unique"); }
+        names = mapstr_insert(names, name, true);
+        c = c + 1;
+    }
+    let group_index = match column(header, group_column) { Option::Some(i) => i, Option::None => { return Result::Err(str_concat("missing column: ", group_column)); } };
+    let value_index = match column(header, value_column) { Option::Some(i) => i, Option::None => { return Result::Err(str_concat("missing column: ", value_column)); } };
+    let mut groups: MapStr<Group> = mapstr_new();
+    let mut total = 0;
+    let mut r = 1;
+    while r < vec_len(rows) {
+        let row = vec_at(rows, r);
+        if vec_len(row) != vec_len(header) { return Result::Err(str_concat("wrong field count at record ", to_string(r + 1))); }
+        let key = vec_at(row, group_index);
+        let value = match parse_int(str_trim(vec_at(row, value_index))) {
+            Option::Some(n) => n,
+            Option::None => { return Result::Err(str_concat("invalid signed integer at record ", to_string(r + 1))); }
+        };
+        total = match checked_add_i64(total, value) { Option::Some(n) => n, Option::None => { return Result::Err("file total overflow"); } };
+        match mapstr_get(groups, key) {
+            Option::Some(mut group) => {
+                group.sum = match checked_add_i64(group.sum, value) { Option::Some(n) => n, Option::None => { return Result::Err("group total overflow"); } };
+                group.count = group.count + 1;
+                group.minimum = min_i64(group.minimum, value);
+                group.maximum = max_i64(group.maximum, value);
+            },
+            Option::None => {
+                if mapstr_len(groups) >= 10000 { return Result::Err("group count exceeds 10000"); }
+                groups = mapstr_insert(groups, key, Group { name: key, count: 1, sum: value, minimum: value, maximum: value });
+            }
+        };
+        r = r + 1;
+    }
+    Result::Ok(FileReport { rows: vec_len(rows) - 1, bytes: str_len(text), total: total, groups: mapstr_vals(groups) })
+}
+fn worker(paths: Vec<String>, next: AtomicI64, done: Channel<Completion>, group: String, value: String) -> i64 {
+    let mut count = 0;
+    loop {
+        let index = next.fetch_add(1);
+        if index >= vec_len(paths) { return count; }
+        let path = vec_at(paths, index);
+        let result = match fs_read_text(path, 524288) {
+            Result::Ok(text) => report(text, group, value),
+            Result::Err(e) => Result::Err(io_error_message(e))
+        };
+        match done.send(Completion { index: index, report: result }) {
+            Result::Ok(_) => {},
+            Result::Err(_) => { return count; }
+        };
+        count = count + 1;
+    }
+}
+fn merge(reports: Array<Result<FileReport, String>>, paths: Vec<String>) -> Result<FileReport, String> {
+    let mut groups: MapStr<Group> = mapstr_new();
+    let mut rows = 0;
+    let mut bytes = 0;
+    let mut total = 0;
+    let mut i = 0;
+    while i < array_len(reports) {
+        let file = match array_get_unchecked(reports, i) {
+            Result::Ok(f) => f,
+            Result::Err(e) => { return Result::Err(str_concat3(vec_at(paths, i), ": ", e)); }
+        };
+        rows = rows + file.rows;
+        if rows > 200000 { return Result::Err("total row count exceeds 200000"); }
+        bytes = bytes + file.bytes;
+        total = match checked_add_i64(total, file.total) { Option::Some(n) => n, Option::None => { return Result::Err("combined total overflow"); } };
+        let mut g = 0;
+        while g < vec_len(file.groups) {
+            let incoming = vec_at(file.groups, g);
+            match mapstr_get(groups, incoming.name) {
+                Option::Some(mut existing) => {
+                    existing.sum = match checked_add_i64(existing.sum, incoming.sum) { Option::Some(n) => n, Option::None => { return Result::Err("combined group total overflow"); } };
+                    existing.count = existing.count + incoming.count;
+                    existing.minimum = min_i64(existing.minimum, incoming.minimum);
+                    existing.maximum = max_i64(existing.maximum, incoming.maximum);
+                },
+                Option::None => {
+                    if mapstr_len(groups) >= 10000 { return Result::Err("group count exceeds 10000"); }
+                    groups = mapstr_insert(groups, incoming.name, incoming);
+                }
+            };
+            g = g + 1;
+        }
+        i = i + 1;
+    }
+    Result::Ok(FileReport { rows: rows, bytes: bytes, total: total, groups: vec_sort(mapstr_vals(groups)) })
+}
+fn render(summary: FileReport, files: i64) -> String {
+    let mut parts: Vec<String> = vec_new();
+    parts = vec_push(parts, str_concat3("{\"files\":", to_string(files), ",\"rows\":"));
+    parts = vec_push(parts, str_concat3(to_string(summary.rows), ",\"bytes\":", to_string(summary.bytes)));
+    parts = vec_push(parts, str_concat3(",\"total\":", to_string(summary.total), ",\"groups\":["));
+    let mut i = 0;
+    while i < vec_len(summary.groups) {
+        if i > 0 { parts = vec_push(parts, ","); }
+        let g = vec_at(summary.groups, i);
+        parts = vec_push(parts, str_concat3("{\"key\":", json_quote(g.name), ",\"count\":"));
+        parts = vec_push(parts, str_concat3(to_string(g.count), ",\"sum\":", to_string(g.sum)));
+        parts = vec_push(parts, str_concat3(",\"min\":", to_string(g.minimum), ",\"max\":"));
+        parts = vec_push(parts, str_concat(to_string(g.maximum), "}"));
+        i = i + 1;
+    }
+    parts = vec_push(parts, "]}");
+    str_join(parts, "")
+}
+fn main() -> i64 {
+    let args = match process_args() { Result::Ok(a) => a, Result::Err(e) => { return failure(io_error_message(e)); } };
+    if array_len(args) < 6 || array_len(args) > 37 {
+        stderr_line("usage: gcr-csvreport <workers:1..8> <group-column> <value-column> <output.json|-> <file> [file ...] (at most 32 files)");
+        return 2;
+    }
+    let workers = match parse_int(array_get_unchecked(args, 1)) { Option::Some(n) => n, Option::None => 0 };
+    if workers < 1 || workers > 8 { return failure("worker count must be between 1 and 8"); }
+    let group = array_get_unchecked(args, 2);
+    let value = array_get_unchecked(args, 3);
+    let output = array_get_unchecked(args, 4);
+    let mut paths: Vec<String> = vec_new();
+    let mut i = 5;
+    while i < array_len(args) { paths = vec_push(paths, array_get_unchecked(args, i)); i = i + 1; }
+    let count = min_i64(workers, vec_len(paths));
+    let done: Channel<Completion> = Channel::new(count);
+    let next = AtomicI64::new(0);
+    let mut threads: Vec<Thread<i64>> = vec_new();
+    i = 0;
+    while i < count { threads = vec_push(threads, Thread::spawn(|| worker(paths, next, done, group, value))); i = i + 1; }
+    let mut reports: Array<Result<FileReport, String>> = array_new(vec_len(paths));
+    i = 0;
+    while i < vec_len(paths) {
+        let completion = done.recv_value();
+        array_set(reports, completion.index, completion.report);
+        i = i + 1;
+    }
+    done.close();
+    i = 0;
+    let mut completed = 0;
+    while i < vec_len(threads) { completed = completed + vec_at(threads, i).join(); i = i + 1; }
+    if completed != vec_len(paths) { return failure("worker completion count mismatch"); }
+    let summary = match merge(reports, paths) { Result::Ok(s) => s, Result::Err(e) => { return failure(e); } };
+    let json = render(summary, vec_len(paths));
+    let written = if str_eq(output, "-") { stdout_line(json) } else { fs_write_text_atomic(output, str_concat(json, "\n")) };
+    match written { Result::Ok(_) => 0, Result::Err(e) => failure(io_error_message(e)) }
+}

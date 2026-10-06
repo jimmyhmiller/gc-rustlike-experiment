@@ -1,0 +1,51 @@
+#[value] struct Label { text: String, number: i64 }
+#[value] enum Inline { Record(Label), Other(i64, String) }
+enum Packet { Data(i8, Inline, i64, Option<String>), Empty }
+fn collect_noise() -> i64 {
+    let mut i = 0;
+    while i < 50 { let s = str_concat("temporary",to_string(i)); i = i + str_len(s) / str_len(s); }
+    i
+}
+fn inspect(packet: Packet) -> i64 {
+    collect_noise();
+    match packet {
+        Packet::Data(prefix, inline, suffix, tail) if prefix == 7 => {
+            let label = match inline { Inline::Record(label) if label.number == 42 => label, _ => { return 1; } };
+            if str_eq(label.text,"persist λ") == false || suffix != 91 { return 2; }
+            match tail { Option::Some(text) if str_eq(text,"tail 🦀") => 0, _ => 3 }
+        },
+        _ => 4
+    }
+}
+fn main() -> i64 {
+    let unit: Option<()> = Option::Some(());
+    let unit_status = match unit { Option::Some(value) if true => { let copy = value; 0 }, _ => 14 };
+    if unit_status != 0 { return unit_status; }
+    let unit_ref: Result<(),String> = Result::Ok(());
+    let ref_status = match unit_ref { Result::Ok(value) if true => { let copy = value; 0 }, _ => 15 };
+    if ref_status != 0 { return ref_status; }
+    let packet = Packet::Data(7,Inline::Record(Label { text:"persist λ",number:42 }),91,Option::Some("tail 🦀"));
+    if field_count(packet) != 2 || field_i64(packet,0) != 7 || field_i64(packet,1) != 91 { return 13; }
+    let status = inspect(packet);
+    if status != 0 { return status; }
+    match packet {
+        Packet::Data(prefix, inline, suffix, tail) => {
+            let label = match inline { Inline::Record(label) => label, _ => { return 5; } };
+            collect_noise();
+            if prefix != 7 || suffix != 91 || label.number != 42 || str_eq(label.text,"persist λ") == false { return 6; }
+            if str_eq(opt_expect(tail,"tail"),"tail 🦀") == false { return 7; }
+        },
+        _ => { return 8; }
+    };
+    let other = Packet::Data(7,Inline::Other(12,"other"),91,Option::None);
+    collect_noise();
+    match other {
+        Packet::Data(_, inner, _, tail) => {
+            match inner { Inline::Other(n,text) if n == 12 && str_eq(text,"other") => {}, _ => { return 9; } };
+            if opt_is_some(tail) { return 10; }
+        },
+        _ => { return 11; }
+    };
+    let empty: Packet = Packet::Empty;
+    match empty { Packet::Data(_, _, _, _) if false => 12, _ => 0 }
+}

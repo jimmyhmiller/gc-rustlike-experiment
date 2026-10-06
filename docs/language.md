@@ -19,7 +19,11 @@ The legacy `array_get_unchecked`/`vec_get_unchecked` names now retain a backing
 array bounds check and abort with a diagnostic on invalid indices. Array lengths
 and allocation-size arithmetic are validated before allocation. This protects
 against malformed or racing collection metadata; it does not make a sequence
-of collection operations atomic.
+of collection operations atomic. Ordinary Vec, HashMap and MapStr require external
+synchronization for shared mutation, including through backing-array aliases.
+Safely published collections can be read concurrently while their storage is
+unchanged. Concurrent collection types will be separate APIs; they are not yet
+implemented. See [concurrency.md](concurrency.md) for the memory-safety contract.
 Scalar array slots initially contain zero/false. Reference and inline-value
 array slots have no generic default value: initialize each slot with `array_set`
 before reading it. An in-bounds read of an unwritten slot aborts with an
@@ -43,3 +47,11 @@ need defined contracts and additional tests.
 Use [tour.md](tour.md) for existing examples and [STATUS.md](STATUS.md) for
 observed test evidence. Unsupported capabilities should produce diagnostics;
 production compiler robustness still needs validation beyond parser fuzzing.
+
+
+The embedded [CSV/heap APIs](csv-heap.md) support application data processing.
+Match arms receive contextual return/binding types for generic enum inference,
+and `mut` enum payload bindings retain their mutability in switch and guarded
+matches. Both inline and reference enums support inline payload extraction;
+nested managed references remain traced across moving GC. Inline payloads of
+reference enums are currently omitted from runtime field reflection.
