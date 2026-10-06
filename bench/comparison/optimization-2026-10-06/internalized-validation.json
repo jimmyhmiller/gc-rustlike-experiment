@@ -1,0 +1,10 @@
+{
+  "status": "experiment rejected; production remains 10ca307",
+  "workspace_passed": 533,
+  "workspace_ignored": 8,
+  "native_tsan_executions": 18,
+  "runtime_tsan_tests": 7,
+  "base_commit": "10ca307",
+  "patch": "internalization-experiment.patch",
+  "benchmark_sources_unchanged_from_production": true
+}

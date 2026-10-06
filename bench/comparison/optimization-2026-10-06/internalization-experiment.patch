@@ -1,0 +1,97 @@
+diff --git a/docs/gc.md b/docs/gc.md
+index e412ad1..0574a6d 100644
+--- a/docs/gc.md
++++ b/docs/gc.md
+@@ -266,3 +266,9 @@ address order different from reservation order. Cards use atomic bitmap words;
+ concurrent marks of different cards in a word compose with fetch_or. Collection
+ still uses initialized-range metadata to avoid interpreting unused TLAB tails as
+ objects. Neither optimization changes which references are traced.
++
++Optimized modules expose only their execution entry points. Managed helpers use
++internal linkage so LLVM can specialize calls and remove unused arguments.
++Foreign declarations remain external, and address-taken closures and C callback
++trampolines retain their reachable signatures. Unoptimized and full-debug modules
++keep the original function definitions and managed calling convention.
+diff --git a/src/codegen.rs b/src/codegen.rs
+index 10afe5b..61f046c 100644
+--- a/src/codegen.rs
++++ b/src/codegen.rs
+@@ -492,7 +492,7 @@ pub fn emit_llvm_ir(prog: &CoreProgram, optimize: bool) -> Result<String, Codege
+     let ctx = Context::create();
+     let compiled = codegen(&ctx, prog)?;
+     if optimize {
+-        optimize_module(&compiled.module)?;
++        optimize_module(&compiled.module, &[&compiled.entry_name])?;
+     }
+     Ok(compiled.module.print_to_string().to_string())
+ }
+@@ -4291,7 +4291,7 @@ fn core_disc(e: &CoreExprKind) -> &'static str {
+ /// Run the standard LLVM optimization pipeline (`default<O3>`) over the module
+ /// in place: mem2reg, inlining, instcombine, GVN, loop opts, etc. This is where
+ /// monomorphized gc-rust code gets its speed.
+-fn optimize_module(module: &Module) -> Result<(), CodegenError> {
++fn optimize_module(module: &Module, exported: &[&str]) -> Result<(), CodegenError> {
+     use inkwell::OptimizationLevel;
+     use inkwell::passes::PassBuilderOptions;
+     use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
+@@ -4307,6 +4307,17 @@ fn optimize_module(module: &Module) -> Result<(), CodegenError> {
+         RelocMode::Default,
+         CodeModel::Default,
+     ).ok_or_else(|| CodegenError("cannot create optimization target machine".into()))?;
++    // The optimized whole-program module exports only its entry points.
++    // Foreign declarations remain external; callback/closure addresses remain
++    // reachable through their uses. Private helpers can be specialized and have
++    // unused arguments removed without exposing an unstable managed ABI.
++    for function in module.get_functions() {
++        if function.count_basic_blocks() != 0
++            && !exported.iter().any(|name| function.get_name().to_bytes() == name.as_bytes())
++        {
++            function.set_linkage(inkwell::module::Linkage::Internal);
++        }
++    }
+     let opts = PassBuilderOptions::create();
+     module.run_passes("default<O3>", &machine, opts)
+         .map_err(|e| CodegenError(format!("LLVM optimization failed: {e}")))
+@@ -4502,7 +4513,7 @@ pub fn jit_run_i64_with_args(
+     // Optimize the module (mem2reg + inlining + the standard O3 pipeline) so the
+     // monomorphized, GC-framed code is actually fast. Without this the JIT runs
+     // naive IR (every local a stack slot).
+-    optimize_module(&compiled.module)?;
++    optimize_module(&compiled.module, &[&compiled.entry_name])?;
+     let ee = compiled
+         .module
+         .create_jit_execution_engine(OptimizationLevel::Aggressive)
+@@ -4888,7 +4899,7 @@ pub fn codegen_aot_object_level(
+     let machine = if level.is_full() {
+         host_target_machine_opt(OptimizationLevel::None)?
+     } else {
+-        optimize_module(module)?;
++        optimize_module(module, &["gcrust_entry", "main"])?;
+         host_target_machine()?
+     };
+     if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {
+diff --git a/src/codegen_effects.rs b/src/codegen_effects.rs
+index d220dc6..7e1b253 100644
+--- a/src/codegen_effects.rs
++++ b/src/codegen_effects.rs
+@@ -194,6 +194,20 @@ mod tests {
+         assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 766);
+     }
+ 
++    #[test]
++    fn optimized_modules_keep_entry_and_foreign_abi_but_remove_dead_helpers() {
++        let source = "
++            extern \"C\" fn gcr_linkage_probe(x: i64) -> i64;
++            fn unused(x: i64) -> i64 { let mut i = 0; while i < x { i = i+1; } i }
++            fn main() -> i64 { gcr_linkage_probe(4) }
++        ";
++        let (program, _) = analyze(source);
++        let ir = crate::codegen::emit_llvm_ir(&program, true).unwrap();
++        assert!(ir.lines().any(|line| line.starts_with("define ") && line.contains("@main(") && !line.contains("internal")), "{ir}");
++        assert!(ir.lines().any(|line| line.starts_with("declare ") && line.contains("@gcr_linkage_probe(")), "{ir}");
++        assert!(!ir.contains("@unused("), "{ir}");
++    }
++
+     fn analyze(source: &str) -> (CoreProgram, Vec<bool>) {
+         let (module, _) = crate::compile::parse_with_prelude(source).unwrap();
+         let resolved = crate::resolve::resolve_module(module).unwrap();
