@@ -135,7 +135,7 @@ fn gen_prog(rng: &mut Rng) -> (String, i64) {
             }
             let n_total = per * k;
             body.push_str(&format!(
-                "  let mut total = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv(); total = total + vec_get_unchecked(item, 0); got = got + 1; }}\n",
+                "  let mut total = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }}\n",
                 n_total));
             for i in 0..k { body.push_str(&format!("  let _j{} = t{}.join();\n", i, i)); }
             body.push_str("  total\n}\n");
@@ -158,7 +158,7 @@ fn gen_prog(rng: &mut Rng) -> (String, i64) {
             body.push_str(&format!("  let tp = Thread::spawn(|| prod(ch, {}));\n", per));
             body.push_str(&format!("  let tv = Thread::spawn(|| bvec({}));\n", vn));
             body.push_str(&format!(
-                "  let mut csum = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv(); csum = csum + vec_get_unchecked(item, 0); got = got + 1; }}\n",
+                "  let mut csum = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv_value(); csum = csum + vec_get_unchecked(item, 0); got = got + 1; }}\n",
                 per));
             body.push_str("  let _ja = ta.join();\n  let _jp = tp.join();\n  let vres = vsum(tv.join());\n");
             body.push_str("  a.deref() + csum + vres\n}\n");

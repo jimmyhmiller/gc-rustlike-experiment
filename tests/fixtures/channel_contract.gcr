@@ -1,0 +1,102 @@
+#[value] enum Message { Pair(i64, String), Empty }
+struct Record { n: i64, text: String }
+fn pipeline(ch: Channel<i64>) -> i64 {
+    let mut n = 0;
+    while n < 100 {
+        match ch.send(n) { Result::Ok(_) => (), Result::Err(_) => return 1 };
+        n = n + 1;
+    }
+    ch.close();
+    0
+}
+fn main() -> i64 {
+    let ch: Channel<i64> = Channel::new(2);
+    ch.send(10); ch.send(20);
+    ch.close(); ch.close();
+    if ch.recv_value() != 10 || ch.recv_value() != 20 { return 1; }
+    match ch.recv() { Option::Some(_) => return 2, Option::None => () };
+    match ch.send(30) { Result::Ok(_) => return 3, Result::Err(n) => if n != 30 { return 4; } };
+
+    let full: Channel<i64> = Channel::new(1);
+    full.send(100);
+    let first = Thread::spawn(|| full.send(101));
+    let second = Thread::spawn(|| full.send(102));
+    while full.waiting_senders() != 2 { thread_yield(); }
+    full.close(); full.close();
+    match first.join() { Result::Ok(_) => return 5, Result::Err(n) => if n != 101 { return 6; } };
+    match second.join() { Result::Ok(_) => return 7, Result::Err(n) => if n != 102 { return 8; } };
+    if full.recv_value() != 100 { return 9; }
+    match full.recv() { Option::Some(_) => return 10, Option::None => () };
+
+    let empty: Channel<String> = Channel::new(1);
+    let a = Thread::spawn(|| empty.recv());
+    let b = Thread::spawn(|| empty.recv());
+    while empty.waiting_receivers() != 2 { thread_yield(); }
+    empty.close();
+    match a.join() { Option::Some(_) => return 11, Option::None => () };
+    match b.join() { Option::Some(_) => return 12, Option::None => () };
+
+    let values: Channel<Message> = Channel::new(3);
+    values.send(Message::Pair(42, str_concat("live", "λ")));
+    values.send(Message::Empty);
+    let mut n = 0;
+    while n < 80 { let pressure = str_concat("garbage", to_string(n)); n = n + 1; }
+    match values.recv_value() { Message::Pair(n, s) => if n != 42 || !str_eq(s, "liveλ") { return 13; }, Message::Empty => return 14 };
+    match values.recv_value() { Message::Empty => (), Message::Pair(_, _) => return 15 };
+    values.close();
+
+    let refs: Channel<Record> = Channel::new(1);
+    refs.close();
+    let mut original = Record { n: 7, text: "retained" };
+    match refs.send(original) { Result::Ok(_) => return 16, Result::Err(unsent) => { let mut rejected = unsent; rejected.n = 99; } };
+    if original.n != 99 { return 17; }
+
+    // Witness mutation cannot replace the canonical native queue storage.
+    let mut stable: Channel<i64> = Channel::new(1);
+    stable.send(77);
+    stable.buf = array_new(0);
+    if stable.recv_value() != 77 { return 18; }
+    stable.close();
+
+    let floats: Channel<f64> = Channel::new(1); floats.send(1.5);
+    if floats.recv_value() != 1.5 { return 19; } floats.close();
+    let bools: Channel<bool> = Channel::new(1); bools.send(true);
+    if !bools.recv_value() { return 20; } bools.close();
+    let pipe: Channel<i64> = Channel::new(3);
+    let producer = Thread::spawn(|| pipeline(pipe));
+    let mut expected = 0;
+    let mut complete = false;
+    while !complete {
+        match pipe.recv() {
+            Option::Some(n) => {
+                if n != expected { return 21; }
+                let pressure = str_concat("pipeline", to_string(n));
+                expected = expected + 1;
+            },
+            Option::None => complete = true
+        }
+    }
+    if expected != 100 || producer.join() != 0 { return 22; }
+
+    let mut round = 0;
+    while round < 64 {
+        let racing: Channel<i64> = Channel::new(1);
+        let sender = Thread::spawn(|| racing.send(round));
+        let closer = Thread::spawn(|| racing.close());
+        closer.join();
+        racing.close();
+        match sender.join() {
+            Result::Ok(_) => match racing.recv() {
+                Option::Some(n) => if n != round { return 23; },
+                Option::None => return 24
+            },
+            Result::Err(n) => {
+                if n != round { return 25; }
+                match racing.recv() { Option::Some(_) => return 26, Option::None => () };
+            }
+        }
+        match racing.recv() { Option::Some(_) => return 27, Option::None => () };
+        round = round + 1;
+    }
+    0
+}

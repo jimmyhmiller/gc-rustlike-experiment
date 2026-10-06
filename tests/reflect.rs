@@ -424,8 +424,8 @@ fn heap_dump_renders_object_graph() {
     // in-degree-0 proxy), so an object must be held by an actual root to count as
     // reachable. A permanent-extra RootSource is the simplest GC root here.
     struct Root(std::cell::Cell<u64>);
-    impl gcrust::gc::RootSource for Root {
-        fn scan_roots(&self, v: &mut dyn FnMut(*mut u64)) {
+    unsafe impl gcrust::gc::RootSource for Root {
+        unsafe fn scan_roots(&self, v: &mut dyn FnMut(*mut u64)) {
             v(self.0.as_ptr());
         }
     }

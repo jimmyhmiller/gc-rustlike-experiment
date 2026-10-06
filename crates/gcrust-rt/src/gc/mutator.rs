@@ -108,7 +108,7 @@ impl Mutator {
     ///
     /// # Safety
     /// `info` must accurately describe the object layout for header type `H`.
-    pub fn alloc<H: ObjHeader>(
+    pub unsafe fn alloc<H: ObjHeader>(
         &mut self,
         allocator: &dyn Alloc,
         info: &'static TypeInfo,
@@ -177,8 +177,8 @@ impl Mutator {
     }
 }
 
-impl RootSource for Mutator {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl RootSource for Mutator {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         for cell in &self.roots {
             visitor(cell.as_ptr());
         }

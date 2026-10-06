@@ -332,9 +332,9 @@ fn frame_chain_empty() {
     assert_eq!(chain.depth(), 0);
 
     let mut slots = vec![];
-    chain.scan_roots(&mut |slot| {
-        slots.push(unsafe { *slot });
-    });
+    unsafe { chain.scan_roots(&mut |slot| {
+        slots.push(*slot);
+    }); }
     assert!(slots.is_empty());
 }
 
@@ -347,13 +347,13 @@ fn frame_chain_push_pop() {
     frame.slots[2].set(0xEEFF);
 
     {
-        let _guard = chain.push(&frame);
+        let _guard = unsafe { chain.push(&frame) };
         assert_eq!(chain.depth(), 1);
 
         let mut slots = vec![];
-        chain.scan_roots(&mut |slot| {
-            slots.push(unsafe { *slot });
-        });
+        unsafe { chain.scan_roots(&mut |slot| {
+            slots.push(*slot);
+        }); }
         assert_eq!(slots, vec![0xAABB, 0xCCDD, 0xEEFF]);
     }
     assert_eq!(chain.depth(), 0);
@@ -368,26 +368,26 @@ fn frame_chain_nested_frames() {
     outer.slots[0].set(100);
     outer.slots[1].set(200);
 
-    let _guard_outer = chain.push(&outer);
+    let _guard_outer = unsafe { chain.push(&outer) };
     assert_eq!(chain.depth(), 1);
 
     inner.slots[0].set(300);
     {
-        let _guard_inner = chain.push(&inner);
+        let _guard_inner = unsafe { chain.push(&inner) };
         assert_eq!(chain.depth(), 2);
 
         let mut slots = vec![];
-        chain.scan_roots(&mut |slot| {
-            slots.push(unsafe { *slot });
-        });
+        unsafe { chain.scan_roots(&mut |slot| {
+            slots.push(*slot);
+        }); }
         assert_eq!(slots, vec![300, 100, 200]);
     }
     assert_eq!(chain.depth(), 1);
 
     let mut slots = vec![];
-    chain.scan_roots(&mut |slot| {
-        slots.push(unsafe { *slot });
-    });
+    unsafe { chain.scan_roots(&mut |slot| {
+        slots.push(*slot);
+    }); }
     assert_eq!(slots, vec![100, 200]);
 }
 
@@ -398,12 +398,12 @@ fn frame_chain_gc_updates_slots() {
     frame.slots[0].set(0x1000);
     frame.slots[1].set(0x2000);
 
-    let _guard = chain.push(&frame);
+    let _guard = unsafe { chain.push(&frame) };
 
-    chain.scan_roots(&mut |slot| unsafe {
+    unsafe { chain.scan_roots(&mut |slot| {
         let old = *slot;
         *slot = old * 2;
-    });
+    }); }
 
     assert_eq!(frame.slots[0].get(), 0x2000);
     assert_eq!(frame.slots[1].get(), 0x4000);
@@ -436,9 +436,9 @@ fn root_set_scan_roots() {
     rs.add(30);
 
     let mut vals = vec![];
-    rs.scan_roots(&mut |slot| {
-        vals.push(unsafe { *slot });
-    });
+    unsafe { rs.scan_roots(&mut |slot| {
+        vals.push(*slot);
+    }); }
     assert_eq!(vals, vec![10, 20, 30]);
 }
 
@@ -448,9 +448,9 @@ fn root_set_gc_update() {
     rs.add(100);
     rs.add(200);
 
-    rs.scan_roots(&mut |slot| unsafe {
+    unsafe { rs.scan_roots(&mut |slot| {
         *slot += 1;
-    });
+    }); }
 
     assert_eq!(rs.get(0), 101);
     assert_eq!(rs.get(1), 201);
@@ -578,7 +578,7 @@ fn bump_reset() {
     let _ptr1 = bump.alloc(&INFO, 0);
     assert!(bump.used() > 0);
 
-    bump.reset();
+    unsafe { bump.reset() };
     assert_eq!(bump.used(), 0);
     assert_eq!(bump.remaining(), bump.size());
 
@@ -747,7 +747,7 @@ fn atomic_bump_reset() {
     let _ = bump.alloc(&INFO, 0);
     assert!(bump.used() > 0);
 
-    bump.reset();
+    unsafe { bump.reset() };
     assert_eq!(bump.used(), 0);
 
     assert!(!bump.alloc(&INFO, 0).is_null());
@@ -759,8 +759,8 @@ fn atomic_bump_reset() {
 
 struct SingleRoot(Cell<u64>);
 
-impl RootSource for SingleRoot {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl RootSource for SingleRoot {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         visitor(self.0.as_ptr());
     }
 }
@@ -769,8 +769,8 @@ impl RootSource for SingleRoot {
 #[allow(dead_code)]
 struct VecRoots(Vec<Cell<u64>>);
 
-impl RootSource for VecRoots {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl RootSource for VecRoots {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         for cell in &self.0 {
             visitor(cell.as_ptr());
         }
@@ -1133,7 +1133,7 @@ fn semi_space_with_frame_chain() {
     frame.slots[0].set(parent as u64);
     frame.slots[1].set(child as u64);
 
-    let _guard = chain.push(&frame);
+    let _guard = unsafe { chain.push(&frame) };
 
     unsafe { gc.collect::<IdentityPtrPolicy>(&type_table, &mut [&chain]) };
 
@@ -1204,7 +1204,7 @@ fn semi_space_traces_and_relocates_interior_pointer() {
     let chain = FrameChain::new();
     let frame = RootFrame::<1>::new();
     frame.slots[0].set(holder as u64);
-    let _guard = chain.push(&frame);
+    let _guard = unsafe { chain.push(&frame) };
 
     unsafe { gc.collect::<IdentityPtrPolicy>(&type_table, &mut [&chain]) };
 
@@ -1241,7 +1241,7 @@ fn mutator_alloc_returns_rooted_object() {
     let bump = BumpAllocator::new::<Compact>(4096);
     let mut m = Mutator::new();
 
-    let r = m.alloc::<Compact>(&bump, &INFO, 0).unwrap();
+    let r = unsafe { m.alloc::<Compact>(&bump, &INFO, 0) }.unwrap();
     let ptr = m.get(&r).bits() as *const u8;
     assert!(!ptr.is_null());
     assert!(bump.contains(ptr));
@@ -1269,8 +1269,8 @@ fn mutator_alloc_full_returns_none() {
     let bump = BumpAllocator::new::<Compact>(size);
     let mut m = Mutator::new();
 
-    let _r1 = m.alloc::<Compact>(&bump, &INFO, 0).unwrap();
-    assert!(m.alloc::<Compact>(&bump, &INFO, 0).is_none());
+    let _r1 = unsafe { m.alloc::<Compact>(&bump, &INFO, 0) }.unwrap();
+    assert!(unsafe { m.alloc::<Compact>(&bump, &INFO, 0) }.is_none());
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1331,7 +1331,7 @@ fn mutator_thread_basic_alloc() {
     let heap = Arc::new(Heap::new::<Compact>(4096, vec![INFO]));
     let mt: MutatorThread<IdentityPtrPolicy> = MutatorThread::register(heap.clone());
 
-    let obj = mt.alloc_obj::<Compact>(&INFO, 0);
+    let obj = unsafe { mt.alloc_obj::<Compact>(&INFO, 0) };
     assert!(!obj.is_null());
 }
 
@@ -1393,7 +1393,7 @@ fn alloc_site_profile_merges_threads_and_salvages_retired() {
 
     // Deregister the worker: its allocations must survive via the retired
     // accumulator (no silent loss when a thread joins before the profile).
-    heap.deregister_thread(&worker_ts);
+    unsafe { heap.deregister_thread(&worker_ts) };
     drop(worker_ts);
 
     let prof2 = heap.alloc_site_profile();
@@ -1480,12 +1480,12 @@ fn alloc_site_profile_dump_concurrent_with_live_worker_no_hang() {
             for _ in 0..n_allocs {
                 unsafe { mt.state().record_alloc(0, bytes_each) };
                 done.fetch_add(1, Ordering::Relaxed);
-                mt.safepoint(); // park here if a dump is pausing the world
+                unsafe { mt.safepoint() }; // park here if a dump is pausing the world
             }
             // Stay a live, safepoint-responsive mutator (no more allocs) so the
             // main thread can dump while we're still registered.
             while !stop.load(Ordering::Relaxed) {
-                mt.safepoint();
+                unsafe { mt.safepoint() };
                 std::thread::yield_now();
             }
             // mt drops -> deregister -> fold counts into retired.
@@ -1547,10 +1547,10 @@ fn alloc_site_profile_dump_concurrent_resize_stress_asan() {
                 // Increasing site id → the counter Vec grows (reallocs).
                 unsafe { mt.state().record_alloc(i as u32, bytes_each) };
                 done.fetch_add(1, Ordering::Relaxed);
-                mt.safepoint();
+                unsafe { mt.safepoint() };
             }
             while !stop.load(Ordering::Relaxed) {
-                mt.safepoint();
+                unsafe { mt.safepoint() };
                 std::thread::yield_now();
             }
         })
@@ -1641,7 +1641,7 @@ fn mutator_thread_safepoint_noop_without_gc() {
     let heap = Arc::new(Heap::new::<Compact>(4096, vec![]));
     let mt: MutatorThread<IdentityPtrPolicy> = MutatorThread::register(heap.clone());
     // Should not block when no GC is requested.
-    mt.safepoint();
+    unsafe { mt.safepoint() };
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1713,4 +1713,251 @@ fn read_barrier_follows_forwarding() {
 
     let r = unsafe { read_barrier(from_ptr, 0) };
     assert_eq!(r, to_ptr);
+}
+
+#[test]
+fn major_collection_preserves_old_to_young_edges_for_next_minor() {
+    // Include interior references and a pointer far beyond the object's start
+    // card, so rebuilding cards must respect the actual layout and scan policy.
+    let shapes = [
+        (
+            TypeInfo::for_header(Full::SIZE)
+                .with_type_id(0)
+                .with_fields(1),
+            0,
+            16,
+        ),
+        (
+            TypeInfo::for_header(Full::SIZE)
+                .with_type_id(0)
+                .with_raw_bytes(24)
+                .with_interior_ptrs(&[32]),
+            0,
+            32,
+        ),
+        (
+            TypeInfo::for_header(Full::SIZE)
+                .with_type_id(0)
+                .with_varlen_values(0),
+            141,
+            24 + 140 * 8,
+        ),
+    ];
+    for (parent_info, length, pointer_offset) in shapes {
+        for mutator_driven in [false, true] {
+            let child_info = TypeInfo::for_header(Full::SIZE)
+                .with_type_id(1)
+                .with_raw_bytes(8);
+            let heap = Heap::new_generational::<Full>(4096, 4096, vec![parent_info, child_info]);
+            let (thread, _) = heap.register_thread();
+            let parent = heap.alloc_obj::<Full>(&parent_info, length);
+            let child = heap.alloc_nursery_obj::<Full>(&child_info, 0);
+            assert!(!parent.is_null() && !child.is_null());
+            unsafe {
+                (parent.add(pointer_offset) as *mut *mut u8).write(child);
+                (child.add(16) as *mut u64).write(42);
+            }
+            heap.mark_card_dirty(parent);
+            let root = heap.globals.add(parent as u64);
+            unsafe {
+                if mutator_driven {
+                    heap.mutator_triggered_gc::<IdentityPtrPolicy>(&thread);
+                } else {
+                    heap.collect::<IdentityPtrPolicy>(&[]);
+                }
+            }
+            let relocated_parent = heap.globals.get(root) as *mut u8;
+            assert_ne!(parent, relocated_parent);
+            unsafe {
+                heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&thread);
+            }
+            let promoted_child =
+                unsafe { (relocated_parent.add(pointer_offset) as *const *mut u8).read() };
+            assert!(
+                heap.is_tenured(promoted_child),
+                "major lost remembered edge (mutator-driven={mutator_driven}, offset={pointer_offset})"
+            );
+            assert_eq!(unsafe { (promoted_child.add(16) as *const u64).read() }, 42);
+            unsafe { heap.safe_deregister_thread(&thread) };
+        }
+    }
+}
+
+#[test]
+fn local_buffers_survive_major_and_are_invalidated_by_minor_and_space_flip() {
+    let info = TypeInfo::for_header(Full::SIZE).with_fields(1);
+    for generational in [false, true] {
+        let heap = std::sync::Arc::new(if generational {
+            Heap::new_generational::<Full>(128 * 1024, 512 * 1024, vec![info])
+        } else { Heap::new::<Full>(512 * 1024, vec![info]) });
+        let mt = MutatorThread::<IdentityPtrPolicy>::register(heap.clone());
+        let frame = RootFrame::<1>::new();
+        let _guard = unsafe { mt.frame_chain().push(&frame) };
+        for _ in 0..12 {
+            let parent = unsafe { mt.alloc_obj::<Full>(&info, 0) };
+            unsafe { parent.add(16).cast::<u64>().write(frame.slots[0].get()); }
+            frame.slots[0].set(parent as u64);
+            unsafe { heap.mutator_triggered_gc::<IdentityPtrPolicy>(mt.state()); }
+            if generational { unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(mt.state()); } }
+            let next = unsafe { mt.alloc_obj::<Full>(&info, 0) };
+            assert_ne!(next as u64, frame.slots[0].get());
+            unsafe { next.add(16).cast::<u64>().write(frame.slots[0].get()); }
+            frame.slots[0].set(next as u64);
+        }
+        // Exercise the external collection/prewalk entry while our root chain
+        // is quiescent. No other mutator is registered in this fixture.
+        unsafe { mt.state().enter_blocked() };
+        unsafe { heap.collect::<IdentityPtrPolicy>(&[]); }
+        unsafe { mt.state().exit_blocked(&heap) };
+        let mut ptr = frame.slots[0].get() as *mut u8;
+        let mut length = 0;
+        while !ptr.is_null() {
+            assert!(heap.contains_either(ptr));
+            ptr = unsafe { ptr.add(16).cast::<*mut u8>().read() };
+            length += 1;
+        }
+        assert_eq!(length, 24);
+        let mut allocated = 0;
+        unsafe { heap.walk_live_objects(&mut |_, _| allocated += 1); }
+        assert!(allocated >= length);
+    }
+}
+
+#[test]
+#[ignore = "mutator allocation scaling benchmark; run explicitly in release"]
+fn mutator_tlab_allocation_throughput() {
+    let info = TypeInfo::for_header(Full::SIZE).with_raw_bytes(16);
+    let workers: usize = std::env::var("GCR_ALLOC_BENCH_WORKERS").unwrap_or_else(|_| "1".into()).parse().unwrap();
+    let count = 250000;
+    for local in [false, true] {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let heap = std::sync::Arc::new(Heap::new::<Full>(64 * 1024 * 1024, vec![info]));
+            let start = std::sync::Barrier::new(workers + 1);
+            let elapsed = std::thread::scope(|scope| {
+                let tasks: Vec<_> = (0..workers).map(|_| {
+                    let heap = &heap;
+                    let start = &start;
+                    scope.spawn(move || {
+                        let mt = MutatorThread::<IdentityPtrPolicy>::register(heap.clone());
+                        start.wait();
+                        for _ in 0..count {
+                            let ptr = if local { unsafe { mt.alloc_obj::<Full>(&info, 0) } } else { heap.alloc_obj::<Full>(&info, 0) };
+                            assert!(!ptr.is_null());
+                        }
+                    })
+                }).collect();
+                let clock = std::time::Instant::now();
+                start.wait();
+                for task in tasks { task.join().unwrap(); }
+                clock.elapsed().as_nanos()
+            });
+            let mut objects = 0;
+            unsafe { heap.walk_live_objects(&mut |_, _| objects += 1); }
+            assert_eq!(objects, workers * count);
+            samples.push(elapsed);
+        }
+        samples.sort_unstable();
+        eprintln!("allocation benchmark: workers={workers} tlab={local} objects={} median_ns={}", workers * count, samples[2]);
+    }
+}
+
+#[test]
+fn dirty_card_starts_with_a_spanning_object_before_a_later_object() {
+    let array = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_varlen_values(0);
+    let leaf = TypeInfo::for_header(Full::SIZE).with_type_id(1).with_raw_bytes(8);
+    let heap = Heap::new_generational::<Full>(4096, 4096, vec![array, leaf]);
+    let (thread, _) = heap.register_thread();
+    let parent = heap.alloc_obj::<Full>(&array, 81);
+    let trailing = heap.alloc_obj::<Full>(&leaf, 0);
+    let young = heap.alloc_nursery_obj::<Full>(&leaf, 0);
+    let slot = unsafe { parent.add(array.varlen_element_offset(80)) };
+    assert_eq!((slot as usize - parent as usize) / 512, (trailing as usize - parent as usize) / 512);
+    unsafe { slot.cast::<u64>().write(young as u64); }
+    heap.mark_card_dirty(slot);
+    heap.globals.add(parent as u64);
+    unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&thread); }
+    let moved = unsafe { slot.cast::<*mut u8>().read() };
+    assert!(heap.is_tenured(moved), "dirty card skipped the object spanning its leading boundary");
+    unsafe { heap.safe_deregister_thread(&thread) };
+}
+
+#[test]
+fn stress_collects_for_each_allocation_under_contention() {
+    use std::sync::Arc;
+    const INFO: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0);
+    for generational in [false, true] {
+        let heap = Arc::new(if generational {
+            Heap::new_generational::<Full>(65536, 65536, vec![INFO])
+        } else {
+            Heap::new::<Full>(65536, vec![INFO])
+        });
+        heap.set_gc_every_alloc(true);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let heap = heap.clone();
+                scope.spawn(move || {
+                    let mt = MutatorThread::<IdentityPtrPolicy>::register(heap.clone());
+                    for _ in 0..100 {
+                        if generational {
+                            // Exercise the runtime's nursery stress path, including
+                            // the first request against an empty nursery.
+                            unsafe {
+                                heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(mt.state());
+                            }
+                            let p = unsafe { heap.alloc_mutator_obj::<Full>(mt.state(), &INFO, 0) };
+                            assert!(!p.is_null());
+                        } else {
+                            assert!(!unsafe { mt.alloc_obj::<Full>(&INFO, 0) }.is_null());
+                        }
+                        // No object escapes this allocation; the next pause may
+                        // reclaim it. Registration and exit remain GC-aware.
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            if generational {
+                heap.minor_collections()
+            } else {
+                heap.collections()
+            },
+            400
+        );
+    }
+}
+
+#[test]
+fn blocked_mutators_retire_poll_storage_only_after_pause_release() {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    const WORKERS: usize = 16;
+    let heap = Arc::new(Heap::new::<Full>(4096, vec![]));
+    for _ in 0..32 {
+        let ready = Arc::new(Barrier::new(WORKERS + 1));
+        let observed = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let heap = heap.clone(); let ready = ready.clone(); let observed = observed.clone();
+                scope.spawn(move || {
+                    let (state, _) = heap.register_thread();
+                    let flag = Box::new(AtomicU8::new(0));
+                    unsafe { state.set_poll_flag(&*flag as *const AtomicU8 as *mut AtomicU8); }
+                    unsafe { state.enter_blocked() };
+                    ready.wait();
+                    while !heap.gc_requested() { std::thread::yield_now(); }
+                    observed.fetch_add(1, Ordering::Release);
+                    unsafe { state.exit_blocked(&heap) };
+                    unsafe { heap.safe_deregister_thread(&state) };
+                    // The collector's snapshot owns state, not flag storage.
+                    // Retirement must wait for its final flag access.
+                    drop(flag);
+                });
+            }
+            ready.wait();
+            let pause = heap.pause_world();
+            while observed.load(Ordering::Acquire) != WORKERS { std::thread::yield_now(); }
+            drop(pause);
+        });
+    }
 }

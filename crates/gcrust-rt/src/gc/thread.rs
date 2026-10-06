@@ -54,7 +54,7 @@ pub const STATE_BLOCKED: u8 = 2;
 /// their roots while they're suspended.
 pub struct ThreadState {
     /// Shadow frame chain for this thread's stack roots.
-    pub frame_chain: FrameChain,
+    frame_chain: FrameChain,
 
     /// Current state: STATE_RUNNING or STATE_AT_SAFEPOINT.
     state: AtomicU8,
@@ -100,7 +100,10 @@ pub struct ThreadState {
     /// Set once via [`set_poll_flag`](Self::set_poll_flag) right after
     /// the owning `Thread` is constructed; the address is stable for the
     /// `Thread`'s lifetime (it lives in a `Box`).
-    poll_flag: AtomicPtr<u8>,
+    poll_flag: AtomicPtr<AtomicU8>,
+    /// Serializes flag installation with stop requests, retaining a request
+    /// raised after registration but before the runtime Thread is constructed.
+    poll_registration: Mutex<bool>,
 
     /// The OS thread that owns (and registered) this state. Recorded at
     /// construction — registration always happens on the owning thread.
@@ -129,6 +132,7 @@ pub struct ThreadState {
     /// reads happen only at a quiescent merge (program end / safepoint), same
     /// access discipline as `satb_buffer`.
     alloc_sites: UnsafeCell<Vec<SiteCounter>>,
+    tlab: UnsafeCell<crate::gc::alloc::Tlab>,
 }
 
 /// Maximum nesting of runtime alloc fns parking scratch roots at once.
@@ -153,11 +157,36 @@ impl ThreadState {
             satb_buffer: UnsafeCell::new(SATBBuffer::new(256)),
             parked_jit_fp: AtomicPtr::new(std::ptr::null_mut()),
             poll_flag: AtomicPtr::new(std::ptr::null_mut()),
+            poll_registration: Mutex::new(false),
             os_thread: std::thread::current().id(),
             gc_scratch: Default::default(),
             scratch_depth: std::sync::atomic::AtomicUsize::new(0),
             alloc_sites: UnsafeCell::new(Vec::new()),
+            tlab: UnsafeCell::new(crate::gc::alloc::Tlab::new()),
         }
+    }
+
+    fn assert_owner_running(&self) {
+        assert_eq!(self.os_thread, std::thread::current().id(), "roots belong to the registering thread");
+        assert_eq!(self.state.load(Ordering::Acquire), STATE_RUNNING, "cannot mutate parked roots");
+    }
+
+    /// Access host frame storage only on the registering RUNNING mutator.
+    /// Collector access goes through root enumeration under a world pause.
+    pub fn frame_chain(&self) -> &FrameChain {
+        self.assert_owner_running();
+        &self.frame_chain
+    }
+
+    /// Called only by this state's owning mutator, between safepoints.
+    pub(crate) unsafe fn alloc_local(
+        &self,
+        space: &crate::gc::AtomicBumpAllocator,
+        info: &TypeInfo,
+        len: usize,
+    ) -> *mut u8 {
+        debug_assert_eq!(self.os_thread, std::thread::current().id());
+        unsafe { (&mut *self.tlab.get()).alloc(space, info, len) }
     }
 
     /// Record one allocation at `site_id` of `bytes` bytes (Target-1b
@@ -197,6 +226,7 @@ impl ThreadState {
     /// at the top of a runtime fn that parks roots; pass the result to
     /// `scratch_reset` before returning.
     pub fn scratch_mark(&self) -> usize {
+        self.assert_owner_running();
         self.scratch_depth.load(Ordering::Acquire)
     }
 
@@ -205,7 +235,11 @@ impl ThreadState {
     /// the slot index; re-read the (possibly relocated) pointer with
     /// [`scratch_at`](Self::scratch_at) after each alloc. Panics if the
     /// stack overflows `GC_SCRATCH_DEPTH` (runtime-fn nesting is shallow).
-    pub fn push_scratch(&self, ptr: *const u8) -> usize {
+    /// # Safety
+    /// Owning RUNNING mutator; ptr is a valid managed pointer or null and is
+    /// reloaded after every collection. Preserve all live slots until use ends.
+    pub unsafe fn push_scratch(&self, ptr: *const u8) -> usize {
+        self.assert_owner_running();
         let i = self.scratch_depth.load(Ordering::Acquire);
         assert!(
             i < GC_SCRATCH_DEPTH,
@@ -218,13 +252,20 @@ impl ThreadState {
 
     /// Read scratch slot `i` (the post-relocation pointer).
     pub fn scratch_at(&self, i: usize) -> *mut u8 {
+        self.assert_owner_running();
+        assert!(i < self.scratch_depth.load(Ordering::Acquire), "scratch root is not live");
         self.gc_scratch[i].load(Ordering::Acquire) as *mut u8
     }
 
     /// Pop the scratch stack back to a depth previously returned by
     /// [`scratch_mark`](Self::scratch_mark), so a later collection doesn't
     /// pin stale pointers.
-    pub fn scratch_reset(&self, mark: usize) {
+    /// # Safety
+    /// Owning RUNNING mutator, restoring a valid LIFO mark; no live inner roots
+    /// or callers may depend on the removed slots.
+    pub unsafe fn scratch_reset(&self, mark: usize) {
+        self.assert_owner_running();
+        assert!(mark <= self.scratch_depth.load(Ordering::Acquire), "invalid scratch mark");
         self.scratch_depth.store(mark, Ordering::Release);
     }
 
@@ -233,10 +274,15 @@ impl ThreadState {
     /// early-returns (wire decode, arg builders): the `Drop` runs on every
     /// exit path, so a decode error can't leak stale scratch roots that a
     /// later collection would wrongly pin/scan.
-    pub fn scratch_scope(&self) -> ScratchScope<'_> {
+    /// # Safety
+    /// Scope stays on the RUNNING owner and is destroyed in LIFO order before
+    /// any outer scratch roots are reset. Do not transfer or forget live roots.
+    pub unsafe fn scratch_scope(&self) -> ScratchScope<'_> {
+        self.assert_owner_running();
         ScratchScope {
             ts: self,
             mark: self.scratch_mark(),
+            _owner: core::marker::PhantomData,
         }
     }
 
@@ -248,19 +294,28 @@ impl ThreadState {
     /// Point this thread's safepoint poll flag at the owning runtime
     /// `Thread`'s `state` byte. Called once, right after the `Thread` is
     /// built, before the thread starts running JIT'd code.
-    pub fn set_poll_flag(&self, state_byte: *mut u8) {
+    /// # Safety
+    /// Non-null storage is a valid pinned AtomicU8 until detached. Detaching
+    /// serializes with every coordinator access before the storage may be freed.
+    pub unsafe fn set_poll_flag(&self, state_byte: *mut AtomicU8) {
+        let requested = self.poll_registration.lock().unwrap();
+        if *requested && !state_byte.is_null() {
+            unsafe { (*state_byte).store(1, Ordering::Release); }
+        }
         self.poll_flag.store(state_byte, Ordering::Release);
     }
 
     /// Ask this thread to reach a safepoint by raising its JIT poll flag.
     /// No-op if the thread has no runtime `Thread` (null flag). The store
-    /// is a benign single-byte race with the JIT's plain-load poll: the
-    /// thread is guaranteed to observe it on a subsequent poll (cache
-    /// coherence), which is all liveness requires.
+    /// pairs with the JIT's atomic acquire poll. A volatile non-atomic LLVM
+    /// load would still be a data race; both sides must access this byte
+    /// atomically.
     pub fn request_poll(&self) {
+        let mut requested = self.poll_registration.lock().unwrap();
+        *requested = true;
         let p = self.poll_flag.load(Ordering::Acquire);
         if !p.is_null() {
-            unsafe { (*(p as *const AtomicU8)).store(1, Ordering::Release) };
+            unsafe { (*p).store(1, Ordering::Release) };
         }
     }
 
@@ -269,21 +324,27 @@ impl ThreadState {
     /// poll re-park. (The JIT slow path also clears it; this is the
     /// belt-and-braces clear for threads that parked some other way.)
     pub fn clear_poll(&self) {
+        let mut requested = self.poll_registration.lock().unwrap();
+        *requested = false;
         let p = self.poll_flag.load(Ordering::Acquire);
         if !p.is_null() {
-            unsafe { (*(p as *const AtomicU8)).store(0, Ordering::Release) };
+            unsafe { (*p).store(0, Ordering::Release) };
         }
     }
 
     /// Set the JIT frame pointer that should be exposed to GC root
     /// scans while this thread is parked at a safepoint. Cleared
     /// (with `clear_parked_jit_fp`) on resume.
-    pub fn set_parked_jit_fp(&self, fp: *const u8) {
+    /// # Safety
+    /// Owning RUNNING mutator; fp is null or a valid published JIT frame chain until cleared after resumption.
+    pub unsafe fn set_parked_jit_fp(&self, fp: *const u8) {
         self.parked_jit_fp.store(fp as *mut u8, Ordering::Release);
     }
 
     /// Clear the parked JIT FP pointer.
-    pub fn clear_parked_jit_fp(&self) {
+    /// # Safety
+    /// Owning RUNNING mutator after resumption; no collector is scanning the retired JIT frames.
+    pub unsafe fn clear_parked_jit_fp(&self) {
         self.parked_jit_fp
             .store(std::ptr::null_mut(), Ordering::Release);
     }
@@ -305,7 +366,9 @@ impl ThreadState {
 
     /// Enter safepoint: mark this thread as suspended and wait
     /// for the GC to finish.
-    pub fn enter_safepoint(&self) {
+    /// # Safety
+    /// Owning registered mutator; all live references are published and no heap/root mutation occurs until resumption.
+    pub unsafe fn enter_safepoint(&self) {
         self.safepoint_gen.fetch_add(1, Ordering::AcqRel);
         self.state.store(STATE_AT_SAFEPOINT, Ordering::Release);
 
@@ -319,7 +382,9 @@ impl ThreadState {
     }
 
     /// Resume this thread after GC completes.
-    pub fn resume(&self) {
+    /// # Safety
+    /// Coordinator holds the registry release protocol; evacuation and all root updates for this state are complete.
+    pub unsafe fn resume(&self) {
         let mut gc_done = self.safepoint_lock.lock().unwrap();
         *gc_done = true;
         self.safepoint_cond.notify_one();
@@ -384,9 +449,9 @@ impl ThreadState {
     ///   allowed after `exit_blocked` returns.
     ///
     /// # Safety
-    /// Logically — not type-system — unsafe: violating the preconditions
-    /// causes UB at the GC level (missed roots, dangling pointers).
-    pub fn enter_blocked(&self) {
+    /// Violating these preconditions can expose missed roots or dangling pointers.
+    /// Owning RUNNING mutator; all live roots are published and heap/root mutation stops until matching exit_blocked.
+    pub unsafe fn enter_blocked(&self) {
         self.safepoint_gen.fetch_add(1, Ordering::AcqRel);
         let prev = self.state.swap(STATE_BLOCKED, Ordering::AcqRel);
         debug_assert_eq!(
@@ -403,7 +468,9 @@ impl ThreadState {
     /// fired during the blocked window — without this, the next
     /// `enter_safepoint` would observe the residual flag and exit early
     /// without participating in the next collection.
-    pub fn exit_blocked(&self, heap: &Heap) {
+    /// # Safety
+    /// Owning BLOCKED mutator, paired with enter_blocked and the exact heap it registered with.
+    pub unsafe fn exit_blocked(&self, heap: &Heap) {
         loop {
             // Wait for any active STW window to fully close before
             // resuming. Concurrent GC's `barriers_active` is also a
@@ -462,7 +529,9 @@ impl ThreadState {
     /// The owning thread must have no live un-rooted heap pointers and
     /// must never run mutator code on this state again. Violating this
     /// is a GC-level soundness bug.
-    pub fn park_handed_off(&self) {
+    /// # Safety
+    /// Owning mutator participates in the collector handoff protocol with all live roots published.
+    pub unsafe fn park_handed_off(&self) {
         if self
             .state
             .compare_exchange(
@@ -482,16 +551,24 @@ impl ThreadState {
 /// to root them across a subsequent allocation; re-read the relocated
 /// pointer with [`get`](Self::get) after each alloc. The region pops back to
 /// its opening depth on drop, so every exit path (including `?` errors)
-/// cleans up.
+/// cleans up. The token cannot be transferred to another thread:
+/// ```compile_fail
+/// use gcrust_rt::gc::thread::ScratchScope;
+/// fn requires_send<T: Send>() {}
+/// requires_send::<ScratchScope<'static>>();
+/// ```
 pub struct ScratchScope<'a> {
     ts: &'a ThreadState,
     mark: usize,
+    _owner: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl<'a> ScratchScope<'a> {
     /// Push a heap pointer; returns its slot index for later [`get`](Self::get).
-    pub fn push(&self, ptr: *const u8) -> usize {
-        self.ts.push_scratch(ptr)
+    /// # Safety
+    /// ptr is a valid live managed reference or null on this RUNNING owner.
+    pub unsafe fn push(&self, ptr: *const u8) -> usize {
+        unsafe { self.ts.push_scratch(ptr) }
     }
 
     /// Read the (possibly relocated) pointer at slot index `i`.
@@ -502,13 +579,13 @@ impl<'a> ScratchScope<'a> {
 
 impl Drop for ScratchScope<'_> {
     fn drop(&mut self) {
-        self.ts.scratch_reset(self.mark);
+        unsafe { self.ts.scratch_reset(self.mark); }
     }
 }
 
-impl RootSource for ThreadState {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
-        self.frame_chain.scan_roots(visitor);
+unsafe impl RootSource for ThreadState {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+        unsafe { self.frame_chain.scan_roots(visitor); }
         // Scratch roots: heap pointers a runtime fn parked here across an
         // allocation. Only the live prefix `[0..depth)` is scanned; slots
         // above `depth` hold stale pointers a popped frame left behind.
@@ -536,18 +613,24 @@ impl RootSource for ThreadState {
 /// let mut mt = MutatorThread::register(heap.clone());
 ///
 /// let frame = RootFrame::<2>::new();
-/// let _guard = mt.frame_chain().push(&frame);
+/// let _guard = unsafe { mt.frame_chain().push(&frame) };
 ///
 /// let obj = mt.alloc_obj::<Compact>(&PAIR_INFO, 0);
 /// frame.slots[0].set(obj as u64);
 ///
 /// mt.safepoint(); // check for GC
 /// ```
+/// Mutator state and shadow roots belong to the registering OS thread.
+/// ```compile_fail
+/// use gcrust_rt::gc::{MutatorThread, IdentityPtrPolicy};
+/// fn requires_send<T: Send>() {}
+/// requires_send::<MutatorThread<IdentityPtrPolicy>>();
+/// ```
 pub struct MutatorThread<P: PtrPolicy> {
     heap: Arc<Heap>,
     state: Arc<ThreadState>,
     thread_id: usize,
-    _marker: core::marker::PhantomData<P>,
+    _marker: core::marker::PhantomData<(P, std::rc::Rc<()>)>,
 }
 
 impl<P: PtrPolicy> MutatorThread<P> {
@@ -564,7 +647,7 @@ impl<P: PtrPolicy> MutatorThread<P> {
 
     /// Access the thread's shadow frame chain for rooting.
     pub fn frame_chain(&self) -> &FrameChain {
-        &self.state.frame_chain
+        self.state.frame_chain()
     }
 
     /// Access the thread state (for advanced usage).
@@ -585,7 +668,10 @@ impl<P: PtrPolicy> MutatorThread<P> {
     /// Call this at loop backedges and other natural safepoints.
     /// Fast path: single relaxed atomic load + branch.
     #[inline(always)]
-    pub fn safepoint(&self) {
+    /// # Safety
+    /// All live managed references must remain registered and valid through any
+    /// collection, and this must run on the owning mutator thread.
+    pub unsafe fn safepoint(&self) {
         // Flush SATB buffer if full (before entering safepoint)
         let buf = unsafe { self.state.satb_buffer() };
         if buf.should_flush() {
@@ -595,7 +681,7 @@ impl<P: PtrPolicy> MutatorThread<P> {
             if let Some(ref tracer) = self.heap.tracer {
                 tracer.record_thread(self.thread_id, TraceState::AtSafepoint);
             }
-            self.state.enter_safepoint();
+            unsafe { self.state.enter_safepoint() };
             if let Some(ref tracer) = self.heap.tracer {
                 tracer.record_thread(self.thread_id, TraceState::Running);
             }
@@ -610,7 +696,10 @@ impl<P: PtrPolicy> MutatorThread<P> {
     /// Fast path when no GC is active: single atomic load + branch.
     /// When GC is active: push to thread-local Vec (no synchronization).
     #[inline(always)]
-    pub fn write_barrier(&self, old_value: u64) {
+    /// # Safety
+    /// Run on the owning mutator thread. `old_value` must be null or a valid
+    /// managed reference under this heap's pointer policy.
+    pub unsafe fn write_barrier(&self, old_value: u64) {
         if !self.heap.barriers_active() {
             return;
         }
@@ -679,19 +768,22 @@ impl<P: PtrPolicy> MutatorThread<P> {
     /// After this returns the thread is RUNNING again and the caller
     /// should poll `safepoint()` reasonably soon — a fresh GC may have
     /// started while we were exiting the blocked window.
-    pub fn lock_safe<'a, T>(&self, mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
-        self.state.enter_blocked();
+    /// # Safety
+    /// All live managed references must remain registered and valid through any
+    /// collection; allocation descriptors must match this heap and header.
+    pub unsafe fn lock_safe<'a, T>(&self, mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+        unsafe { self.state.enter_blocked() };
         let guard = match mutex.lock() {
             Ok(g) => g,
             Err(poisoned) => {
                 // Even on poison we must restore state, otherwise the
                 // thread leaks the BLOCKED state and the GC will treat
                 // it as safepoint-equivalent forever.
-                self.state.exit_blocked(&self.heap);
+                unsafe { self.state.exit_blocked(&self.heap) };
                 panic!("lock_safe: mutex poisoned: {poisoned}");
             }
         };
-        self.state.exit_blocked(&self.heap);
+        unsafe { self.state.exit_blocked(&self.heap) };
         guard
     }
 
@@ -714,11 +806,14 @@ impl<P: PtrPolicy> MutatorThread<P> {
     /// (generational) or major GC (non-generational) and retries.
     ///
     /// Returns null only if allocation still fails after GC.
-    pub fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+    /// # Safety
+    /// All live managed references must remain registered and valid through any
+    /// collection; allocation descriptors must match this heap and header.
+    pub unsafe fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
         if self.heap.gc_every_alloc() {
             self.trigger_gc();
         }
-        let ptr = self.heap.alloc_nursery(info, varlen_len);
+        let ptr = unsafe { self.heap.alloc_mutator(&self.state, info, varlen_len) };
         if !ptr.is_null() {
             return ptr;
         }
@@ -727,11 +822,17 @@ impl<P: PtrPolicy> MutatorThread<P> {
 
     /// Allocate and initialize header + varlen count.
     /// Triggers GC if from-space is full.
-    pub fn alloc_obj<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+    /// # Safety
+    /// All live managed references must remain registered and valid through any
+    /// collection; allocation descriptors must match this heap and header.
+    pub unsafe fn alloc_obj<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
         if self.heap.gc_every_alloc() {
             self.trigger_gc();
         }
-        let ptr = self.heap.alloc_nursery_obj::<H>(info, varlen_len);
+        let ptr = unsafe {
+            self.heap
+                .alloc_mutator_obj::<H>(&self.state, info, varlen_len)
+        };
         if !ptr.is_null() {
             return ptr;
         }
@@ -743,13 +844,13 @@ impl<P: PtrPolicy> MutatorThread<P> {
         if self.heap.has_nursery() {
             // Try minor GC first → retry nursery
             self.trigger_minor_gc();
-            let ptr = self.heap.alloc_nursery(info, varlen_len);
+            let ptr = unsafe { self.heap.alloc_mutator(&self.state, info, varlen_len) };
             if !ptr.is_null() {
                 return ptr;
             }
             // Nursery still full (shouldn't happen after reset) → try major GC
             self.trigger_gc();
-            let ptr = self.heap.alloc_nursery(info, varlen_len);
+            let ptr = unsafe { self.heap.alloc_mutator(&self.state, info, varlen_len) };
             if !ptr.is_null() {
                 return ptr;
             }
@@ -762,21 +863,23 @@ impl<P: PtrPolicy> MutatorThread<P> {
     }
 
     #[cold]
-    fn alloc_obj_slow_path<H: ObjHeader>(
-        &self,
-        info: &TypeInfo,
-        varlen_len: usize,
-    ) -> *mut u8 {
+    fn alloc_obj_slow_path<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
         if self.heap.has_nursery() {
             // Try minor GC first → retry nursery
             self.trigger_minor_gc();
-            let ptr = self.heap.alloc_nursery_obj::<H>(info, varlen_len);
+            let ptr = unsafe {
+                self.heap
+                    .alloc_mutator_obj::<H>(&self.state, info, varlen_len)
+            };
             if !ptr.is_null() {
                 return ptr;
             }
             // Major GC
             self.trigger_gc();
-            let ptr = self.heap.alloc_nursery_obj::<H>(info, varlen_len);
+            let ptr = unsafe {
+                self.heap
+                    .alloc_mutator_obj::<H>(&self.state, info, varlen_len)
+            };
             if !ptr.is_null() {
                 return ptr;
             }
@@ -798,7 +901,7 @@ impl<P: PtrPolicy> MutatorThread<P> {
             // Concurrent major GC in progress — wait for it
             while self.heap.barriers_active() {
                 if self.heap.gc_requested() {
-                    self.state.enter_safepoint();
+                    unsafe { self.state.enter_safepoint() };
                 } else {
                     std::thread::yield_now();
                 }
@@ -828,7 +931,7 @@ impl<P: PtrPolicy> MutatorThread<P> {
                     if let Some(ref tracer) = self.heap.tracer {
                         tracer.record_thread(self.thread_id, TraceState::AtSafepoint);
                     }
-                    self.state.enter_safepoint();
+                    unsafe { self.state.enter_safepoint() };
                 } else {
                     std::thread::yield_now();
                 }
@@ -844,6 +947,58 @@ impl<P: PtrPolicy> MutatorThread<P> {
 
 impl<P: PtrPolicy> Drop for MutatorThread<P> {
     fn drop(&mut self) {
-        self.heap.safe_deregister_thread(&self.state);
+        unsafe { self.heap.safe_deregister_thread(&self.state) };
+    }
+}
+
+#[cfg(test)]
+mod poll_registration_tests {
+    use super::*;
+
+    #[test]
+    fn host_frame_access_rejects_a_different_owner_thread() {
+        let state = ThreadState::new();
+        std::thread::scope(|scope| {
+            let result = scope.spawn(|| state.frame_chain().depth()).join();
+            assert!(result.is_err());
+        });
+        assert_eq!(state.frame_chain().depth(), 0);
+    }
+
+    #[test]
+    fn request_before_flag_installation_is_not_lost() {
+        let state = ThreadState::new();
+        let flag = AtomicU8::new(0);
+        state.request_poll();
+        unsafe { state.set_poll_flag(&flag as *const AtomicU8 as *mut AtomicU8); }
+        assert_eq!(flag.load(Ordering::Acquire), 1);
+        state.clear_poll();
+        assert_eq!(flag.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cleared_request_is_not_replayed_on_late_installation() {
+        let state = ThreadState::new();
+        let flag = AtomicU8::new(0);
+        state.request_poll();
+        state.clear_poll();
+        unsafe { state.set_poll_flag(&flag as *const AtomicU8 as *mut AtomicU8); }
+        assert_eq!(flag.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_registration_and_stop_request_always_raise_flag() {
+        for _ in 0..64 {
+            let state = ThreadState::new();
+            let start = std::sync::Barrier::new(2);
+            let flag = AtomicU8::new(0);
+            std::thread::scope(|scope| {
+                let requester = scope.spawn(|| { start.wait(); state.request_poll(); });
+                start.wait();
+                unsafe { state.set_poll_flag(&flag as *const AtomicU8 as *mut AtomicU8); }
+                requester.join().unwrap();
+            });
+            assert_eq!(flag.load(Ordering::Acquire), 1);
+        }
     }
 }

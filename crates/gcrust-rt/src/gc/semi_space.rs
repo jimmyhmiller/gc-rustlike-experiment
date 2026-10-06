@@ -172,9 +172,9 @@ impl SemiSpace {
 
         // Phase 1: scan roots, copy/forward root targets
         for source in roots.iter() {
-            source.scan_roots(&mut |slot| {
-                unsafe { self.process_slot::<P>(slot) };
-            });
+            unsafe { source.scan_roots(&mut |slot| {
+                self.process_slot::<P>(slot);
+            }); }
         }
 
         // Phase 2: Cheney scan — walk to-space linearly
@@ -204,7 +204,7 @@ impl SemiSpace {
 
         // Phase 3: swap spaces, reset old from-space (now to-space)
         core::mem::swap(&mut self.from, &mut self.to);
-        self.to.reset();
+        unsafe { self.to.reset() };
         self.collections += 1;
 
         // Clear type_table reference (no longer valid after collect returns)

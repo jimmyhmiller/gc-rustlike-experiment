@@ -1,0 +1,90 @@
+// Immutable after construction: publish the whole summary with pointer CAS.
+struct Summary { files: i64, bytes: i64, lines: i64, errors: i64, warnings: i64 }
+
+fn empty() -> Summary { Summary { files: 0, bytes: 0, lines: 0, errors: 0, warnings: 0 } }
+fn merge(a: Summary, b: Summary) -> Summary {
+    Summary { files: a.files + b.files, bytes: a.bytes + b.bytes, lines: a.lines + b.lines,
+        errors: a.errors + b.errors, warnings: a.warnings + b.warnings }
+}
+fn analyze(text: String) -> Summary {
+    let mut lines = 0;
+    let mut errors = 0;
+    let mut warnings = 0;
+    let mut start = 0;
+    while start < str_len(text) {
+        let newline = str_find_from(text, "\n", start);
+        let end = if newline < 0 { str_len(text) } else { newline };
+        if str_find_range(text, "ERROR", start, end) >= 0 { errors = errors + 1; }
+        if str_find_range(text, "WARN", start, end) >= 0 { warnings = warnings + 1; }
+        lines = lines + 1;
+        start = end + 1;
+    }
+    Summary { files: 1, bytes: str_len(text), lines: lines, errors: errors, warnings: warnings }
+}
+fn worker(paths: Vec<String>, next: AtomicI64, total: Atom<Summary>) -> Result<i64, String> {
+    loop {
+        let index = next.fetch_add(1);
+        if index >= vec_len(paths) { return Result::Ok(0); }
+        let path = vec_at(paths, index);
+        let text = match fs_read_text(path, 1048576) {
+            Result::Ok(s) => s,
+            Result::Err(e) => { return Result::Err(io_error_message(e)); }
+        };
+        let delta = analyze(text);
+        // The retry callback has no effects: each successful CAS commits one file.
+        total.swap(|old: Summary| merge(old, delta));
+    }
+}
+fn worker_count(text: String) -> i64 {
+    if str_len(text) == 0 || str_len(text) > 2 { return 0; }
+    let mut n = 0;
+    let mut i = 0;
+    while i < str_len(text) {
+        let digit = str_get(text, i) - 48;
+        if digit < 0 || digit > 9 { return 0; }
+        n = n * 10 + digit;
+        i = i + 1;
+    }
+    if n >= 1 && n <= 64 { n } else { 0 }
+}
+fn fail(message: String) -> i64 { stderr_line(str_concat("gcr-logstats: ", message)); 1 }
+fn main() -> i64 {
+    let args = match process_args() { Result::Ok(a) => a, Result::Err(e) => { return fail(io_error_message(e)); } };
+    if array_len(args) < 3 || array_len(args) > 10002 {
+        stderr_line("usage: gcr-logstats <workers:1..64> <file> [file ...]");
+        return 2;
+    }
+    let workers = worker_count(array_get_unchecked(args, 1));
+    if workers == 0 { return fail("worker count must be an integer from 1 to 64"); }
+    let mut paths: Vec<String> = vec_new();
+    let mut i = 2;
+    while i < array_len(args) { paths = vec_push(paths, array_get_unchecked(args, i)); i = i + 1; }
+    let next = AtomicI64::new(0);
+    let total: Atom<Summary> = Atom::new(empty());
+    let mut threads: Vec<Thread<Result<i64, String>>> = vec_new();
+    let count = if workers < vec_len(paths) { workers } else { vec_len(paths) };
+    i = 0;
+    while i < count {
+        threads = vec_push(threads, Thread::spawn(|| worker(paths, next, total)));
+        i = i + 1;
+    }
+    let mut failure: Option<String> = Option::None;
+    i = 0;
+    while i < vec_len(threads) {
+        match vec_at(threads, i).join() {
+            Result::Ok(_) => {},
+            Result::Err(e) => { match failure { Option::None => { failure = Option::Some(e); }, Option::Some(_) => {} }; }
+        };
+        i = i + 1;
+    }
+    match failure { Option::Some(e) => { return fail(e); }, Option::None => {} };
+    let s = total.deref();
+    let mut parts: Vec<String> = vec_new();
+    parts = vec_push(parts, "{\"files\":"); parts = vec_push(parts, to_string(s.files));
+    parts = vec_push(parts, ",\"bytes\":"); parts = vec_push(parts, to_string(s.bytes));
+    parts = vec_push(parts, ",\"lines\":"); parts = vec_push(parts, to_string(s.lines));
+    parts = vec_push(parts, ",\"error_lines\":"); parts = vec_push(parts, to_string(s.errors));
+    parts = vec_push(parts, ",\"warning_lines\":"); parts = vec_push(parts, to_string(s.warnings));
+    parts = vec_push(parts, "}");
+    match stdout_line(str_join(parts, "")) { Result::Ok(_) => 0, Result::Err(e) => fail(io_error_message(e)) }
+}

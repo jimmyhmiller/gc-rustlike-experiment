@@ -367,10 +367,8 @@ pub enum CoreExprKind {
     /// out of bounds). The CoreExpr's repr is the `Option<T>` value enum; `elem`
     /// is the element repr used for the in-bounds load.
     ArrayGet { array: Box<CoreExpr>, index: Box<CoreExpr>, elem: Repr },
-    /// Unchecked element read: a raw load with NO bounds check, yielding `T`
-    /// directly. The unsafe escape hatch behind `array_get`; out-of-bounds is
-    /// undefined behaviour. Used by trusted, already-bounds-checked code (e.g.
-    /// the prelude's `Vec` internals) and hot paths. Repr is the element repr.
+    /// Legacy direct-return read. Validates backing-array bounds and initialized
+    /// reference/value slots; invalid access aborts with a diagnostic.
     ArrayGetUnchecked { array: Box<CoreExpr>, index: Box<CoreExpr>, elem: Repr },
     /// Checked element read for the `a[i]` index operator: bounds-checked, yields
     /// `T` directly, and aborts (clear error) on out-of-bounds — Rust-like
@@ -390,7 +388,7 @@ pub enum CoreExprKind {
     /// the env + code pointer and calls `ai_thread_spawn`. See `docs/threads.md`.
     ThreadSpawn(Box<CoreExpr>),
     /// `thread_join(handle)` → block until the thread finishes; yields its i64
-    /// result. Consumes the `RawPtr` handle.
+    /// result. Repeat and concurrent observations return the same result.
     ThreadJoin(Box<CoreExpr>),
     /// Clojure-style atom (single mutable cell holding an immutable value).
     /// `AtomLoad` atomically loads the atom's value field (a GC pointer slot).
@@ -402,13 +400,11 @@ pub enum CoreExprKind {
     /// true, else yield false. The retry loop of `swap!` is written in-language
     /// over this (so old/new/atom are ordinary frame roots — GC-safe for free).
     AtomCas { atom: Box<CoreExpr>, old: Box<CoreExpr>, new: Box<CoreExpr> },
-    /// Channel `send`: store `value` (a GC pointer) into the channel's on-heap
-    /// `buf` at the control block `ctrl`'s tail slot, blocking while full. The
-    /// queued value is traced by the GC via `buf`. Yields i64 0.
+    /// Commit an initialized message box into native traced queue slots. `buf`
+    /// witnesses its generic type. Returns 0 on commitment, 1 on closed.
     ChanSend { buf: Box<CoreExpr>, ctrl: Box<CoreExpr>, value: Box<CoreExpr> },
-    /// Channel `recv`: pop the head element of `buf` (blocking while empty);
-    /// yields the element as `elem` (a GC pointer, or null when closed+drained —
-    /// the prelude wraps the result as `Option<T>`).
+    /// Pop a native FIFO slot, blocking while empty. Repr is Option<elem>:
+    /// None means closed+drained, Some contains an initialized message box.
     ChanRecv { buf: Box<CoreExpr>, ctrl: Box<CoreExpr>, elem: Repr },
     /// A direct call to a named runtime extern with already-lowered scalar/ptr
     /// args, threading the `Thread*` as the leading argument. Used for the

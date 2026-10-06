@@ -421,6 +421,8 @@ struct FnLowerer<'a, 'r, 'm> {
     /// Parallel: each local's semantic Ty (for checking).
     local_tys: Vec<Ty>,
     ret_ty: Ty,
+    /// True until an unannotated closure obtains a return constraint.
+    infer_ret: bool,
 }
 
 fn lower_fn<'a>(
@@ -453,6 +455,7 @@ fn lower_fn<'a>(
             local_names: vec![],
             local_tys: vec![],
             ret_ty: ret_ty.clone(),
+            infer_ret: false,
         };
         let mut params = Vec::new();
         let mut extern_by_ref = Vec::new();
@@ -527,6 +530,7 @@ fn lower_fn<'a>(
         local_names: vec![],
         local_tys: vec![],
         ret_ty: ret_ty.clone(),
+        infer_ret: false,
     };
 
     let mut params = Vec::new();
@@ -886,11 +890,27 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             ExprKind::Return(v) => {
                 let cv = match v {
                     Some(e) => {
-                        let (ce, t) = self.expr(e, Some(&self.ret_ty.clone()))?;
+                        let expected = if self.infer_ret {
+                            None
+                        } else {
+                            Some(self.ret_ty.clone())
+                        };
+                        let (ce, t) = self.expr(e, expected.as_ref())?;
+                        if self.infer_ret && !is_never(&t) {
+                            self.ret_ty = t.clone();
+                            self.infer_ret = false;
+                        }
                         check_assignable(&t, &self.ret_ty.clone(), e.span)?;
                         Some(Box::new(ce))
                     }
-                    None => None,
+                    None => {
+                        if self.infer_ret {
+                            self.ret_ty = Ty::unit();
+                            self.infer_ret = false;
+                        }
+                        check_assignable(&Ty::unit(), &self.ret_ty, e.span)?;
+                        None
+                    }
                 };
                 // `return` diverges — type never (assignable to any context).
                 // P2 (DWARF): span the return so stepping stops on it.
@@ -1744,9 +1764,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok((CoreExpr::new(CoreExprKind::ArrayGetChecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
     }
 
-    /// `array_get_unchecked(a, i)` — the unsafe escape hatch behind `array_get`:
-    /// a raw load returning `T` with NO bounds check (out-of-bounds is undefined
-    /// behaviour). For trusted, already-bounds-checked code and hot paths.
+    /// Legacy `array_get_unchecked(a, i)` returns T directly, with backend
+    /// validation of backing bounds and initialized reference/value storage.
     fn array_get_unchecked_op(&mut self, arr: &Expr, idx: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         let (ca, aty) = self.expr(arr, None)?;
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_get_unchecked on a non-array".into(), span })?;
@@ -2158,7 +2177,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let saved_locals = std::mem::take(&mut self.locals);
         let saved_local_names = std::mem::take(&mut self.local_names);
         let saved_local_tys = std::mem::take(&mut self.local_tys);
-        let saved_ret = std::mem::replace(&mut self.ret_ty, declared_ret.clone().unwrap_or_else(Ty::unit));
+        let saved_ret = std::mem::replace(
+            &mut self.ret_ty,
+            declared_ret.clone().unwrap_or_else(Ty::unit),
+        );
+        let saved_infer_ret = std::mem::replace(&mut self.infer_ret, declared_ret.is_none());
 
         // Bind captures first as locals; codegen initializes these from the env.
         let mut cap_locals = Vec::new();
@@ -2178,7 +2201,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
         let (body_block, body_ty) = self.block_for_closure(body, declared_ret.as_ref())?;
         let ret_ty = match &declared_ret {
-            Some(t) => { check_assignable(&body_ty, t, span)?; t.clone() }
+            Some(t) => {
+                check_assignable(&body_ty, t, span)?;
+                t.clone()
+            }
+            None if !self.infer_ret => {
+                check_assignable(&body_ty, &self.ret_ty, span)?;
+                self.ret_ty.clone()
+            }
             None => body_ty,
         };
         self.ret_ty = ret_ty.clone();
@@ -2189,6 +2219,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.scope = saved_scope;
         self.local_tys = saved_local_tys;
         self.ret_ty = saved_ret;
+        self.infer_ret = saved_infer_ret;
 
         let _ = code_id;
         // Compute each capture's ABSOLUTE byte offset within the env (past the
@@ -2849,6 +2880,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if (name == "atom_load" || name == "atom_cas")
             && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name)
         {
+            let arity = if name == "atom_load" { 1 } else { 3 };
+            if args.len() != arity {
+                return err(format!("`{name}` takes {arity} argument(s)"), span);
+            }
             // First arg is the atom; recover its element type T from `Atom<T>`.
             let (catom, atom_ty) = self.expr(&args[0], None)?;
             let elem_ty = match &atom_ty {
@@ -2856,15 +2891,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 _ => return err(format!("`{}` requires an `Atom<T>`, found `{}`", name, ty_display(&atom_ty)), args[0].span),
             };
             let elem = self.repr_of(&elem_ty, args[0].span)?;
+            if !matches!(elem, Repr::Scalar(_) | Repr::Ref(_)) {
+                return err("Atom operations require a scalar or managed reference; inline aggregates have no CAS equality contract", span);
+            }
             if name == "atom_load" {
-                if args.len() != 1 { return err("`atom_load` takes 1 argument", span); }
                 return Ok((
                     CoreExpr::new(CoreExprKind::AtomLoad { atom: Box::new(catom), elem: elem.clone() }, elem),
                     elem_ty,
                 ));
             }
             // atom_cas(a, old, new) -> bool
-            if args.len() != 3 { return err("`atom_cas` takes 3 arguments (atom, old, new)", span); }
             let (cold, oldt) = self.expr(&args[1], Some(&elem_ty))?;
             check_assignable(&oldt, &elem_ty, args[1].span)?;
             let (cnew, newt) = self.expr(&args[2], Some(&elem_ty))?;
@@ -2877,16 +2913,22 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ty::bool(),
             ));
         }
-        // Channel intrinsics. `chan_new(cap) -> RawPtr` (control block);
-        // `chan_send(buf, ctrl, v) -> i64`; `chan_recv(buf, ctrl) -> T`. `buf` is
-        // the on-heap element Array<T>; the GC traces queued values via it.
+        // Native channel intrinsics operate on initialized reference message
+        // boxes. Witness arrays bind the generic type, not queue storage.
+        // Public Channel<T> boxes/unboxes arbitrary managed representations.
         if name == "chan_new"
             && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == "chan_new")
         {
-            if args.len() != 1 { return err("`chan_new` takes 1 argument (capacity)", span); }
-            let (ccap, _) = self.expr(&args[0], Some(&Ty::i64()))?;
+            if args.len() != 2 { return err("`chan_new` takes capacity and message array", span); }
+            let (ccap, actual) = self.expr(&args[0], Some(&Ty::i64()))?;
+            check_assignable(&actual, &Ty::i64(), span)?;
+            let (buffer, buffer_ty) = self.expr(&args[1], None)?;
+            let message_ty = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
+            let message_repr = self.repr_of(&message_ty, span)?;
+            let Repr::Ref(layout) = message_repr else { return err("channel intrinsic requires a reference message box", span); };
+            let layout_expr = CoreExpr::new(CoreExprKind::ConstInt(layout as u64, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
             return Ok((
-                CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_chan_new", args: vec![ccap], ret: Repr::Scalar(ScalarRepr::Ptr) }, Repr::Scalar(ScalarRepr::Ptr)),
+                CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_chan_new", args: vec![ccap, buffer, layout_expr], ret: Repr::Scalar(ScalarRepr::Ptr) }, Repr::Scalar(ScalarRepr::Ptr)),
                 Ty::Prim(Prim::RawPtr),
             ));
         }
@@ -2894,9 +2936,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == "chan_send")
         {
             if args.len() != 3 { return err("`chan_send` takes 3 arguments (buf, ctrl, value)", span); }
-            let (cbuf, _) = self.expr(&args[0], None)?;
-            let (cctrl, _) = self.expr(&args[1], None)?;
-            let (cval, _) = self.expr(&args[2], None)?;
+            let (cbuf, buffer_ty) = self.expr(&args[0], None)?;
+            let expected = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
+            if !matches!(self.repr_of(&expected, span)?, Repr::Ref(_)) { return err("channel intrinsic requires a reference message box", span); }
+            let (cctrl, ctrl_ty) = self.expr(&args[1], Some(&Ty::Prim(Prim::RawPtr)))?;
+            check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
+            let (cval, actual) = self.expr(&args[2], Some(&expected))?;
+            check_assignable(&actual, &expected, span)?;
             return Ok((
                 CoreExpr::new(CoreExprKind::ChanSend { buf: Box::new(cbuf), ctrl: Box::new(cctrl), value: Box::new(cval) }, Repr::Scalar(ScalarRepr::I64)),
                 Ty::i64(),
@@ -2907,21 +2953,35 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         {
             if args.len() != 2 { return err("`chan_recv` takes 2 arguments (buf, ctrl)", span); }
             let (cbuf, bty) = self.expr(&args[0], None)?;
-            let (cctrl, _) = self.expr(&args[1], None)?;
+            let (cctrl, ctrl_ty) = self.expr(&args[1], Some(&Ty::Prim(Prim::RawPtr)))?;
+            check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
             let elem_ty = array_elem_ty(&bty)
                 .ok_or_else(|| LowerError { msg: format!("`chan_recv` buffer must be an Array, found `{}`", ty_display(&bty)), span: args[0].span })?;
             let elem = self.repr_of(&elem_ty, span)?;
+            if !matches!(elem, Repr::Ref(_)) { return err("channel intrinsic requires a reference message box", span); }
+            let option_ty = Ty::Named { name: "Option".into(), args: vec![elem_ty] };
+            let option_repr = self.repr_of(&option_ty, span)?;
             return Ok((
-                CoreExpr::new(CoreExprKind::ChanRecv { buf: Box::new(cbuf), ctrl: Box::new(cctrl), elem: elem.clone() }, elem),
-                elem_ty,
+                CoreExpr::new(CoreExprKind::ChanRecv { buf: Box::new(cbuf), ctrl: Box::new(cctrl), elem: elem.clone() }, option_repr),
+                option_ty,
             ));
         }
-        if (name == "chan_sender_clone" || name == "chan_sender_drop")
+        if (name == "chan_waiting_senders" || name == "chan_waiting_receivers")
+            && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name)
+        {
+            if args.len() != 1 { return err("channel waiter count takes one control handle", span); }
+            let (ctrl, actual) = self.expr(&args[0], Some(&Ty::Prim(Prim::RawPtr)))?;
+            check_assignable(&actual, &Ty::Prim(Prim::RawPtr), span)?;
+            let func = if name == "chan_waiting_senders" { "ai_chan_waiting_senders" } else { "ai_chan_waiting_receivers" };
+            return Ok((CoreExpr::new(CoreExprKind::RuntimeCall { func, args: vec![ctrl], ret: Repr::Scalar(ScalarRepr::I64) }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()));
+        }
+        if (name == "chan_sender_clone" || name == "chan_sender_drop" || name == "chan_close")
             && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name)
         {
             if args.len() != 1 { return err(format!("`{}` takes 1 argument (ctrl)", name), span); }
-            let (cctrl, _) = self.expr(&args[0], None)?;
-            let func = if name == "chan_sender_clone" { "ai_chan_sender_clone" } else { "ai_chan_sender_drop" };
+            let (cctrl, ctrl_ty) = self.expr(&args[0], Some(&Ty::Prim(Prim::RawPtr)))?;
+            check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
+            let func = match name { "chan_sender_clone" => "ai_chan_sender_clone", "chan_close" => "ai_chan_close", _ => "ai_chan_sender_drop" };
             return Ok((
                 CoreExpr::new(CoreExprKind::RuntimeCall { func, args: vec![cctrl], ret: Repr::Unit }, Repr::Unit),
                 Ty::unit(),

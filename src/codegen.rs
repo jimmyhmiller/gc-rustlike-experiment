@@ -657,6 +657,51 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
+    /// Load one mutable managed slot in the language's SC order. Bool has
+    /// byte storage even though its SSA representation is i1.
+    fn managed_load(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let storage = if *repr == Repr::Scalar(ScalarRepr::Bool) {
+            self.ctx.i8_type().as_basic_type_enum()
+        } else { self.llvm_ty(repr).ok_or_else(|| CodegenError("invalid managed scalar load".into()))? };
+        let alignment = match repr {
+            Repr::Scalar(s) => s.bits().max(8) / 8,
+            Repr::Ref(_) => 8,
+            _ => return Err(CodegenError("aggregate must use a managed snapshot".into())),
+        };
+        let value = self.builder.build_load(storage, addr, name).unwrap();
+        let instruction = value.as_instruction_value().unwrap();
+        instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
+        instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?;
+        Ok(if *repr == Repr::Scalar(ScalarRepr::Bool) {
+            self.builder.build_int_truncate(value.into_int_value(), self.ctx.bool_type(), "managed.bool").unwrap().into()
+        } else { value })
+    }
+
+    fn managed_store(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr) -> Result<(), CodegenError> {
+        let (stored, alignment) = match repr {
+            Repr::Scalar(ScalarRepr::Bool) => (
+                self.builder.build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "managed.bool.byte").unwrap().into(), 1,
+            ),
+            Repr::Scalar(s) => (value, s.bits().max(8) / 8),
+            Repr::Ref(_) => (value, 8),
+            _ => return Err(CodegenError("aggregate must use a managed snapshot".into())),
+        };
+        let instruction = self.builder.build_store(addr, stored).unwrap();
+        instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
+        instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn managed_lock(&self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>) -> PointerValue<'ctx> {
+        let f = self.module.get_function("ai_managed_lock").unwrap();
+        call_result(self.builder.build_call(f, &[fcx.thread.into(), obj.into()], "managed.object").unwrap()).into_pointer_value()
+    }
+
+    fn managed_unlock(&self, fcx: &FnCtx<'ctx>) {
+        let f = self.module.get_function("ai_managed_unlock").unwrap();
+        self.builder.build_call(f, &[fcx.thread.into()], "").unwrap();
+    }
+
     fn declare_fn(&self, _id: FuncId, f: &CoreFn) -> FunctionValue<'ctx> {
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         // Foreign `extern "C"` function: a plain C declaration with exactly its
@@ -1550,10 +1595,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 };
                 let buf = self.builder.build_array_alloca(i8t, byte_len, "ascb.buf").unwrap();
                 let cin = self.module.get_function("ai_buf_copy_in").unwrap();
-                self.builder.build_call(cin, &[fcx.thread.into(), sv.into(), buf.into(), byte_len.into()], "").unwrap();
+                self.builder.build_call(cin, &[fcx.thread.into(), sv.into(), buf.into(), byte_len.into(), i64t.const_int(elem.bits() as u64, false).into()], "").unwrap();
                 if *copy_out {
                     // Queue a write-back; gen_call replays it after the extern call.
-                    fcx.pending_copy_outs.push((src.as_ref().clone(), buf, byte_len));
+                    fcx.pending_copy_outs.push((src.as_ref().clone(), buf, byte_len, elem.bits()));
                 }
                 Ok(Some(buf.into()))
             }
@@ -1621,15 +1666,26 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 // Atomic load of the atom's value field (first pointer slot).
                 let a = self.gen_expr(fcx, atom)?.unwrap().into_pointer_value();
                 let slot = self.obj_addr(a, Self::HEADER);
-                let lty = self.llvm_ty(elem).ok_or_else(|| CodegenError("atom of unit".into()))?;
-                let load = self.builder.build_load(lty, slot, "atom.load").unwrap();
+                // Bool occupies a byte in memory; floating CAS compares bits.
+                let storage = match elem {
+                    Repr::Scalar(ScalarRepr::Bool) => self.ctx.i8_type().into(),
+                    Repr::Scalar(ScalarRepr::F32) => self.ctx.i32_type().into(),
+                    Repr::Scalar(ScalarRepr::F64) => self.ctx.i64_type().into(),
+                    _ => self.llvm_ty(elem).ok_or_else(|| CodegenError("unsupported atom representation".into()))?,
+                };
+                let load = self.builder.build_load(storage, slot, "atom.load").unwrap();
                 let inst = load.as_instruction_value().unwrap();
                 // Atomics require natural alignment (8 for our pointer/i64-wide
                 // value fields); the default field alignment (4) is UB for an
                 // atomic load and faults at runtime.
-                inst.set_alignment(8).ok();
-                inst.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).ok();
-                Ok(Some(load))
+                inst.set_alignment(8).map_err(|e| CodegenError(e.to_string()))?;
+                inst.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?;
+                let value = match elem {
+                    Repr::Scalar(ScalarRepr::Bool) => self.builder.build_int_truncate(load.into_int_value(), self.ctx.bool_type(), "atom.bool").unwrap().into(),
+                    Repr::Scalar(ScalarRepr::F32 | ScalarRepr::F64) => self.builder.build_bit_cast(load, self.llvm_ty(elem).unwrap(), "atom.float").unwrap(),
+                    _ => load,
+                };
+                Ok(Some(value))
             }
             CoreExprKind::AtomCas { atom, old, new } => {
                 // Atomic compare-and-swap the value field; barrier on success.
@@ -1637,13 +1693,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let oldv = self.gen_expr(fcx, old)?.unwrap();
                 let newv = self.gen_expr(fcx, new)?.unwrap();
                 let slot = self.obj_addr(a, Self::HEADER);
+                let encode = |v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
+                    match &old.repr {
+                        Repr::Scalar(ScalarRepr::Bool) => self.builder.build_int_z_extend(v.into_int_value(), self.ctx.i8_type(), "atom.bool.bits").unwrap().into(),
+                        Repr::Scalar(s @ (ScalarRepr::F32 | ScalarRepr::F64)) => self.builder.build_bit_cast(v, self.ctx.custom_width_int_type(s.bits()), "atom.float.bits").unwrap(),
+                        _ => v,
+                    }
+                };
                 let cas = self.builder.build_cmpxchg(
-                    slot, oldv, newv,
+                    slot, encode(oldv), encode(newv),
                     AtomicOrdering::SequentiallyConsistent,
                     AtomicOrdering::SequentiallyConsistent,
                 ).unwrap();
-                // cmpxchg requires natural alignment of the value field.
-                cas.as_instruction_value().unwrap().set_alignment(8).ok();
+                // LLVM gives cmpxchg the operand's natural alignment by default.
+                // Our first object field is 8-aligned, satisfying every supported
+                // scalar/reference operand. Inkwell's alignment setter only
+                // accepts load/store/alloca, so it cannot strengthen this value.
                 // cmpxchg yields { value, i1 success }; element 1 is the success bool.
                 let ok = self.builder.build_extract_value(cas, 1, "cas.ok").unwrap().into_int_value();
                 // Generational write barrier: a successful install may create an
@@ -1660,13 +1725,28 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     f, &[fcx.thread.into(), b.into(), c.into(), v.into()], "chsend").unwrap());
                 Ok(Some(r))
             }
-            CoreExprKind::ChanRecv { buf, ctrl, elem: _ } => {
+            CoreExprKind::ChanRecv { buf, ctrl, elem } => {
                 let b = self.gen_expr(fcx, buf)?.unwrap().into_pointer_value();
                 let c = self.gen_expr(fcx, ctrl)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_chan_recv").unwrap();
-                let r = call_result(self.builder.build_call(
-                    f, &[fcx.thread.into(), b.into(), c.into()], "chrecv").unwrap());
-                Ok(Some(r))
+                let value = call_result(self.builder.build_call(
+                    f, &[fcx.thread.into(), b.into(), c.into()], "chrecv").unwrap()).into_pointer_value();
+                let Repr::Value(option) = e.repr else { return Err(CodegenError("channel receive requires Option representation".into())); };
+                let some_bb = self.ctx.append_basic_block(fcx.func, "channel.some");
+                let none_bb = self.ctx.append_basic_block(fcx.func, "channel.none");
+                let merge_bb = self.ctx.append_basic_block(fcx.func, "channel.result");
+                let empty = self.builder.build_is_null(value, "channel.closed").unwrap();
+                self.builder.build_conditional_branch(empty, none_bb, some_bb).unwrap();
+                self.builder.position_at_end(some_bb);
+                let some = self.build_value_variant(option, 1, &[(value.into(), elem.clone())]);
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(none_bb);
+                let none = self.build_value_variant(option, 0, &[]);
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.build_phi(self.value_struct_ty(option), "channel.option").unwrap();
+                phi.add_incoming(&[(&some, some_bb), (&none, none_bb)]);
+                Ok(Some(phi.as_basic_value()))
             }
             CoreExprKind::RuntimeCall { func, args, ret } => {
                 let f = self.module.get_function(func)
@@ -1753,7 +1833,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             CoreExprKind::Field { base, loc } => self.gen_field(fcx, base, loc),
             CoreExprKind::SetField { base, loc, value } => {
-                let obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
+                let mut obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
+                let aggregate = matches!(loc, FieldLoc::ValueAt { .. });
+                if aggregate { obj = self.managed_lock(fcx, obj); }
                 let v = self.gen_expr(fcx, value)?.unwrap();
                 let off = match loc {
                     FieldLoc::Ptr { idx } => Self::HEADER + (*idx as u64) * 8,
@@ -1765,7 +1847,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     FieldLoc::ValueField { .. } => return Err(CodegenError("value-struct field is immutable".into())),
                 };
                 let addr = self.obj_addr(obj, off);
-                self.builder.build_store(addr, v).unwrap();
+                if aggregate { self.builder.build_store(addr, v).unwrap(); }
+                else { self.managed_store(addr, v, &value.repr)?; }
                 // Generational write barrier. A direct pointer store (FieldLoc::Ptr)
                 // may create an old→young edge. So may a flattened value-with-
                 // references store (FieldLoc::ValueAt): each reference embedded in
@@ -1806,6 +1889,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     }
                     _ => {}
                 }
+                if aggregate { self.managed_unlock(fcx); }
                 Ok(Some(self.ctx.i64_type().const_zero().into()))
             }
             CoreExprKind::Match { scrutinee, arms } => self.gen_match(fcx, scrutinee, arms, &e.repr),
@@ -1878,6 +1962,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         let i32t = self.ctx.i32_type();
         let i64t = self.ctx.i64_type();
+        self.module.add_function(
+            "ai_managed_lock", ptr.fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_managed_unlock", self.ctx.void_type().fn_type(&[ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // ptr ai_gc_alloc_fixed(ptr thread, i32 type_id, i32 site_id)
         self.module.add_function(
             "ai_gc_alloc_fixed",
@@ -1902,10 +1994,24 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.ctx.void_type().fn_type(&[ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        {
+            let f = self.module.add_function("ai_uninitialized_array_fail",
+                self.ctx.void_type().fn_type(&[ptr.into(), i64t.into()], false),
+                Some(inkwell::module::Linkage::External));
+            for name in ["noreturn", "cold"] {
+                let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+                f.add_attribute(inkwell::attributes::AttributeLoc::Function, self.ctx.create_enum_attribute(kind, 0));
+            }
+        }
         // void ai_bounds_fail(ptr thread, i64 index, i64 len) -- aborts, never
         // returns. Marked noreturn + cold so the inlined array bounds check keeps
         // the in-bounds path straight-line and the trap path out of line.
         {
+            self.module.add_function(
+                "ai_array_allocation_len",
+                i64t.fn_type(&[ptr.into(), i64t.into(), i64t.into(), i32t.into()], false),
+                Some(inkwell::module::Linkage::External),
+            );
             let f = self.module.add_function(
                 "ai_bounds_fail",
                 self.ctx.void_type().fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
@@ -2099,16 +2205,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             i64t.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
-        // void ai_buf_copy_in(ptr thread, ptr obj, ptr dst, i64 byte_len)
+        // void ai_buf_copy_in(ptr thread, ptr obj, ptr dst, i64 byte_len, i64 bits)
         self.module.add_function(
             "ai_buf_copy_in",
-            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t.into()], false),
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
-        // void ai_buf_copy_out(ptr thread, ptr obj, ptr src, i64 byte_len)
+        // void ai_buf_copy_out(ptr thread, ptr obj, ptr src, i64 byte_len, i64 bits)
         self.module.add_function(
             "ai_buf_copy_out",
-            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t.into()], false),
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
         // Threads. ptr ai_thread_spawn(ptr parent, ptr env, ptr code)
@@ -2147,13 +2253,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             ptr.fn_type(&[ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        for name in ["ai_chan_waiting_senders", "ai_chan_waiting_receivers"] {
+            self.module.add_function(name, i64t.fn_type(&[ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
+        }
         // Channels.
         self.module.add_function("ai_chan_new",
-            ptr.fn_type(&[ptr.into(), i64t.into()], false), Some(inkwell::module::Linkage::External));
+            ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i32t.into()], false), Some(inkwell::module::Linkage::External));
         self.module.add_function("ai_chan_send",
             i64t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
         self.module.add_function("ai_chan_recv",
             ptr.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
+        self.module.add_function("ai_chan_close",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
         self.module.add_function("ai_chan_sender_clone",
             self.ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
         self.module.add_function("ai_chan_sender_drop",
@@ -2279,7 +2390,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     raw_cursor = align_up64(raw_cursor, sz);
                     let addr = self.obj_addr(obj, raw_cursor);
                     raw_cursor += sz;
-                    if let Some(v) = v { self.builder.build_store(addr, *v).unwrap(); }
+                    if let Some(v) = v {
+                        // Initialize the entire bool byte, including its upper
+                        // bits: Atom<bool> CAS compares the byte representation.
+                        let stored = if *s == ScalarRepr::Bool {
+                            self.builder.build_int_z_extend(v.into_int_value(), self.ctx.i8_type(), "bool.byte").unwrap().into()
+                        } else { *v };
+                        self.builder.build_store(addr, stored).unwrap();
+                    }
                 }
                 Repr::Value(vid) => {
                     // A flattened value aggregate: store the whole LLVM struct at
@@ -2605,11 +2723,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let n64 = if n.get_type().get_bit_width() < 64 {
             self.builder.build_int_s_extend(n, i64t, "n64").unwrap()
         } else { n };
-        // varlen_len: for Values arrays it's element count; for Bytes arrays
-        // it's the byte length (n * stride).
-        let varlen_len = if traced { n64 } else {
-            self.builder.build_int_mul(n64, i64t.const_int(stride, false), "blen").unwrap()
-        };
+        // Validate before multiplying: a wrapped byte count would allocate a
+        // smaller object than its source-language array length requires.
+        let validate = self.module.get_function("ai_array_allocation_len").unwrap();
+        let varlen_len = call_result(self.builder.build_call(validate, &[
+            fcx.thread.into(), n64.into(), i64t.const_int(stride, false).into(),
+            i32t.const_int(traced as u64, false).into(),
+        ], "array.allocation.len").unwrap()).into_int_value();
         let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
         let obj = call_result(self.builder.build_call(
@@ -2653,24 +2773,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let (stride, _) = Self::elem_stride(elem);
         let addr = self.array_elem_addr(obj, idx, stride);
         let ty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
-        if let Repr::Value(_) = elem {
-            let pointer = self.ctx.ptr_type(AddressSpace::default());
-            let boxed = self.builder.build_load(pointer, addr, "element.box").unwrap().into_pointer_value();
-            let empty = self.ctx.append_basic_block(fcx.func, "element.zero");
+        if matches!(elem, Repr::Value(_) | Repr::Ref(_)) {
+            let pointer = self.managed_load(addr, &Repr::Scalar(ScalarRepr::Ptr), "element.pointer")?.into_pointer_value();
+            let empty = self.ctx.append_basic_block(fcx.func, "element.uninitialized");
             let present = self.ctx.append_basic_block(fcx.func, "element.present");
-            let merge = self.ctx.append_basic_block(fcx.func, "element.merge");
-            let is_null = self.builder.build_is_null(boxed, "element.unset").unwrap();
+            let is_null = self.builder.build_is_null(pointer, "element.unset").unwrap();
             self.builder.build_conditional_branch(is_null, empty, present).unwrap();
             self.builder.position_at_end(empty);
-            self.builder.build_unconditional_branch(merge).unwrap();
+            let fail = self.module.get_function("ai_uninitialized_array_fail").unwrap();
+            self.builder.build_call(fail, &[fcx.thread.into(), idx.into()], "").unwrap();
+            self.builder.build_unreachable().unwrap();
             self.builder.position_at_end(present);
-            let value = self.builder.build_load(ty, self.obj_addr(boxed, Self::HEADER), "element.value").unwrap();
-            self.builder.build_unconditional_branch(merge).unwrap();
-            self.builder.position_at_end(merge);
-            let phi = self.builder.build_phi(ty, "element").unwrap();
-            phi.add_incoming(&[(&ty.const_zero(), empty), (&value, present)]);
-            Ok(phi.as_basic_value())
-        } else { Ok(self.builder.build_load(ty, addr, "element").unwrap()) }
+            if matches!(elem, Repr::Value(_)) {
+                Ok(self.builder.build_load(ty, self.obj_addr(pointer, Self::HEADER), "element.value").unwrap())
+            } else { Ok(pointer.into()) }
+        } else { self.managed_load(addr, elem, "element") }
     }
 
     /// `array_get(a, i)` yields `Option<T>`: `Some(a[i])` when in bounds, `None`
@@ -2727,8 +2844,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(Some(phi.as_basic_value()))
     }
 
-    /// `array_get_unchecked(a, i)` — a raw element load with no bounds check,
-    /// yielding `T` directly (the unsafe escape hatch behind `array_get`).
+    /// Legacy direct-return indexing validates the actual backing array. A
+    /// caller's earlier metadata check may be invalidated by a racing mutation.
     fn gen_array_get_unchecked(
         &mut self,
         fcx: &mut FnCtx<'ctx>,
@@ -2739,6 +2856,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         let idx64 = self.idx_to_i64(idx);
+        let len = self.array_logical_len(obj, &array.repr)?;
+        self.emit_bounds_check(fcx, idx64, len);
         let v = self.load_array_element(fcx, obj, idx64, elem)?;
         Ok(Some(v))
     }
@@ -2783,7 +2902,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.emit_bounds_check(fcx, idx64, len);
         let (stride, _) = Self::elem_stride(elem);
         let addr = self.array_elem_addr(obj, idx64, stride);
-        self.builder.build_store(addr, val).unwrap();
+        let stored_repr = if matches!(elem, Repr::Value(_)) {
+            Repr::Scalar(ScalarRepr::Ptr)
+        } else { elem.clone() };
+        self.managed_store(addr, val, &stored_repr)?;
         // Generational write barrier: a long-lived (tenured) array may receive a
         // young pointer element. `emit_write_barrier` no-ops for scalar elements.
         self.emit_write_barrier(fcx, obj, val);
@@ -2925,7 +3047,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let v = self.builder.build_extract_value(agg, *index, "vfld").unwrap();
             return Ok(Some(v));
         }
-        let obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
+        let mut obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
+        let aggregate = matches!(loc, FieldLoc::ValueAt { .. });
+        if aggregate { obj = self.managed_lock(fcx, obj); }
         let (off, lty): (u64, BasicTypeEnum) = match loc {
             FieldLoc::Ptr { idx } => (
                 Self::HEADER + (*idx as u64) * 8,
@@ -2948,7 +3072,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             FieldLoc::ValueField { .. } => unreachable!(),
         };
         let addr = self.obj_addr(obj, off);
-        let v = self.builder.build_load(lty, addr, "fld").unwrap();
+        let v = if aggregate {
+            let snapshot = self.builder.build_load(lty, addr, "fld.snapshot").unwrap();
+            self.managed_unlock(fcx);
+            snapshot
+        } else {
+            let repr = match loc {
+                FieldLoc::Raw { repr, .. } => Repr::Scalar(*repr),
+                FieldLoc::Ptr { .. } => Repr::Scalar(ScalarRepr::Ptr),
+                _ => unreachable!(),
+            };
+            self.managed_load(addr, &repr, "fld")?
+        };
         Ok(Some(v))
     }
 
@@ -3580,12 +3715,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         if fcx.pending_copy_outs.len() > copy_out_base {
             let cout = self.module.get_function("ai_buf_copy_out").unwrap();
             let pending: Vec<_> = fcx.pending_copy_outs.drain(copy_out_base..).collect();
-            for (src, buf, byte_len) in pending {
+            for (src, buf, byte_len, bits) in pending {
                 // Native callbacks or another mutator may have moved the array.
                 let obj = self.gen_expr(fcx, &src)?.unwrap().into_pointer_value();
                 self.builder.build_call(
                     cout,
-                    &[fcx.thread.into(), obj.into(), buf.into(), byte_len.into()],
+                    &[fcx.thread.into(), obj.into(), buf.into(), byte_len.into(), self.ctx.i64_type().const_int(bits as u64, false).into()],
                     "",
                 ).unwrap();
             }
@@ -3622,15 +3757,27 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     /// Emit a GC safepoint poll: `if (thread.state != 0) ai_gc_pollcheck_slow(thread)`.
-    /// The load is volatile so the optimizer can't hoist it out of the loop.
+    /// Acquire pairs with the coordinator's release store. Volatile also keeps
+    /// polls at loop checkpoints; volatility alone would not prevent a race.
     fn emit_safepoint_poll(&self, fcx: &FnCtx<'ctx>) {
         let i8t = self.ctx.i8_type();
         let state_ptr = self.thread_field_ptr(fcx.func, crate::runtime::thread_offsets::STATE);
         let load = self.builder.build_load(i8t, state_ptr, "gcstate").unwrap();
-        load.as_instruction_value().unwrap().set_volatile(true).ok();
-        let is_set = self.builder.build_int_compare(
-            IntPredicate::NE, load.into_int_value(), i8t.const_zero(), "gcpoll",
-        ).unwrap();
+        let instruction = load.as_instruction_value().unwrap();
+        instruction.set_alignment(1).unwrap();
+        instruction
+            .set_atomic_ordering(AtomicOrdering::Acquire)
+            .unwrap();
+        instruction.set_volatile(true).unwrap();
+        let is_set = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                load.into_int_value(),
+                i8t.const_zero(),
+                "gcpoll",
+            )
+            .unwrap();
         let slow_bb = self.ctx.append_basic_block(fcx.func, "gc.slow");
         let cont_bb = self.ctx.append_basic_block(fcx.func, "gc.cont");
         self.builder.build_conditional_branch(is_set, slow_bb, cont_bb).unwrap();
@@ -3656,7 +3803,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         fcx.loop_headers.push(header_bb);
 
         self.builder.position_at_end(header_bb);
-        // GC safepoint poll at the loop header: load thread.state (volatile);
+        // GC safepoint poll at the loop header: atomic acquire, volatile;
         // if non-zero, trap into ai_gc_pollcheck_slow so the mutator parks.
         self.emit_safepoint_poll(fcx);
         self.gen_block(fcx, body)?;
@@ -3738,7 +3885,7 @@ struct FnCtx<'ctx> {
     /// FFI copy-out buffers awaiting write-back: `(heap object, stack buffer,
     /// byte length)`. Filled by an `AsCBytes { copy_out: true }` argument and
     /// drained by `gen_call` AFTER the extern call returns. See `docs/ffi.md`.
-    pending_copy_outs: Vec<(CoreExpr, PointerValue<'ctx>, IntValue<'ctx>)>,
+    pending_copy_outs: Vec<(CoreExpr, PointerValue<'ctx>, IntValue<'ctx>, u32)>,
     /// This function's DWARF `DISubprogram` scope (debugger P2) — `Some` only when
     /// emitting debug info. Debug locations for the function's nodes use it as
     /// their scope (one function = one source, so scope/file stay consistent).
@@ -4051,6 +4198,8 @@ pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec
         ("ai_str_to_float", runtime::ai_str_to_float as *const () as usize),
         ("ai_str_hash", runtime::ai_str_hash as *const () as usize),
         ("ai_str_copy_to_buf", runtime::ai_str_copy_to_buf as *const () as usize),
+        ("ai_managed_lock", runtime::ai_managed_lock as *const () as usize),
+        ("ai_managed_unlock", runtime::ai_managed_unlock as *const () as usize),
         ("ai_buf_copy_in", runtime::ai_buf_copy_in as *const () as usize),
         ("ai_buf_copy_out", runtime::ai_buf_copy_out as *const () as usize),
         ("ai_thread_spawn", runtime::ai_thread_spawn as *const () as usize),
@@ -4060,6 +4209,9 @@ pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec
         ("ai_thread_current_id", runtime::ai_thread_current_id as *const () as usize),
         ("ai_closure_code_ptr", runtime::ai_closure_code_ptr as *const () as usize),
         ("ai_chan_new", runtime::ai_chan_new as *const () as usize),
+        ("ai_chan_close", runtime::ai_chan_close as *const () as usize),
+        ("ai_chan_waiting_senders", runtime::ai_chan_waiting_senders as *const () as usize),
+        ("ai_chan_waiting_receivers", runtime::ai_chan_waiting_receivers as *const () as usize),
         ("ai_chan_send", runtime::ai_chan_send as *const () as usize),
         ("ai_chan_recv", runtime::ai_chan_recv as *const () as usize),
         ("ai_chan_sender_clone", runtime::ai_chan_sender_clone as *const () as usize),
@@ -4071,6 +4223,8 @@ pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec
         ("ai_atomic_i64_compare_and_set", runtime::ai_atomic_i64_compare_and_set as *const () as usize),
         ("ai_gc_write_barrier", runtime::ai_gc_write_barrier as *const () as usize),
         ("ai_bounds_fail", runtime::ai_bounds_fail as *const () as usize),
+        ("ai_uninitialized_array_fail", runtime::ai_uninitialized_array_fail as *const () as usize),
+        ("ai_array_allocation_len", runtime::ai_array_allocation_len as *const () as usize),
         ("ai_arithmetic_fail", runtime::ai_arithmetic_fail as *const () as usize),
     ] {
         if let Some(f) = compiled.module.get_function(name) {
@@ -4119,6 +4273,9 @@ pub fn jit_run_i64_with_args(prog: &CoreProgram, mode: GcRunMode, arguments: Vec
     // Publish the current thread so FFI callback trampolines can recover it.
     runtime::set_current_thread(thread);
     let result = unsafe { f(thread) };
+    unsafe {
+        rt.finish_threads();
+    }
     // Opt-in heap dump once the program returns (heap quiescent).
     // `GCR_HEAP_DUMP=json` emits a structured snapshot; other values emit text.
     if let Some(mode) = std::env::var_os("GCR_HEAP_DUMP") {
@@ -4389,6 +4546,19 @@ pub fn codegen_aot_object_level(
         optimize_module(module);
         host_target_machine()?
     };
+    if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {
+        use inkwell::attributes::{Attribute, AttributeLoc};
+        use inkwell::passes::PassBuilderOptions;
+        let kind = Attribute::get_named_enum_kind_id("sanitize_thread");
+        for function in module.get_functions() {
+            if function.count_basic_blocks() != 0 {
+                function.add_attribute(AttributeLoc::Function, ctx.create_enum_attribute(kind, 0));
+            }
+        }
+        module.run_passes("tsan-module,function(tsan)", &machine, PassBuilderOptions::create())
+            .map_err(|e| CodegenError(format!("ThreadSanitizer instrumentation failed: {e}")))?;
+        module.verify().map_err(|e| CodegenError(format!("instrumented AOT module verify failed: {e}")))?;
+    }
     machine
         .write_to_file(module, FileType::Object, obj_path)
         .map_err(|e| CodegenError(format!("object emission failed: {}", e.to_string())))?;
@@ -4429,7 +4599,11 @@ pub fn build_executable_level(
     // pulls libc; we add the rest explicitly. `extra_link_args` (from `gcr build
     // --link-arg …`) is appended for FFI programs — notably the self-hosting
     // compiler, which links libLLVM (`-L<llvm>/lib -lLLVM -Wl,-rpath,…`).
-    let status = std::process::Command::new("cc")
+    let mut linker = std::process::Command::new("cc");
+    if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {
+        linker.arg("-fsanitize=thread");
+    }
+    let status = linker
         .arg("-o")
         .arg(out_path)
         .arg(&obj_path)

@@ -289,3 +289,30 @@ fn jit_object_survives_collection_via_precise_roots() {
     // And exactly one collection ran.
     assert_eq!(ctx.heap().collections(), 1, "expected exactly one collection");
 }
+
+#[test]
+fn generated_safepoint_polls_are_atomic_before_and_after_optimization() {
+    let source = "fn main() -> i64 { let mut i = 0; while i < 100 { i = i + 1; } i }";
+    let (module, _) = gcrust::compile::parse_with_prelude(source).unwrap();
+    let resolved = gcrust::resolve::resolve_module(module).unwrap();
+    let program = gcrust::lower::lower_program(&resolved.globals).unwrap();
+    for optimize in [false, true] {
+        let ir = gcrust::codegen::emit_llvm_ir(&program, optimize).unwrap();
+        let polls: Vec<_> = ir
+            .lines()
+            .filter(|line| line.contains("load") && line.contains("gcstate"))
+            .collect();
+        assert!(
+            !polls.is_empty(),
+            "missing safepoint poll (optimized={optimize})"
+        );
+        for poll in polls {
+            assert!(
+                poll.contains("load atomic volatile i8")
+                    && poll.contains("acquire")
+                    && poll.contains("align 1"),
+                "{poll}"
+            );
+        }
+    }
+}

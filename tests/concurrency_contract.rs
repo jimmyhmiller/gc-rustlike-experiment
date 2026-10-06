@@ -27,7 +27,7 @@ fn main() -> i64 {
         queue.send(p);
         0
     });
-    let received = queue.recv();
+    let received = queue.recv_value();
     if received.n != 13 || !str_eq(received.text, "channelλ") { return 83; }
     producer.join();
     let published = Payload { n: 0, text: "" };

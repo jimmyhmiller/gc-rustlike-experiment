@@ -61,8 +61,10 @@ The target sharing and execution contract is [concurrency.md](concurrency.md).
 Current capture checks can be bypassed through aliases and higher-order calls,
 while ordinary heap codegen is not race-safe. Implement managed memory ordering,
 aggregate coherence and GC/barrier coordination before removing Sync restrictions.
-Repair raw thread-handle ownership: repeated or concurrent join must never reuse a
-freed native handle. Structured outcomes, cancellation and async remain required.
+Root-owned completion records now support repeated/concurrent joins without
+freeing aliased native handles. Root exit drains descendants and releases records;
+metadata grows with total spawns until then. Nested scopes, earlier reclamation,
+structured outcomes, cancellation and async remain required.
 
 Acceptance:
 
@@ -132,7 +134,7 @@ production readiness across workloads.
 
 ## Next work
 
-Follow the ordered [implementation plan](PLAN.md): repair execution-handle
+Follow the ordered [implementation plan](PLAN.md): preserve the repaired execution
 ownership and closure inference, implement managed race safety, then add structured
 outcomes, cancellation and async. The search application exercises the evolving
 standard library. Numeric release budgets and declared platform support remain

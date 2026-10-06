@@ -46,7 +46,7 @@ fn channel_producer_consumer() {
             let ch: Channel<Vec<i64>> = Channel::new(2);
             let t = Thread::spawn(|| produce(ch, 5));
             let mut total = 0; let mut got = 0;
-            while got < 5 { let item = ch.recv(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
+            while got < 5 { let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
             let _j = t.join();
             total
         }
@@ -66,7 +66,7 @@ fn channel_under_gc_stress() {
             let ch: Channel<Vec<i64>> = Channel::new(2);
             let t = Thread::spawn(|| produce(ch, 5));
             let mut total = 0; let mut got = 0;
-            while got < 5 { let item = ch.recv(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
+            while got < 5 { let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
             let _j = t.join();
             total
         }
@@ -87,7 +87,7 @@ fn channel_multi_producer_fan_in() {
             let t1 = Thread::spawn(|| produce(ch, 0, 100));
             let t2 = Thread::spawn(|| produce(ch, 1000, 100));
             let mut total = 0; let mut got = 0;
-            while got < 200 { let item = ch.recv(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
+            while got < 200 { let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
             let _a = t1.join(); let _b = t2.join();
             total
         }

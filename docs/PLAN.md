@@ -1,26 +1,63 @@
 # Implementation plan
 
-Updated 2026-10-03. This plan records remaining work, not completed features.
+Updated 2026-10-05. Completed checkpoints are identified below; the remaining
+sections describe proposed work.
 The target semantics are in [concurrency.md](concurrency.md); verified behavior
 and open defects are in [STATUS.md](STATUS.md). Release gates are in
 [PRODUCTION.md](PRODUCTION.md).
 
-## 1. Repair execution ownership and compiler inference
+## 1. Execution ownership and compiler inference — implemented 2026-10-04
 
-Replace the raw consuming native thread handle with owned completion state.
-Specify which current Thread APIs transition to repeatable join and typed outcomes.
-Root the result until every observer has finished; reclaim native handles exactly
-once. Add regressions for repeated/concurrent joins, dropped aliases, completion
-before join, and collection during retirement in JIT and optimized AOT.
+Root-owned native completion records replace consuming raw-handle ownership.
+`Thread<T>.join()` and scalar `thread_join` can observe completion repeatedly and
+concurrently. The OS join handle is consumed once; managed results stay traced by
+live Thread aliases. Root exit drains children and descendants before diagnostics
+or JIT-code retirement, then releases completion metadata. Native panic still maps
+to zero. Nested scopes, fallible spawn, typed outcomes and cancellation remain in
+later steps. Completion metadata currently grows with total spawns until root exit.
 
-Reproduce and repair integer early-return inference inside a spawn closure.
-The existing publication fixture uses an if/else expression; it does not fix the
-inference defect. Add a regression containing the original early return.
+Inferred closure return types now reconcile explicit returns with the body result,
+including early returns, return-only branches and nested closures; incompatible
+return types are rejected. The original publication reproduction is executable.
 
-Exit criteria: no raw-handle reuse/double free; stable completion observations;
-original inference reproduction accepted with the correct result.
+Regression coverage: `tests/thread_completion.rs` runs aliased and concurrent
+joins, dropped aliases, GC-relocated reference/value results, abandoned descendants
+and the original inference reproduction in bounded JIT/AOT subprocesses. Runtime
+unit tests cover completion before first join and reclamation with an externally
+retained heap. Current verification commands/results are in STATUS.md.
 
-## 2. Make managed sharing safe
+## 2. Make managed sharing safe — in progress
+
+The 2026-10-04 collector audit repaired atomic poll/card races, allocation-free
+minor-GC coordination, and preservation of nursery edges across major collection.
+The selected collector target is parallel stop-the-world moving collection with
+concurrent application mutators. Major and minor evacuation now use atomic copy
+ownership, batched worker tasks and quiescence detection. The heap-wide
+managed-access mutex proposal was withdrawn before implementation. Persistent
+collector workers, exact batched copy reservation and mutator TLABs with
+initialized-range descriptors are implemented. Collector copying buffers
+with local cursors and the remaining sharing/API audit remain work; details
+and measured limits are in [gc.md](gc.md).
+
+Generated mutable scalar/reference fields and array slots now use SC atomics.
+Inline aggregate field reads/replacements use relocation-aware address stripes
+and an SC linearization event; critical regions contain no safepoint or
+allocation. Native channel/string-array accesses and FFI scalar buffer copies
+use matching atomics. Mixed store buffering, enum/value replacement and live
+embedded references pass JIT/AOT, normal/stress GC. Optimized LLVM structural
+checks and the native ThreadSanitizer gate pass. Startup poll registration and
+pause-release/retirement handoffs have focused regressions.
+
+This is a partial checkpoint, not the section's exit criterion. Collection
+metadata may still be observed inconsistently during structural mutation;
+collection operation consistency and low-level owner/collector root APIs remain
+to audit and repair. Root registration/enumeration and GC transitions now have
+explicit unsafe contracts; scratch storage is owner-checked and poll retirement
+detaches native storage before freeing it. The broader allocator API audit remains.
+Backing-array bounds and unwritten reference/value slots now
+produce defined diagnostic failures; array allocation arithmetic is checked.
+Transitional Sync capture checks remain in place. See STATUS.md for exact
+coverage and sanitizer limits.
 
 Inventory every heap access, aggregate copy, reference publication and write
 barrier. Implement the proposed SC managed memory model and coherent aggregate
@@ -39,6 +76,18 @@ Exit criteria: the memory-model conformance cases pass in JIT/AOT under GC stres
 no reliance on capture rejection to preserve managed memory safety.
 
 ## 3. Add synchronization, outcomes and structured lifetimes
+
+Channel ownership/close checkpoint implemented 2026-10-05: native queue slots
+are traced in all collector/root enumeration paths; witnesses cannot replace
+queue storage. Positive capacity is validated. Scalar, reference and inline-value
+messages use initialized boxes. `send` returns Result<(),T> with the unsent value
+on close; `recv` returns Option<T>, with None only when closed and drained.
+Explicit close is idempotent and wakes all sender/receiver waiters. Closed,
+drained slot storage retires immediately; stable handle metadata retires after
+root children drain. Earlier handle reclamation and cancellation remain work.
+FIFO, wakeups, close/send races, value preservation and JIT/AOT moving-GC behavior
+have bounded regressions and native sanitizer coverage. This does not finish the
+lock, typed execution-outcome or nested scope requirements below.
 
 Implement reentrant locks and condition waits, with lexical cleanup. Replace
 channel close with an explicit idempotent state transition, waking all waiters
@@ -96,3 +145,27 @@ publication test passes in debug and release, each executing JIT and native AOT
 under moving-GC stress. Full-suite totals were not rerun after that addition.
 Exact commands and limitations are recorded in STATUS.md. None of the future
 concurrency features above is certified by those counts.
+
+## Application-driven acceptance workloads — 2026-10-04
+
+Use real applications alongside focused memory-model litmus tests. An application
+passing through a synchronized subset does not certify arbitrary managed races.
+
+1. **gcr-search**: preserve persisted-index/ordered-query correctness. Extend to
+   incremental refresh and concurrent queries when scope/cancellation semantics
+   exist. Publish immutable index generations through Atom; exercise bounded
+   request queues, refresh cancellation, shutdown and eventually networking/async.
+2. **gcr-logstats**: implemented bounded parallel UTF-8 file summaries. Fixed
+   workers claim files using AtomicI64 and publish immutable summaries using Atom
+   CAS. Serial differential checks cover JIT/native, normal/stress GC and I/O
+   failures. Extend to streaming live monitoring after resource lifetimes and
+   cancellation are defined; exercise blocked readers, queue close and shutdown.
+3. **Service acceptance**: sustained requests, refresh/monitor activity, client
+   disconnects and shutdown during GC. Add networking through real service needs,
+   then bounded async request handling; require correctness and numeric memory,
+   latency and shutdown budgets before declaring the service gate complete.
+
+AtomicI64 cells now have stable root-execution ownership and are reclaimed after
+children drain. Cells remain retained until that boundary; earlier reclamation
+and bounded long-running resource lifetimes remain work. Never free a native
+atomic based on one alias disappearing.

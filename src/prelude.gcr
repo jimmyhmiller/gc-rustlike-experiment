@@ -211,9 +211,8 @@ fn vec_get<T>(v: Vec<T>, i: i64) -> Option<T> {
     if i < 0 || i >= v.len { Option::None } else { Option::Some(array_get_unchecked(v.data, i)) }
 }
 
-// Unchecked indexing: returns the element directly with NO bounds check (the
-// unsafe escape hatch behind `vec_get`). For trusted, already-bounds-checked
-// callers and hot loops; out-of-range is undefined behaviour.
+// Legacy direct-return indexing. The backing array still checks its own bounds:
+// racing metadata changes produce a defined failure instead of a raw bad read.
 fn vec_get_unchecked<T>(v: Vec<T>, i: i64) -> T { array_get_unchecked(v.data, i) }
 
 // `vec_set`/`vec_push` mutate the backing array, so they take `mut v`: under
@@ -1240,16 +1239,21 @@ fn vec_max<T: Ord>(v: Vec<T>) -> Option<T> {
 // Java's `FutureTask.outcome`): the child stores `f()` into a plain heap cell on
 // finish, and because the parent holds the (GC-rooted) handle, the result is
 // traced + relocated for free until joined. Cross-thread safe publication comes
-// from `thread_join` (a real OS thread join = a happens-before edge), NOT from
-// any atomic on the cell — exactly like Java. Lambdas and named fns interchangeable.
+// from `thread_join`: the first observer joins the OS thread; subsequent
+// observers acquire the completion mutex and inherit that publication edge.
+// Lambdas and named fns are interchangeable.
 struct ThreadResult<T> { v: Option<T> }
 
 // Sharing the cell between child (one write, before finishing) and parent (one
-// read, after join) is safe because `thread_join` orders them — assert Sync
+// reads, after join) is safe because `thread_join` orders them — assert Sync
 // (the auto-deriver can't see the join provides the ordering).
 impl Sync for ThreadResult {}
 
 struct Thread<T> { handle: RawPtr, result: ThreadResult<T> }
+
+// Completion records are root-execution-owned. Concurrent joins synchronize
+// before reading the cell; the child is its only writer and writes once.
+impl Sync for Thread {}
 
 impl Thread {
     fn spawn<T>(f: fn() -> T) -> Thread<T> {
@@ -1285,7 +1289,8 @@ impl<T> Thread<T> {
 
 // ---- AtomicI64 — a lock-free shared integer (see docs/threads.md) ----------
 // The cell lives off the GC heap (stable address), so concurrent CAS/fetch_add
-// are safe. Shareable across threads.
+// are safe. The root execution owns cells until all children drain at shutdown.
+// Shareable across threads.
 #[value]
 struct AtomicI64 { cell: RawPtr }
 
@@ -1300,7 +1305,9 @@ impl AtomicI64 {
 }
 
 // ---- Atom<T> — a Clojure-style atom (see docs/threads.md) ------------------
-// Holds a single immutable value. You never mutate in place: you atomically SWAP
+// Operations support scalars and managed references; inline aggregates are rejected.
+// Scalar CAS compares representation bits (including float NaNs/signed zero);
+// reference CAS compares identity. Holds a single immutable value. Atomically SWAP
 // which immutable value the atom points at. `swap` applies a pure function and
 // retries on contention (lock-free CAS loop). Shareable across threads; reads
 // always see a consistent immutable snapshot.
@@ -1340,27 +1347,34 @@ impl<T> Atom<T> {
     }
 }
 
-// ---- Channel<T> — a bounded, blocking message channel (see docs/threads.md) -
-// The element buffer is an on-heap Array<T> (GC traces queued values); a runtime
-// control block (RawPtr) holds the mutex/condvars/indices. send blocks while
-// full, recv blocks while empty (parking, not spinning). Shareable across
-// threads (built from a synchronized control block).
-struct Channel<T> { buf: Array<T>, ctrl: RawPtr }
+// ---- Channel<T> — bounded FIFO with rooted messages and idempotent close ----
+// The zero-length witness carries the generic type only. Runtime-owned slots
+// retain and relocate queued message boxes, independently of witness mutation.
+struct ChannelMessage<T> { value: T }
+struct Channel<T> { buf: Array<ChannelMessage<T>>, ctrl: RawPtr }
 
 impl<T> Channel<T> {
     fn new(cap: i64) -> Channel<T> {
-        let b: Array<T> = array_new(cap);
-        Channel { buf: b, ctrl: chan_new(cap) }
+        let b: Array<ChannelMessage<T>> = array_new(0);
+        Channel { buf: b, ctrl: chan_new(cap, b) }
     }
+    fn send(self, v: T) -> Result<(), T> {
+        let message = ChannelMessage { value: v };
+        if chan_send(self.buf, self.ctrl, message) == 0 { Result::Ok(()) }
+        else { Result::Err(v) }
+    }
+    fn recv(self) -> Option<T> {
+        match chan_recv(self.buf, self.ctrl) {
+            Option::Some(message) => Option::Some(message.value),
+            Option::None => Option::None
+        }
+    }
+    // Convenience for callers whose protocol requires another message.
+    fn recv_value(self) -> T {
+        match self.recv() { Option::Some(value) => value, Option::None => panic("receive on closed drained channel") }
+    }
+    fn close(self) -> i64 { chan_close(self.ctrl); 0 }
+    fn waiting_senders(self) -> i64 { chan_waiting_senders(self.ctrl) }
+    fn waiting_receivers(self) -> i64 { chan_waiting_receivers(self.ctrl) }
 }
-
-impl<T> Channel<T> {
-    fn send(self, v: T) -> i64 { chan_send(self.buf, self.ctrl, v) }
-    fn recv(self) -> T { chan_recv(self.buf, self.ctrl) }
-    fn close(self) -> i64 { chan_sender_drop(self.ctrl); 0 }
-}
-
-// A Channel synchronizes access internally (its control block holds the lock),
-// so it is safe to SHARE across threads — assert Sync explicitly (the auto-
-// deriver can't prove the runtime control block makes the mutable buffer safe).
 impl Sync for Channel {}

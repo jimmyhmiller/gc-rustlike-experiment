@@ -4,7 +4,7 @@ fn main() -> i64 {
   let ch: Channel<i64> = Channel::new(2);
   let t = Thread::spawn(|| produce(ch, 9));
   let mut total = 0; let mut got = 0;
-  while got < 9 { total = total + ch.recv(); got = got + 1; }
+  while got < 9 { total = total + ch.recv_value(); got = got + 1; }
   t.join();
   total + 6   // sum 0..8 = 36, +6 = 42
 }

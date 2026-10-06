@@ -8,16 +8,25 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 /// (e.g., for moving/forwarding pointers). `&self` enables composability —
 /// multiple root sources can be scanned through shared references, behind
 /// `Arc`, etc. Interior mutability (`Cell` for per-thread, `Mutex` for shared)
-/// makes this safe.
-pub trait RootSource {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64));
+/// supplies writable storage; callers still establish quiescence.
+///
+/// # Safety
+/// Implementations must enumerate initialized, writable root words whose
+/// addresses stay valid until collection finishes. They must not resize/free
+/// enumerated storage during the caller's collection interval.
+pub unsafe trait RootSource {
+    /// # Safety
+    /// Root owners are quiescent (unless the visitor only performs atomic
+    /// accesses to pinned atomic slots), slots remain alive through the visit/collection,
+    /// and the visitor interprets bits using the heap's actual pointer policy.
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64));
 }
 
 // Blanket impl: scan a slice of root sources.
-impl<T: RootSource> RootSource for [T] {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl<T: RootSource> RootSource for [T] {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         for source in self {
-            source.scan_roots(visitor);
+            unsafe { source.scan_roots(visitor); }
         }
     }
 }
@@ -96,7 +105,7 @@ impl<const N: usize> RootFrame<N> {
 ///
 /// fn foo(chain: &FrameChain) {
 ///     let mut frame = RootFrame::<2>::new();
-///     let guard = chain.push(&mut frame);
+///     let guard = unsafe { chain.push(&mut frame) };
 ///     frame.slots[0].set(some_heap_ptr as u64);
 ///     frame.slots[1].set(another_ptr as u64);
 ///     // ... do work, may trigger GC which walks chain ...
@@ -114,16 +123,20 @@ impl FrameChain {
         }
     }
 
-    /// Push a frame onto the chain. Returns a guard that pops it on drop.
-    ///
-    /// # Safety contract
-    /// The returned `FrameGuard` borrows the frame mutably, ensuring:
-    /// - The frame outlives the guard (stack discipline)
-    /// - Only one guard exists per frame
-    /// Push a frame onto the chain. Returns a guard that pops it on drop.
-    ///
-    /// Takes `&RootFrame` because all mutable fields use `Cell`.
-    pub fn push<'a, const N: usize>(&'a self, frame: &'a RootFrame<N>) -> FrameGuard<'a> {
+    /// Raw stack registration is explicitly unsafe:
+    /// ```compile_fail
+    /// use gcrust_rt::gc::roots::{FrameChain, RootFrame};
+    /// let chain = FrameChain::new();
+    /// let frame = RootFrame::<1>::new();
+    /// let guard = chain.push(&frame);
+    /// std::mem::forget(guard);
+    /// ```
+    /// Register borrowed frame storage with a manually managed lifetime.
+    /// # Safety
+    /// The frame must remain at this address and registered at most once until
+    /// its guard is dropped. A forgotten guard must be unregistered before the
+    /// frame dies. Mutate/scan only on its owner or while that owner is parked.
+    pub unsafe fn push<'a, const N: usize>(&'a self, frame: &'a RootFrame<N>) -> FrameGuard<'a> {
         frame.header.parent.set(self.top.get());
         // Cast from the whole RootFrame pointer (not &frame.header) so the
         // raw pointer's provenance covers the trailing slots, not just the header.
@@ -132,7 +145,16 @@ impl FrameChain {
                 .cast::<FrameHeader>()
                 .cast_mut(),
         );
-        FrameGuard { chain: self }
+        FrameGuard { chain: self, frame: self.top.get() }
+    }
+
+    /// Root borrowed stack storage for the duration of a callback. The guard
+    /// stays private, so safe code cannot forget it or outlive frame storage.
+    pub fn with_frame<R, const N: usize>(&self, frame: &mut RootFrame<N>, f: impl FnOnce(&RootFrame<N>) -> R) -> R {
+        // The exclusive frame borrow prevents duplicate registration; its
+        // storage outlives this private guard, including unwinding.
+        let _guard = unsafe { self.push(frame) };
+        f(frame)
     }
 
     /// Push a raw FrameHeader pointer onto the chain.
@@ -148,7 +170,7 @@ impl FrameChain {
     pub unsafe fn push_raw<'a>(&'a self, header: *mut FrameHeader) -> FrameGuard<'a> {
         unsafe { (*header).parent.set(self.top.get()) };
         self.top.set(header);
-        FrameGuard { chain: self }
+        FrameGuard { chain: self, frame: self.top.get() }
     }
 
     /// Push a raw FrameHeader without returning a guard.
@@ -191,8 +213,8 @@ impl FrameChain {
     }
 }
 
-impl RootSource for FrameChain {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl RootSource for FrameChain {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         let mut cursor = self.top.get();
         while !cursor.is_null() {
             unsafe {
@@ -209,21 +231,32 @@ impl RootSource for FrameChain {
     }
 }
 
-/// RAII guard that pops a frame from the chain on drop.
-///
-/// Ensures stack discipline: frames are always popped in reverse
-/// push order (guaranteed by Rust's drop order for locals).
+/// Registration guard that unlinks its exact frame on drop. Owned scopes may
+/// retire out of order; raw registrations still carry their lifetime contract.
 pub struct FrameGuard<'a> {
     chain: &'a FrameChain,
+    frame: *mut FrameHeader,
 }
 
-impl<'a> Drop for FrameGuard<'a> {
+impl Drop for FrameGuard<'_> {
     fn drop(&mut self) {
-        let top = self.chain.top.get();
-        assert!(!top.is_null(), "FrameGuard::drop: chain is empty");
-        unsafe {
-            self.chain.top.set((*top).parent.get());
+        // Owned RootScopes may be dropped in any order. Unlink this exact
+        // node; popping the top would leave a freed middle frame registered.
+        let mut cursor = self.chain.top.get();
+        let mut child: *mut FrameHeader = std::ptr::null_mut();
+        while !cursor.is_null() {
+            unsafe {
+                if cursor == self.frame {
+                    let parent = (*cursor).parent.get();
+                    if child.is_null() { self.chain.top.set(parent); }
+                    else { (*child).parent.set(parent); }
+                    return;
+                }
+                child = cursor;
+                cursor = (*cursor).parent.get();
+            }
         }
+        panic!("FrameGuard::drop: registered frame is missing");
     }
 }
 
@@ -354,8 +387,9 @@ impl DynRootFrame {
 
 // ─── Rooted<T> + RootScope (high-level handle abstraction) ─────────
 //
-// `Rooted<'scope, T>` and `RootScope` are the safe, hard-to-misuse face
-// of the rooting machinery. Frontends that hold u64 GC handles in Rust
+// `Rooted<'scope, T>` and `RootScope` provide scoped storage lifetimes for
+// the rooting machinery. Valid managed pointer bits remain a caller obligation.
+// Frontends that hold u64 GC handles in Rust
 // across allocation points (every allocator extern called from JIT, every
 // host-side helper that walks heap-allocated trees) should pin them in a
 // `RootScope`. The compiler's borrow checker enforces that:
@@ -500,7 +534,11 @@ thread_local! {
 
 /// Install `chain` as the thread-local active frame chain. The previous
 /// installation is restored when the returned guard drops.
-pub fn install_chain<'a>(chain: &'a FrameChain) -> InstallChainGuard<'a> {
+/// # Safety
+/// Keep the chain alive until the guard is dropped, including if it is
+/// forgotten, and restore installations strictly in reverse order. Prefer
+/// with_chain, which keeps its restoration guard private.
+pub unsafe fn install_chain<'a>(chain: &'a FrameChain) -> InstallChainGuard<'a> {
     let prev = ACTIVE_CHAIN.with(|c| {
         let p = c.get();
         c.set(chain as *const _);
@@ -510,6 +548,12 @@ pub fn install_chain<'a>(chain: &'a FrameChain) -> InstallChainGuard<'a> {
         prev,
         _phantom: PhantomData,
     }
+}
+
+/// Install an active chain only during a callback, restoring it on every exit.
+pub fn with_chain<R>(chain: &FrameChain, f: impl FnOnce() -> R) -> R {
+    let _guard = unsafe { install_chain(chain) };
+    f()
 }
 
 /// RAII guard restoring the previous thread-local chain on drop.
@@ -592,8 +636,8 @@ impl RootSet {
     }
 }
 
-impl RootSource for RootSet {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl RootSource for RootSet {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         for cell in &self.slots {
             visitor(cell.as_ptr());
         }
@@ -693,8 +737,8 @@ impl AtomicRootSet {
     }
 }
 
-impl RootSource for AtomicRootSet {
-    fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+unsafe impl RootSource for AtomicRootSet {
+    unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
         let ptr = self.ptr.load(Ordering::Relaxed);
         let len = self.len.load(Ordering::Relaxed);
         for i in 0..len {
@@ -755,9 +799,9 @@ mod atomic_root_set_tests {
         rs.add(30);
 
         let mut visited = Vec::new();
-        rs.scan_roots(&mut |slot_ptr| {
-            visited.push(unsafe { *slot_ptr });
-        });
+        unsafe { rs.scan_roots(&mut |slot_ptr| {
+            visited.push(*slot_ptr);
+        }); }
         assert_eq!(visited, vec![10, 20, 30]);
     }
 
@@ -768,12 +812,10 @@ mod atomic_root_set_tests {
         rs.add(200);
 
         // Simulate GC forwarding: double every root value
-        rs.scan_roots(&mut |slot_ptr| {
-            unsafe {
-                let old = *slot_ptr;
-                *slot_ptr = old * 2;
-            }
-        });
+        unsafe { rs.scan_roots(&mut |slot_ptr| {
+            let old = *slot_ptr;
+            *slot_ptr = old * 2;
+        }); }
 
         assert_eq!(rs.get(0), 200);
         assert_eq!(rs.get(1), 400);
@@ -951,14 +993,13 @@ mod atomic_root_set_tests {
             thread::spawn(move || {
                 barrier.wait();
                 for _cycle in 0..100 {
-                    rs.scan_roots(&mut |slot_ptr| {
-                        unsafe {
-                            // Atomic store through the raw pointer
-                            let atomic = slot_ptr as *const AtomicU64;
-                            let old = (*atomic).load(Ordering::Relaxed);
-                            (*atomic).store(old + 1000, Ordering::Relaxed);
-                        }
-                    });
+                    unsafe { rs.scan_roots(&mut |slot_ptr| {
+                        // This test's concurrent visitor uses atomics; it does
+                        // not perform the moving collector's plain slot writes.
+                        let atomic = slot_ptr as *const AtomicU64;
+                        let old = (*atomic).load(Ordering::Relaxed);
+                        (*atomic).store(old + 1000, Ordering::Relaxed);
+                    }); }
                 }
                 gc_done.store(true, Ordering::Release);
             })
@@ -1043,7 +1084,7 @@ mod atomic_root_set_tests {
     fn scan_roots_empty_set() {
         let rs = AtomicRootSet::new();
         let mut count = 0;
-        rs.scan_roots(&mut |_| count += 1);
+        unsafe { rs.scan_roots(&mut |_| count += 1); }
         assert_eq!(count, 0);
     }
 
@@ -1105,10 +1146,10 @@ mod rooted_tests {
 
         // Simulate a moving GC: walk the chain via scan_roots, rewrite
         // every slot to a "relocated" address.
-        chain.scan_roots(&mut |slot| unsafe {
+        unsafe { chain.scan_roots(&mut |slot| {
             let bits = *slot;
             *slot = bits | 0xBBBB_0000;
-        });
+        }); }
 
         assert_eq!(r.get(), 0xAAAA | 0xBBBB_0000,
             "Rooted::get must see the GC's in-place update");
@@ -1144,7 +1185,7 @@ mod rooted_tests {
             // even when not all slots are used; unused slots are zero and
             // a real PtrPolicy will filter them out at decode time.
             let mut visited = Vec::new();
-            chain.scan_roots(&mut |slot| visited.push(unsafe { *slot }));
+            unsafe { chain.scan_roots(&mut |slot| visited.push(*slot)); }
             assert!(visited.contains(&1), "outer root not scanned");
             assert!(visited.contains(&2), "inner root not scanned");
             assert_eq!(visited.iter().filter(|&&v| v != 0).count(), 2);
@@ -1153,7 +1194,7 @@ mod rooted_tests {
         // Inner scope dropped — only outer remains.
         assert_eq!(chain.depth(), 1);
         let mut visited = Vec::new();
-        chain.scan_roots(&mut |slot| visited.push(unsafe { *slot }));
+        unsafe { chain.scan_roots(&mut |slot| visited.push(*slot)); }
         assert!(visited.contains(&1));
         assert_eq!(visited.iter().filter(|&&v| v != 0).count(), 1);
     }
@@ -1172,7 +1213,7 @@ mod rooted_tests {
     #[test]
     fn with_scope_uses_thread_local_chain() {
         let chain = FrameChain::new();
-        let _g = install_chain(&chain);
+        let _g = unsafe { install_chain(&chain) };
         let result = with_scope(2, |scope| {
             let r: Rooted<'_, TestVal> = scope.root(42);
             r.get()
@@ -1193,7 +1234,7 @@ mod rooted_tests {
         let outer_chain = FrameChain::new();
         let inner_chain = FrameChain::new();
 
-        let _g1 = install_chain(&outer_chain);
+        let _g1 = unsafe { install_chain(&outer_chain) };
         // outer is active
         with_scope(1, |s| {
             let _r: Rooted<'_, TestVal> = s.root(10);
@@ -1201,7 +1242,7 @@ mod rooted_tests {
         });
 
         {
-            let _g2 = install_chain(&inner_chain);
+            let _g2 = unsafe { install_chain(&inner_chain) };
             with_scope(1, |s| {
                 let _r: Rooted<'_, TestVal> = s.root(20);
                 assert_eq!(inner_chain.depth(), 1);
@@ -1215,5 +1256,64 @@ mod rooted_tests {
             let _r: Rooted<'_, TestVal> = s.root(30);
             assert_eq!(outer_chain.depth(), 1);
         });
+    }
+}
+
+#[cfg(test)]
+mod registration_lifetime_tests {
+    use super::*;
+
+    fn values(chain: &FrameChain) -> Vec<u64> {
+        let mut values = Vec::new();
+        // Owner-only, all registered storage remains alive during enumeration.
+        unsafe { chain.scan_roots(&mut |slot| values.push(*slot)); }
+        values
+    }
+
+    #[test]
+    fn owned_scopes_can_retire_out_of_order_without_dangling_frames() {
+        let chain = FrameChain::new();
+        let outer = RootScope::new(&chain, 1);
+        let _outer_root = outer.root::<u64>(10);
+        let middle = RootScope::new(&chain, 1);
+        let _middle_root = middle.root::<u64>(20);
+        let inner = RootScope::new(&chain, 1);
+        let _inner_root = inner.root::<u64>(30);
+        drop(middle);
+        assert_eq!(values(&chain), vec![30, 10]);
+        drop(outer);
+        assert_eq!(values(&chain), vec![30]);
+        drop(inner);
+        assert_eq!(chain.depth(), 0);
+    }
+
+    #[test]
+    fn callback_frame_unregisters_on_unwind() {
+        let chain = FrameChain::new();
+        let mut frame = RootFrame::<1>::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            chain.with_frame(&mut frame, |roots| {
+                roots.slots[0].set(42);
+                assert_eq!(values(&chain), vec![42]);
+                panic!("exercise callback cleanup");
+            });
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(chain.depth(), 0);
+    }
+
+    #[test]
+    fn callback_installation_restores_outer_chain_on_unwind() {
+        let outer = FrameChain::new();
+        let inner = FrameChain::new();
+        with_chain(&outer, || {
+            with_scope(1, |scope| { let _root = scope.root::<u64>(10); assert_eq!(values(&outer), vec![10]); });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_chain(&inner, || { panic!("exercise installation cleanup"); });
+            }));
+            assert!(outcome.is_err());
+            with_scope(1, |scope| { let _root = scope.root::<u64>(20); assert_eq!(values(&outer), vec![20]); });
+        });
+        assert!(ACTIVE_CHAIN.with(|active| active.get().is_null()));
     }
 }

@@ -3,8 +3,8 @@
 This is the target language contract, proposed on 2026-10-03. It is not a claim
 that the current compiler implements it. The implementation ledger below is part
 of this document. API spellings for scopes, tasks, locks and async are illustrative
-until their syntax and types are implemented. Existing Thread/Atom/Channel APIs
-retain their current behavior during migration.
+until their syntax and types are implemented. The ledger records implemented
+changes, including typed channel send/receive outcomes.
 
 ## Shared heap and memory model
 
@@ -69,8 +69,9 @@ can still cause an application deadlock.
 
 AtomicI64 load/store/fetch-add/CAS are SC. CAS succeeds exactly when the current
 integer equals the expected integer; it has no spurious failure. Atom<T> uses
-reference identity for reference values and representation-defined equality for
-supported scalar values; aggregate CAS requires a separately specified equality
+reference identity for reference values and bit-pattern equality for
+supported scalar values (NaNs compare by their bits, and positive/negative zero
+are distinct); aggregate CAS requires a separately specified equality
 contract before support. swap's callback may execute repeatedly, so it must not
 perform irreversible effects; only one successful replacement is committed.
 ABA is possible without versioned state. reset is an atomic replacement.
@@ -154,24 +155,25 @@ a thread/task unregisters roots only after its result and failure are published.
 | Area | Observed today | Required before version 1 conformance |
 |---|---|---|
 | Sharing | Direct spawn captures checked against Sync; aliases/higher-order callbacks bypass the check | Race-safe backend and collections, then remove ordinary managed Sync restrictions consistently |
-| Memory | Ordinary heap accesses use LLVM non-atomic loads/stores | SC scalar/reference accesses, coherent aggregate snapshots, synchronized barriers and relocation |
-| Thread start/join | Shared GC heap, environment rooted across start, native join and managed result | Owned runtime completion state; repeat/concurrent join safety; fallible spawn |
-| Join lifetime | Native join reconstructs and frees a Box from a raw handle | Aliased handles must never free or join the same native allocation twice; current alias/repeat join requires repair |
-| Atomics | AtomicI64 and Atom reference operations use SC | Audit mixed managed accesses, supported CAS types and resource reclamation |
-| Channels | Mutex/condition-variable queue; last explicit sender drop closes; capacity clamps to one; closed send returns success-like zero | Explicit close, unsent-value errors, complete wakeups, cancellation-aware waiters and resource lifetime |
+| Memory | Mutable scalar/reference fields and array slots use SC atomics; inline aggregate fields use relocation-aware striped snapshots | Complete collection/initialization and native root API audit; extend conformance coverage |
+| Thread start/join | Shared GC heap, rooted environment/result, root-owned completion state; repeated/concurrent join | Fallible spawn and typed outcomes |
+| Join lifetime | Stable root-owned completion records; OS handle consumed once; JIT/AOT drain abandoned descendants at root exit | Nested scopes and earlier metadata reclamation; cancellable drain |
+| Atomics | AtomicI64 and scalar/reference Atom operations use SC; bool uses byte storage, float CAS compares bits; native cells retire after root children drain | Audit mixed ordinary managed accesses; earlier native-cell reclamation for long-lived roots; aggregate CAS equality design |
+| Channels | Positive-capacity native FIFO with traced message boxes; idempotent close wakes all; send returns Result<(),T>, recv returns Option<T>; drained closed storage retires | Cancellation-aware waiters, async methods and earlier handle-metadata reclamation |
 | Failure | Several failures abort; native join maps native panic to zero | Typed completion outcomes and propagation after cleanup |
 | Tasks/async | No async syntax, continuation frames or scheduler | Cold futures, task scopes, resumable GC roots and blocking executor |
 | Cancellation/shutdown | No structured cancellation or child registry | Scope ownership, checkpoints, waiter removal, deterministic cleanup and root drain |
 | JIT/AOT | Existing thread/atomic/channel tests and parallel app run through both | Same contract suite for every new feature, optimized builds and GC stress |
 
-The capture-check bypass is still a current safety exposure because codegen is
-not race-safe. It is not a reason to make shared mutable objects illegal in the
+The capture-check bypass is still a current safety exposure because collection
+and low-level runtime safety audits are incomplete. It is not a reason to make shared mutable objects illegal in the
 target language. Adding closure provenance restrictions is not the next step.
 
 ## Acceptance and implementation order
 
-1. Repair thread-handle ownership and define native-resource reclamation. Add
-   repeat/concurrent join regressions before exposing cloneable completion handles.
+1. Thread-handle ownership is repaired for root-execution lifetimes (2026-10-04).
+   Preserve repeat/concurrent join and abandoned-descendant regressions; extend
+   reclamation to nested scopes when those are introduced.
 2. Implement managed SC access, aggregate snapshots and collector/barrier
    coordination. Audit collections and all optimizations, then remove Sync gates.
 3. Add reentrant locks, typed outcomes, explicit channel close and scope ownership.

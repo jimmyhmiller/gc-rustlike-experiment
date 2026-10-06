@@ -1,4 +1,5 @@
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex};
 
 use crate::gc::field::{init_header, read_type_id, read_varlen_count, write_varlen_count};
 use crate::gc::header::{Compact, ObjHeader};
@@ -13,7 +14,8 @@ use crate::gc::type_info::{TypeInfo, VarLenKind};
 pub trait Alloc {
     /// Allocate space for an object described by `info` with `varlen_len`
     /// variable-length elements. Returns a zeroed pointer, or null if
-    /// the allocation cannot be satisfied.
+    /// the allocation cannot be satisfied. Atomic managed arenas support
+    /// eight-byte alignment; legacy bump arenas also support larger alignments.
     fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8;
 }
 
@@ -84,7 +86,7 @@ impl AllocWindow {
     /// flip, both under STW or before any mutator runs).
     pub fn point_at(&self, space: &AtomicBumpAllocator, limit: usize) {
         self.cursor.store(
-            &space.cursor as *const AtomicUsize as *mut u8,
+            &*space.cursor as *const AtomicUsize as *mut u8,
             Ordering::Release,
         );
         self.base.store(space.base, Ordering::Release);
@@ -105,6 +107,7 @@ impl AllocWindow {
 pub struct BumpAllocator {
     base: *mut u8,
     cursor: Cell<usize>,
+    allocations: RefCell<Vec<usize>>,
     size: usize,
     type_id_offset: usize,
     owned: bool,
@@ -126,6 +129,7 @@ impl BumpAllocator {
         Self {
             base,
             cursor: Cell::new(0),
+            allocations: RefCell::new(Vec::new()),
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
             owned: true,
@@ -142,6 +146,7 @@ impl BumpAllocator {
         Self {
             base,
             cursor: Cell::new(0),
+            allocations: RefCell::new(Vec::new()),
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
             owned: false,
@@ -151,7 +156,12 @@ impl BumpAllocator {
     /// Reset the cursor to 0. After this, the entire region can be reused.
     ///
     /// Typically called after GC evacuation has copied all live objects out.
-    pub fn reset(&self) {
+    ///
+    /// # Safety
+    /// No old object access or heap walk may overlap reset or subsequent reuse.
+    /// All previous allocations must be retired.
+    pub unsafe fn reset(&self) {
+        self.allocations.borrow_mut().clear();
         self.cursor.set(0);
     }
 
@@ -190,13 +200,23 @@ impl BumpAllocator {
 
 impl Alloc for BumpAllocator {
     fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
-        let obj_size = info.allocation_size(varlen_len);
+        let Some(obj_size) = info.checked_allocation_size(varlen_len) else {
+            return core::ptr::null_mut();
+        };
         let align = 1usize << info.align_log2;
 
         let cur = self.cursor.get();
         // Align cursor up
-        let aligned = (cur + align - 1) & !(align - 1);
-        let new_cursor = aligned + obj_size;
+        let Some(address) = (self.base as usize).checked_add(cur) else {
+            return core::ptr::null_mut();
+        };
+        let Some(padded) = address.checked_add(align - 1) else {
+            return core::ptr::null_mut();
+        };
+        let aligned = (padded & !(align - 1)) - self.base as usize;
+        let Some(new_cursor) = aligned.checked_add(obj_size) else {
+            return core::ptr::null_mut();
+        };
 
         if new_cursor > self.size {
             return core::ptr::null_mut();
@@ -209,6 +229,7 @@ impl Alloc for BumpAllocator {
             core::ptr::write_bytes(ptr, 0, obj_size);
         }
 
+        self.allocations.borrow_mut().push(aligned);
         self.cursor.set(new_cursor);
         ptr
     }
@@ -216,29 +237,10 @@ impl Alloc for BumpAllocator {
 
 impl HeapWalker for BumpAllocator {
     unsafe fn walk(&self, type_table: &[TypeInfo], visitor: &mut dyn FnMut(*mut u8, &TypeInfo)) {
-        let mut offset = 0usize;
-        let used = self.cursor.get();
-
-        while offset < used {
+        for &offset in self.allocations.borrow().iter() {
             let ptr = unsafe { self.base.add(offset) };
             let type_id = unsafe { read_type_id(ptr, self.type_id_offset) };
-            let info = &type_table[type_id as usize];
-
-            // Compute actual object size. For varlen objects we need to read
-            // the element count from the object.
-            let varlen_len = match info.varlen {
-                VarLenKind::None => 0,
-                _ => unsafe { read_varlen_count(ptr, info) },
-            };
-            let obj_size = info.allocation_size(varlen_len);
-
-            visitor(ptr, info);
-
-            // Advance past this object, respecting alignment of the next one.
-            // Since we don't know the next object's alignment here, we advance
-            // by at least obj_size and align to 8 (minimum alignment).
-            let align = 1usize << info.align_log2;
-            offset = ((offset + obj_size) + align - 1) & !(align - 1);
+            visitor(ptr, &type_table[type_id as usize]);
         }
     }
 }
@@ -268,8 +270,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// Uses `fetch_add` with a CAS retry loop for alignment.
 pub struct AtomicBumpAllocator {
+    epoch: AtomicUsize,
+    buffers: Mutex<Vec<Arc<BufferExtent>>>,
     base: *mut u8,
-    cursor: AtomicUsize,
+    // AllocWindow exports this address; boxing keeps it stable when the
+    // allocator or its owning Heap moves during construction.
+    cursor: Box<AtomicUsize>,
     size: usize,
     type_id_offset: usize,
     owned: bool,
@@ -288,8 +294,10 @@ impl AtomicBumpAllocator {
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "AtomicBumpAllocator: allocation failed");
         Self {
+            epoch: AtomicUsize::new(0),
+            buffers: Mutex::new(Vec::new()),
             base,
-            cursor: AtomicUsize::new(0),
+            cursor: Box::new(AtomicUsize::new(0)),
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
             owned: true,
@@ -303,8 +311,11 @@ impl AtomicBumpAllocator {
     /// all GC-traceable fields before the next collection.
     ///
     /// # Safety
-    /// Must only be called when no other thread is allocating.
-    pub fn reset(&self) {
+    /// No allocation, access to old objects, or heap walk may overlap reset.
+    /// All previous allocations and TLAB publications must be retired.
+    pub unsafe fn reset(&self) {
+        self.buffers.lock().unwrap().clear();
+        self.epoch.fetch_add(1, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
     }
 
@@ -319,7 +330,8 @@ impl AtomicBumpAllocator {
 
     /// Number of bytes remaining.
     pub fn remaining(&self) -> usize {
-        self.size.saturating_sub(self.cursor.load(Ordering::Acquire))
+        self.size
+            .saturating_sub(self.cursor.load(Ordering::Acquire))
     }
 
     /// Base pointer of the region.
@@ -345,60 +357,261 @@ impl AtomicBumpAllocator {
     }
 }
 
-impl Alloc for AtomicBumpAllocator {
-    fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
-        let obj_size = info.allocation_size(varlen_len);
-        let align = 1usize << info.align_log2;
-
-        // CAS loop to atomically bump the cursor with alignment
+impl AtomicBumpAllocator {
+    /// Reserve a batch of exact object extents with one cursor CAS. All bytes
+    /// must be initialized before publication, and no linear walk may run until
+    /// reservations complete. No unused copying-buffer tail is introduced.
+    pub(crate) unsafe fn reserve_batch(
+        &self,
+        layouts: &[(usize, usize)],
+        addresses: &mut Vec<*mut u8>,
+    ) -> bool {
         loop {
             let cur = self.cursor.load(Ordering::Relaxed);
-            let aligned = (cur + align - 1) & !(align - 1);
-            let new_cursor = aligned + obj_size;
+            let mut end = cur;
+            addresses.clear();
+            for &(size, align) in layouts {
+                if align != 8 || size == 0 || size % 8 != 0 {
+                    return false;
+                }
+                let Some(padded) = end.checked_add(align - 1) else {
+                    return false;
+                };
+                let aligned = padded & !(align - 1);
+                let Some(next) = aligned.checked_add(size) else {
+                    return false;
+                };
+                if next > self.size {
+                    return false;
+                }
+                addresses.push(unsafe { self.base.add(aligned) });
+                end = next;
+            }
+            if self
+                .cursor
+                .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
 
+    /// Reserve an object extent without clearing it. Collector copying must
+    /// initialize every byte before publishing the object or walking the heap.
+    /// Concurrent linear walks are forbidden until all reservations are filled.
+    pub(crate) unsafe fn alloc_uninitialized(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if info.align_log2 != 3 {
+            return core::ptr::null_mut();
+        }
+        let Some(obj_size) = info.checked_allocation_size(varlen_len) else {
+            return core::ptr::null_mut();
+        };
+        let align = 1usize << info.align_log2;
+        loop {
+            let cur = self.cursor.load(Ordering::Relaxed);
+            let Some(padded) = cur.checked_add(align - 1) else {
+                return core::ptr::null_mut();
+            };
+            let aligned = padded & !(align - 1);
+            let Some(new_cursor) = aligned.checked_add(obj_size) else {
+                return core::ptr::null_mut();
+            };
             if new_cursor > self.size {
                 return core::ptr::null_mut();
             }
-
-            match self.cursor.compare_exchange_weak(
-                cur,
-                new_cursor,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let ptr = unsafe { self.base.add(aligned) };
-                    unsafe {
-                        core::ptr::write_bytes(ptr, 0, obj_size);
-                    }
-                    return ptr;
-                }
-                Err(_) => continue, // Another thread won, retry
+            if self
+                .cursor
+                .compare_exchange_weak(cur, new_cursor, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return unsafe { self.base.add(aligned) };
             }
         }
     }
 }
 
+/// A reserved TLAB with a published initialized prefix. Only the buffer owner
+/// advances initialized; collectors read it after the safepoint handshake.
+struct BufferExtent {
+    start: usize,
+    end: usize,
+    initialized: AtomicUsize,
+}
+
+/// Owning-thread-only allocation state. Descriptors survive thread teardown in
+/// the allocator until reset, so abandoned tails remain accounted for.
+pub(crate) struct Tlab {
+    allocator: usize,
+    epoch: usize,
+    cursor: usize,
+    extent: Option<Arc<BufferExtent>>,
+    target_bytes: usize,
+}
+impl Tlab {
+    pub(crate) fn new() -> Self {
+        Self {
+            allocator: 0,
+            epoch: 0,
+            cursor: 0,
+            extent: None,
+            target_bytes: 2048,
+        }
+    }
+    pub(crate) fn alloc(
+        &mut self,
+        space: &AtomicBumpAllocator,
+        info: &TypeInfo,
+        len: usize,
+    ) -> *mut u8 {
+        if info.align_log2 != 3 {
+            return core::ptr::null_mut();
+        }
+        let Some(size) = info.checked_allocation_size(len) else {
+            return core::ptr::null_mut();
+        };
+        let align = 1usize << info.align_log2;
+        // Large allocations retain exact shared reservations rather than
+        // monopolizing or wasting an ordinary thread-local buffer.
+        if size > 8192 {
+            return space.alloc(info, len);
+        }
+        let identity = space as *const _ as usize;
+        let epoch = space.epoch.load(Ordering::Acquire);
+        if self.allocator != identity || self.epoch != epoch {
+            self.extent = None;
+            self.allocator = identity;
+            self.epoch = epoch;
+        }
+        loop {
+            if let Some(extent) = &self.extent {
+                let aligned = match self.cursor.checked_add(align - 1) {
+                    Some(n) => n & !(align - 1),
+                    None => return core::ptr::null_mut(),
+                };
+                if let Some(end) = aligned.checked_add(size).filter(|&end| end <= extent.end) {
+                    let ptr = unsafe { space.base.add(aligned) };
+                    unsafe {
+                        core::ptr::write_bytes(ptr, 0, size);
+                    }
+                    self.cursor = end;
+                    extent.initialized.store(end, Ordering::Relaxed);
+                    return ptr;
+                }
+            }
+            if self.extent.is_some() {
+                self.target_bytes = (self.target_bytes * 2).min(32768);
+            }
+            self.extent = None;
+            let extent = match space.reserve_buffer(size, align, self.target_bytes) {
+                Some(extent) => extent,
+                None => return core::ptr::null_mut(),
+            };
+            self.cursor = extent.start;
+            self.extent = Some(extent);
+        }
+    }
+}
+impl AtomicBumpAllocator {
+    fn reserve_buffer(
+        &self,
+        minimum: usize,
+        align: usize,
+        target: usize,
+    ) -> Option<Arc<BufferExtent>> {
+        loop {
+            let cur = self.cursor.load(Ordering::Relaxed);
+            let start = cur.checked_add(align - 1)? & !(align - 1);
+            let remaining = self.size.checked_sub(start)?;
+            if remaining < minimum {
+                return None;
+            }
+            let bytes = remaining.min(target.max(minimum)) & !7;
+            if bytes < minimum {
+                return None;
+            }
+            let end = start.checked_add(bytes)?;
+            if self
+                .cursor
+                .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let extent = Arc::new(BufferExtent {
+                start,
+                end,
+                initialized: AtomicUsize::new(start),
+            });
+            self.buffers.lock().unwrap().push(extent.clone());
+            return Some(extent);
+        }
+    }
+
+    /// Initialized object regions, excluding every active or retired TLAB tail.
+    /// Caller must have stopped mutators before interpreting these boundaries.
+    pub(crate) fn initialized_ranges(&self) -> Vec<core::ops::Range<usize>> {
+        let used = self.used();
+        let mut holes: Vec<_> = self
+            .buffers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b.initialized.load(Ordering::Relaxed)..b.end)
+            .filter(|r| !r.is_empty())
+            .collect();
+        holes.sort_unstable_by_key(|r| r.start);
+        let mut ranges = Vec::with_capacity(holes.len() + 1);
+        let mut start = 0;
+        for hole in holes {
+            if start < hole.start {
+                ranges.push(start..hole.start);
+            }
+            start = hole.end;
+        }
+        if start < used {
+            ranges.push(start..used);
+        }
+        ranges
+    }
+}
+
+impl Alloc for AtomicBumpAllocator {
+    fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        let ptr = unsafe { self.alloc_uninitialized(info, varlen_len) };
+        if !ptr.is_null() {
+            unsafe {
+                core::ptr::write_bytes(ptr, 0, info.allocation_size(varlen_len));
+            }
+        }
+        ptr
+    }
+}
+
 impl HeapWalker for AtomicBumpAllocator {
     unsafe fn walk(&self, type_table: &[TypeInfo], visitor: &mut dyn FnMut(*mut u8, &TypeInfo)) {
-        let mut offset = 0usize;
-        let used = self.cursor.load(Ordering::Acquire);
+        for range in self.initialized_ranges() {
+            let mut offset = range.start;
+            while offset < range.end {
+                let ptr = unsafe { self.base.add(offset) };
+                let type_id = unsafe { read_type_id(ptr, self.type_id_offset) };
+                let info = &type_table[type_id as usize];
 
-        while offset < used {
-            let ptr = unsafe { self.base.add(offset) };
-            let type_id = unsafe { read_type_id(ptr, self.type_id_offset) };
-            let info = &type_table[type_id as usize];
+                let varlen_len = match info.varlen {
+                    VarLenKind::None => 0,
+                    _ => unsafe { read_varlen_count(ptr, info) },
+                };
+                let obj_size = info.allocation_size(varlen_len);
 
-            let varlen_len = match info.varlen {
-                VarLenKind::None => 0,
-                _ => unsafe { read_varlen_count(ptr, info) },
-            };
-            let obj_size = info.allocation_size(varlen_len);
+                assert!(
+                    obj_size <= range.end - offset,
+                    "object crosses initialized allocation extent"
+                );
+                visitor(ptr, info);
 
-            visitor(ptr, info);
-
-            let align = 1usize << info.align_log2;
-            offset = ((offset + obj_size) + align - 1) & !(align - 1);
+                let align = 1usize << info.align_log2;
+                offset = ((offset + obj_size) + align - 1) & !(align - 1);
+            }
         }
     }
 }
@@ -451,9 +664,255 @@ pub unsafe extern "C" fn bump_alloc_init_compact(
 /// FFI: reset a bump allocator's cursor to 0.
 ///
 /// # Safety
-/// `allocator` must point to a valid `BumpAllocator`.
+/// `allocator` must point to a valid `BumpAllocator`; all old allocations
+/// must be retired, with no overlapping object access or heap walk.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bump_reset(allocator: *const BumpAllocator) {
     let allocator = unsafe { &*allocator };
-    allocator.reset();
+    unsafe { allocator.reset() };
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use crate::gc::Full;
+
+    #[test]
+    fn exhausted_cursor_cannot_wrap_during_reservation() {
+        let allocator = AtomicBumpAllocator::new::<Full>(4096);
+        let info = TypeInfo::for_header(Full::SIZE);
+        for cursor in [usize::MAX, usize::MAX - 7, usize::MAX - 15] {
+            allocator.cursor.store(cursor, Ordering::Relaxed);
+            assert!(unsafe { allocator.alloc_uninitialized(&info, 0) }.is_null());
+            assert_eq!(allocator.cursor.load(Ordering::Relaxed), cursor);
+        }
+        unsafe { allocator.reset() };
+    }
+    #[test]
+    fn batch_reservation_uses_exact_extents_and_does_not_advance_on_failure() {
+        let allocator = AtomicBumpAllocator::new::<Full>(128);
+        let mut addresses = Vec::new();
+        assert!(unsafe { allocator.reserve_batch(&[(24, 8), (32, 8), (16, 8)], &mut addresses) });
+        assert_eq!(allocator.used(), 72);
+        assert_eq!(
+            addresses
+                .iter()
+                .map(|&ptr| ptr as usize - allocator.base() as usize)
+                .collect::<Vec<_>>(),
+            vec![0, 24, 56]
+        );
+        assert!(!unsafe { allocator.reserve_batch(&[(24, 8), (64, 8)], &mut addresses) });
+        assert_eq!(allocator.used(), 72);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::gc::Full;
+    #[test]
+    fn exported_cursor_address_survives_allocator_moves() {
+        let allocator = AtomicBumpAllocator::new::<Full>(4096);
+        let window = AllocWindow::empty();
+        window.point_at(&allocator, 4096);
+        let exported = window.cursor.load(Ordering::Acquire);
+        let allocator = Box::new(allocator);
+        assert_eq!(
+            exported,
+            &*allocator.cursor as *const AtomicUsize as *mut u8
+        );
+        let info = TypeInfo::for_header(Full::SIZE);
+        assert!(!allocator.alloc(&info, 0).is_null());
+        assert_eq!(
+            unsafe { (&*exported.cast::<AtomicUsize>()).load(Ordering::Acquire) },
+            info.allocation_size(0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tlab_tests {
+    use super::*;
+    use crate::gc::Full;
+
+    #[test]
+    fn initialized_walk_skips_poisoned_active_and_retired_tails() {
+        let space = AtomicBumpAllocator::new::<Full>(128 * 1024);
+        let info = TypeInfo::for_header(Full::SIZE).with_fields(1);
+        let mut first = Tlab::new();
+        let mut second = Tlab::new();
+        for tlab in [&mut first, &mut second] {
+            let obj = tlab.alloc(&space, &info, 0);
+            unsafe {
+                init_header::<Full>(obj, 0);
+            }
+        }
+        // Make treating a buffer's unused bytes as object headers fail loudly.
+        for extent in space.buffers.lock().unwrap().iter() {
+            let start = extent.initialized.load(Ordering::Relaxed);
+            unsafe {
+                core::ptr::write_bytes(space.base.add(start), 0xff, extent.end - start);
+            }
+        }
+        drop(first);
+        let mut count = 0;
+        unsafe {
+            space.walk(&[info], &mut |_, _| count += 1);
+        }
+        assert_eq!(count, 2);
+        // Reusing an active buffer must zero newly allocated fields despite the
+        // poisoned tail, then expand only the initialized prefix.
+        let obj = second.alloc(&space, &info, 0);
+        unsafe {
+            init_header::<Full>(obj, 0);
+            assert_eq!(obj.add(16).cast::<u64>().read(), 0);
+        }
+        count = 0;
+        unsafe {
+            space.walk(&[info], &mut |_, _| count += 1);
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn reset_invalidates_a_partially_used_buffer() {
+        let space = AtomicBumpAllocator::new::<Full>(65536);
+        let info = TypeInfo::for_header(Full::SIZE);
+        let mut tlab = Tlab::new();
+        let old = tlab.alloc(&space, &info, 0);
+        unsafe {
+            init_header::<Full>(old, 0);
+        }
+        unsafe { space.reset() };
+        let fresh = tlab.alloc(&space, &info, 0);
+        assert_eq!(old, fresh);
+        unsafe {
+            init_header::<Full>(fresh, 0);
+        }
+        assert_eq!(space.buffers.lock().unwrap().len(), 1);
+        let mut count = 0;
+        unsafe {
+            space.walk(&[info], &mut |_, _| count += 1);
+        }
+        assert_eq!(count, 1);
+    }
+    #[test]
+    fn buffers_start_small_and_grow_with_allocation_demand() {
+        let space = AtomicBumpAllocator::new::<Full>(512 * 1024);
+        let info = TypeInfo::for_header(Full::SIZE);
+        let mut tlab = Tlab::new();
+        let first = tlab.alloc(&space, &info, 0);
+        unsafe {
+            init_header::<Full>(first, 0);
+        }
+        assert_eq!(space.used(), 2048);
+        for _ in 0..20000 {
+            let ptr = tlab.alloc(&space, &info, 0);
+            assert!(!ptr.is_null());
+            unsafe {
+                init_header::<Full>(ptr, 0);
+            }
+        }
+        let buffers = space.buffers.lock().unwrap();
+        assert_eq!(buffers[0].end - buffers[0].start, 2048);
+        assert!(
+            buffers
+                .iter()
+                .all(|buffer| buffer.end - buffer.start <= 32768)
+        );
+        assert_eq!(
+            buffers.last().unwrap().end - buffers.last().unwrap().start,
+            32768
+        );
+    }
+}
+
+#[cfg(test)]
+mod allocation_boundary_tests {
+    use super::*;
+    use crate::gc::header::Full;
+
+    #[test]
+    fn invalid_extents_leave_bump_and_atomic_cursors_unchanged() {
+        let bump = BumpAllocator::new::<Full>(4096);
+        let atomic = AtomicBumpAllocator::new::<Full>(4096);
+        let bytes = TypeInfo::for_header(Full::SIZE).with_varlen_bytes(0);
+        let over_aligned = bytes.with_align_log2(6);
+        let mut invalid_align = bytes;
+        invalid_align.align_log2 = usize::BITS as u8;
+        for allocator in [&bump as &dyn Alloc, &atomic as &dyn Alloc] {
+            assert!(allocator.alloc(&bytes, usize::MAX).is_null());
+            assert!(allocator.alloc(&invalid_align, 0).is_null());
+
+        }
+        assert!(atomic.alloc(&over_aligned, 0).is_null());
+        assert_eq!(bump.used(), 0);
+        assert_eq!(atomic.used(), 0);
+        assert!(!bump.alloc(&bytes, 8).is_null());
+        assert!(!atomic.alloc(&bytes, 8).is_null());
+        assert_eq!(bump.used(), bytes.checked_allocation_size(8).unwrap());
+        assert_eq!(atomic.used(), bump.used());
+    }
+
+    #[test]
+    fn invalid_tlab_extents_do_not_reserve_or_publish_buffers() {
+        let space = AtomicBumpAllocator::new::<Full>(4096);
+        let bytes = TypeInfo::for_header(Full::SIZE).with_varlen_bytes(0);
+        let mut tlab = Tlab::new();
+        assert!(tlab.alloc(&space, &bytes, usize::MAX).is_null());
+        assert!(tlab.alloc(&space, &bytes.with_align_log2(6), 0).is_null());
+        assert_eq!(space.used(), 0);
+        assert!(space.buffers.lock().unwrap().is_empty());
+        assert!(!tlab.alloc(&space, &bytes, 8).is_null());
+        let before = space.used();
+        let initialized = space.buffers.lock().unwrap()[0]
+            .initialized
+            .load(Ordering::Acquire);
+        assert!(tlab.alloc(&space, &bytes, usize::MAX).is_null());
+        assert_eq!(space.used(), before);
+        assert_eq!(
+            space.buffers.lock().unwrap()[0]
+                .initialized
+                .load(Ordering::Acquire),
+            initialized
+        );
+    }
+
+    #[test]
+    fn invalid_batch_alignment_does_not_advance_shared_cursor() {
+        let space = AtomicBumpAllocator::new::<Full>(4096);
+        let mut addresses = Vec::new();
+        for layouts in [&[(24, 8), (64, 64)][..], &[(0, 8)][..], &[(16, 0)][..]] {
+            assert!(!unsafe { space.reserve_batch(layouts, &mut addresses) });
+            assert_eq!(space.used(), 0);
+        }
+        assert!(unsafe { space.reserve_batch(&[(24, 8)], &mut addresses) });
+        assert_eq!(space.used(), 24);
+    }
+
+
+    #[test]
+    fn legacy_bump_walk_skips_mixed_alignment_padding() {
+        let mut storage = vec![0u8; 4096 + 64];
+        let base = unsafe { storage.as_mut_ptr().add(8) };
+        let bump = unsafe { BumpAllocator::from_region::<Compact>(base, 4096) };
+        let normal = TypeInfo::for_header(Compact::SIZE).with_fields(1);
+        let mut aligned = normal.with_align_log2(6);
+        aligned.type_id = 1;
+        let mut expected = Vec::new();
+        for info in [&normal, &aligned, &normal, &aligned] {
+            let ptr = unsafe { alloc_obj::<Compact>(&bump, info, 0) };
+            assert!(!ptr.is_null());
+            assert_eq!(ptr as usize % (1usize << info.align_log2), 0);
+            expected.push(ptr);
+        }
+        let mut visited = Vec::new();
+        unsafe { bump.walk(&[normal, aligned], &mut |ptr, _| visited.push(ptr)); }
+        assert_eq!(visited, expected);
+        unsafe { bump.reset(); }
+        visited.clear();
+        unsafe { bump.walk(&[normal, aligned], &mut |ptr, _| visited.push(ptr)); }
+        assert!(visited.is_empty());
+    }
+
 }

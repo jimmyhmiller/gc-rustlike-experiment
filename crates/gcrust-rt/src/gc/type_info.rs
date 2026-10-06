@@ -170,6 +170,35 @@ impl TypeInfo {
     }
 
     /// Total allocation size in bytes for an object with `varlen_len` variable-length elements.
+    /// Check arithmetic and the Rust pointer-offset limit before accepting an
+    /// untrusted length. Keep this consistent with `allocation_size` below.
+    pub fn checked_allocation_size(&self, varlen_len: usize) -> Option<usize> {
+        if self.align_log2 < 3 {
+            return None;
+        }
+        let raw_end = self
+            .raw_data_offset()
+            .checked_add(self.raw_byte_count as usize)?;
+        let size = match self.varlen {
+            VarLenKind::None => raw_end.checked_add(7)? & !7,
+            VarLenKind::Values => self
+                .varlen_count_offset()
+                .checked_add(8)?
+                .checked_add(varlen_len.checked_mul(8)?)?,
+            VarLenKind::Bytes => {
+                self.varlen_count_offset()
+                    .checked_add(8)?
+                    .checked_add(varlen_len)?
+                    .checked_add(7)?
+                    & !7
+            }
+        };
+        let align = 1usize.checked_shl(self.align_log2 as u32)?;
+        let total = size.checked_add(align - 1)? & !(align - 1);
+        (total <= isize::MAX as usize).then_some(total)
+    }
+
+    /// Total allocation size for a length validated by checked_allocation_size.
     /// Result is aligned to the object's alignment requirement.
     pub const fn allocation_size(&self, varlen_len: usize) -> usize {
         let size = match self.varlen {
@@ -185,5 +214,48 @@ impl TypeInfo {
         };
         let align = 1usize << self.align_log2;
         (size + align - 1) & !(align - 1)
+    }
+}
+
+#[cfg(test)]
+mod allocation_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn checked_sizes_match_layouts_and_reject_unrepresentable_tails() {
+        for header in [8, 16] {
+            for alignment in [3, 4, 6] {
+                for fields in [0, 3] {
+                    for raw in [0, 7, 32] {
+                        let base = TypeInfo::for_header(header)
+                            .with_fields(fields)
+                            .with_raw_bytes(raw)
+                            .with_align_log2(alignment);
+                        for info in [
+                            base,
+                            base.with_varlen_bytes(fields),
+                            base.with_varlen_values(fields),
+                        ] {
+                            for length in [0, 1, 7, 1001] {
+                                assert_eq!(
+                                    info.checked_allocation_size(length),
+                                    Some(info.allocation_size(length))
+                                );
+                            }
+                            if info.varlen != VarLenKind::None {
+                                for length in [isize::MAX as usize, usize::MAX - 7, usize::MAX] {
+                                    assert_eq!(info.checked_allocation_size(length), None);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut under_aligned = TypeInfo::for_header(16);
+        under_aligned.align_log2 = 2;
+        assert_eq!(under_aligned.checked_allocation_size(0), None);
+        let invalid_alignment = TypeInfo::for_header(16).with_align_log2(255);
+        assert_eq!(invalid_alignment.checked_allocation_size(0), None);
     }
 }

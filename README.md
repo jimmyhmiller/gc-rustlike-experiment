@@ -38,11 +38,15 @@ the extra result line printed by the JIT driver.
 ./target/debug/gcr build examples/project -o /tmp/gcr-calculator
 ```
 
-## Application
+## Applications
 
 [gcr-search](apps/gcr-search/README.md) is a gc-rust CLI that saves a text snapshot
 of a directory and runs literal queries against it. It exercises checked host
 I/O, strings, collections, serialization, native execution, and moving GC.
+
+[gcr-logstats](apps/gcr-logstats/README.md) summarizes real UTF-8 log files with
+atomic work claiming and immutable CAS-published summaries. It exercises a fixed
+worker set, checked parallel I/O, atomics and moving-GC contention.
 
 ## Documentation
 

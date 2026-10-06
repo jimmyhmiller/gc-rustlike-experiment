@@ -33,6 +33,8 @@
 //! `const _: ()` asserts below fail the build if it drifts.
 
 pub mod io;
+pub(crate) mod managed;
+pub use managed::{ai_managed_lock, ai_managed_unlock};
 
 use crate::gc::{AllocWindow, Full, Heap, IdentityPtrPolicy, ThreadState, TypeInfo};
 use std::sync::Arc;
@@ -79,7 +81,7 @@ pub struct Thread {
     /// Safepoint flag. `0` = running normally. Non-zero means the GC has
     /// requested a safepoint; the next safepoint poll traps into
     /// [`ai_gc_pollcheck_slow`].
-    pub state: u8,
+    pub state: std::sync::atomic::AtomicU8,
     _pad: [u8; 7],
 
     /// Head of this thread's shadow-stack chain. Each compiled function
@@ -103,6 +105,8 @@ pub struct Thread {
     pub alloc_window: *const AllocWindow,
     /// Execution-local argv, shared immutably with child mutators.
     pub arguments: Arc<Vec<std::ffi::OsString>>,
+    /// Owning-mutator aggregate critical section; never live at a safepoint.
+    managed_lock: Option<usize>,
 }
 
 pub mod thread_offsets {
@@ -287,13 +291,14 @@ impl RuntimeContext {
 
         let mut ctx = RuntimeContext {
             thread: Box::new(Thread {
-                state: 0,
+                state: std::sync::atomic::AtomicU8::new(0),
                 _pad: [0; 7],
                 top_frame: core::ptr::null_mut(),
                 heap: Arc::as_ptr(&heap) as *mut Heap,
                 dyna_thread: Arc::as_ptr(&dyna),
                 alloc_window,
                 arguments: Arc::new(std::env::args_os().collect()),
+                managed_lock: None,
             }),
             heap,
             dyna,
@@ -301,8 +306,8 @@ impl RuntimeContext {
 
         // Point the safepoint poll flag at the live Thread::state byte so a GC
         // requested from another thread flips the byte this mutator polls.
-        ctx.dyna
-            .set_poll_flag(&mut ctx.thread.state as *mut u8);
+        unsafe { ctx.dyna
+            .set_poll_flag(&mut ctx.thread.state as *mut std::sync::atomic::AtomicU8); }
         ctx
     }
 
@@ -340,9 +345,55 @@ impl RuntimeContext {
     }
 }
 
+impl RuntimeContext {
+    /// Drain root-execution children, including descendants admitted by them.
+    /// Completion metadata is retained until this boundary so borrowed aliases
+    /// never dangle; native OS handles are consumed once by the first observer.
+    ///
+    /// # Safety
+    /// No managed entry may be active on this context's main mutator. Its frame
+    /// chain is retired here; callers must root any managed values they retain
+    /// separately. The JIT code must stay loaded until this method returns.
+    pub unsafe fn finish_threads(&mut self) {
+        // main has returned: its generated frames no longer exist. Keep this
+        // mutator registered but BLOCKED while draining children, so their GC
+        // can proceed without scanning stale main frame addresses.
+        self.thread.top_frame = core::ptr::null_mut();
+        let thread = self.thread_ptr();
+        unsafe {
+            blocking_region(thread, || {
+                let mut index = 0;
+                loop {
+                    // Never hold the registry lock while joining: children may
+                    // spawn more children. Visit those newly registered records
+                    // too, before letting the heap or generated code retire.
+                    let completion = self
+                        .heap
+                        .thread_completions
+                        .lock()
+                        .unwrap()
+                        .get(index)
+                        .cloned();
+                    let Some(completion) = completion else {
+                        break;
+                    };
+                    completion.join();
+                    index += 1;
+                }
+            });
+        }
+        self.heap.thread_completions.lock().unwrap().clear();
+        self.heap.atomic_cells.lock().unwrap().clear();
+        self.heap.channels.lock().unwrap().clear();
+    }
+}
+
 impl Drop for RuntimeContext {
     fn drop(&mut self) {
-        self.heap.safe_deregister_thread(&self.dyna);
+        unsafe {
+            self.finish_threads();
+        }
+        unsafe { self.heap.safe_deregister_thread(&self.dyna) };
     }
 }
 
@@ -354,10 +405,38 @@ impl Drop for RuntimeContext {
 /// The u64 is the closure's result (a scalar, or a GC pointer bit-pattern).
 type ClosureFn = unsafe extern "C" fn(*mut Thread, *mut u8) -> u64;
 
-/// A spawned thread's join handle, owned on the Rust side and handed to compiled
-/// code as an opaque `*mut`. Keeps the heap `Arc` alive for the child's lifetime.
+/// Root-execution-owned completion record. Compiled aliases borrow its stable
+/// address; none owns or frees it. The OS handle is consumed exactly once, and
+/// the scalar outcome is retained for every subsequent observer. Managed Thread
+/// results remain in the traced ThreadResult cell, not in this native record.
 pub struct JoinHandle {
-    handle: Option<std::thread::JoinHandle<u64>>,
+    state: Mutex<JoinState>,
+}
+
+enum JoinState {
+    Running(std::thread::JoinHandle<u64>),
+    Complete(u64),
+    /// Only present while the observer holds the state mutex through OS join.
+    Joining,
+}
+
+impl JoinHandle {
+    fn join(&self) -> u64 {
+        // Managed callers enter a blocking region BEFORE taking this lock. Holding
+        // it through OS join gives each observer the completion publication edge
+        // while allowing the child and other mutators to collect.
+        let mut state = self.state.lock().unwrap();
+        if let JoinState::Complete(result) = *state {
+            return result;
+        }
+        let JoinState::Running(handle) = core::mem::replace(&mut *state, JoinState::Joining) else {
+            unreachable!()
+        };
+        // Preserve the existing native-panic result until typed outcomes exist.
+        let result = handle.join().unwrap_or(0);
+        *state = JoinState::Complete(result);
+        result
+    }
 }
 
 /// Spawn a new OS thread that runs gc-rust closure code against the SAME heap as
@@ -389,20 +468,23 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
     let code_bits = code as usize;
 
     let arguments = unsafe { (*parent).arguments.clone() };
+    let child_heap = heap.clone();
     let join = std::thread::spawn(move || -> u64 {
+        let heap = child_heap;
         // Register this child as a mutator thread on the shared heap.
         let (dyna, _id) = heap.register_thread();
         let alloc_window = heap.alloc_window_ptr();
         let mut thread = Box::new(Thread {
-            state: 0,
+            state: std::sync::atomic::AtomicU8::new(0),
             _pad: [0; 7],
             top_frame: core::ptr::null_mut(),
             heap: Arc::as_ptr(&heap) as *mut Heap,
             dyna_thread: Arc::as_ptr(&dyna),
             alloc_window,
             arguments,
+            managed_lock: None,
         });
-        dyna.set_poll_flag(&mut thread.state as *mut u8);
+        unsafe { dyna.set_poll_flag(&mut thread.state as *mut std::sync::atomic::AtomicU8); }
         let tptr = &mut *thread as *mut Thread;
         set_current_thread(tptr);
 
@@ -410,14 +492,14 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
         // into our own scratch root so it survives the call's allocations, and
         // release the global slot.
         let mark = dyna.scratch_mark();
-        let slot = dyna.push_scratch(heap.globals.get(root_idx) as *const u8);
+        let slot = unsafe { dyna.push_scratch(heap.globals.get(root_idx) as *const u8) };
         heap.globals.set(root_idx, 0); // un-root the global handoff slot
         let env = dyna.scratch_at(slot);
 
         let f: ClosureFn = unsafe { core::mem::transmute(code_bits) };
         let result = unsafe { f(tptr, env) };
 
-        dyna.scratch_reset(mark);
+        unsafe { dyna.scratch_reset(mark); }
         set_current_thread(core::ptr::null_mut());
         // ORDERING INVARIANT (load-bearing): deregister BEFORE `thread` (the
         // Box) drops at end of closure. The poll flag points into `thread.state`
@@ -426,11 +508,16 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
         // removes us from the registry atomically w.r.t. the GC census, so after
         // it returns no collector can `request_poll` into the about-to-free Box.
         // Reordering (dropping `thread` first) would be a use-after-free.
-        heap.safe_deregister_thread(&dyna);
+        unsafe { heap.safe_deregister_thread(&dyna) };
         result
     });
 
-    Box::into_raw(Box::new(JoinHandle { handle: Some(join) }))
+    let completion = Arc::new(JoinHandle {
+        state: Mutex::new(JoinState::Running(join)),
+    });
+    let address = Arc::as_ptr(&completion) as *mut JoinHandle;
+    heap.thread_completions.lock().unwrap().push(completion);
+    address
 }
 
 /// Run `body` while this mutator is transitioned to `STATE_BLOCKED`, so a
@@ -468,8 +555,8 @@ unsafe fn blocking_region<R>(thread: *mut Thread, body: impl FnOnce() -> R) -> R
         struct Unblock<'a>(&'a ThreadState, &'a Heap);
         impl Drop for Unblock<'_> {
             fn drop(&mut self) {
-                self.0.exit_blocked(self.1);
-                self.0.clear_parked_jit_fp();
+                unsafe { self.0.exit_blocked(self.1) };
+                unsafe { self.0.clear_parked_jit_fp() };
             }
         }
         let _guard = Unblock(dyna, heap);
@@ -477,22 +564,17 @@ unsafe fn blocking_region<R>(thread: *mut Thread, body: impl FnOnce() -> R) -> R
     }
 }
 
-/// Join a spawned thread, returning its `u64` result. Consumes the handle.
+/// Observe a spawned thread, returning the same `u64` result on every join.
 /// Transitions the joining thread to BLOCKED so a collection triggered by the
 /// child (or any other thread) can proceed while we wait.
 ///
 /// # Safety
 /// `thread` must be the caller's live mutator thread; `handle` a `*mut JoinHandle`
-/// from `ai_thread_spawn`, not yet joined.
+/// from `ai_thread_spawn` in the same active root execution (before
+/// `RuntimeContext::finish_threads`). Aliases may join concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ai_thread_join(thread: *mut Thread, handle: *mut JoinHandle) -> u64 {
-    unsafe {
-        let mut h = Box::from_raw(handle);
-        match h.handle.take() {
-            Some(j) => blocking_region(thread, move || j.join().unwrap_or(0)),
-            None => 0,
-        }
-    }
+    unsafe { blocking_region(thread, || (&*handle).join()) }
 }
 
 /// `Thread.sleep(ms)`. Transitions to BLOCKED so a sleeping mutator doesn't stall
@@ -515,156 +597,202 @@ pub extern "C" fn ai_thread_yield(_thread: *mut Thread) {
 }
 
 // =============================================================================
-// Channels — Sender<T> / Receiver<T> over a bounded, blocking, on-heap queue
-// =============================================================================
-//
-// Design (mirrors Go's hchan / Java's ArrayBlockingQueue): the element BUFFER is
-// an ON-HEAP object (a varlen pointer array) so the GC traces + relocates the
-// queued values for free — nothing lives off-heap except the indices + sync. A
-// Rust control block holds the mutex + two condvars + head/tail/count/closed.
-// `recv`/`send` block by PARKING on a condvar (never spin), transitioning to
-// BLOCKED so a stop-the-world GC can proceed. The buffer pointer is read fresh
-// from the (frame-rooted) channel object on each access — never held across a
-// wait — so relocation during a park can't dangle it. See `docs/threads.md`.
+use std::sync::{Condvar, Mutex, RwLock};
 
-use std::sync::{Condvar, Mutex};
+// Channels — stable execution-owned metadata and traced native queue slots.
+// =============================================================================
 
 struct ChanState {
     head: usize,
     tail: usize,
     count: usize,
-    cap: usize,
     closed: bool,
-    senders: usize, // live Sender handles; channel auto-closes at 0
+    senders: usize,
+    waiting_senders: usize,
+    waiting_receivers: usize,
 }
 
 pub struct ChanCtrl {
     state: Mutex<ChanState>,
     not_empty: Condvar,
     not_full: Condvar,
+    // Fixed addresses scanned by every major/minor collection under STW.
+    slots: RwLock<Option<Box<[std::sync::atomic::AtomicU64]>>>,
+    cap: usize,
+    array_type: u16,
+    message_type: u16,
 }
 
-/// `Channel::new(cap)` → a `RawPtr` to a fresh control block for a `cap`-slot
-/// channel (the element buffer is allocated separately, on the heap).
-#[unsafe(no_mangle)]
-pub extern "C" fn ai_chan_new(_thread: *mut Thread, cap: i64) -> *mut ChanCtrl {
-    let cap = cap.max(1) as usize;
-    Box::into_raw(Box::new(ChanCtrl {
-        state: Mutex::new(ChanState { head: 0, tail: 0, count: 0, cap, closed: false, senders: 1 }),
-        not_empty: Condvar::new(),
-        not_full: Condvar::new(),
-    }))
-}
+impl ChanCtrl {
+    /// Caller holds a world pause; mutators cannot publish or retire slots.
+    pub(crate) unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
+        // Mutators take this lock only while RUNNING, with the queue state
+        // lock held and no intervening safepoint. Thus no parked mutator can
+        // hold it while the collector scans. Storage cannot retire during STW.
+        let slots = self.slots.read().unwrap();
+        if let Some(slots) = slots.as_ref() {
+            for slot in slots { visitor(slot.as_ptr()); }
+        }
+    }
 
-/// Register a cloned Sender (so the channel doesn't auto-close while it lives).
-///
-/// # Safety
-/// `ctrl` must be a live channel control block.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_chan_sender_clone(thread: *mut Thread, ctrl: *const ChanCtrl) {
-    unsafe { blocking_region(thread, || (*ctrl).state.lock().unwrap()).senders += 1; }
-}
-
-/// Drop a Sender; when the last one goes, close the channel and wake receivers.
-///
-/// # Safety
-/// As [`ai_chan_sender_clone`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_chan_sender_drop(thread: *mut Thread, ctrl: *const ChanCtrl) {
-    unsafe {
-        let c = &*ctrl;
-        let mut st = blocking_region(thread, || c.state.lock().unwrap());
-        st.senders -= 1;
-        if st.senders == 0 {
-            st.closed = true;
-            c.not_empty.notify_all();
+    unsafe fn validate(&self, thread: *mut Thread, witness: *const u8) {
+        let heap = unsafe { &*(*thread).heap };
+        if unsafe { heap.obj_type_id(witness) } != self.array_type {
+            eprintln!("gc-rust: channel handle/message type mismatch");
+            std::process::abort();
         }
     }
 }
 
-/// `sender.send(buf, value)`: store the GC pointer `value` into the heap buffer
-/// `buf` at the tail slot, blocking while the channel is full. Yields i64 0.
-///
+/// Allocate a positive-capacity native queue, registered before publication.
+/// Witness arrays establish the generic type only; their contents/capacity do
+/// not own queue storage. Native slots are roots, not managed array elements.
 /// # Safety
-/// `thread` valid; `buf` a live varlen-pointer-array heap object with at least
-/// `cap` slots; `ctrl` a live control block; `value` a GC pointer or null.
+/// Running owning mutator; witness is a live array of the supplied message type.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_chan_send(thread: *mut Thread, buf: *mut u8, ctrl: *const ChanCtrl, value: *mut u8) -> i64 {
+pub unsafe extern "C" fn ai_chan_new(thread: *mut Thread, cap: i64, witness: *const u8, message_type: u32) -> *mut ChanCtrl {
+    if cap <= 0 || (cap as u64) > (isize::MAX as u64 / 8) {
+        eprintln!("gc-rust: channel capacity must be positive and representable: {cap}");
+        std::process::abort();
+    }
+    let heap = unsafe { &*(*thread).heap };
+    let channel = Arc::new(ChanCtrl {
+        state: Mutex::new(ChanState { head: 0, tail: 0, count: 0, closed: false, senders: 1, waiting_senders: 0, waiting_receivers: 0 }),
+        not_empty: Condvar::new(), not_full: Condvar::new(),
+        slots: RwLock::new(Some((0..cap).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())),
+        cap: cap as usize,
+        array_type: unsafe { heap.obj_type_id(witness) }, message_type: message_type as u16,
+    });
+    let pointer = Arc::as_ptr(&channel).cast_mut();
+    heap.channels.lock().unwrap().push(channel);
+    pointer
+}
+
+/// # Safety
+/// Owning live mutator and live execution-owned channel handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_chan_sender_clone(thread: *mut Thread, ctrl: *const ChanCtrl) {
+    let mut state = unsafe { blocking_region(thread, || (*ctrl).state.lock().unwrap()) };
+    state.senders = state.senders.checked_add(1).expect("channel sender count overflow");
+}
+
+/// Idempotent explicit close: wake both kinds of waiter. Queued values drain.
+/// # Safety
+/// Owning live mutator and live execution-owned channel handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_chan_close(thread: *mut Thread, ctrl: *const ChanCtrl) {
+    let c = unsafe { &*ctrl };
+    let mut state = unsafe { blocking_region(thread, || c.state.lock().unwrap()) };
+    state.closed = true;
+    if state.count == 0 { c.slots.write().unwrap().take(); }
+    c.not_empty.notify_all();
+    c.not_full.notify_all();
+}
+
+/// Queue diagnostics used to observe blocked participants, under the same lock.
+/// # Safety
+/// Live owning mutator and execution-owned channel handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_chan_waiting_senders(thread: *mut Thread, ctrl: *const ChanCtrl) -> i64 {
+    unsafe { blocking_region(thread, || (*ctrl).state.lock().unwrap()).waiting_senders as i64 }
+}
+/// # Safety
+/// As ai_chan_waiting_senders.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_chan_waiting_receivers(thread: *mut Thread, ctrl: *const ChanCtrl) -> i64 {
+    unsafe { blocking_region(thread, || (*ctrl).state.lock().unwrap()).waiting_receivers as i64 }
+}
+
+/// # Safety
+/// As ai_chan_close; each sender registration may be retired once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_chan_sender_drop(thread: *mut Thread, ctrl: *const ChanCtrl) {
+    let c = unsafe { &*ctrl };
+    let mut state = unsafe { blocking_region(thread, || c.state.lock().unwrap()) };
+    if state.senders > 0 { state.senders -= 1; }
+    if state.senders == 0 {
+        state.closed = true;
+        if state.count == 0 { c.slots.write().unwrap().take(); }
+        c.not_empty.notify_all();
+        c.not_full.notify_all();
+    }
+}
+
+/// Return 0 on commitment, 1 on closed (the caller retains the unsent value).
+/// FIFO linearization occurs under the state lock when the slot is installed.
+/// # Safety
+/// Live owning mutator, witness array, handle and initialized message box.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_chan_send(thread: *mut Thread, witness: *mut u8, ctrl: *const ChanCtrl, value: *mut u8) -> i64 {
     unsafe {
         let c = &*ctrl;
+        c.validate(thread, witness);
         let t = &*thread;
-        let dyna = &*t.dyna_thread;
         let heap = &*t.heap;
-        // Root `value` AND `buf` in scratch so a GC during the park relocates
-        // them (they're held as raw Rust args, not in the published frame). We
-        // re-read both from scratch after waking.
-        let mark = dyna.scratch_mark();
-        let vslot = dyna.push_scratch(value as *const u8);
-        let bslot = dyna.push_scratch(buf as *const u8);
-        let mut st = blocking_region(thread, || c.state.lock().unwrap());
-        // Block while full. Publish our frame + go BLOCKED so a GC can run while
-        // we park.
-        while st.count == st.cap && !st.closed {
+        if value.is_null() || heap.obj_type_id(value) != c.message_type {
+            eprintln!("gc-rust: channel message type mismatch");
+            std::process::abort();
+        }
+        let dyna = &*t.dyna_thread;
+        let roots = dyna.scratch_scope();
+        let vslot = roots.push(value);
+        let mut state = blocking_region(thread, || c.state.lock().unwrap());
+        while state.count == c.cap && !state.closed {
             dyna.set_parked_jit_fp(t.top_frame as *const u8);
             dyna.enter_blocked();
-            st = c.not_full.wait(st).unwrap();
+            state.waiting_senders += 1;
+            state = c.not_full.wait(state).unwrap();
+            state.waiting_senders -= 1;
             dyna.exit_blocked(heap);
             dyna.clear_parked_jit_fp();
         }
-        if st.closed { dyna.scratch_reset(mark); return 0; }
-        // Re-read the (possibly relocated) buffer + value from scratch.
-        let buf = dyna.scratch_at(bslot);
-        let value = dyna.scratch_at(vslot);
-        let slot = buf.add(STR_DATA_OFF + st.tail * 8) as *mut *mut u8;
-        *slot = value;
-        // Generational write barrier: buffer (maybe old) ← value (maybe young).
-        if heap.has_nursery() && !value.is_null() && heap.is_nursery(value) && heap.is_tenured(buf) {
-            heap.mark_card_dirty(buf);
+        if state.closed { return 1; }
+        {
+            let slots = c.slots.read().unwrap();
+            slots.as_ref().expect("open channel has storage")[state.tail]
+                .store(roots.get(vslot) as u64, Ordering::SeqCst);
         }
-        dyna.scratch_reset(mark);
-        st.tail = (st.tail + 1) % st.cap;
-        st.count += 1;
+        state.tail = (state.tail + 1) % c.cap;
+        state.count += 1;
         c.not_empty.notify_one();
         0
     }
 }
 
-/// `receiver.recv(buf)`: pop the head element from the heap buffer `buf`,
-/// blocking while empty. Returns the GC pointer (or null when the channel is
-/// closed and drained — the language wraps this as `None`).
-///
+/// Return null only for closed+drained. Popped values transfer from the native
+/// slot root to the running caller without a safepoint in between.
 /// # Safety
-/// As [`ai_chan_send`].
+/// Live owning mutator, witness array and channel handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_chan_recv(thread: *mut Thread, buf: *mut u8, ctrl: *const ChanCtrl) -> *mut u8 {
+pub unsafe extern "C" fn ai_chan_recv(thread: *mut Thread, witness: *mut u8, ctrl: *const ChanCtrl) -> *mut u8 {
     unsafe {
         let c = &*ctrl;
+        c.validate(thread, witness);
         let t = &*thread;
         let dyna = &*t.dyna_thread;
         let heap = &*t.heap;
-        let mark = dyna.scratch_mark();
-        let bslot = dyna.push_scratch(buf as *const u8);
-        let mut st = blocking_region(thread, || c.state.lock().unwrap());
-        while st.count == 0 && !st.closed {
+        let mut state = blocking_region(thread, || c.state.lock().unwrap());
+        while state.count == 0 && !state.closed {
             dyna.set_parked_jit_fp(t.top_frame as *const u8);
             dyna.enter_blocked();
-            st = c.not_empty.wait(st).unwrap();
+            state.waiting_receivers += 1;
+            state = c.not_empty.wait(state).unwrap();
+            state.waiting_receivers -= 1;
             dyna.exit_blocked(heap);
             dyna.clear_parked_jit_fp();
         }
-        if st.count == 0 {
-            dyna.scratch_reset(mark);
-            return core::ptr::null_mut(); // closed + drained → None
-        }
-        let buf = dyna.scratch_at(bslot);
-        let slot = buf.add(STR_DATA_OFF + st.head * 8) as *mut *mut u8;
-        let v = *slot;
-        *slot = core::ptr::null_mut(); // clear so the GC can reclaim it after recv
-        st.head = (st.head + 1) % st.cap;
-        st.count -= 1;
+        if state.count == 0 { return core::ptr::null_mut(); }
+        let value = {
+            let slots = c.slots.read().unwrap();
+            slots.as_ref().expect("queued channel has storage")[state.head]
+                .swap(0, Ordering::SeqCst) as *mut u8
+        };
+        assert!(!value.is_null(), "committed channel slot is empty");
+        state.head = (state.head + 1) % c.cap;
+        state.count -= 1;
+        if state.closed && state.count == 0 { c.slots.write().unwrap().take(); }
         c.not_full.notify_one();
-        dyna.scratch_reset(mark);
-        v
+        value
     }
 }
 
@@ -672,23 +800,31 @@ pub unsafe extern "C" fn ai_chan_recv(thread: *mut Thread, buf: *mut u8, ctrl: *
 // AtomicI64 — a lock-free shared integer cell
 // =============================================================================
 //
-// The cell lives OFF the GC heap (a leaked Box), so its address is stable: the
+// The cell lives OFF the GC heap (an execution-owned Arc), so its address is stable: the
 // relocating collector never moves it, and concurrent CAS/fetch-add operate on a
 // fixed location. The gc-rust handle is a `RawPtr` to this `AtomicI64`. (Scalars
 // aren't GC pointers, so the cell needs no root registration.)
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-/// `AtomicI64::new(v)` → a `RawPtr` to a fresh off-heap atomic cell.
+/// `AtomicI64::new(v)` → a borrowed pointer to a stable execution-owned cell.
+/// All aliases remain valid until root shutdown has drained every child.
+///
+/// # Safety
+/// `thread` must be a live mutator in the owning root execution.
 #[unsafe(no_mangle)]
-pub extern "C" fn ai_atomic_i64_new(_thread: *mut Thread, v: i64) -> *mut AtomicI64 {
-    Box::into_raw(Box::new(AtomicI64::new(v)))
+pub unsafe extern "C" fn ai_atomic_i64_new(thread: *mut Thread, v: i64) -> *mut AtomicI64 {
+    let cell = Arc::new(AtomicI64::new(v));
+    let address = Arc::as_ptr(&cell) as *mut AtomicI64;
+    let heap = unsafe { &*(*thread).heap };
+    heap.atomic_cells.lock().unwrap().push(cell);
+    address
 }
 
 /// `a.load()` (SeqCst).
 ///
 /// # Safety
-/// `a` must be a live cell from `ai_atomic_i64_new`.
+/// `a` must be a cell from `ai_atomic_i64_new` in an active root execution.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ai_atomic_i64_load(_thread: *mut Thread, a: *const AtomicI64) -> i64 {
     unsafe { (*a).load(Ordering::SeqCst) }
@@ -924,6 +1060,9 @@ pub unsafe extern "C" fn gcr_runtime_main(
     // Publish the current thread so FFI callback trampolines can recover it.
     set_current_thread(thread);
     let result = entry(thread);
+    unsafe {
+        rt.finish_threads();
+    }
     // Opt-in heap dump: render the live object graph with reflection metadata,
     // after the program returns (heap quiescent). `GCR_HEAP_DUMP=json` emits a
     // structured snapshot for tooling; any other non-empty value emits text.
@@ -1213,6 +1352,10 @@ pub unsafe extern "C" fn ai_gc_alloc_varlen(
         let t = &*thread;
         let heap = &*t.heap;
         let info: &TypeInfo = heap.type_info_by_id(type_id as u16);
+        if info.checked_allocation_size(varlen_len as usize).is_none() {
+            eprintln!("gc-rust: variable-length allocation size overflow");
+            std::process::abort();
+        }
         let p = alloc_with_published_frame(t, heap, info, varlen_len as usize);
         // Allocation-site profiling (Target-1b) — see `ai_gc_alloc_fixed`.
         if !p.is_null() {
@@ -1277,11 +1420,8 @@ pub unsafe extern "C" fn ai_str_copy_to_buf(_thread: *mut Thread, s: *const u8, 
 /// `obj` must be a valid varlen object with at least `byte_len` data bytes; `dst`
 /// must point to at least `byte_len` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_buf_copy_in(_thread: *mut Thread, obj: *const u8, dst: *mut u8, byte_len: i64) {
-    unsafe {
-        let src = obj.add(STR_DATA_OFF);
-        core::ptr::copy_nonoverlapping(src, dst, byte_len as usize);
-    }
+pub unsafe extern "C" fn ai_buf_copy_in(_thread: *mut Thread, obj: *const u8, dst: *mut u8, byte_len: i64, bits: i64) {
+    unsafe { managed::copy_scalar_buffer(obj.add(STR_DATA_OFF).cast_mut(), dst, byte_len, bits, false); }
 }
 
 /// FFI copy-out: copy `byte_len` bytes from the stack buffer `src` BACK into a
@@ -1292,11 +1432,8 @@ pub unsafe extern "C" fn ai_buf_copy_in(_thread: *mut Thread, obj: *const u8, ds
 /// `obj` must be a valid varlen object with room for `byte_len` data bytes; `src`
 /// must point to at least `byte_len` readable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_buf_copy_out(_thread: *mut Thread, obj: *mut u8, src: *const u8, byte_len: i64) {
-    unsafe {
-        let dst = obj.add(STR_DATA_OFF);
-        core::ptr::copy_nonoverlapping(src, dst, byte_len as usize);
-    }
+pub unsafe extern "C" fn ai_buf_copy_out(_thread: *mut Thread, obj: *mut u8, src: *const u8, byte_len: i64, bits: i64) {
+    unsafe { managed::copy_scalar_buffer(obj.add(STR_DATA_OFF), src.cast_mut(), byte_len, bits, true); }
 }
 
 /// FFI boundary: enter a foreign (`extern "C"`) call. Publishes this thread's
@@ -1412,14 +1549,14 @@ unsafe fn alloc_with_published_frame(
             // Generational: allocate in the nursery; on full, a MINOR GC (cheap,
             // scavenges only the young generation), retry, then fall back to a
             // major GC, and finally to tenured space directly.
-            let mut p = heap.alloc_nursery_obj::<Full>(info, varlen_len);
+            let mut p = heap.alloc_mutator_obj::<Full>(dyna, info, varlen_len);
             if p.is_null() {
                 heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(dyna);
-                p = heap.alloc_nursery_obj::<Full>(info, varlen_len);
+                p = heap.alloc_mutator_obj::<Full>(dyna, info, varlen_len);
             }
             if p.is_null() {
                 heap.mutator_triggered_gc::<IdentityPtrPolicy>(dyna);
-                p = heap.alloc_nursery_obj::<Full>(info, varlen_len);
+                p = heap.alloc_mutator_obj::<Full>(dyna, info, varlen_len);
             }
             if p.is_null() {
                 // The object doesn't fit the (just-cleared) nursery — allocate it
@@ -1429,10 +1566,10 @@ unsafe fn alloc_with_published_frame(
             p
         } else {
             // Non-generational semi-space: from-space, then a major GC + retry.
-            let mut p = heap.alloc_obj::<Full>(info, varlen_len);
+            let mut p = heap.alloc_mutator_obj::<Full>(dyna, info, varlen_len);
             if p.is_null() {
                 heap.mutator_triggered_gc::<IdentityPtrPolicy>(dyna);
-                p = heap.alloc_obj::<Full>(info, varlen_len);
+                p = heap.alloc_mutator_obj::<Full>(dyna, info, varlen_len);
             }
             p
         };
@@ -1477,6 +1614,28 @@ pub extern "C" fn ai_bounds_fail(_thread: *mut Thread, index: i64, len: i64) -> 
         index, len
     );
     std::process::abort();
+}
+
+/// Reference/value array slots have no universal default inhabitant. Null is
+/// internal unpublished storage, never a valid source-language element.
+#[unsafe(no_mangle)]
+pub extern "C" fn ai_uninitialized_array_fail(_thread: *mut Thread, index: i64) -> ! {
+    eprintln!("gc-rust: uninitialized array element at index {index}");
+    std::process::abort();
+}
+
+/// Validate source-language array lengths before computing the allocator's
+/// trailing count. This is nonallocating and cannot suspend the mutator.
+#[unsafe(no_mangle)]
+pub extern "C" fn ai_array_allocation_len(
+    _thread: *mut Thread, count: i64, stride: u64, traced: i32,
+) -> u64 {
+    let bytes = (count as u64).checked_mul(stride);
+    if count < 0 || stride == 0 || bytes.is_none_or(|n| n > isize::MAX as u64) {
+        eprintln!("gc-rust: invalid array length: {count} (element size {stride})");
+        std::process::abort();
+    }
+    if traced != 0 { count as u64 } else { bytes.unwrap() }
 }
 
 #[unsafe(no_mangle)]
@@ -1626,7 +1785,8 @@ pub unsafe extern "C" fn ai_str_join(thread: *mut Thread, type_id: u32, array: *
         let mut bytes = Vec::new();
         for index in 0..count as usize {
             if index > 0 { bytes.extend_from_slice(sep); }
-            let string = *(array.add(STR_DATA_OFF + index * 8) as *const *const u8);
+            let string = (&*array.add(STR_DATA_OFF + index * 8).cast::<std::sync::atomic::AtomicPtr<u8>>()).load(Ordering::SeqCst);
+            if string.is_null() { ai_uninitialized_array_fail(thread, index as i64); }
             bytes.extend_from_slice(str_bytes(string));
         }
         alloc_string_from_bytes(thread, type_id, &bytes)
@@ -1791,5 +1951,92 @@ pub unsafe extern "C" fn ai_gc_pollcheck_slow(thread: *mut Thread) {
         dyna.set_parked_jit_fp(t.top_frame as *const u8);
         dyna.enter_safepoint();
         dyna.clear_parked_jit_fp();
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn completed_native_thread_can_be_observed_repeatedly() {
+        let native = std::thread::spawn(|| 81);
+        // Exercise completion before the first observer, without timing sleeps.
+        while !native.is_finished() {
+            std::thread::yield_now();
+        }
+        let completion = JoinHandle {
+            state: Mutex::new(JoinState::Running(native)),
+        };
+        assert_eq!(completion.join(), 81);
+        assert_eq!(completion.join(), 81);
+        assert!(matches!(
+            *completion.state.lock().unwrap(),
+            JoinState::Complete(81)
+        ));
+    }
+
+    #[test]
+    fn atomic_cells_keep_stable_aliases_and_retire_with_root_execution() {
+        let mut context = RuntimeContext::new(1 << 20, vec![]);
+        let heap = context.heap().clone();
+        let first = unsafe { ai_atomic_i64_new(context.thread_ptr(), 7) };
+        let weak = Arc::downgrade(&heap.atomic_cells.lock().unwrap()[0]);
+        // Force registry growth; previously returned addresses must stay valid.
+        for n in 0..1024 {
+            unsafe { ai_atomic_i64_new(context.thread_ptr(), n) };
+        }
+        let alias = first;
+        unsafe {
+            assert_eq!(ai_atomic_i64_fetch_add(context.thread_ptr(), first, 3), 7);
+            assert_eq!(ai_atomic_i64_load(context.thread_ptr(), alias), 10);
+        }
+        drop(context);
+        assert!(heap.atomic_cells.lock().unwrap().is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn retired_runtime_detaches_poll_storage_with_retained_state() {
+        let context = RuntimeContext::new(1 << 20, vec![]);
+        let state = context.dyna.clone();
+        drop(context);
+        // Safe coordinator operations must not write a freed Thread::state.
+        state.request_poll();
+        state.clear_poll();
+    }
+
+    #[test]
+    fn channel_native_metadata_retires_after_execution_with_retained_heap() {
+        let array = TypeInfo::for_header(16).with_varlen_values(0).with_type_id(0);
+        let message = TypeInfo::for_header(16).with_raw_bytes(8).with_type_id(1);
+        let mut context = RuntimeContext::new(1 << 20, vec![array, message]);
+        let heap = context.heap().clone();
+        let thread = context.thread_ptr();
+        let witness = unsafe { ai_gc_alloc_varlen(thread, 0, 0, 0) };
+        let handle = unsafe { ai_chan_new(thread, 1, witness, 1) };
+        let weak = Arc::downgrade(&heap.channels.lock().unwrap()[0]);
+        for _ in 0..128 { unsafe { ai_chan_new(thread, 2, witness, 1); } }
+        // Registry growth cannot invalidate a borrowed handle or its slots.
+        unsafe { ai_chan_close(thread, handle); ai_chan_close(thread, handle); }
+        assert!(unsafe { &*handle }.state.lock().unwrap().closed);
+        assert!(unsafe { &*handle }.slots.read().unwrap().is_none());
+        drop(context);
+        assert!(heap.channels.lock().unwrap().is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn teardown_releases_completion_records_even_if_embedder_keeps_heap() {
+        let context = RuntimeContext::new(1 << 20, vec![]);
+        let heap = context.heap().clone();
+        let completion = Arc::new(JoinHandle {
+            state: Mutex::new(JoinState::Running(std::thread::spawn(|| 42))),
+        });
+        let weak = Arc::downgrade(&completion);
+        heap.thread_completions.lock().unwrap().push(completion);
+        drop(context);
+        assert!(heap.thread_completions.lock().unwrap().is_empty());
+        assert!(weak.upgrade().is_none());
     }
 }
