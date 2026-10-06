@@ -810,6 +810,9 @@ impl<P: PtrPolicy> MutatorThread<P> {
     /// All live managed references must remain registered and valid through any
     /// collection; allocation descriptors must match this heap and header.
     pub unsafe fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.heap.accepts_allocation(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         if self.heap.gc_every_alloc() {
             self.trigger_gc();
         }
@@ -826,6 +829,9 @@ impl<P: PtrPolicy> MutatorThread<P> {
     /// All live managed references must remain registered and valid through any
     /// collection; allocation descriptors must match this heap and header.
     pub unsafe fn alloc_obj<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.heap.accepts_header::<H>(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         if self.heap.gc_every_alloc() {
             self.trigger_gc();
         }
@@ -855,10 +861,10 @@ impl<P: PtrPolicy> MutatorThread<P> {
                 return ptr;
             }
             // Last resort: allocate directly in tenured
-            self.heap.alloc_tenured(info, varlen_len)
+            unsafe { self.heap.alloc_tenured(info, varlen_len) }
         } else {
             self.trigger_gc();
-            self.heap.alloc(info, varlen_len)
+            unsafe { self.heap.alloc(info, varlen_len) }
         }
     }
 
@@ -884,10 +890,10 @@ impl<P: PtrPolicy> MutatorThread<P> {
                 return ptr;
             }
             // Last resort: tenured
-            self.heap.alloc_obj::<H>(info, varlen_len)
+            unsafe { self.heap.alloc_obj::<H>(info, varlen_len) }
         } else {
             self.trigger_gc();
-            self.heap.alloc_obj::<H>(info, varlen_len)
+            unsafe { self.heap.alloc_obj::<H>(info, varlen_len) }
         }
     }
 

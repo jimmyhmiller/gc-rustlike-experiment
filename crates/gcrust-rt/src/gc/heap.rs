@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::gc::field::{read_type_id, read_varlen_count};
-use crate::gc::header::ObjHeader;
+use crate::gc::header::{HeaderLayout, ObjHeader};
 use crate::gc::reflect::{AllocSite, TypeMeta, ValueMeta};
 use crate::gc::roots::{AtomicRootSet, RootSource};
 use crate::gc::scan::scan_object;
@@ -167,6 +167,7 @@ pub struct Heap {
     gc_lock: Mutex<()>,
 
     type_id_offset: usize,
+    header: HeaderLayout,
     type_table: Vec<TypeInfo>,
     /// Cold, optional reflection metadata (type/field names + field types),
     /// parallel to `type_table` by `type_id`. Set once at startup via
@@ -271,6 +272,7 @@ pub struct AllocSiteStat {
 impl Heap {
     /// Create a new heap with two spaces of `space_size` bytes each.
     pub fn new<H: ObjHeader>(space_size: usize, type_table: Vec<TypeInfo>) -> Self {
+        Self::validate_type_table::<H>(&type_table);
         let heap = Heap {
             spaces: [
                 AtomicBumpAllocator::new::<H>(space_size),
@@ -289,6 +291,7 @@ impl Heap {
             gc_requested: AtomicBool::new(false),
             gc_lock: Mutex::new(()),
             type_id_offset: H::TYPE_ID_OFFSET,
+            header: HeaderLayout::of::<H>(),
             type_table,
             type_meta: OnceLock::new(),
             value_meta: OnceLock::new(),
@@ -305,7 +308,9 @@ impl Heap {
             jit_frame_walker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             collector_workers: OnceLock::new(),
         };
-        heap.alloc_window.point_at(&heap.spaces[0], space_size);
+        unsafe {
+            heap.alloc_window.point_at(&heap.spaces[0], space_size);
+        }
         heap
     }
 
@@ -315,7 +320,12 @@ impl Heap {
     /// New allocations go to the nursery. When the nursery fills, a minor
     /// GC promotes survivors to tenured from-space. When tenured space fills,
     /// a major GC (STW or concurrent) collects the old generation.
-    pub fn new_generational<H: ObjHeader>(nursery_size: usize, tenured_size: usize, type_table: Vec<TypeInfo>) -> Self {
+    pub fn new_generational<H: ObjHeader>(
+        nursery_size: usize,
+        tenured_size: usize,
+        type_table: Vec<TypeInfo>,
+    ) -> Self {
+        Self::validate_type_table::<H>(&type_table);
         let spaces = [
             AtomicBumpAllocator::new::<H>(tenured_size),
             AtomicBumpAllocator::new::<H>(tenured_size),
@@ -339,6 +349,7 @@ impl Heap {
             gc_requested: AtomicBool::new(false),
             gc_lock: Mutex::new(()),
             type_id_offset: H::TYPE_ID_OFFSET,
+            header: HeaderLayout::of::<H>(),
             type_table,
             type_meta: OnceLock::new(),
             value_meta: OnceLock::new(),
@@ -362,7 +373,9 @@ impl Heap {
         // Generational mode allocates via the nursery path, which the
         // JIT inline window does not model — leave the window CLOSED
         // (limit 0) so inline allocation always defers to the runtime.
-        heap.alloc_window.point_at(&heap.spaces[0], 0);
+        unsafe {
+            heap.alloc_window.point_at(&heap.spaces[0], 0);
+        }
         heap
     }
 
@@ -373,10 +386,12 @@ impl Heap {
     /// non-null, the walker is invoked with that fp and a visitor.
     ///
     /// # Safety
-    /// The walker must remain valid for the lifetime of the Heap.
+    /// The walker must remain valid for the lifetime of the Heap and match all
+    /// published JIT frame layouts. Install/replace it only before mutators run
+    /// or under a world pause with no walker invocation in progress.
     /// The supplied `*mut u64` slots must be live for the duration of
     /// the visitor call (they are, by the safepoint contract).
-    pub fn set_jit_frame_walker(
+    pub unsafe fn set_jit_frame_walker(
         &self,
         walker: unsafe fn(*const u8, &mut dyn FnMut(*mut u64)),
     ) {
@@ -468,44 +483,55 @@ impl Heap {
         }
     }
 
-    /// Dynamically register a new `TypeInfo`, growing `type_table` in place.
-    /// Returns the new `type_id` (= the prior length).
+    /// Register a layout before sharing the heap, assigning its stable type id.
+    /// Exclusive access prevents table reallocation from racing readers or
+    /// invalidating borrowed layouts. A shared runtime must regain exclusive
+    /// ownership before adding types; a world pause alone does not end Rust
+    /// borrows of existing entries.
     ///
-    /// Used by the **code-fetch handshake**: when a server receives a
-    /// `Code` frame containing a closure / struct / enum shape whose
-    /// `TypeInfo` wasn't known at heap-construction time, it needs to
-    /// register a new entry so subsequent `alloc_obj` calls (and GC
-    /// scans of those objects) find the right shape.
-    ///
-    /// # Safety
-    ///
-    /// This mutates a `Vec<TypeInfo>` through a `&self` reference using
-    /// interior mutability via raw pointers. The contract is:
-    ///
-    /// - **No concurrent GC.** The GC reads `type_table` from any
-    ///   thread; a concurrent grow could observe a moved buffer. Caller
-    ///   must ensure no GC is in progress AND that no mutator is
-    ///   running JIT'd code that could trigger a GC.
-    /// - **No concurrent calls.** Two simultaneous `dynamic_add_type`
-    ///   calls would race.
-    ///
-    /// Both are satisfied by the sole caller, `IncrementalJit::install`,
-    /// which runs this under a [`Heap::pause_world`] guard (every other
-    /// mutator parked + `gc_lock` held → no concurrent GC or JIT) and
-    /// whose `&mut Runtime` signature already excludes concurrent installs.
-    /// - **Stable indices.** Pre-existing `type_id`s remain valid: we
-    ///   only push, never reorder or shrink. Pointers into `type_table`
-    ///   may dangle if the Vec reallocates — but the only places that
-    ///   read are `&self.type_table[idx]` accessors that re-borrow
-    ///   each time, so they're fine. Do NOT cache `&TypeInfo` across
-    ///   a `dynamic_add_type` call.
-    pub unsafe fn dynamic_add_type(&self, ti: TypeInfo) -> u16 {
-        let table_ptr = (&self.type_table) as *const Vec<TypeInfo> as *mut Vec<TypeInfo>;
-        unsafe {
-            let id = (*table_ptr).len() as u16;
-            (*table_ptr).push(ti);
-            id
+    /// ```compile_fail
+    /// use gcrust_rt::gc::{Compact, Heap, ObjHeader, TypeInfo};
+    /// let heap = Heap::new::<Compact>(4096, vec![]);
+    /// let shared = &heap;
+    /// shared.dynamic_add_type(TypeInfo::for_header(Compact::SIZE));
+    /// ```
+    pub fn dynamic_add_type(&mut self, mut ti: TypeInfo) -> u16 {
+        let id = u16::try_from(self.type_table.len()).expect("heap type-id space exhausted");
+        ti.type_id = id;
+        assert!(
+            self.header.accepts(&ti, 0) && ti.align_log2 == 3,
+            "invalid heap type layout"
+        );
+        self.type_table.push(ti);
+        id
+    }
+
+    fn validate_type_table<H: ObjHeader>(table: &[TypeInfo]) {
+        assert!(
+            table.len() <= u16::MAX as usize + 1,
+            "heap type-id space exhausted"
+        );
+        let header = HeaderLayout::of::<H>();
+        for (index, info) in table.iter().enumerate() {
+            assert_eq!(
+                info.type_id as usize, index,
+                "heap type id must equal its table index"
+            );
+            assert!(
+                header.accepts(info, 0) && info.align_log2 == 3,
+                "invalid heap type layout"
+            );
         }
+    }
+
+    pub(crate) fn accepts_allocation(&self, info: &TypeInfo, len: usize) -> bool {
+        self.header.accepts(info, len)
+            && info.align_log2 == 3
+            && self.type_table.get(info.type_id as usize) == Some(info)
+    }
+
+    pub(crate) fn accepts_header<H: ObjHeader>(&self, info: &TypeInfo, len: usize) -> bool {
+        self.header.is::<H>() && self.accepts_allocation(info, len)
     }
 
     /// Read the current length of `type_table`. Mostly useful in tests
@@ -804,7 +830,9 @@ impl Heap {
         let closed = self.alloc_window.limit.load(Ordering::Acquire) == 0;
         let space = self.from_space();
         let limit = if closed { 0 } else { space.size() };
-        self.alloc_window.point_at(space, limit);
+        unsafe {
+            self.alloc_window.point_at(space, limit);
+        }
     }
 
     /// Create a new heap with statemap tracing enabled.
@@ -970,12 +998,39 @@ impl Heap {
     ///
     /// Returns null if from-space is exhausted. Caller should
     /// trigger GC via `collect()` and retry.
-    pub fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+    /// # Safety
+    /// Caller must be a registered RUNNING mutator of this heap, or hold
+    /// exclusive access with no collector/mutator activity. A world pause is
+    /// not permission to allocate: it may belong to another thread.
+    /// Keep every live reference rooted and finish initialization before any
+    /// safepoint, collection, heap walk, or publication. Raw allocation must
+    /// initialize the matching header and variable-length count itself.
+    pub unsafe fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.accepts_allocation(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         self.from_space().alloc(info, varlen_len)
     }
 
     /// Allocate and initialize header + varlen count.
-    pub fn alloc_obj<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+    /// # Safety
+    /// Caller must be a registered RUNNING mutator of this heap, or hold
+    /// exclusive access with no collector/mutator activity. A world pause is
+    /// not permission to allocate: it may belong to another thread.
+    /// Keep every live reference rooted and finish initialization before any
+    /// safepoint, collection, heap walk, or publication. Raw allocation must
+    /// initialize the matching header and variable-length count itself.
+    ///
+    /// ```compile_fail
+    /// use gcrust_rt::gc::{Full, Heap, ObjHeader, TypeInfo};
+    /// let info = TypeInfo::for_header(Full::SIZE);
+    /// let heap = Heap::new::<Full>(4096, vec![info]);
+    /// heap.alloc_obj::<Full>(&info, 0);
+    /// ```
+    pub unsafe fn alloc_obj<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.accepts_header::<H>(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         unsafe { crate::gc::alloc::alloc_obj::<H>(self.from_space(), info, varlen_len) }
     }
 
@@ -1011,13 +1066,18 @@ impl Heap {
     /// constructors run before the move into `Arc`, so the cursor
     /// pointer they record would dangle). Preserves a CLOSED window
     /// (limit 0: stress / generational).
-    pub fn sync_alloc_window(&self) {
+    /// # Safety
+    /// No mutator or collector may read/use the window during this operation;
+    /// hold exclusive heap access or a world pause and do not allocate in it.
+    pub unsafe fn sync_alloc_window(&self) {
         let closed = self.alloc_window.limit.load(Ordering::Acquire) == 0
             || self.nursery_state.is_some()
             || self.gc_every_alloc();
         let space = self.from_space();
         let limit = if closed { 0 } else { space.size() };
-        self.alloc_window.point_at(space, limit);
+        unsafe {
+            self.alloc_window.point_at(space, limit);
+        }
     }
 
     /// Check if this heap has a nursery (generational mode).
@@ -1045,13 +1105,29 @@ impl Heap {
     /// # Safety
     /// Called only by this state's owning mutator while running, before any
     /// safepoint. The state must remain bound to this heap.
-    pub(crate) unsafe fn alloc_mutator(&self, thread: &ThreadState, info: &TypeInfo, len: usize) -> *mut u8 {
+    pub(crate) unsafe fn alloc_mutator(
+        &self,
+        thread: &ThreadState,
+        info: &TypeInfo,
+        len: usize,
+    ) -> *mut u8 {
+        if !self.accepts_allocation(info, len) {
+            return core::ptr::null_mut();
+        }
         let space = self.nursery_state.as_ref().map_or_else(|| self.from_space(), |ns| &ns.nursery);
         if self.gc_every_alloc() { return space.alloc(info, len); }
         unsafe { thread.alloc_local(space, info, len) }
     }
 
-    pub(crate) unsafe fn alloc_mutator_obj<H: ObjHeader>(&self, thread: &ThreadState, info: &TypeInfo, len: usize) -> *mut u8 {
+    pub(crate) unsafe fn alloc_mutator_obj<H: ObjHeader>(
+        &self,
+        thread: &ThreadState,
+        info: &TypeInfo,
+        len: usize,
+    ) -> *mut u8 {
+        if !self.accepts_header::<H>(info, len) {
+            return core::ptr::null_mut();
+        }
         let ptr = unsafe { self.alloc_mutator(thread, info, len) };
         if !ptr.is_null() { unsafe {
             crate::gc::field::init_header::<H>(ptr, info.type_id);
@@ -1061,7 +1137,17 @@ impl Heap {
     }
 
     /// Allocate from the nursery if generational, otherwise from from-space.
-    pub fn alloc_nursery(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+    /// # Safety
+    /// Caller must be a registered RUNNING mutator of this heap, or hold
+    /// exclusive access with no collector/mutator activity. A world pause is
+    /// not permission to allocate: it may belong to another thread.
+    /// Keep every live reference rooted and finish initialization before any
+    /// safepoint, collection, heap walk, or publication. Raw allocation must
+    /// initialize the matching header and variable-length count itself.
+    pub unsafe fn alloc_nursery(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.accepts_allocation(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         match &self.nursery_state {
             Some(ns) => ns.nursery.alloc(info, varlen_len),
             None => self.from_space().alloc(info, varlen_len),
@@ -1069,11 +1155,21 @@ impl Heap {
     }
 
     /// Allocate and init header in the nursery if generational, otherwise from-space.
-    pub fn alloc_nursery_obj<H: ObjHeader>(
+    /// # Safety
+    /// Caller must be a registered RUNNING mutator of this heap, or hold
+    /// exclusive access with no collector/mutator activity. A world pause is
+    /// not permission to allocate: it may belong to another thread.
+    /// Keep every live reference rooted and finish initialization before any
+    /// safepoint, collection, heap walk, or publication. Raw allocation must
+    /// initialize the matching header and variable-length count itself.
+    pub unsafe fn alloc_nursery_obj<H: ObjHeader>(
         &self,
         info: &TypeInfo,
         varlen_len: usize,
     ) -> *mut u8 {
+        if !self.accepts_header::<H>(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         match &self.nursery_state {
             Some(ns) => unsafe { crate::gc::alloc::alloc_obj::<H>(&ns.nursery, info, varlen_len) },
             None => unsafe { crate::gc::alloc::alloc_obj::<H>(self.from_space(), info, varlen_len) },
@@ -1081,8 +1177,15 @@ impl Heap {
     }
 
     /// Allocate directly in tenured from-space (for promotion during minor GC).
-    pub fn alloc_tenured(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
-        self.from_space().alloc(info, varlen_len)
+    /// # Safety
+    /// Caller must be a registered RUNNING mutator of this heap, or hold
+    /// exclusive access with no collector/mutator activity. A world pause is
+    /// not permission to allocate: it may belong to another thread.
+    /// Keep every live reference rooted and finish initialization before any
+    /// safepoint, collection, heap walk, or publication. Raw allocation must
+    /// initialize the matching header and variable-length count itself.
+    pub unsafe fn alloc_tenured(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        unsafe { self.alloc(info, varlen_len) }
     }
 
     /// Mark the card covering `obj` as dirty (old→young pointer write).
@@ -1318,7 +1421,11 @@ impl Heap {
     /// thread after requesting all mutators to stop.
     ///
     /// # Safety
-    /// - All objects in from-space must have valid headers.
+    /// - All objects must match their registered layouts, including initialized
+    ///   headers, lengths and reference representations for `P`.
+    /// - Every root source must expose live, writable, nonoverlapping slots that
+    ///   remain valid until relocation completes. No allocation, mutation, or
+    ///   independent root scan may overlap collection.
     /// - All mutator threads must be at safepoints (not running mutator code).
     /// - `extra_roots` can provide additional root sources beyond the
     ///   registered threads and globals.
@@ -1514,7 +1621,7 @@ impl Heap {
     /// requesting thread — identified by OS thread id — is excluded so it
     /// can keep running). Used to make a non-allocating critical section
     /// (e.g. installing new JIT code: `engine.add_module`, growing the
-    /// type table via `dynamic_add_type`, merging shape maps) safe against
+    /// merging shape maps) safe against
     /// concurrent JIT execution and GC.
     ///
     /// Holds `gc_lock` for the guard's lifetime, so no collection can run
@@ -2467,8 +2574,6 @@ impl Heap {
 
         obj_starts
     }
-
-
 }
 
 /// Guard returned by [`Heap::pause_world`]. While alive, every other

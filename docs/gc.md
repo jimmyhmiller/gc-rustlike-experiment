@@ -22,6 +22,7 @@ blocking/native transitions publish frames for collection.
 | Variable | Default | Interpretation |
 | --- | --- | --- |
 | GCR_NURSERY_MB | 16 | Nursery setting in MiB |
+| GCR_STRESS_HEAP_MB | 8 | Per-space MiB for every-allocation stress execution, shared by JIT/native |
 | GCR_TENURED_MB | 256 | Tenured setting in MiB |
 
 Positive integer values override defaults; invalid/zero/overflowing inputs fall back to the
@@ -168,3 +169,41 @@ pause rather than coalescing; an empty nursery still receives a stress cycle.
 Raw heap allocation primitives do not collect by themselves: embedding code
 must use its registered mutator allocation API. Stress mode deliberately
 sacrifices throughput to expose missing roots and relocation errors.
+
+## Embedding allocation and header contracts — 2026-10-06
+
+`ObjHeader` is an unsafe trait: its physical size, initialized type-id layout and
+reserved first forwarding word must satisfy the documented representation
+contract. Arenas retain the validated physical layout. Allocation rejects header
+size/alignment mismatches, malformed interior-reference offsets and invalid
+extents before reserving space or writing a header. Atomic arenas remain limited
+to eight-byte alignment; the legacy arena retains greater alignment support.
+Zero-sized arenas are rejected before calling the native allocator.
+
+Heap construction validates layout ids against their table indices. Heap and
+mutator allocation reject unregistered or altered layouts, and initialized
+allocation also checks the header's physical size, alignment and type-id offset.
+Invalid mutator requests return null before triggering stress GC or reserving a
+TLAB. `dynamic_add_type` now requires `&mut Heap`, assigns the new id and rejects
+id exhaustion; shared-reference vector mutation is removed. Live shared-runtime
+type extension is not provided by this API. A world pause cannot invalidate
+outstanding Rust borrows of existing layouts.
+
+Direct Heap allocation is unsafe. Callers must either be registered RUNNING
+mutators or have exclusive access without collector/mutator activity. They finish
+header/length initialization and root publication before a safepoint, heap walk
+or collection. Taking a world pause does not authorize another thread to
+allocate. JIT frame-walker installation and allocation-window remapping are
+also unsafe, with explicit quiescence and storage-lifetime contracts.
+
+The legacy Cheney collector scans exact allocation starts instead of treating
+alignment padding as objects. Its forwarding entry uses the reserved first
+header word, matching the heap collector and `follow_forwarding`, including Full
+headers whose type id is in the second word. Regressions retain mixed-alignment
+cyclic graphs through repeated collections and verify Full-header forwarding.
+
+Dynamic root frames store real `Cell<u64>` slots. Escaping registration guards
+require unsafe lifetime management; `DynRootFrame::with_pushed` keeps its guard
+private, rejects duplicate registration, and unlinks on normal return or unwind.
+The managed references placed in slots remain subject to the collector's pointer
+policy and root-enumeration contracts.

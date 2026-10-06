@@ -284,7 +284,9 @@ impl RuntimeContext {
         let heap = Arc::new(heap);
         // The GC walks our shadow-stack chain through this walker whenever a
         // parked thread has published its top frame.
-        heap.set_jit_frame_walker(walk_gc_frames);
+        unsafe {
+            heap.set_jit_frame_walker(walk_gc_frames);
+        }
 
         let (dyna, _id) = heap.register_thread();
         let alloc_window = heap.alloc_window_ptr();
@@ -910,7 +912,7 @@ pub struct AotLayout {
 /// (they previously disagreed — AOT 1 MB vs JIT 16 MB nursery — so the same
 /// program had different perf/GC by run mode). Defaults: 16 MB nursery / 256 MB
 /// tenured (per space). Override with `GCR_NURSERY_MB` / `GCR_TENURED_MB`
-/// (decimal megabytes).
+/// (binary MiB).
 ///
 /// The nursery is sized so ordinary workloads DO collect (not sized past the
 /// workload to dodge GC), while being large enough that a moderately-sized object
@@ -945,6 +947,13 @@ mod configuration_tests {
         let overflow = (usize::MAX / (1 << 20) + 1).to_string();
         assert_eq!(heap_setting_bytes(Some(&overflow), 16), 16 << 20);
     }
+}
+
+/// Per-space capacity for collect-on-every-allocation stress execution.
+/// JIT and native drivers share this setting so valid larger applications can
+/// exercise relocation without being restricted to the default eight MiB.
+pub fn configured_stress_heap_size() -> usize {
+    heap_setting_bytes(std::env::var("GCR_STRESS_HEAP_MB").ok().as_deref(), 8)
 }
 
 /// The native driver and JIT use the same opt-in stress selection.
@@ -1039,7 +1048,7 @@ pub unsafe extern "C" fn gcr_runtime_main(
     // precise-layout detector under debug / --gc-stress / GCR_GC_VERIFY=1.
     let (nursery, tenured) = configured_heap_sizes();
     let mut rt = if configured_gc_stress() {
-        let rt = RuntimeContext::new(8 << 20, type_table);
+        let rt = RuntimeContext::new(configured_stress_heap_size(), type_table);
         rt.heap().set_gc_every_alloc(true);
         rt
     } else {

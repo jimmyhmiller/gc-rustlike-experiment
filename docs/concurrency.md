@@ -32,9 +32,19 @@ may use immutable boxes and atomic slot replacement or locks. Several separate
 field operations are not a transaction. Consequently `counter.n = counter.n + 1`
 can lose updates. Atomics or a lock are required for a compound invariant. A
 collection's individual fields being safe does not make push/remove/iteration
-linearizable: unsynchronized structural mutation must return a defined error or
-operate on a valid snapshot, never produce an invalid index, pointer or variant.
-Each collection API must choose which behavior before becoming shareable.
+linearizable. Ordinary Vec and Map/HashMap/MapStr are unsynchronized collections,
+following the JVM collection model: callers must synchronize access when any
+participant mutates shared storage. This includes aliases of their backing arrays.
+Concurrent reads of a safely published collection are supported when that storage
+is not being mutated. Unsynchronized mutation can lose updates, observe inconsistent
+logical contents or fail existing bounds/initialization checks; it has no collection
+operation consistency guarantee. It must still preserve managed memory safety:
+no out-of-bounds native access, fabricated reference or torn aggregate may escape.
+
+Separate concurrent Vec/Map types will specify atomic operations, iteration and
+snapshot behavior explicitly. They are planned APIs, not implemented wrappers or
+implicit synchronization added to ordinary collections. Their implementation follows
+the lock and structured-lifetime foundations.
 
 All objects are initialized before publication. Constructors may not expose a
 partially initialized reference. Allocation, collection, safepoints, sleep and
@@ -154,8 +164,8 @@ a thread/task unregisters roots only after its result and failure are published.
 
 | Area | Observed today | Required before version 1 conformance |
 |---|---|---|
-| Sharing | Direct spawn captures checked against Sync; aliases/higher-order callbacks bypass the check | Race-safe backend and collections, then remove ordinary managed Sync restrictions consistently |
-| Memory | Mutable scalar/reference fields and array slots use SC atomics; inline aggregate fields use relocation-aware striped snapshots | Complete collection/initialization and native root API audit; extend conformance coverage |
+| Sharing | Direct spawn captures checked against Sync; aliases/higher-order callbacks bypass the check | Race-safe managed accesses and collection boundary checks, then remove ordinary managed Sync restrictions consistently |
+| Memory | Mutable scalar/reference fields and array slots use SC atomics; inline aggregate fields use relocation-aware striped snapshots | Complete managed boundary/initialization and native root API audit; ordinary collections remain unsynchronized |
 | Thread start/join | Shared GC heap, rooted environment/result, root-owned completion state; repeated/concurrent join | Fallible spawn and typed outcomes |
 | Join lifetime | Stable root-owned completion records; OS handle consumed once; JIT/AOT drain abandoned descendants at root exit | Nested scopes and earlier metadata reclamation; cancellable drain |
 | Atomics | AtomicI64 and scalar/reference Atom operations use SC; bool uses byte storage, float CAS compares bits; native cells retire after root children drain | Audit mixed ordinary managed accesses; earlier native-cell reclamation for long-lived roots; aggregate CAS equality design |
@@ -175,7 +185,8 @@ target language. Adding closure provenance restrictions is not the next step.
    Preserve repeat/concurrent join and abandoned-descendant regressions; extend
    reclamation to nested scopes when those are introduced.
 2. Implement managed SC access, aggregate snapshots and collector/barrier
-   coordination. Audit collections and all optimizations, then remove Sync gates.
+   coordination. Audit memory safety at collection boundaries and all optimizations,
+   then remove Sync gates; ordinary collections retain external synchronization.
 3. Add reentrant locks, typed outcomes, explicit channel close and scope ownership.
 4. Add cooperative cancellation and shutdown, including blocked/native behavior.
 5. Lower async into rooted continuations; implement tasks and the blocking executor.

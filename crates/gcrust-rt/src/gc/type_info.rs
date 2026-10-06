@@ -20,7 +20,7 @@
 /// │   varlen[0..n]    │  n elements (Values or bytes)
 /// └───────────────────┘
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeInfo {
     /// Numeric type identifier. Stored in the object header for fast type dispatch.
     /// Set by the runtime when registering types (e.g., 0=String, 1=Closure, etc.)
@@ -83,6 +83,10 @@ impl TypeInfo {
     /// const STR: TypeInfo = TypeInfo::for_header(Compact::SIZE).with_varlen_bytes(0);
     /// ```
     pub const fn for_header(header_size: usize) -> Self {
+        assert!(
+            header_size >= 8 && header_size % 8 == 0 && header_size <= u16::MAX as usize,
+            "header size must be representable whole eight-byte words"
+        );
         Self {
             type_id: 0, // set by runtime when registering types
             header_size: header_size as u16,
@@ -173,7 +177,17 @@ impl TypeInfo {
     /// Check arithmetic and the Rust pointer-offset limit before accepting an
     /// untrusted length. Keep this consistent with `allocation_size` below.
     pub fn checked_allocation_size(&self, varlen_len: usize) -> Option<usize> {
-        if self.align_log2 < 3 {
+        if self.align_log2 < 3 || self.header_size < 8 || self.header_size % 8 != 0 {
+            return None;
+        }
+        // Interior references must be aligned complete words inside the raw
+        // section, not the header, fixed pointer fields, or variable tail.
+        let raw_start = self.raw_data_offset();
+        let raw_end = raw_start.checked_add(self.raw_byte_count as usize)?;
+        if self.interior_ptrs.iter().any(|&off| {
+            let off = off as usize;
+            off % 8 != 0 || off < raw_start || off.checked_add(8).is_none_or(|end| end > raw_end)
+        }) {
             return None;
         }
         let raw_end = self
@@ -257,5 +271,39 @@ mod allocation_boundary_tests {
         assert_eq!(under_aligned.checked_allocation_size(0), None);
         let invalid_alignment = TypeInfo::for_header(16).with_align_log2(255);
         assert_eq!(invalid_alignment.checked_allocation_size(0), None);
+    }
+}
+
+#[cfg(test)]
+mod descriptor_contract_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_headers_and_interior_references_are_rejected() {
+        let valid = TypeInfo::for_header(16).with_fields(1).with_raw_bytes(16);
+        for header_size in [0, 7, 9, 15] {
+            assert_eq!(
+                TypeInfo {
+                    header_size,
+                    ..valid
+                }
+                .checked_allocation_size(0),
+                None
+            );
+        }
+        for offsets in [&[0][..], &[16][..], &[25][..], &[40][..], &[65528][..]] {
+            let offsets = Box::leak(offsets.to_vec().into_boxed_slice());
+            assert_eq!(
+                valid.with_interior_ptrs(offsets).checked_allocation_size(0),
+                None
+            );
+        }
+        assert_eq!(
+            valid
+                .with_interior_ptrs(&[24, 32])
+                .checked_allocation_size(0),
+            Some(40)
+        );
+        assert!(std::panic::catch_unwind(|| TypeInfo::for_header(65536 + 16)).is_err());
     }
 }

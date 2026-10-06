@@ -23,7 +23,8 @@ pub fn lookup_type_info<'a>(type_id: u16, type_table: &'a [&'static TypeInfo]) -
 /// Write the object header into a freshly allocated object.
 ///
 /// # Safety
-/// `obj` must point to a valid allocation of at least `H::SIZE` bytes.
+/// `obj` must point to a valid allocation of at least `size_of::<H>()` bytes,
+/// aligned to `align_of::<H>()`. `H` must match the arena's configured header.
 /// The memory must not be concurrently accessed.
 #[inline(always)]
 pub unsafe fn init_header<H: ObjHeader>(obj: *mut u8, type_id: u16) {

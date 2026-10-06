@@ -145,7 +145,11 @@ impl FrameChain {
                 .cast::<FrameHeader>()
                 .cast_mut(),
         );
-        FrameGuard { chain: self, frame: self.top.get() }
+        FrameGuard {
+            chain: self,
+            frame: self.top.get(),
+            registration: None,
+        }
     }
 
     /// Root borrowed stack storage for the duration of a callback. The guard
@@ -170,7 +174,11 @@ impl FrameChain {
     pub unsafe fn push_raw<'a>(&'a self, header: *mut FrameHeader) -> FrameGuard<'a> {
         unsafe { (*header).parent.set(self.top.get()) };
         self.top.set(header);
-        FrameGuard { chain: self, frame: self.top.get() }
+        FrameGuard {
+            chain: self,
+            frame: self.top.get(),
+            registration: None,
+        }
     }
 
     /// Push a raw FrameHeader without returning a guard.
@@ -236,6 +244,7 @@ unsafe impl RootSource for FrameChain {
 pub struct FrameGuard<'a> {
     chain: &'a FrameChain,
     frame: *mut FrameHeader,
+    registration: Option<&'a Cell<bool>>,
 }
 
 impl Drop for FrameGuard<'_> {
@@ -250,6 +259,7 @@ impl Drop for FrameGuard<'_> {
                     let parent = (*cursor).parent.get();
                     if child.is_null() { self.chain.top.set(parent); }
                     else { (*child).parent.set(parent); }
+                    if let Some(registration) = self.registration { registration.set(false); }
                     return;
                 }
                 child = cursor;
@@ -281,8 +291,9 @@ impl Drop for FrameGuard<'_> {
 /// ```
 pub struct DynRootFrame {
     /// Raw allocation: [FrameHeader][Cell<u64> × slot_count]
-    backing: Vec<u64>,
+    backing: Vec<Cell<u64>>,
     slot_count: usize,
+    registered: Cell<bool>,
 }
 
 impl DynRootFrame {
@@ -292,8 +303,10 @@ impl DynRootFrame {
     pub fn new(slot_count: usize) -> Self {
         let header_words = std::mem::size_of::<FrameHeader>() / 8;
         debug_assert_eq!(header_words, 2);
-        let total_words = header_words + slot_count;
-        let mut backing = vec![0u64; total_words];
+        let total_words = header_words
+            .checked_add(slot_count)
+            .expect("root frame size overflow");
+        let mut backing = vec![Cell::new(0u64); total_words];
 
         // Initialize the FrameHeader in-place.
         let header_ptr = backing.as_mut_ptr() as *mut FrameHeader;
@@ -304,6 +317,7 @@ impl DynRootFrame {
         DynRootFrame {
             backing,
             slot_count,
+            registered: Cell::new(false),
         }
     }
 
@@ -315,9 +329,33 @@ impl DynRootFrame {
     /// Push this frame onto a FrameChain. Returns a guard that pops it on drop.
     ///
     /// # Safety
-    /// The DynRootFrame must outlive the returned FrameGuard.
-    pub fn push_onto<'a>(&'a self, chain: &'a FrameChain) -> FrameGuard<'a> {
-        unsafe { chain.push_raw(self.header_ptr()) }
+    /// The frame must stay alive at a stable address until the registration is
+    /// unlinked, even if the guard is forgotten. No concurrent scan or repeated
+    /// registration of this same frame may occur.
+    ///
+    /// ```compile_fail
+    /// use gcrust_rt::gc::{DynRootFrame, FrameChain};
+    /// let chain = FrameChain::new();
+    /// let frame = DynRootFrame::new(1);
+    /// let guard = frame.push_onto(&chain);
+    /// std::mem::forget(guard);
+    /// drop(frame);
+    /// ```
+    pub unsafe fn push_onto<'a>(&'a self, chain: &'a FrameChain) -> FrameGuard<'a> {
+        assert!(
+            !self.registered.replace(true),
+            "dynamic root frame is already registered"
+        );
+        let mut guard = unsafe { chain.push_raw(self.header_ptr()) };
+        guard.registration = Some(&self.registered);
+        guard
+    }
+
+    /// Register for a callback, unlinking the frame on normal return or unwind.
+    /// The private guard cannot be forgotten by the callback.
+    pub fn with_pushed<R>(&self, chain: &FrameChain, body: impl FnOnce(&Self) -> R) -> R {
+        let _guard = unsafe { self.push_onto(chain) };
+        body(self)
     }
 
     /// Number of root slots.
@@ -325,28 +363,7 @@ impl DynRootFrame {
         self.slot_count
     }
 
-    /// Get the value in slot `i`.
-    pub fn get(&self, i: usize) -> u64 {
-        assert!(
-            i < self.slot_count,
-            "slot index {i} >= slot_count {}",
-            self.slot_count
-        );
-        let header_words = std::mem::size_of::<FrameHeader>() / 8;
-        let slot_ptr = unsafe {
-            (self.backing.as_ptr().add(header_words + i) as *const Cell<u64>)
-                .as_ref()
-                .unwrap()
-        };
-        slot_ptr.get()
-    }
-
-    /// Direct access to slot `i`. The slot is the GC's canonical storage
-    /// for that root: the collector may rewrite it during a moving
-    /// collection, so the cell type guarantees interior mutability is safe
-    /// for shared (`&self`) borrows. Used by the `Rooted` / `RootScope`
-    /// abstraction to hand out slot references that are stable across
-    /// GC points.
+    /// Borrow stable, interior-mutable root storage at slot `i`.
     pub fn slot(&self, i: usize) -> &Cell<u64> {
         assert!(
             i < self.slot_count,
@@ -354,27 +371,17 @@ impl DynRootFrame {
             self.slot_count
         );
         let header_words = std::mem::size_of::<FrameHeader>() / 8;
-        unsafe {
-            (self.backing.as_ptr().add(header_words + i) as *const Cell<u64>)
-                .as_ref()
-                .unwrap()
-        }
+        &self.backing[header_words + i]
+    }
+
+    /// Get the value in slot `i`.
+    pub fn get(&self, i: usize) -> u64 {
+        self.slot(i).get()
     }
 
     /// Set the value in slot `i`.
     pub fn set(&self, i: usize, val: u64) {
-        assert!(
-            i < self.slot_count,
-            "slot index {i} >= slot_count {}",
-            self.slot_count
-        );
-        let header_words = std::mem::size_of::<FrameHeader>() / 8;
-        let slot_ptr = unsafe {
-            (self.backing.as_ptr().add(header_words + i) as *const Cell<u64>)
-                .as_ref()
-                .unwrap()
-        };
-        slot_ptr.set(val);
+        self.slot(i).set(val);
     }
 
     /// Zero all slots (used before mirroring live values at safepoints).

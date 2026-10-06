@@ -59,8 +59,10 @@ Audit aliasing/capture rules for supported shared types and channels.
 
 The target sharing and execution contract is [concurrency.md](concurrency.md).
 Current capture checks can be bypassed through aliases and higher-order calls,
-while ordinary heap codegen is not race-safe. Implement managed memory ordering,
-aggregate coherence and GC/barrier coordination before removing Sync restrictions.
+and the managed-access audit is still incomplete. Mutable fields/array slots now
+use SC accesses and aggregate snapshots; finish GC/barrier and memory-safety
+boundary audits before removing Sync restrictions. Ordinary Vec/Map require
+external synchronization for shared mutation; concurrent versions are separate APIs.
 Root-owned completion records now support repeated/concurrent joins without
 freeing aliased native handles. Root exit drains descendants and releases records;
 metadata grows with total spawns until then. Nested scopes, earlier reclamation,

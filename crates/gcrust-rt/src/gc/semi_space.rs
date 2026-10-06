@@ -1,5 +1,5 @@
 use crate::gc::field::{read_type_id, read_varlen_count};
-use crate::gc::header::ObjHeader;
+use crate::gc::header::{HeaderLayout, ObjHeader};
 use crate::gc::roots::RootSource;
 use crate::gc::scan::scan_object;
 use crate::gc::type_info::{TypeInfo, VarLenKind};
@@ -84,6 +84,7 @@ pub struct SemiSpace {
     from: BumpAllocator,
     to: BumpAllocator,
     type_id_offset: usize,
+    header: HeaderLayout,
     collections: usize,
     /// Temporarily set during collect() so copy_or_forward can look up TypeInfo.
     /// Only valid during a collection cycle.
@@ -98,6 +99,7 @@ impl SemiSpace {
             from: BumpAllocator::new::<H>(space_size),
             to: BumpAllocator::new::<H>(space_size),
             type_id_offset: H::TYPE_ID_OFFSET,
+            header: HeaderLayout::of::<H>(),
             collections: 0,
             type_table_ptr: core::ptr::null(),
             type_table_len: 0,
@@ -116,6 +118,9 @@ impl SemiSpace {
     ///
     /// Returns null if from-space is exhausted.
     pub fn alloc_obj<H: ObjHeader>(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.header.is::<H>() || !self.header.accepts(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         unsafe { crate::gc::alloc::alloc_obj::<H>(&self.from, info, varlen_len) }
     }
 
@@ -151,21 +156,23 @@ impl SemiSpace {
 
     // ─── Collection ─────────────────────────────────────────────
 
-    /// Run a Cheney collection.
-    ///
-    /// Copies all objects reachable from `roots` into to-space, updates
-    /// all root slots and inter-object pointers, then swaps spaces.
-    ///
-    /// # Safety
-    /// - All objects in from-space must have valid headers and varlen counts.
-    /// - `roots` must enumerate all live root slots (mutator roots, globals, etc.).
-    /// - No references into from-space may be held across this call.
     /// Access the type table set during collect().
     fn type_table(&self) -> &[TypeInfo] {
         unsafe { core::slice::from_raw_parts(self.type_table_ptr, self.type_table_len) }
     }
 
-    pub unsafe fn collect<P: PtrPolicy>(&mut self, type_table: &[TypeInfo], roots: &mut [&dyn RootSource]) {
+    /// Run a Cheney collection, rewriting every registered root and object slot.
+    /// # Safety
+    /// All objects must have initialized headers/lengths matching `type_table`
+    /// and valid pointer representations for `P`. Roots must enumerate all
+    /// live writable slots, remain valid through collection, and not overlap.
+    /// No allocation, object access or independent scan may run concurrently.
+    /// Reload references from rewritten roots after collection.
+    pub unsafe fn collect<P: PtrPolicy>(
+        &mut self,
+        type_table: &[TypeInfo],
+        roots: &mut [&dyn RootSource],
+    ) {
         // Store type_table reference for use by copy_or_forward
         self.type_table_ptr = type_table.as_ptr();
         self.type_table_len = type_table.len();
@@ -177,29 +184,17 @@ impl SemiSpace {
             }); }
         }
 
-        // Phase 2: Cheney scan — walk to-space linearly
-        let mut scan_offset = 0usize;
-        // We re-read to.used() each iteration because copying objects
-        // during scan_object grows to-space.
-        while scan_offset < self.to.used() {
-            let obj = unsafe { self.to.base().add(scan_offset) };
+        // Phase 2: Cheney scan in allocation order. Exact object starts skip
+        // absolute-address alignment padding, including padding before the
+        // first object. Evacuation can append more objects during each scan.
+        let mut scan_index = 0;
+        while let Some(obj) = self.to.allocated_object(scan_index) {
             let type_id = unsafe { read_type_id(obj, self.type_id_offset) };
             let info = &type_table[type_id as usize];
-
             unsafe {
-                scan_object(obj, info, |slot| {
-                    self.process_slot::<P>(slot);
-                });
+                scan_object(obj, info, |slot| self.process_slot::<P>(slot));
             }
-
-            // Advance past this object
-            let varlen_len = match info.varlen {
-                VarLenKind::None => 0,
-                _ => unsafe { read_varlen_count(obj, info) },
-            };
-            let obj_size = info.allocation_size(varlen_len);
-            let align = 1usize << info.align_log2;
-            scan_offset = (scan_offset + obj_size + align - 1) & !(align - 1);
+            scan_index += 1;
         }
 
         // Phase 3: swap spaces, reset old from-space (now to-space)
@@ -228,7 +223,7 @@ impl SemiSpace {
     /// Returns `Some(forwarding_addr)` if bit 63 is set (forwarding marker).
     /// Returns `None` if the header word is a normal type_id (not forwarded).
     unsafe fn check_forwarded(&self, old: *mut u8) -> Option<*mut u8> {
-        let slot = unsafe { old.add(self.type_id_offset) as *const u64 };
+        let slot = old as *const u64;
         let word = unsafe { *slot };
         if word & FORWARDING_BIT != 0 {
             Some((word & !FORWARDING_BIT) as *mut u8)
@@ -240,7 +235,7 @@ impl SemiSpace {
     /// Write a forwarding pointer into the header slot of the old object.
     /// Sets bit 63 to mark it as forwarded.
     unsafe fn install_forwarding(&self, old: *mut u8, new: *mut u8) {
-        let slot = unsafe { old.add(self.type_id_offset) as *mut u64 };
+        let slot = old as *mut u64;
         unsafe { *slot = (new as u64) | FORWARDING_BIT };
     }
 
@@ -248,7 +243,7 @@ impl SemiSpace {
     /// forwarding address. Otherwise copy it to to-space and install
     /// a forwarding pointer.
     unsafe fn copy_or_forward(&mut self, old: *mut u8) -> *mut u8 {
-        // Check for forwarding pointer in the type_info slot
+        // Check the reserved first header word for forwarding
         if let Some(forwarded) = unsafe { self.check_forwarded(old) } {
             return forwarded;
         }

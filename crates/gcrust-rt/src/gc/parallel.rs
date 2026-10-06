@@ -431,14 +431,14 @@ mod tests {
                 .with_type_id(1)
                 .with_varlen_bytes(0);
             let heap = if full {
-                Heap::new::<Full>(4 * 1024 * 1024, vec![info, info])
+                Heap::new::<Full>(4 * 1024 * 1024, vec![info.with_type_id(0), info])
             } else {
-                Heap::new::<Compact>(4 * 1024 * 1024, vec![info, info])
+                Heap::new::<Compact>(4 * 1024 * 1024, vec![info.with_type_id(0), info])
             };
             let old = if full {
-                heap.alloc_obj::<Full>(&info, 1024 * 1024)
+                unsafe { heap.alloc_obj::<Full>(&info, 1024 * 1024) }
             } else {
-                heap.alloc_obj::<Compact>(&info, 1024 * 1024)
+                unsafe { heap.alloc_obj::<Compact>(&info, 1024 * 1024) }
             };
             unsafe {
                 std::ptr::write_bytes(old.add(info.varlen_element_offset(0)), 0xa5, 1024 * 1024);
@@ -495,9 +495,9 @@ mod tests {
             let objects: Vec<_> = (0..count)
                 .map(|_| {
                     if full {
-                        heap.alloc_obj::<Full>(&info, 0)
+                        unsafe { heap.alloc_obj::<Full>(&info, 0) }
                     } else {
-                        heap.alloc_obj::<Compact>(&info, 0)
+                        unsafe { heap.alloc_obj::<Compact>(&info, 0) }
                     }
                 })
                 .collect();
@@ -584,7 +584,7 @@ mod tests {
         let info = TypeInfo::for_header(Full::SIZE).with_varlen_bytes(2);
         let heap = Heap::new::<Full>(96 * 1024 * 1024, vec![info]);
         let objects: Vec<_> = (0..count)
-            .map(|_| heap.alloc_obj::<Full>(&info, bytes))
+            .map(|_| unsafe { heap.alloc_obj::<Full>(&info, bytes) })
             .collect();
         for (i, &obj) in objects.iter().enumerate() {
             for field in 0..2 {
@@ -648,7 +648,7 @@ mod tests {
         let (thread, _) = heap.register_thread();
         let count = 12000;
         let nodes: Vec<_> = (0..count)
-            .map(|_| heap.alloc_nursery_obj::<Full>(&node, 0))
+            .map(|_| unsafe { heap.alloc_nursery_obj::<Full>(&node, 0) })
             .collect();
         for (i, &obj) in nodes.iter().enumerate() {
             unsafe {
@@ -660,7 +660,7 @@ mod tests {
                     .write(Tagged::encode_ptr(nodes[0]));
             }
         }
-        let old = heap.alloc_obj::<Full>(&array, count);
+        let old = unsafe { heap.alloc_obj::<Full>(&array, count) };
         for (i, &child) in nodes.iter().enumerate() {
             let slot = unsafe { old.add(array.varlen_element_offset(i)) };
             unsafe {
@@ -703,8 +703,8 @@ mod tests {
         let info = TypeInfo::for_header(Full::SIZE).with_fields(1);
         let heap = Heap::new::<Full>(4096, vec![info]);
         let old = [
-            heap.alloc_obj::<Full>(&info, 0) as usize,
-            heap.alloc_obj::<Full>(&info, 0) as usize,
+            unsafe { heap.alloc_obj::<Full>(&info, 0) } as usize,
+            unsafe { heap.alloc_obj::<Full>(&info, 0) } as usize,
         ];
         let barrier = Barrier::new(2);
         let results = std::thread::scope(|scope| {

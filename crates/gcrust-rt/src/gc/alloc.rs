@@ -2,7 +2,7 @@ use core::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
 
 use crate::gc::field::{init_header, read_type_id, read_varlen_count, write_varlen_count};
-use crate::gc::header::{Compact, ObjHeader};
+use crate::gc::header::{Compact, HeaderLayout, ObjHeader};
 use crate::gc::type_info::{TypeInfo, VarLenKind};
 
 // ─── Traits ──────────────────────────────────────────────────────────
@@ -36,12 +36,18 @@ pub trait HeapWalker {
 ///
 /// # Safety
 /// - `allocator` must return properly aligned, zeroed memory.
-/// - `info` must accurately describe the object layout.
+/// - `info` must accurately describe the object layout and `H` must match the
+///   arena's configured header, including its type-id offset.
+/// - No collection, reset or walk may overlap reservation/initialization.
+///   Initialize all pointer slots and register the object before a safepoint.
 pub unsafe fn alloc_obj<H: ObjHeader>(
     allocator: &dyn Alloc,
     info: &TypeInfo,
     varlen_len: usize,
 ) -> *mut u8 {
+    if !HeaderLayout::of::<H>().accepts(info, varlen_len) {
+        return core::ptr::null_mut();
+    }
     let ptr = allocator.alloc(info, varlen_len);
     if ptr.is_null() {
         return ptr;
@@ -84,7 +90,11 @@ impl AllocWindow {
     }
     /// Point the window at `space` (called at construction and at every
     /// flip, both under STW or before any mutator runs).
-    pub fn point_at(&self, space: &AtomicBumpAllocator, limit: usize) {
+    /// # Safety
+    /// `space` must outlive all window consumers. No consumer may read or use
+    /// the window while its three-part allocation mapping is being replaced.
+    pub unsafe fn point_at(&self, space: &AtomicBumpAllocator, limit: usize) {
+        assert!(limit <= space.size(), "allocation window exceeds its arena");
         self.cursor.store(
             &*space.cursor as *const AtomicUsize as *mut u8,
             Ordering::Release,
@@ -110,6 +120,7 @@ pub struct BumpAllocator {
     allocations: RefCell<Vec<usize>>,
     size: usize,
     type_id_offset: usize,
+    header: HeaderLayout,
     owned: bool,
 }
 
@@ -123,6 +134,7 @@ impl BumpAllocator {
     /// The header type `H` determines the `type_id_offset` used by
     /// the heap walker.
     pub fn new<H: ObjHeader>(size: usize) -> Self {
+        assert!(size > 0, "arena size must be positive");
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "BumpAllocator: allocation failed");
@@ -132,6 +144,7 @@ impl BumpAllocator {
             allocations: RefCell::new(Vec::new()),
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
+            header: HeaderLayout::of::<H>(),
             owned: true,
         }
     }
@@ -143,12 +156,20 @@ impl BumpAllocator {
     /// - The region must remain valid for the lifetime of this allocator.
     /// - The caller is responsible for freeing the region.
     pub unsafe fn from_region<H: ObjHeader>(base: *mut u8, size: usize) -> Self {
+        assert!(
+            !base.is_null()
+                && size > 0
+                && size <= isize::MAX as usize
+                && (base as usize).checked_add(size).is_some(),
+            "invalid arena region"
+        );
         Self {
             base,
             cursor: Cell::new(0),
             allocations: RefCell::new(Vec::new()),
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
+            header: HeaderLayout::of::<H>(),
             owned: false,
         }
     }
@@ -198,8 +219,22 @@ impl BumpAllocator {
     }
 }
 
+impl BumpAllocator {
+    /// Return the exact start of an allocated object. The collector releases
+    /// the metadata borrow before scanning, so evacuation may append objects.
+    pub(crate) fn allocated_object(&self, index: usize) -> Option<*mut u8> {
+        self.allocations
+            .borrow()
+            .get(index)
+            .map(|&offset| unsafe { self.base.add(offset) })
+    }
+}
+
 impl Alloc for BumpAllocator {
     fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        if !self.header.accepts(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         let Some(obj_size) = info.checked_allocation_size(varlen_len) else {
             return core::ptr::null_mut();
         };
@@ -278,6 +313,7 @@ pub struct AtomicBumpAllocator {
     cursor: Box<AtomicUsize>,
     size: usize,
     type_id_offset: usize,
+    header: HeaderLayout,
     owned: bool,
 }
 
@@ -290,6 +326,11 @@ unsafe impl Sync for AtomicBumpAllocator {}
 impl AtomicBumpAllocator {
     /// Create a new atomic bump allocator that owns a region of `size` bytes.
     pub fn new<H: ObjHeader>(size: usize) -> Self {
+        assert!(size > 0, "arena size must be positive");
+        assert!(
+            HeaderLayout::of::<H>().supported_by_atomic_arena(),
+            "atomic arena headers must be at most eight-byte aligned"
+        );
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "AtomicBumpAllocator: allocation failed");
@@ -300,6 +341,7 @@ impl AtomicBumpAllocator {
             cursor: Box::new(AtomicUsize::new(0)),
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
+            header: HeaderLayout::of::<H>(),
             owned: true,
         }
     }
@@ -404,6 +446,9 @@ impl AtomicBumpAllocator {
         if info.align_log2 != 3 {
             return core::ptr::null_mut();
         }
+        if !self.header.accepts(info, varlen_len) {
+            return core::ptr::null_mut();
+        }
         let Some(obj_size) = info.checked_allocation_size(varlen_len) else {
             return core::ptr::null_mut();
         };
@@ -464,7 +509,7 @@ impl Tlab {
         info: &TypeInfo,
         len: usize,
     ) -> *mut u8 {
-        if info.align_log2 != 3 {
+        if info.align_log2 != 3 || !space.header.accepts(info, len) {
             return core::ptr::null_mut();
         }
         let Some(size) = info.checked_allocation_size(len) else {
@@ -714,7 +759,9 @@ mod window_tests {
     fn exported_cursor_address_survives_allocator_moves() {
         let allocator = AtomicBumpAllocator::new::<Full>(4096);
         let window = AllocWindow::empty();
-        window.point_at(&allocator, 4096);
+        unsafe {
+            window.point_at(&allocator, 4096);
+        }
         let exported = window.cursor.load(Ordering::Acquire);
         let allocator = Box::new(allocator);
         assert_eq!(
@@ -915,4 +962,115 @@ mod allocation_boundary_tests {
         assert!(visited.is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod header_contract_tests {
+    use super::*;
+    use crate::gc::{Full, SemiSpace};
+
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy)]
+    struct AlignedHeader {
+        id: u16,
+        padding: [u8; 62],
+    }
+    // All 64 bytes are initialized, the type-id word is aligned at offset zero,
+    // and the forwarding bit is clear. The arena must honor 64-byte alignment.
+    unsafe impl ObjHeader for AlignedHeader {
+        const SIZE: usize = 64;
+        const TYPE_ID_OFFSET: usize = 0;
+        fn new(id: u16) -> Self {
+            Self {
+                id,
+                padding: [0; 62],
+            }
+        }
+        fn type_id(&self) -> u16 {
+            self.id
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct OffsetHeader {
+        id: u16,
+        padding: [u8; 6],
+        extra: u64,
+    }
+    // Same physical size/alignment as Full, but type id is in its first word.
+    unsafe impl ObjHeader for OffsetHeader {
+        const SIZE: usize = 16;
+        const TYPE_ID_OFFSET: usize = 0;
+        fn new(id: u16) -> Self {
+            Self {
+                id,
+                padding: [0; 6],
+                extra: 0,
+            }
+        }
+        fn type_id(&self) -> u16 {
+            self.id
+        }
+    }
+
+    #[test]
+    fn same_sized_header_with_different_type_id_offset_is_rejected() {
+        let info = TypeInfo::for_header(Full::SIZE).with_type_id(1);
+        let heap = crate::gc::Heap::new::<Full>(64, vec![info.with_type_id(0), info]);
+        // Exclusive heap access. Size/alignment alone are insufficient: later
+        // collection would otherwise read the type id at the wrong offset.
+        assert!(unsafe { heap.alloc_obj::<OffsetHeader>(&info, 0) }.is_null());
+        assert!(unsafe { heap.alloc_nursery_obj::<OffsetHeader>(&info, 0) }.is_null());
+        assert_eq!(heap.from_used(), 0);
+        let gc = SemiSpace::new::<Full>(64);
+        assert!(gc.alloc_obj::<OffsetHeader>(&info, 0).is_null());
+        assert_eq!(gc.from_used(), 0);
+    }
+
+    #[test]
+    fn mismatched_header_is_rejected_before_reservation_or_initialization() {
+        let bump = BumpAllocator::new::<Compact>(64);
+        let compact = TypeInfo::for_header(Compact::SIZE);
+        let full = TypeInfo::for_header(Full::SIZE);
+        // Previously the first call wrote a 16-byte Full into an eight-byte
+        // allocation; the second crossed the arena's configured header layout.
+        assert!(unsafe { alloc_obj::<Full>(&bump, &compact, 0) }.is_null());
+        assert!(unsafe { alloc_obj::<Full>(&bump, &full, 0) }.is_null());
+        assert_eq!(bump.used(), 0);
+        assert!(!unsafe { alloc_obj::<Compact>(&bump, &compact, 0) }.is_null());
+        assert_eq!(bump.used(), Compact::SIZE);
+
+        let gc = SemiSpace::new::<Compact>(64);
+        assert!(gc.alloc_obj::<Full>(&full, 0).is_null());
+        assert_eq!(gc.from_used(), 0);
+        assert!(!gc.alloc_obj::<Compact>(&compact, 0).is_null());
+    }
+
+    #[test]
+    fn physical_header_alignment_is_checked_and_supported_legacy_alignment_survives() {
+        let bump = BumpAllocator::new::<AlignedHeader>(256);
+        let under_aligned = TypeInfo::for_header(AlignedHeader::SIZE);
+        assert!(unsafe { alloc_obj::<AlignedHeader>(&bump, &under_aligned, 0) }.is_null());
+        assert_eq!(bump.used(), 0);
+        let aligned = under_aligned.with_align_log2(6);
+        let ptr = unsafe { alloc_obj::<AlignedHeader>(&bump, &aligned, 0) };
+        assert!(!ptr.is_null());
+        assert_eq!(ptr as usize % 64, 0);
+        let mut visited = Vec::new();
+        // Exclusive arena access; the one allocation has a complete header.
+        unsafe {
+            bump.walk(&[aligned], &mut |obj, _| visited.push(obj));
+        }
+        assert_eq!(visited, [ptr]);
+        assert!(
+            std::panic::catch_unwind(|| AtomicBumpAllocator::new::<AlignedHeader>(256)).is_err()
+        );
+    }
+
+    #[test]
+    fn zero_sized_arenas_are_rejected_before_native_allocation() {
+        assert!(std::panic::catch_unwind(|| BumpAllocator::new::<Compact>(0)).is_err());
+        assert!(std::panic::catch_unwind(|| AtomicBumpAllocator::new::<Compact>(0)).is_err());
+    }
 }
