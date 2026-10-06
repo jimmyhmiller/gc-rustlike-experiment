@@ -1,0 +1,65 @@
+[
+  {
+    "Workload": "nbody",
+    "Before ms": 133.606,
+    "After ms": 118.16,
+    "Rust O3 ms": 26.493,
+    "Java ms": 43.384,
+    "Speedup": 1.13,
+    "gc-rust / Java": 2.72
+  },
+  {
+    "Workload": "spectralnorm",
+    "Before ms": 37.336,
+    "After ms": 36.784,
+    "Rust O3 ms": 34.263,
+    "Java ms": 61.454,
+    "Speedup": 1.02,
+    "gc-rust / Java": 0.6
+  },
+  {
+    "Workload": "fannkuchredux",
+    "Before ms": 24.486,
+    "After ms": 22.723,
+    "Rust O3 ms": 12.87,
+    "Java ms": 16.037,
+    "Speedup": 1.08,
+    "gc-rust / Java": 1.42
+  },
+  {
+    "Workload": "binarytrees",
+    "Before ms": 270.945,
+    "After ms": 18.501,
+    "Rust O3 ms": 68.878,
+    "Java ms": 9.119,
+    "Speedup": 14.65,
+    "gc-rust / Java": 2.03
+  },
+  {
+    "Workload": "scalar",
+    "Before ms": 39.219,
+    "After ms": 36.209,
+    "Rust O3 ms": 36.411,
+    "Java ms": 41.461,
+    "Speedup": 1.08,
+    "gc-rust / Java": 0.87
+  },
+  {
+    "Workload": "array",
+    "Before ms": 6.654,
+    "After ms": 5.924,
+    "Rust O3 ms": 3.972,
+    "Java ms": 6.281,
+    "Speedup": 1.12,
+    "gc-rust / Java": 0.94
+  },
+  {
+    "Workload": "nbody_objects",
+    "Before ms": null,
+    "After ms": 114.321,
+    "Rust O3 ms": 26.259,
+    "Java ms": 43.596,
+    "Speedup": null,
+    "gc-rust / Java": 2.62
+  }
+]

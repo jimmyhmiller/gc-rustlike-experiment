@@ -15,7 +15,7 @@ use crate::gc::statemap::TraceState;
 
 /// Per-(allocation-site) cumulative count + byte total. One entry per
 /// compile-time-assigned site id (see `Heap::set_alloc_sites`). Updated by
-/// the owning thread on the allocation slow path; summed across threads at
+/// the owning thread on compiled and runtime allocation paths; summed across threads at
 /// dump time. Plain integers — NOT atomics — because only the owning thread
 /// ever writes them (between safepoints) and they are read only when the
 /// world is quiescent (program end / a safepoint). Keeping them non-atomic
@@ -30,6 +30,12 @@ pub struct SiteCounter {
     /// sized it via `TypeInfo::allocation_size`).
     pub bytes: u64,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<SiteCounter>() == 16);
+    assert!(core::mem::offset_of!(SiteCounter, count) == 0);
+    assert!(core::mem::offset_of!(SiteCounter, bytes) == 8);
+};
 
 // ─── Thread states ──────────────────────────────────────────────────
 
@@ -189,6 +195,19 @@ impl ThreadState {
         unsafe { (&mut *self.tlab.get()).alloc(space, info, len) }
     }
 
+    /// Layout and size have been validated by this thread's heap. Owning
+    /// RUNNING mutator only; no safepoint may overlap TLAB initialization.
+    pub(crate) unsafe fn alloc_local_sized(&self, space: &crate::gc::AtomicBumpAllocator, size: usize) -> *mut u8 {
+        debug_assert_eq!(self.os_thread, std::thread::current().id());
+        unsafe { (&mut *self.tlab.get()).alloc_sized(space, size) }
+    }
+
+    /// Obtain the stable owner-only window address. The ThreadState must stay
+    /// alive and allocation may only be performed by this state's mutator.
+    pub(crate) unsafe fn inline_tlab_ptr(&self) -> *mut crate::gc::InlineTlab {
+        unsafe { core::ptr::addr_of_mut!((*self.tlab.get()).window) }
+    }
+
     /// Record one allocation at `site_id` of `bytes` bytes (Target-1b
     /// allocation-site profiling). Called by `ai_gc_alloc_*` on the owning
     /// thread's slow path. Non-atomic, owning-thread-only; grows the counter
@@ -205,6 +224,11 @@ impl ThreadState {
         let idx = site_id as usize;
         if idx >= v.len() {
             v.resize(idx + 1, SiteCounter::default());
+            // Compiled allocations update these same owner-only counters.
+            // Refresh the window after every possible vector relocation.
+            let window = unsafe { &mut (*self.tlab.get()).window };
+            window.counters = v.as_mut_ptr();
+            window.counters_len = v.len();
         }
         let c = &mut v[idx];
         c.count += 1;

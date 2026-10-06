@@ -69,22 +69,8 @@ fn generated_shared_accesses_remain_atomic_and_snapshot_regions_cannot_collect()
         assert!(ir.contains("load atomic i64") && ir.contains("store atomic i64"));
         assert!(ir.contains("load atomic i8") && ir.contains("store atomic i8"));
         assert!(ir.contains("load atomic double") && ir.contains("store atomic double"));
-        let mut held = false;
-        let mut snapshots = 0;
+        assert!(check_snapshot_paths(&ir) > 0, "missing aggregate regions");
         for line in ir.lines() {
-            if line.contains("call ptr @ai_managed_lock(") {
-                assert!(!held, "nested generated aggregate region");
-                held = true;
-                snapshots += 1;
-            } else if line.contains("call void @ai_managed_unlock(") {
-                assert!(held, "unpaired generated aggregate release");
-                held = false;
-            } else if held && line.contains("call ") {
-                assert!(
-                    line.contains("@ai_gc_write_barrier("),
-                    "unexpected call in snapshot region: {line}"
-                );
-            }
             if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot")
             {
                 assert!(
@@ -93,9 +79,92 @@ fn generated_shared_accesses_remain_atomic_and_snapshot_regions_cannot_collect()
                 );
             }
         }
-        assert!(
-            !held && snapshots > 0,
-            "missing/unbalanced aggregate regions"
-        );
     }
+}
+
+// Follow control flow rather than textual block order. LLVM may lay a poll
+// block between acquisition and release in the printed IR without putting it
+// on any path that holds the snapshot stripe.
+fn check_snapshot_paths(ir: &str) -> usize {
+    use std::collections::{HashMap, HashSet};
+    let mut functions = Vec::new();
+    let mut current = Vec::new();
+    let mut inside = false;
+    for line in ir.lines() {
+        if line.starts_with("define ") {
+            inside = true;
+            current.clear();
+        } else if inside && line == "}" {
+            functions.push(std::mem::take(&mut current));
+            inside = false;
+        } else if inside {
+            current.push(line);
+        }
+    }
+    let mut snapshots = 0;
+    for lines in functions {
+        let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut entry = None;
+        let mut label = "";
+        for line in lines {
+            if !line.starts_with(' ')
+                && let Some((name, _)) = line.split_once(':')
+            {
+                label = name;
+                entry.get_or_insert(name);
+                blocks.entry(name).or_default();
+            } else if !label.is_empty() {
+                blocks.get_mut(label).unwrap().push(line);
+            }
+        }
+        let Some(entry) = entry else { continue };
+        let mut pending = vec![(entry.to_string(), false)];
+        let mut visited = HashSet::new();
+        let mut locks = HashSet::new();
+        while let Some((label, mut held)) = pending.pop() {
+            if !visited.insert((label.clone(), held)) {
+                continue;
+            }
+            let lines = blocks
+                .get(label.as_str())
+                .expect("missing control-flow block");
+            for (index, line) in lines.iter().enumerate() {
+                if line.contains("call ptr @ai_managed_lock(") {
+                    assert!(!held, "nested aggregate region in {label}");
+                    held = true;
+                    locks.insert((label.clone(), index));
+                } else if line.contains("call void @ai_managed_unlock(") {
+                    assert!(held, "unpaired release in {label}");
+                    held = false;
+                } else if held && line.contains("call ") {
+                    assert!(
+                        line.contains("@ai_gc_write_barrier("),
+                        "unexpected call in snapshot region: {line}"
+                    );
+                }
+                if line.trim_start().starts_with("ret ") || line.trim() == "unreachable" {
+                    assert!(!held, "snapshot stripe held at exit in {label}");
+                }
+            }
+            for line in lines {
+                for target in line.split("label %").skip(1) {
+                    let name: String = target
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                        .collect();
+                    pending.push((name, held));
+                }
+            }
+        }
+        snapshots += locks.len();
+    }
+    snapshots
+}
+
+#[test]
+fn snapshot_path_check_accepts_reordered_blocks_and_rejects_collecting_paths() {
+    let good = "define void @test() {\nentry:\n  call ptr @ai_managed_lock(ptr %t, ptr %o)\n  br label %release\nunrelated:\n  call void @ai_gc_pollcheck_slow(ptr %t)\n  ret void\nrelease:\n  call void @ai_managed_unlock(ptr %t)\n  ret void\n}\n";
+    assert_eq!(check_snapshot_paths(good), 1);
+    let bad = good.replace("br label %release", "br label %unrelated");
+    assert!(std::panic::catch_unwind(|| check_snapshot_paths(&bad)).is_err());
 }

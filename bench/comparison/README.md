@@ -31,7 +31,7 @@ schedules. RSS is the peak across warmup plus measured iterations, not live heap
 is not evidence of zero heap usage. Process wall time includes **all** iterations
 and VM startup; it must not be reported as startup latency alone.
 
-Rust uses `-C opt-level=2 -C panic=abort`; gc-rust uses its default LLVM O2 AOT
+Rust defaults to `-C opt-level=2 -C panic=abort` (use `--rust-opt-level 3` for O3); gc-rust now uses its default LLVM O3 AOT
 build with its release runtime. Java uses OpenJDK with `-Xms16m -Xmx512m
 -XX:+UseG1GC` and an English locale. gc-rust uses a 16 MiB nursery, 256 MiB
 per tenured semispace, and one collector worker. These are explicit configurations,
@@ -75,3 +75,13 @@ comparison, also verify their signatures against the all-language baseline.
 Run `python3 bench/comparison/summarize.py` after recording results.json and
 rust-o3.json. Run `python3 bench/comparison/profile.py` separately for macOS CPU
 sampling and a collection log. See [findings and priorities](INVESTIGATION.md).
+
+
+The saved initial investigation used gc-rust O2; its historical records remain
+unchanged. The optimization follow-up records a fresh checkout of that baseline
+and the changed compiler/runtime separately in
+[optimization-2026-10-06](optimization-2026-10-06/REPORT.md).
+`nbody_objects` is a separate diagnostic variant using a Body object array in
+gc-rust, preserving the original nbody benchmark. It helps distinguish source
+layout choices from compiler/runtime improvements; its results must be labeled
+separately.

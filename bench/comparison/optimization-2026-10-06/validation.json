@@ -1,0 +1,11 @@
+{
+  "workspace_passed": 532,
+  "workspace_ignored": 8,
+  "native_tsan_executions": 18,
+  "runtime_tsan_tests": 7,
+  "baseline_commit": "35b81576b71cb280e8aafb4115c2a76323570000",
+  "original_sources_unchanged": true,
+  "implementation_hashes_match": true,
+  "tree_alloc_objects_per_fork": 96665730,
+  "tree_alloc_bytes_per_fork": 3866628960
+}

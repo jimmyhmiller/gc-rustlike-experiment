@@ -26,7 +26,9 @@ chosen production application before deciding which runtime optimization to buil
 
 ## Current measured comparison (2026-10-06)
 
-A new release AOT/Rust O2/Rust O3/OpenJDK 21 comparison is available in
+The optimization follow-up and fresh baseline control are in
+[comparison/optimization-2026-10-06/REPORT.md](comparison/optimization-2026-10-06/REPORT.md).
+The original release AOT/Rust O2/Rust O3/OpenJDK 21 comparison is available in
 [comparison/MEASUREMENTS.md](comparison/MEASUREMENTS.md), with
 [methodology](comparison/README.md), [profile-supported findings](comparison/INVESTIGATION.md),
 and raw per-iteration records. It uses three process forks and explicit in-process

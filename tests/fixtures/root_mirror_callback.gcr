@@ -1,0 +1,30 @@
+// A collecting C callback relocates the caller's roots while it is BLOCKED.
+// Both retained objects and mutable FFI copy-out must use refreshed pointers.
+struct Sentinel { sequence: i64, text: String }
+extern "C" fn qsort(mut base: RawPtr, n: i64, size: i64, compar: extern fn(RawPtr, RawPtr) -> i32);
+
+fn compare(a: RawPtr, b: RawPtr) -> i32 {
+    let mut i = 0;
+    while i < 32 {
+        let mut scratch: Array<i64> = array_new(8192);
+        array_set(scratch, 8191, i);
+        if array_get_unchecked(scratch, 8191) != i { panic("callback array corrupted"); }
+        i = i + 1;
+    }
+    let x = ptr_read_i64(a);
+    let y = ptr_read_i64(b);
+    if x < y { -1 as i32 } else if x > y { 1 as i32 } else { 0 as i32 }
+}
+
+fn main() -> i64 {
+    let sentinel = Sentinel { sequence: 42, text: to_string(42) };
+    let mut values: Array<i64> = array_new(5);
+    array_set(values, 0, 30); array_set(values, 1, 10); array_set(values, 2, 50);
+    array_set(values, 3, 20); array_set(values, 4, 40);
+    qsort(as_c_bytes(values), 5, 8, compare);
+    if sentinel.sequence != 42 || !str_eq(sentinel.text, "42") { panic("native callback lost caller root"); }
+    let checksum = array_get_unchecked(values, 0) * 100 + array_get_unchecked(values, 4);
+    if checksum != 1050 { panic("copy-out used stale array"); }
+    print_int(checksum);
+    0
+}

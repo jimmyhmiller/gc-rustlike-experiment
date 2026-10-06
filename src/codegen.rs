@@ -49,7 +49,7 @@ struct DebugCx<'ctx> {
 
 /// How much DWARF a build emits. `None` for JIT / `emit llvm` (no debug info);
 /// `LineTables` is the default `gcr build` (P2 — stepping + breakpoints, kept
-/// even under O2); `Full` is `gcr build --debug` (P3 — local-variable
+/// even under O3); `Full` is `gcr build --debug` (P3 — local-variable
 /// inspection, requires unoptimized codegen).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebugLevel {
@@ -111,6 +111,7 @@ pub fn codegen_with_debug<'ctx>(
         builder,
         prog,
         funcs: HashMap::new(),
+        nonrelocating: crate::codegen_effects::nonrelocating_functions(prog),
         trampolines: HashMap::new(),
         alloc_sites: Vec::new(),
         alloc_site_ids: HashMap::new(),
@@ -483,7 +484,7 @@ fn build_debug_cx<'ctx>(
 }
 
 /// Emit the LLVM IR text for a whole program — the `gcr emit llvm` tap that
-/// completes the source→silicon chain. With `optimize`, runs the same O2
+/// completes the source→silicon chain. With `optimize`, runs the same O3
 /// pipeline the JIT/AOT paths use, so you see the IR that actually executes;
 /// without it, the naive pre-optimization IR (every local a stack slot), which
 /// maps more directly onto the Core IR.
@@ -491,7 +492,7 @@ pub fn emit_llvm_ir(prog: &CoreProgram, optimize: bool) -> Result<String, Codege
     let ctx = Context::create();
     let compiled = codegen(&ctx, prog)?;
     if optimize {
-        optimize_module(&compiled.module);
+        optimize_module(&compiled.module)?;
     }
     Ok(compiled.module.print_to_string().to_string())
 }
@@ -502,6 +503,7 @@ struct Codegen<'ctx, 'p> {
     builder: Builder<'ctx>,
     prog: &'p CoreProgram,
     funcs: HashMap<FuncId, FunctionValue<'ctx>>,
+    nonrelocating: Vec<bool>,
     /// Cache of synthesized FFI callback trampolines, keyed by the gc-rust
     /// FuncId they wrap (one trampoline per referenced function).
     trampolines: HashMap<FuncId, FunctionValue<'ctx>>,
@@ -694,7 +696,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     fn managed_lock(&self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>) -> PointerValue<'ctx> {
         let f = self.module.get_function("ai_managed_lock").unwrap();
-        call_result(self.builder.build_call(f, &[fcx.thread.into(), obj.into()], "managed.object").unwrap()).into_pointer_value()
+        call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), obj.into()], "managed.object").unwrap()).into_pointer_value()
     }
 
     fn managed_unlock(&self, fcx: &FnCtx<'ctx>) {
@@ -986,15 +988,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         let ptr = self.ctx.ptr_type(AddressSpace::default());
 
+        // Proven nonrelocating callees never park, so collectors cannot inspect
+        // their stack or move their references during execution. Their callers
+        // retain the traced roots across the call. Keep full-debug frame storage
+        // for editable reference locals and debugger consistency.
+        let requires_roots = !self.nonrelocating[id as usize]
+            || self.debug.as_ref().is_some_and(|debug| debug.full);
         // Partition locals: Ref-typed locals become GC frame *direct* root slots;
         // all others get plain allocas. Count the refs to size the frame.
-        let num_roots = f.locals.iter().filter(|r| matches!(r, Repr::Ref(_))).count();
+        let num_roots = if requires_roots { f.locals.iter().filter(|r| matches!(r, Repr::Ref(_))).count() } else { 0 };
         // Map: local id -> root index (only for Ref locals).
         let mut root_index: Vec<Option<u32>> = vec![None; f.locals.len()];
         {
             let mut ri = 0u32;
             for (i, r) in f.locals.iter().enumerate() {
-                if matches!(r, Repr::Ref(_)) {
+                if requires_roots && matches!(r, Repr::Ref(_)) {
                     root_index[i] = Some(ri);
                     ri += 1;
                 }
@@ -1011,6 +1019,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             .locals
             .iter()
             .enumerate()
+            .filter(|_| requires_roots)
             .filter_map(|(i, r)| match r {
                 Repr::Value(vid) if value_has_ref(&self.prog.values, *vid) => {
                     let mut offs = Vec::new();
@@ -1021,12 +1030,26 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             })
             .collect();
         let num_indirect: usize = value_indirect.iter().map(|(_, o)| o.len()).sum();
+        // With no incoming roots or indirect-root locals, all mirrors begin
+        // null. Register the frame for the first reference assignment, before
+        // any subsequent safepoint. Leaf-return paths can then optimize away
+        // frame traffic. Other functions retain entry registration.
+        let defer_frame = num_roots > 0 && num_indirect == 0
+            && f.closure_captures.is_empty()
+            && f.params.iter().all(|repr| !self.repr_relocates(repr))
+            && !self.debug.as_ref().is_some_and(|debug| debug.full);
+        let frame_active = if defer_frame {
+            let active = self.builder.build_alloca(self.ctx.bool_type(), "roots.active").unwrap();
+            self.builder.build_store(active, self.ctx.bool_type().const_zero()).unwrap();
+            Some(active)
+        } else { None };
 
         // Emit the GC frame `{ parent, origin, [num_roots x ptr], [num_indirect x
         // ptr] }` when there are any roots (direct or indirect). A zero-length
         // trailing array adds no bytes, so frames without indirect roots are
         // byte-identical to before.
         let i32t = self.ctx.i32_type();
+        let mut deferred_frame_origin = None;
         let frame = if num_roots > 0 || num_indirect > 0 {
             let roots_arr = ptr.array_type(num_roots as u32);
             let ind_arr = ptr.array_type(num_indirect as u32);
@@ -1035,17 +1058,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 .struct_type(&[ptr.into(), ptr.into(), roots_arr.into(), ind_arr.into()], false);
             let frame = self.builder.build_alloca(frame_ty, "gcframe").unwrap();
             let origin = self.frame_origin(&f.name, num_roots as u32, num_indirect as u32);
-            let origin_field = self.builder.build_struct_gep(frame_ty, frame, 1, "origin.f").unwrap();
-            self.builder.build_store(origin_field, origin).unwrap();
+            if defer_frame { deferred_frame_origin = Some(origin); }
+            else {
+                let origin_field = self.builder.build_struct_gep(frame_ty, frame, 1, "origin.f").unwrap();
+                self.builder.build_store(origin_field, origin).unwrap();
+            }
             // link: parent = thread.top_frame; thread.top_frame = &frame
             let tf_ptr = self.thread_field_ptr(func, crate::runtime::thread_offsets::TOP_FRAME);
-            let prev = self.builder.build_load(ptr, tf_ptr, "prevtop").unwrap();
-            let parent_field = self.builder.build_struct_gep(frame_ty, frame, 0, "parent.f").unwrap();
-            self.builder.build_store(parent_field, prev).unwrap();
-            self.builder.build_store(tf_ptr, frame).unwrap();
+            if !defer_frame {
+                let prev = self.builder.build_load(ptr, tf_ptr, "prevtop").unwrap();
+                let parent_field = self.builder.build_struct_gep(frame_ty, frame, 0, "parent.f").unwrap();
+                self.builder.build_store(parent_field, prev).unwrap();
+                self.builder.build_store(tf_ptr, frame).unwrap();
+            }
             // Zero all direct root slots.
             let roots_field = self.builder.build_struct_gep(frame_ty, frame, 2, "roots.f").unwrap();
-            for k in 0..num_roots {
+            for k in 0..if defer_frame { 0 } else { num_roots } {
                 let slot = unsafe {
                     self.builder.build_in_bounds_gep(
                         roots_arr, roots_field,
@@ -1072,8 +1100,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             None
         };
 
-        // Build slots. Ref locals point at their frame root slot; others get
-        // plain allocas.
+        // Keep traced mirrors separate from private reference allocas so LLVM
+        // can retain references in SSA between relocation boundaries.
+        let mut root_slots = vec![None; f.locals.len()];
         let mut slots: Vec<Option<PointerValue<'ctx>>> = Vec::with_capacity(f.locals.len());
         for (i, lr) in f.locals.iter().enumerate() {
             if let Some(ri) = root_index[i] {
@@ -1085,7 +1114,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         &format!("root{}", ri),
                     ).unwrap()
                 };
-                slots.push(Some(slot));
+                if self.debug.as_ref().is_some_and(|d| d.full) {
+                    // Full-debug locals remain editable in their traced slots.
+                    slots.push(Some(slot));
+                } else {
+                    root_slots[i] = Some(slot);
+                    let private = self.builder.build_alloca(ptr, &format!("ref.local{i}")).unwrap();
+                    self.builder.build_store(private, ptr.const_null()).unwrap();
+                    slots.push(Some(private));
+                }
             } else {
                 match self.llvm_ty(lr) {
                     Some(t) => slots.push(Some(self.builder.build_alloca(t, &format!("l{}", i)).unwrap())),
@@ -1138,6 +1175,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     let addr = self.obj_addr(env, cap.offset);
                     let v = self.builder.build_load(lty, addr, "cap").unwrap();
                     self.builder.build_store(slot, v).unwrap();
+                    if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); }
                 }
             }
         }
@@ -1148,6 +1186,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if let Some(slot) = slots[local] {
                     let arg = func.get_nth_param(llvm_idx).unwrap();
                     self.builder.build_store(slot, arg).unwrap();
+                    if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); }
                 }
                 llvm_idx += 1;
             }
@@ -1257,6 +1296,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let mut fcx = FnCtx {
             func,
             slots,
+            root_slots,
+            frame_active,
+            deferred_frame_origin,
             local_reprs: f.locals.clone(),
             thread: func.get_nth_param(0).unwrap().into_pointer_value(),
             loops: Vec::new(),
@@ -1282,13 +1324,154 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(())
     }
 
-    /// Restore `thread.top_frame = frame.parent` (no-op if this fn has no frame).
+    /// Ref locals have an escaped traced mirror and a private working slot.
+    /// Every assignment updates both. A managed call can relocate mirrors;
+    /// reload working slots if a world pause occurred during the call. LLVM can
+    /// promote private slots to SSA and retain registers on a poll's fast path.
+    fn reload_root_mirrors(&self, fcx: &FnCtx<'ctx>) {
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        for (slot, root) in fcx.slots.iter().zip(&fcx.root_slots) {
+            if let (Some(slot), Some(root)) = (slot, root) {
+                let relocated = self.builder.build_load(ptr, *root, "root.relocated").unwrap();
+                self.builder.build_store(*slot, relocated).unwrap();
+            }
+        }
+    }
+
+    fn load_relocation_epoch(&self, fcx: &FnCtx<'ctx>) -> IntValue<'ctx> {
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let address = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::RELOCATION_EPOCH as u64);
+        let epoch = self.builder.build_load(ptr, address, "gc.epoch_ptr").unwrap().into_pointer_value();
+        let value = self.builder.build_load(self.ctx.i64_type(), epoch, "gc.epoch").unwrap();
+        value.as_instruction_value().unwrap().set_alignment(8).unwrap();
+        value.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
+        value.into_int_value()
+    }
+
+    /// Deferred frames have no live references until registration. Their
+    /// mirrors are initialized on registration, never read while inactive.
+    fn reload_active_root_mirrors(&self, fcx: &FnCtx<'ctx>) {
+        let ready = if let Some(flag) = fcx.frame_active {
+            let active = self.builder.build_load(self.ctx.bool_type(), flag, "roots.active_ffi").unwrap().into_int_value();
+            let reload = self.ctx.append_basic_block(fcx.func, "roots.ffi.reload");
+            let ready = self.ctx.append_basic_block(fcx.func, "roots.ffi.ready");
+            self.builder.build_conditional_branch(active, reload, ready).unwrap();
+            self.builder.position_at_end(reload);
+            Some(ready)
+        } else { None };
+        self.reload_root_mirrors(fcx);
+        if let Some(ready) = ready {
+            self.builder.build_unconditional_branch(ready).unwrap();
+            self.builder.position_at_end(ready);
+        }
+    }
+
+    /// Inactive deferred frames have no live references. Avoid even acquire
+    /// epoch loads on those paths; these loads otherwise survive LLVM DCE.
+    fn prepare_root_reload(&self, fcx: &FnCtx<'ctx>) -> Option<(IntValue<'ctx>, Option<IntValue<'ctx>>)> {
+        if !fcx.root_slots.iter().any(Option::is_some) { return None; }
+        let active = fcx.frame_active.map(|flag| self.builder.build_load(self.ctx.bool_type(), flag, "roots.were_active").unwrap().into_int_value());
+        let before = if let Some(active) = active {
+            let inactive = self.builder.get_insert_block().unwrap();
+            let read = self.ctx.append_basic_block(fcx.func, "roots.epoch.read");
+            let ready = self.ctx.append_basic_block(fcx.func, "roots.epoch.ready");
+            self.builder.build_conditional_branch(active, read, ready).unwrap();
+            self.builder.position_at_end(read);
+            let epoch = self.load_relocation_epoch(fcx);
+            self.builder.build_unconditional_branch(ready).unwrap();
+            self.builder.position_at_end(ready);
+            let before = self.builder.build_phi(self.ctx.i64_type(), "roots.epoch.before").unwrap();
+            before.add_incoming(&[(&self.ctx.i64_type().const_zero(), inactive), (&epoch, read)]);
+            before.as_basic_value().into_int_value()
+        } else { self.load_relocation_epoch(fcx) };
+        Some((before, active))
+    }
+
+    fn reload_if_relocated(&self, fcx: &FnCtx<'ctx>, before: IntValue<'ctx>, active: Option<IntValue<'ctx>>) {
+        let ready = self.ctx.append_basic_block(fcx.func, "roots.ready");
+        if let Some(active) = active {
+            let check = self.ctx.append_basic_block(fcx.func, "roots.epoch.check");
+            self.builder.build_conditional_branch(active, check, ready).unwrap();
+            self.builder.position_at_end(check);
+        }
+        let after = self.load_relocation_epoch(fcx);
+        let changed = self.builder.build_int_compare(IntPredicate::NE, before, after, "gc.relocated").unwrap();
+        let reload = self.ctx.append_basic_block(fcx.func, "roots.reload");
+        self.builder.build_conditional_branch(changed, reload, ready).unwrap();
+        self.builder.position_at_end(reload);
+        self.reload_root_mirrors(fcx);
+        self.builder.build_unconditional_branch(ready).unwrap();
+        self.builder.position_at_end(ready);
+    }
+
+    fn build_managed_call(&self, fcx: &FnCtx<'ctx>, callee: FunctionValue<'ctx>, args: &[inkwell::values::BasicMetadataValueEnum<'ctx>], name: &str)
+        -> Result<inkwell::values::CallSiteValue<'ctx>, inkwell::builder::BuilderError>
+    {
+        let symbol = callee.get_name();
+        let symbol = symbol.to_str().unwrap_or("");
+        // These routines neither collect nor park, or deliberately leave the
+        // thread BLOCKED. Never read root slots between ffi_enter and leave.
+        let managed_id = self.funcs.iter().find_map(|(&id, &function)| (function == callee).then_some(id));
+        let no_relocation = if let Some(id) = managed_id { self.nonrelocating[id as usize] } else { symbol.starts_with("llvm.") || matches!(symbol,
+            "ai_ffi_enter" | "ai_ffi_exit" | "ai_gc_record_alloc" | "ai_gc_write_barrier" |
+            "ai_str_len" | "ai_str_eq" | "ai_str_get" | "ai_str_hash" | "ai_str_to_float" |
+            "ai_bounds_fail" | "ai_uninitialized_array_fail" | "ai_arithmetic_fail" | "ai_panic"
+        ) };
+        let has_roots = fcx.root_slots.iter().any(Option::is_some);
+        // ffi_leave begins BLOCKED, after native callbacks may already have
+        // moved roots. Reload unconditionally after it returns RUNNING.
+        let before = if has_roots && !no_relocation && symbol != "ai_ffi_leave" {
+            self.prepare_root_reload(fcx)
+        } else { None };
+        let call = self.builder.build_call(callee, args, name)?;
+        if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active); }
+        else if has_roots && symbol == "ai_ffi_leave" { self.reload_active_root_mirrors(fcx); }
+        Ok(call)
+    }
+
+    fn ensure_root_frame_linked(&self, fcx: &FnCtx<'ctx>) {
+        if let (Some(flag), Some((frame, frame_ty, tf_ptr))) = (fcx.frame_active, fcx.unlink) {
+            let active = self.builder.build_load(self.ctx.bool_type(), flag, "roots.active_now").unwrap().into_int_value();
+            let link = self.ctx.append_basic_block(fcx.func, "roots.link");
+            let ready = self.ctx.append_basic_block(fcx.func, "roots.linked");
+            self.builder.build_conditional_branch(active, ready, link).unwrap();
+            self.builder.position_at_end(link);
+            let origin_field = self.builder.build_struct_gep(frame_ty, frame, 1, "origin.f").unwrap();
+            self.builder.build_store(origin_field, fcx.deferred_frame_origin.unwrap()).unwrap();
+            let roots = frame_ty.get_field_type_at_index(2).unwrap().into_array_type();
+            let roots_field = self.builder.build_struct_gep(frame_ty, frame, 2, "roots.f").unwrap();
+            for index in 0..roots.len() {
+                let slot = unsafe { self.builder.build_in_bounds_gep(roots, roots_field, &[self.ctx.i32_type().const_zero(), self.ctx.i32_type().const_int(index as u64, false)], "root.init").unwrap() };
+                self.builder.build_store(slot, self.ctx.ptr_type(AddressSpace::default()).const_null()).unwrap();
+            }
+            let parent_field = self.builder.build_struct_gep(frame_ty, frame, 0, "parent.f").unwrap();
+            let parent = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), tf_ptr, "prevtop").unwrap();
+            self.builder.build_store(parent_field, parent).unwrap();
+            self.builder.build_store(tf_ptr, frame).unwrap();
+            self.builder.build_store(flag, self.ctx.bool_type().const_int(1, false)).unwrap();
+            self.builder.build_unconditional_branch(ready).unwrap();
+            self.builder.position_at_end(ready);
+        }
+    }
+
+    /// Restore the parent only if this function registered its frame.
     fn emit_unlink(&self, fcx: &FnCtx<'ctx>) {
         if let Some((frame, frame_ty, tf_ptr)) = fcx.unlink {
+            let ready = if let Some(flag) = fcx.frame_active {
+                let active = self.builder.build_load(self.ctx.bool_type(), flag, "roots.active_return").unwrap().into_int_value();
+                let unlink = self.ctx.append_basic_block(fcx.func, "roots.unlink");
+                let ready = self.ctx.append_basic_block(fcx.func, "roots.return");
+                self.builder.build_conditional_branch(active, unlink, ready).unwrap();
+                self.builder.position_at_end(unlink);
+                Some(ready)
+            } else { None };
             let parent_field = self.builder.build_struct_gep(frame_ty, frame, 0, "parent.r").unwrap();
-            let ptr = self.ctx.ptr_type(AddressSpace::default());
-            let parent = self.builder.build_load(ptr, parent_field, "parent.v").unwrap();
+            let parent = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), parent_field, "parent.v").unwrap();
             self.builder.build_store(tf_ptr, parent).unwrap();
+            if let Some(ready) = ready {
+                self.builder.build_unconditional_branch(ready).unwrap();
+                self.builder.position_at_end(ready);
+            }
         }
     }
 
@@ -1329,6 +1512,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     let v = self.gen_expr(fcx, e)?;
                     if let (Some(slot), Some(v)) = (fcx.slots[*local as usize], v) {
                         self.builder.build_store(slot, v).unwrap();
+                        if let Some(root) = fcx.root_slots[*local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, v).unwrap(); }
                     }
                 }
                 CoreStmt::Expr(e) => {
@@ -1420,32 +1604,32 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     } else { iv.into() }
                 };
                 let f = self.module.get_function(fname).unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), arg.into()], "print").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), arg.into()], "print").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::PrintStr(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_print_str").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), sv.into()], "prints").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "prints").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::PrintStrRaw(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_print_str_raw").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), sv.into()], "printsr").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "printsr").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::StrLen(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_str_len").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), sv.into()], "strlen").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "strlen").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::StrEq(a, b) => {
                 let av = self.gen_expr(fcx, a)?.unwrap().into_pointer_value();
                 let bv = self.gen_expr(fcx, b)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_str_eq").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), av.into(), bv.into()], "streq").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), av.into(), bv.into()], "streq").unwrap());
                 // ai_str_eq returns i64 (0/1); narrow to i1 for the bool repr.
                 let iv = r.into_int_value();
                 let b1 = self.builder.build_int_truncate(iv, self.ctx.bool_type(), "streqb").unwrap();
@@ -1459,7 +1643,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let bv = self.gen_expr(fcx, b)?.unwrap().into_pointer_value();
                 let i32t = self.ctx.i32_type();
                 let f = self.module.get_function("ai_str_concat").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f,
                     &[fcx.thread.into(), i32t.const_int(*layout as u64, false).into(), av.into(), bv.into()],
                     "strcat",
@@ -1470,7 +1654,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
                 let iv = self.gen_expr(fcx, i)?.unwrap().into_int_value();
                 let f = self.module.get_function("ai_str_get").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), sv.into(), iv.into()], "strget").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into(), iv.into()], "strget").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::StrSubstring { layout, s, start, end } => {
@@ -1479,7 +1663,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let en = self.gen_expr(fcx, end)?.unwrap().into_int_value();
                 let i32t = self.ctx.i32_type();
                 let f = self.module.get_function("ai_str_substring").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f,
                     &[fcx.thread.into(), i32t.const_int(*layout as u64, false).into(), sv.into(), st.into(), en.into()],
                     "strsub",
@@ -1490,12 +1674,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let mut cargs = vec![fcx.thread.into(), self.ctx.i32_type().const_int(*layout as u64, false).into()];
                 for arg in args { cargs.push(self.gen_expr(fcx, arg)?.unwrap().into()); }
                 let func = self.module.get_function("ai_str_join").unwrap();
-                Ok(Some(call_result(self.builder.build_call(func, &cargs, "str.join").unwrap())))
+                Ok(Some(call_result(self.build_managed_call(fcx, func, &cargs, "str.join").unwrap())))
             }
             CoreExprKind::Panic(message) => {
                 let message = self.gen_expr(fcx, message)?.unwrap();
                 let func = self.module.get_function("ai_panic").unwrap();
-                self.builder.build_call(func, &[fcx.thread.into(), message.into()], "").unwrap();
+                self.build_managed_call(fcx, func, &[fcx.thread.into(), message.into()], "").unwrap();
                 self.builder.build_unreachable().unwrap();
                 Ok(None)
             }
@@ -1506,13 +1690,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 }
                 for arg in args { cargs.push(self.gen_expr(fcx, arg)?.unwrap().into()); }
                 let func = self.module.get_function("ai_host_call").unwrap();
-                Ok(Some(call_result(self.builder.build_call(func, &cargs, "host.io").unwrap())))
+                Ok(Some(call_result(self.build_managed_call(fcx, func, &cargs, "host.io").unwrap())))
             }
             CoreExprKind::ReadFile { layout, path } => {
                 let pv = self.gen_expr(fcx, path)?.unwrap().into_pointer_value();
                 let i32t = self.ctx.i32_type();
                 let f = self.module.get_function("ai_read_file").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f,
                     &[fcx.thread.into(), i32t.const_int(*layout as u64, false).into(), pv.into()],
                     "readfile",
@@ -1522,7 +1706,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::StrToFloat(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_str_to_float").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), sv.into()], "strtof").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "strtof").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::FloatBits(f) => {
@@ -1533,7 +1717,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::StrHash(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_str_hash").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), sv.into()], "strhash").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "strhash").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::TypeIdOf(obj) => {
@@ -1551,7 +1735,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let ov = self.gen_expr(fcx, obj)?.unwrap().into_pointer_value();
                 let i32t = self.ctx.i32_type();
                 let f = self.module.get_function("ai_type_name").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f,
                     &[fcx.thread.into(), i32t.const_int(*layout as u64, false).into(), ov.into()],
                     "typename",
@@ -1574,12 +1758,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     // byte_len = ai_str_len(s); buffer = byte_len + 1 (NUL).
                     let lenf = self.module.get_function("ai_str_len").unwrap();
                     let len = call_result(
-                        self.builder.build_call(lenf, &[fcx.thread.into(), sv.into()], "ascb.len").unwrap()
+                        self.build_managed_call(fcx, lenf, &[fcx.thread.into(), sv.into()], "ascb.len").unwrap()
                     ).into_int_value();
                     let cap = self.builder.build_int_add(len, i64t.const_int(1, false), "ascb.cap").unwrap();
                     let buf = self.builder.build_array_alloca(i8t, cap, "ascb.buf").unwrap();
                     let cpf = self.module.get_function("ai_str_copy_to_buf").unwrap();
-                    self.builder.build_call(cpf, &[fcx.thread.into(), sv.into(), buf.into()], "").unwrap();
+                    self.build_managed_call(fcx, cpf, &[fcx.thread.into(), sv.into(), buf.into()], "").unwrap();
                     return Ok(Some(buf.into()));
                 }
 
@@ -1595,7 +1779,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 };
                 let buf = self.builder.build_array_alloca(i8t, byte_len, "ascb.buf").unwrap();
                 let cin = self.module.get_function("ai_buf_copy_in").unwrap();
-                self.builder.build_call(cin, &[fcx.thread.into(), sv.into(), buf.into(), byte_len.into(), i64t.const_int(elem.bits() as u64, false).into()], "").unwrap();
+                self.build_managed_call(fcx, cin, &[fcx.thread.into(), sv.into(), buf.into(), byte_len.into(), i64t.const_int(elem.bits() as u64, false).into()], "").unwrap();
                 if *copy_out {
                     // Queue a write-back; gen_call replays it after the extern call.
                     fcx.pending_copy_outs.push((src.as_ref().clone(), buf, byte_len, elem.bits()));
@@ -1607,7 +1791,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let i32t = self.ctx.i32_type();
                 let fname = if *is_float { "ai_str_from_float" } else { "ai_str_from_int" };
                 let f = self.module.get_function(fname).unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f,
                     &[fcx.thread.into(), i32t.const_int(*layout as u64, false).into(), vv.into()],
                     "strfromnum",
@@ -1618,7 +1802,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let cpv = self.gen_expr(fcx, cp)?.unwrap();
                 let i32t = self.ctx.i32_type();
                 let f = self.module.get_function("ai_char_to_str").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f,
                     &[fcx.thread.into(), i32t.const_int(*layout as u64, false).into(), cpv.into()],
                     "strfromchar",
@@ -1647,11 +1831,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 // layout (ptr_fields=0) which gives the WRONG offset for a closure
                 // that captured GC pointers. See `ai_closure_code_ptr`.
                 let codef = self.module.get_function("ai_closure_code_ptr").unwrap();
-                let code = call_result(self.builder.build_call(
+                let code = call_result(self.build_managed_call(fcx,
                     codef, &[fcx.thread.into(), env.into()], "code",
                 ).unwrap()).into_pointer_value();
                 let f = self.module.get_function("ai_thread_spawn").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f, &[fcx.thread.into(), env.into(), code.into()], "spawn",
                 ).unwrap());
                 Ok(Some(r))
@@ -1659,7 +1843,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::ThreadJoin(handle) => {
                 let h = self.gen_expr(fcx, handle)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_thread_join").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into(), h.into()], "join").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), h.into()], "join").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::AtomLoad { atom, elem } => {
@@ -1721,7 +1905,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let c = self.gen_expr(fcx, ctrl)?.unwrap().into_pointer_value();
                 let v = self.gen_expr(fcx, value)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_chan_send").unwrap();
-                let r = call_result(self.builder.build_call(
+                let r = call_result(self.build_managed_call(fcx,
                     f, &[fcx.thread.into(), b.into(), c.into(), v.into()], "chsend").unwrap());
                 Ok(Some(r))
             }
@@ -1729,7 +1913,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let b = self.gen_expr(fcx, buf)?.unwrap().into_pointer_value();
                 let c = self.gen_expr(fcx, ctrl)?.unwrap().into_pointer_value();
                 let f = self.module.get_function("ai_chan_recv").unwrap();
-                let value = call_result(self.builder.build_call(
+                let value = call_result(self.build_managed_call(fcx,
                     f, &[fcx.thread.into(), b.into(), c.into()], "chrecv").unwrap()).into_pointer_value();
                 let Repr::Value(option) = e.repr else { return Err(CodegenError("channel receive requires Option representation".into())); };
                 let some_bb = self.ctx.append_basic_block(fcx.func, "channel.some");
@@ -1757,7 +1941,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         cargs.push(v.into());
                     }
                 }
-                let cs = self.builder.build_call(f, &cargs, "rtcall").unwrap();
+                let cs = self.build_managed_call(fcx, f, &cargs, "rtcall").unwrap();
                 match (cs.try_as_basic_value(), self.llvm_ty(ret)) {
                     (inkwell::values::ValueKind::Basic(v), _) => Ok(Some(v)),
                     (inkwell::values::ValueKind::Instruction(_), _) => Ok(None),
@@ -1766,17 +1950,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::ThreadSleep(ms) => {
                 let m = self.gen_expr(fcx, ms)?.unwrap().into_int_value();
                 let f = self.module.get_function("ai_thread_sleep").unwrap();
-                self.builder.build_call(f, &[fcx.thread.into(), m.into()], "").unwrap();
+                self.build_managed_call(fcx, f, &[fcx.thread.into(), m.into()], "").unwrap();
                 Ok(Some(self.ctx.i64_type().const_zero().into()))
             }
             CoreExprKind::ThreadYield => {
                 let f = self.module.get_function("ai_thread_yield").unwrap();
-                self.builder.build_call(f, &[fcx.thread.into()], "").unwrap();
+                self.build_managed_call(fcx, f, &[fcx.thread.into()], "").unwrap();
                 Ok(Some(self.ctx.i64_type().const_zero().into()))
             }
             CoreExprKind::ThreadCurrentId => {
                 let f = self.module.get_function("ai_thread_current_id").unwrap();
-                let r = call_result(self.builder.build_call(f, &[fcx.thread.into()], "tid").unwrap());
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into()], "tid").unwrap());
                 Ok(Some(r))
             }
             CoreExprKind::If(cond, then_b, else_b) => self.gen_if(fcx, cond, then_b, else_b, &e.repr),
@@ -1805,6 +1989,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let v = self.gen_expr(fcx, value)?;
                 if let (Some(slot), Some(v)) = (fcx.slots[*local as usize], v) {
                     self.builder.build_store(slot, v).unwrap();
+                    if let Some(root) = fcx.root_slots[*local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, v).unwrap(); }
                 }
                 Ok(None)
             }
@@ -1986,6 +2171,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.module.add_function(
             "ai_gc_alloc_fixed",
             ptr.fn_type(&[ptr.into(), i32t.into(), i32t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_gc_record_alloc",
+            self.ctx.void_type().fn_type(&[ptr.into(), i32t.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
         // ptr ai_gc_alloc_varlen(ptr thread, i32 type_id, i64 n, i32 site_id)
@@ -2327,6 +2517,105 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
+    /// Reserve a fixed object in the owning mutator's TLAB. Epoch validation
+    /// rejects buffers invalidated by nursery reset. Stress always takes the
+    /// collecting runtime path. The prefix is published before any safepoint;
+    /// construction stores below initialize fields before the object escapes.
+    fn gen_fixed_allocation(&mut self, fcx: &mut FnCtx<'ctx>, layout: LayoutId, site: u32) -> Result<PointerValue<'ctx>, CodegenError> {
+        use crate::gc::{Full, ObjHeader, TypeInfo, inline_tlab_offsets as off};
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let lay = &self.prog.layouts[layout as usize];
+        let size = TypeInfo::for_header(Full::SIZE).with_fields(lay.ptr_fields).with_raw_bytes(lay.raw_bytes)
+            .checked_allocation_size(0).ok_or_else(|| CodegenError("invalid fixed allocation layout".into()))? as u64;
+        let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
+        let args = [fcx.thread.into(), i32t.const_int(layout as u64, false).into(), i32t.const_int(site as u64, false).into()];
+        if size > 8192 || !matches!(lay.varlen, crate::core::VarLen::None) {
+            return Ok(call_result(self.build_managed_call(fcx, alloc, &args, "obj").unwrap()).into_pointer_value());
+        }
+        let window_addr = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::TLAB_WINDOW as u64);
+        let window = self.builder.build_load(ptr, window_addr, "tlab.window").unwrap().into_pointer_value();
+        let cursor_addr = self.obj_addr(window, off::CURSOR as u64);
+        let cursor = self.builder.build_load(i64t, cursor_addr, "tlab.cursor").unwrap().into_int_value();
+        let limit_addr = self.obj_addr(window, off::LIMIT as u64);
+        let limit = self.builder.build_load(i64t, limit_addr, "tlab.limit").unwrap().into_int_value();
+        let end = self.builder.build_int_add(cursor, i64t.const_int(size, false), "tlab.end").unwrap();
+        let within = self.builder.build_int_compare(IntPredicate::ULE, end, limit, "tlab.within").unwrap();
+        let no_wrap = self.builder.build_int_compare(IntPredicate::UGE, end, cursor, "tlab.no_wrap").unwrap();
+        let available = self.builder.build_and(within, no_wrap, "tlab.available").unwrap();
+        let check = self.ctx.append_basic_block(fcx.func, "alloc.check");
+        let fast = self.ctx.append_basic_block(fcx.func, "alloc.fast");
+        let slow = self.ctx.append_basic_block(fcx.func, "alloc.slow");
+        let merge = self.ctx.append_basic_block(fcx.func, "alloc.merge");
+        self.builder.build_conditional_branch(available, check, slow).unwrap();
+        self.builder.position_at_end(check);
+        let epoch_addr = self.obj_addr(window, off::EPOCH as u64);
+        let epoch_ptr = self.builder.build_load(ptr, epoch_addr, "tlab.epoch_ptr").unwrap().into_pointer_value();
+        let epoch = self.builder.build_load(i64t, epoch_ptr, "tlab.epoch").unwrap();
+        epoch.as_instruction_value().unwrap().set_alignment(8).unwrap();
+        epoch.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
+        let expected_addr = self.obj_addr(window, off::EXPECTED_EPOCH as u64);
+        let expected = self.builder.build_load(i64t, expected_addr, "tlab.expected_epoch").unwrap().into_int_value();
+        let fresh = self.builder.build_int_compare(IntPredicate::EQ, epoch.into_int_value(), expected, "tlab.fresh").unwrap();
+        let stress_addr = self.obj_addr(window, off::STRESS as u64);
+        let stress_ptr = self.builder.build_load(ptr, stress_addr, "tlab.stress_ptr").unwrap().into_pointer_value();
+        let stress = self.builder.build_load(self.ctx.i8_type(), stress_ptr, "tlab.stress").unwrap();
+        stress.as_instruction_value().unwrap().set_alignment(1).unwrap();
+        stress.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
+        let normal = self.builder.build_int_compare(IntPredicate::EQ, stress.into_int_value(), self.ctx.i8_type().const_zero(), "tlab.normal").unwrap();
+        let valid = self.builder.build_and(fresh, normal, "tlab.valid").unwrap();
+        self.builder.build_conditional_branch(valid, fast, slow).unwrap();
+        self.builder.position_at_end(fast);
+        let base_addr = self.obj_addr(window, off::BASE as u64);
+        let base = self.builder.build_load(ptr, base_addr, "tlab.base").unwrap().into_pointer_value();
+        let object = unsafe { self.builder.build_in_bounds_gep(self.ctx.i8_type(), base, &[cursor], "tlab.object").unwrap() };
+        self.builder.build_memset(object, 8, self.ctx.i8_type().const_zero(), i64t.const_int(size, false)).unwrap();
+        let type_addr = self.obj_addr(object, Full::TYPE_ID_OFFSET as u64);
+        self.builder.build_store(type_addr, self.ctx.i16_type().const_int(layout as u64, false)).unwrap();
+        self.builder.build_store(cursor_addr, end).unwrap();
+        let initialized_addr = self.obj_addr(window, off::INITIALIZED as u64);
+        let initialized = self.builder.build_load(ptr, initialized_addr, "tlab.initialized").unwrap().into_pointer_value();
+        let publication = self.builder.build_store(initialized, end).unwrap();
+        publication.set_alignment(8).unwrap();
+        publication.set_atomic_ordering(AtomicOrdering::Monotonic).unwrap();
+        // Keep exact per-site observability without a native call on every
+        // object. The runtime grows the owner-only counter vector on first use
+        // and refreshes its pointer/length after each relocation.
+        let count_fast = self.ctx.append_basic_block(fcx.func, "alloc.record");
+        let count_slow = self.ctx.append_basic_block(fcx.func, "alloc.record_grow");
+        let count_done = self.ctx.append_basic_block(fcx.func, "alloc.record_done");
+        let count_len_addr = self.obj_addr(window, off::COUNTERS_LEN as u64);
+        let count_len = self.builder.build_load(i64t, count_len_addr, "alloc.counter_len").unwrap().into_int_value();
+        let known_site = self.builder.build_int_compare(IntPredicate::ULT, i64t.const_int(site as u64, false), count_len, "alloc.known_site").unwrap();
+        self.builder.build_conditional_branch(known_site, count_fast, count_slow).unwrap();
+        self.builder.position_at_end(count_fast);
+        let counters_addr = self.obj_addr(window, off::COUNTERS as u64);
+        let counters = self.builder.build_load(ptr, counters_addr, "alloc.counters").unwrap().into_pointer_value();
+        let count_addr = self.obj_addr(counters, site as u64 * 16);
+        let bytes_addr = self.obj_addr(counters, site as u64 * 16 + 8);
+        for (addr, increment) in [(count_addr, 1), (bytes_addr, size)] {
+            let old = self.builder.build_load(i64t, addr, "alloc.counter").unwrap().into_int_value();
+            let next = self.builder.build_int_add(old, i64t.const_int(increment, false), "alloc.counter_next").unwrap();
+            self.builder.build_store(addr, next).unwrap();
+        }
+        self.builder.build_unconditional_branch(count_done).unwrap();
+        self.builder.position_at_end(count_slow);
+        let record = self.module.get_function("ai_gc_record_alloc").unwrap();
+        self.build_managed_call(fcx, record, &[fcx.thread.into(), i32t.const_int(site as u64, false).into(), i64t.const_int(size, false).into()], "").unwrap();
+        self.builder.build_unconditional_branch(count_done).unwrap();
+        self.builder.position_at_end(count_done);
+        self.builder.build_unconditional_branch(merge).unwrap();
+        self.builder.position_at_end(slow);
+        let allocated = call_result(self.build_managed_call(fcx, alloc, &args, "obj.slow").unwrap()).into_pointer_value();
+        let slow_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge).unwrap();
+        self.builder.position_at_end(merge);
+        let object_phi = self.builder.build_phi(ptr, "obj").unwrap();
+        object_phi.add_incoming(&[(&object, count_done), (&allocated, slow_end)]);
+        Ok(object_phi.as_basic_value().into_pointer_value())
+    }
+
     /// Allocate a heap object of `layout`, store `tag` (for enums) + `fields`,
     /// and return the pointer. The fields are evaluated and stored; pointer
     /// fields go in the leading pointer slots, raw fields at their byte offset.
@@ -2356,18 +2645,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
 
         let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
-        let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
-        let obj = call_result(
-            self.builder.build_call(
-                alloc,
-                &[
-                    fcx.thread.into(),
-                    i32t.const_int(layout as u64, false).into(),
-                    i32t.const_int(site as u64, false).into(),
-                ],
-                "obj",
-            ).unwrap(),
-        ).into_pointer_value();
+        let obj = self.gen_fixed_allocation(fcx, layout, site)?;
 
         // Reload GC-valued fields from their slots post-allocation (see above).
         for (fe, slot) in fields.iter().zip(vals.iter_mut()) {
@@ -2688,7 +2966,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.build_conditional_branch(oob, fail_bb, ok_bb).unwrap();
         self.builder.position_at_end(fail_bb);
         let f = self.module.get_function("ai_bounds_fail").unwrap();
-        self.builder.build_call(f, &[fcx.thread.into(), idx64.into(), len.into()], "").unwrap();
+        self.build_managed_call(fcx, f, &[fcx.thread.into(), idx64.into(), len.into()], "").unwrap();
         self.builder.build_unreachable().unwrap();
         self.builder.position_at_end(ok_bb);
     }
@@ -2708,7 +2986,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let n = bytes.len() as u64;
         let site = self.alloc_site_id(&Self::current_fn_name(fcx), lid as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
-        let obj = call_result(self.builder.build_call(
+        let obj = call_result(self.build_managed_call(fcx,
             alloc,
             &[
                 fcx.thread.into(),
@@ -2746,13 +3024,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // Validate before multiplying: a wrapped byte count would allocate a
         // smaller object than its source-language array length requires.
         let validate = self.module.get_function("ai_array_allocation_len").unwrap();
-        let varlen_len = call_result(self.builder.build_call(validate, &[
+        let varlen_len = call_result(self.build_managed_call(fcx, validate, &[
             fcx.thread.into(), n64.into(), i64t.const_int(stride, false).into(),
             i32t.const_int(traced as u64, false).into(),
         ], "array.allocation.len").unwrap()).into_int_value();
         let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
-        let obj = call_result(self.builder.build_call(
+        let obj = call_result(self.build_managed_call(fcx,
             alloc,
             &[
                 fcx.thread.into(),
@@ -2801,7 +3079,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.build_conditional_branch(is_null, empty, present).unwrap();
             self.builder.position_at_end(empty);
             let fail = self.module.get_function("ai_uninitialized_array_fail").unwrap();
-            self.builder.build_call(fail, &[fcx.thread.into(), idx.into()], "").unwrap();
+            self.build_managed_call(fcx, fail, &[fcx.thread.into(), idx.into()], "").unwrap();
             self.builder.build_unreachable().unwrap();
             self.builder.position_at_end(present);
             if matches!(elem, Repr::Value(_)) {
@@ -2955,7 +3233,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let site = self.alloc_site_id(&Self::current_fn_name(fcx), env as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
         let obj = call_result(
-            self.builder.build_call(
+            self.build_managed_call(fcx,
                 alloc,
                 &[
                     fcx.thread.into(),
@@ -3030,7 +3308,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // (ptr_fields=0) — wrong for a closure that captured GC pointers — so we
         // must NOT compute the offset from it. See `ai_closure_code_ptr`.
         let codef = self.module.get_function("ai_closure_code_ptr").unwrap();
-        let code_ptr = call_result(self.builder.build_call(
+        let code_ptr = call_result(self.build_managed_call(fcx,
             codef, &[fcx.thread.into(), env.into()], "code",
         ).unwrap()).into_pointer_value();
 
@@ -3048,7 +3326,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Some(rt) => rt.fn_type(&arg_tys, false),
             None => self.ctx.void_type().fn_type(&arg_tys, false),
         };
+        let before = self.prepare_root_reload(fcx);
         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
+        if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active); }
         Ok(match cs.try_as_basic_value() {
             inkwell::values::ValueKind::Basic(v) => Some(v),
             inkwell::values::ValueKind::Instruction(_) => None,
@@ -3237,7 +3517,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             for (field, &local) in arm.binds.iter().enumerate() {
                 if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
                 let value = self.load_value_enum_payload(agg, vid, field, &payload_reprs)?;
-                if let Some(slot) = fcx.slots[local as usize] { self.builder.build_store(slot, value).unwrap(); }
+                if let Some(slot) = fcx.slots[local as usize] {
+                    self.builder.build_store(slot, value).unwrap();
+                    if let Some(root) = fcx.root_slots[local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, value).unwrap(); }
+                }
             }
             let v = self.gen_expr(fcx, &arm.body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -3305,7 +3588,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             for (field, &local) in arm.binds.iter().enumerate() {
                 if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
                 let value = self.load_enum_payload(obj, tag_off, field, &payload_reprs)?;
-                if let Some(slot) = fcx.slots[local as usize] { self.builder.build_store(slot, value).unwrap(); }
+                if let Some(slot) = fcx.slots[local as usize] {
+                    self.builder.build_store(slot, value).unwrap();
+                    if let Some(root) = fcx.root_slots[local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, value).unwrap(); }
+                }
             }
             let v = self.gen_expr(fcx, &arm.body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -3479,7 +3765,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(fail);
         let abort = self.module.get_function("ai_arithmetic_fail").unwrap();
         let reason = self.ctx.i32_type().const_int((op == BinOp::Rem) as u64, false);
-        self.builder.build_call(abort, &[fcx.thread.into(), reason.into()], "").unwrap();
+        self.build_managed_call(fcx, abort, &[fcx.thread.into(), reason.into()], "").unwrap();
         self.builder.build_unreachable().unwrap();
         self.builder.position_at_end(valid);
 
@@ -3579,7 +3865,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let fnty = fty.fn_type(&[fty.into()], false);
             self.module.add_function(&full, fnty, None)
         });
-        let r = call_result(self.builder.build_call(f, &[v.into()], "fi").unwrap());
+        let r = call_result(self.build_managed_call(fcx, f, &[v.into()], "fi").unwrap());
         Ok(Some(r))
     }
 
@@ -3661,7 +3947,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
             let overloads = if intrinsic.is_overloaded() { &types[..] } else { &[] };
             let save = intrinsic.get_declaration(&self.module, overloads).unwrap();
-            Some(call_result(self.builder.build_call(save, &[], "ffi.stack").unwrap()))
+            Some(call_result(self.build_managed_call(fcx, save, &[], "ffi.stack").unwrap()))
         } else { None };
         let mut cargs: Vec<inkwell::values::BasicMetadataValueEnum> =
             if is_extern { vec![] } else { vec![fcx.thread.into()] };
@@ -3754,12 +4040,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // call's correctness does not depend on the C function not allocating.
         if is_extern {
             let enter = self.module.get_function("ai_ffi_enter").unwrap();
-            self.builder.build_call(enter, &[fcx.thread.into()], "").unwrap();
+            self.build_managed_call(fcx, enter, &[fcx.thread.into()], "").unwrap();
         }
-        let cs = self.builder.build_call(callee, &cargs, "call").unwrap();
+        let cs = if is_extern { self.builder.build_call(callee, &cargs, "call").unwrap() }
+            else { self.build_managed_call(fcx, callee, &cargs, "call").unwrap() };
         if is_extern {
             let leave = self.module.get_function("ai_ffi_leave").unwrap();
-            self.builder.build_call(leave, &[fcx.thread.into()], "").unwrap();
+            self.build_managed_call(fcx, leave, &[fcx.thread.into()], "").unwrap();
         }
         // Copy-out: write each `mut` array's stack buffer back into its heap
         // object now that C has filled it (e.g. read(fd, buf, n)).
@@ -3769,7 +4056,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             for (src, buf, byte_len, bits) in pending {
                 // Native callbacks or another mutator may have moved the array.
                 let obj = self.gen_expr(fcx, &src)?.unwrap().into_pointer_value();
-                self.builder.build_call(
+                self.build_managed_call(fcx,
                     cout,
                     &[fcx.thread.into(), obj.into(), buf.into(), byte_len.into(), self.ctx.i64_type().const_int(bits as u64, false).into()],
                     "",
@@ -3802,7 +4089,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
             let overloads = if intrinsic.is_overloaded() { &types[..] } else { &[] };
             let restore = intrinsic.get_declaration(&self.module, overloads).unwrap();
-            self.builder.build_call(restore, &[token.into()], "").unwrap();
+            self.build_managed_call(fcx, restore, &[token.into()], "").unwrap();
         }
         Ok(ret_val)
     }
@@ -3834,7 +4121,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.build_conditional_branch(is_set, slow_bb, cont_bb).unwrap();
         self.builder.position_at_end(slow_bb);
         let poll = self.module.get_function("ai_gc_pollcheck_slow").unwrap();
-        self.builder.build_call(poll, &[fcx.thread.into()], "").unwrap();
+        self.build_managed_call(fcx, poll, &[fcx.thread.into()], "").unwrap();
         self.builder.build_unconditional_branch(cont_bb).unwrap();
         self.builder.position_at_end(cont_bb);
     }
@@ -3924,6 +4211,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 struct FnCtx<'ctx> {
     func: FunctionValue<'ctx>,
     slots: Vec<Option<PointerValue<'ctx>>>,
+    root_slots: Vec<Option<PointerValue<'ctx>>>,
+    frame_active: Option<PointerValue<'ctx>>,
+    deferred_frame_origin: Option<PointerValue<'ctx>>,
     local_reprs: Vec<Repr>,
     thread: PointerValue<'ctx>,
     /// Per active loop: (continuation block, optional break-value slot).
@@ -3998,29 +4288,28 @@ fn core_disc(e: &CoreExprKind) -> &'static str {
     }
 }
 
-/// Run the standard LLVM optimization pipeline (`default<O2>`) over the module
+/// Run the standard LLVM optimization pipeline (`default<O3>`) over the module
 /// in place: mem2reg, inlining, instcombine, GVN, loop opts, etc. This is where
 /// monomorphized gc-rust code gets its speed.
-fn optimize_module(module: &Module) {
+fn optimize_module(module: &Module) -> Result<(), CodegenError> {
     use inkwell::OptimizationLevel;
     use inkwell::passes::PassBuilderOptions;
     use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
 
-    Target::initialize_native(&InitializationConfig::default()).ok();
+    Target::initialize_native(&InitializationConfig::default()).map_err(|e| CodegenError(e.to_string()))?;
     let triple = TargetMachine::get_default_triple();
-    let Ok(target) = Target::from_triple(&triple) else { return };
-    let Some(machine) = target.create_target_machine(
+    let target = Target::from_triple(&triple).map_err(|e| CodegenError(e.to_string()))?;
+    let machine = target.create_target_machine(
         &triple,
         &TargetMachine::get_host_cpu_name().to_string(),
         &TargetMachine::get_host_cpu_features().to_string(),
         OptimizationLevel::Aggressive,
         RelocMode::Default,
         CodeModel::Default,
-    ) else { return };
+    ).ok_or_else(|| CodegenError("cannot create optimization target machine".into()))?;
     let opts = PassBuilderOptions::create();
-    // If the pipeline fails to parse/run, leave the module unoptimized (still
-    // correct, just slower) rather than aborting.
-    let _ = module.run_passes("default<O2>", &machine, opts);
+    module.run_passes("default<O3>", &machine, opts)
+        .map_err(|e| CodegenError(format!("LLVM optimization failed: {e}")))
 }
 
 /// Convert the program's core [`Layout`]s into `gc::TypeInfo`s, one per
@@ -4210,10 +4499,10 @@ pub fn jit_run_i64_with_args(
     use crate::runtime::{self, RuntimeContext};
     let ctx = Context::create();
     let compiled = codegen(&ctx, prog)?;
-    // Optimize the module (mem2reg + inlining + the standard O2 pipeline) so the
+    // Optimize the module (mem2reg + inlining + the standard O3 pipeline) so the
     // monomorphized, GC-framed code is actually fast. Without this the JIT runs
     // naive IR (every local a stack slot).
-    optimize_module(&compiled.module);
+    optimize_module(&compiled.module)?;
     let ee = compiled
         .module
         .create_jit_execution_engine(OptimizationLevel::Aggressive)
@@ -4222,6 +4511,7 @@ pub fn jit_run_i64_with_args(
     // Map runtime externs to their Rust implementations.
     for (name, addr) in [
         ("ai_gc_alloc_fixed", runtime::ai_gc_alloc_fixed as *const () as usize),
+        ("ai_gc_record_alloc", runtime::ai_gc_record_alloc as *const () as usize),
         ("ai_gc_alloc_varlen", runtime::ai_gc_alloc_varlen as *const () as usize),
         ("ai_gc_pollcheck_slow", runtime::ai_gc_pollcheck_slow as *const () as usize),
         ("ai_ffi_enter", runtime::ai_ffi_enter as *const () as usize),
@@ -4458,7 +4748,7 @@ pub fn codegen_aot_object(
 /// Like [`codegen_aot_object`] but with an explicit [`DebugLevel`].
 /// [`DebugLevel::Full`] (debugger P3) emits local-variable DIEs **and skips
 /// optimization** — locals/allocas must survive for `frame variable` to read
-/// them. The default ([`DebugLevel::LineTables`], P2) keeps the O2 pipeline;
+/// them. The default ([`DebugLevel::LineTables`], P2) keeps the O3 pipeline;
 /// LLVM preserves line debug-locations through it, so stepping still works.
 pub fn codegen_aot_object_level(
     prog: &CoreProgram,
@@ -4591,14 +4881,14 @@ pub fn codegen_aot_object_level(
     // ---- Optimize then emit the object ------------------------------------
     // Full-debug builds (P3) skip optimization so locals/allocas survive for
     // `frame variable`. Line-table builds (P2) optimize as usual — debug
-    // locations survive the O2 pipeline, so stepping is unaffected.
+    // locations survive the O3 pipeline, so stepping is unaffected.
     // Full-debug builds (P3) keep the backend at `None` too: an optimizing
     // backend promotes the (still-present) allocas into registers, leaving the
     // `dbg.declare` frame-slot locations stale.
     let machine = if level.is_full() {
         host_target_machine_opt(OptimizationLevel::None)?
     } else {
-        optimize_module(module);
+        optimize_module(module)?;
         host_target_machine()?
     };
     if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {

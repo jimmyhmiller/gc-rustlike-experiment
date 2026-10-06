@@ -98,15 +98,16 @@ pub struct Thread {
     /// GC walks our chain, and to enter the safepoint on a poll trap.
     pub dyna_thread: *const ThreadState,
 
-    /// The heap's inline-allocation window (`cursor` / `base` / `limit` of the
-    /// active from-space, re-pointed at flips under stop-the-world). The
-    /// compiled inline fast path reads it; `limit == 0` (stress mode) closes it
-    /// so every allocation takes the out-of-line slow path.
+    /// Legacy shared-arena allocation window, retained in the runtime ABI.
+    /// It is remapped under stop-the-world arena flips. Compiled fixed-object
+    /// allocation uses the owning `tlab_window` below instead.
     pub alloc_window: *const AllocWindow,
     /// Execution-local argv, shared immutably with child mutators.
     pub arguments: Arc<Vec<std::ffi::OsString>>,
     /// Owning-mutator aggregate critical section; never live at a safepoint.
     managed_lock: Option<usize>,
+    pub tlab_window: *mut crate::gc::InlineTlab,
+    pub relocation_epoch: *const std::sync::atomic::AtomicUsize,
 }
 
 pub mod thread_offsets {
@@ -116,6 +117,8 @@ pub mod thread_offsets {
     pub const HEAP: usize = 16;
     pub const DYNA_THREAD: usize = 24;
     pub const ALLOC_WINDOW: usize = 32;
+    pub const TLAB_WINDOW: usize = 64;
+    pub const RELOCATION_EPOCH: usize = 72;
 }
 
 const _: () = {
@@ -124,6 +127,8 @@ const _: () = {
     assert!(core::mem::offset_of!(Thread, heap) == thread_offsets::HEAP);
     assert!(core::mem::offset_of!(Thread, dyna_thread) == thread_offsets::DYNA_THREAD);
     assert!(core::mem::offset_of!(Thread, alloc_window) == thread_offsets::ALLOC_WINDOW);
+    assert!(core::mem::offset_of!(Thread, tlab_window) == thread_offsets::TLAB_WINDOW);
+    assert!(core::mem::offset_of!(Thread, relocation_epoch) == thread_offsets::RELOCATION_EPOCH);
 };
 
 // =============================================================================
@@ -301,6 +306,8 @@ impl RuntimeContext {
                 alloc_window,
                 arguments: Arc::new(std::env::args_os().collect()),
                 managed_lock: None,
+                tlab_window: unsafe { heap.configure_inline_tlab(&dyna) },
+                relocation_epoch: heap.relocation_epoch_ptr(),
             }),
             heap,
             dyna,
@@ -485,6 +492,8 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
             alloc_window,
             arguments,
             managed_lock: None,
+                tlab_window: unsafe { heap.configure_inline_tlab(&dyna) },
+                relocation_epoch: heap.relocation_epoch_ptr(),
         });
         unsafe { dyna.set_poll_flag(&mut thread.state as *mut std::sync::atomic::AtomicU8); }
         let tptr = &mut *thread as *mut Thread;
@@ -1268,7 +1277,11 @@ pub unsafe extern "C" fn ai_gc_alloc_fixed(
         let t = &*thread;
         let heap = &*t.heap;
         let info: &TypeInfo = heap.type_info_by_id(type_id as u16);
-        let p = alloc_with_published_frame(t, heap, info, 0);
+        // A successful TLAB allocation cannot collect. Other collectors wait
+        // for our safepoint before reading roots; publish the frame only when
+        // entering the path that may collect or run allocation stress.
+        let fast = heap.try_alloc_runtime_fixed(&*t.dyna_thread, type_id as u16);
+        let p = if fast.is_null() { alloc_with_published_frame(t, heap, info, 0) } else { fast };
         // Allocation-site profiling (Target-1b): record this site's count+bytes
         // on the OWNING thread's non-atomic per-site counter. `dyna_thread` is
         // the same `ThreadState` `alloc_with_published_frame` already
@@ -1278,6 +1291,13 @@ pub unsafe extern "C" fn ai_gc_alloc_fixed(
         }
         p
     }
+}
+
+/// Record a compiled inline allocation. Owning RUNNING mutator only; this
+/// operation cannot collect or reach a managed safepoint.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_gc_record_alloc(thread: *mut Thread, site_id: u32, bytes: u64) {
+    unsafe { (*(*thread).dyna_thread).record_alloc(site_id, bytes); }
 }
 
 /// Read a closure env object's CODE POINTER. The code pointer is stored at

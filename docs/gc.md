@@ -207,3 +207,62 @@ require unsafe lifetime management; `DynRootFrame::with_pushed` keeps its guard
 private, rejects duplicate registration, and unlinks on normal return or unwind.
 The managed references placed in slots remain subject to the collector's pointer
 policy and root-enumeration contracts.
+
+
+## Allocation and root fast paths — 2026-10-06
+
+The release compiler uses LLVM O3 and reports optimization failures. Fixed Full
+header objects of at most 8192 bytes can allocate directly in the owning
+mutator's nursery TLAB. The generated path checks capacity, unsigned overflow,
+the arena reset epoch and stress mode. It zeroes the object, initializes its
+header, advances the shared native/generated cursor and publishes the initialized
+extent before any safepoint. Refill, unsupported layouts, stress allocation and
+collection retain the runtime path. The runtime validates canonical registered
+layouts; general embedding allocation keeps its full descriptor checks.
+
+The inline window is a stable member of ThreadState. Its initialized-extent
+pointer remains owned by the TLAB until refill closes the old window. Epoch,
+stress and extent publication are atomic; cursor, limit and allocation-site
+counters belong exclusively to the owning mutator. Generated allocations update
+the same exact site counts and byte totals as runtime allocations. Counter-vector
+growth uses a noncollecting runtime helper. Non-generational allocation windows
+stay disabled.
+
+Optimized reference locals use private working slots and escaped traced mirrors.
+Every assignment updates both. Functions with no reference parameters, closure
+captures or indirect roots defer frame registration until their first reference
+assignment. Until then only private slots are initialized; frame metadata and
+mirrors are initialized when registration occurs, before the new reference is
+published and before any subsequent safepoint. Inactive frames skip relocation
+checks, mirror reads and unlinking. Full-debug functions register on entry.
+Before returning mutators to RUNNING, every world
+pause publishes a relocation epoch after collector root updates. Potentially
+collecting or parking calls compare acquire-loaded epochs and refresh working
+references if the epoch changed. Loop-poll fast paths leave private references
+available to LLVM register promotion. Unknown calls are treated conservatively;
+only explicitly known noncollecting runtime routines, LLVM intrinsics and
+managed callees proven nonrelocating by a conservative call-graph fixed point
+skip this check. The analysis admits straight-line arithmetic, locals, branches, immutable enum reads
+and direct calls; loops, allocation, foreign/indirect calls and unsupported IR
+operations remain effectful. Pure recursive components are safe only when all
+their operations and outgoing calls are safe. Proven nonrelocating optimized
+functions also omit root frames: collectors cannot move objects until the
+executing mutator reaches a safepoint, and these functions contain none. Callers
+retain their traced roots across the call. Full-debug functions retain frames. Managed heap field loads and stores retain their existing sequentially
+consistent semantics.
+
+A foreign call leaves the mutator BLOCKED. Generated code never reloads its roots
+in that state. After ai_ffi_leave restores RUNNING, it refreshes registered mirrors
+unconditionally, including roots moved during callbacks and before managed-array
+copy-out. Full-debug builds continue using root slots directly to preserve
+editable debugger variables.
+
+When the remembered set is empty, minor collection omits tenured indexing and
+starts directly from traced roots. A later dirty collection indexes every new
+initialized range accumulated since the previous update, including arena resets.
+Tenured object/card overlap metadata is extended only over newly initialized
+arena ranges and discarded on arena reset. This includes TLAB prefixes filled in
+address order different from reservation order. Cards use atomic bitmap words;
+concurrent marks of different cards in a word compose with fetch_or. Collection
+still uses initialized-range metadata to avoid interpreting unused TLAB tails as
+objects. Neither optimization changes which references are traced.

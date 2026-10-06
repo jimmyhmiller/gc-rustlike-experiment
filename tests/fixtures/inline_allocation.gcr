@@ -1,0 +1,38 @@
+// Alternate compiled fixed allocation with runtime variable-sized allocation.
+// Retained values must survive nursery reset, buffer reuse, and child allocation.
+struct Item { sequence: i64, text: String }
+
+fn work(seed: i64) -> i64 {
+    let mut keep: Array<Item> = array_new(8);
+    let mut i = 0;
+    while i < 8 {
+        array_set(keep, i, Item { sequence: seed + i, text: to_string(i) });
+        i = i + 1;
+    }
+    let mut total = 0;
+    i = 0;
+    while i < 192 {
+        let mut scratch: Array<i64> = array_new(1024);
+        array_set(scratch, 1023, i);
+        let item = Item { sequence: seed + i, text: to_string(i) };
+        array_set(keep, i % 8, item);
+        total = total + item.sequence + str_len(item.text) + array_get_unchecked(scratch, 1023);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        total = total + array_get_unchecked(keep, i).sequence;
+        i = i + 1;
+    }
+    total
+}
+
+fn main() -> i64 {
+    let sentinel = Item { sequence: 42, text: to_string(42) };
+    let child = Thread::spawn(|| work(1000));
+    let result = work(0) + child.join();
+    if sentinel.sequence != 42 || !str_eq(sentinel.text, "42") { panic("caller root was not refreshed"); }
+    if result != 277276 { panic("inline allocation corrupted retained data"); }
+    print_int(result);
+    0
+}

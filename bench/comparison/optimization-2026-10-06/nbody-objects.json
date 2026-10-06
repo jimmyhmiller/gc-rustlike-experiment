@@ -1,0 +1,2374 @@
+{
+  "environment": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "git": "35b81576b71cb280e8aafb4115c2a76323570000",
+    "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "java": "openjdk version \"21.0.1\" 2023-10-17\nOpenJDK Runtime Environment (build 21.0.1+12-29)\nOpenJDK 64-Bit Server VM (build 21.0.1+12-29, mixed mode, sharing)",
+    "gcr_workers": 1,
+    "gcr_nursery_mb": 16,
+    "gcr_tenured_mb": 256,
+    "rust_opt_level": 3,
+    "gcr_opt_level": 3,
+    "order_seed": 20261006,
+    "cpu": "Apple M2 Max",
+    "memory_bytes": 68719476736,
+    "warmup": 20,
+    "samples": 10,
+    "forks": 3
+  },
+  "benchmarks": {
+    "nbody_objects": {
+      "input": 1000000,
+      "source_sha256": {
+        "nbody_objects.rs": "7b1e5383c53725cf2bb4b0722068b723b6b4e12a4fe83c3ab8b6b120f2360a0d",
+        "nbody_objects.java": "fbcbc7bac2b7ff84bc244f8f08f28340c3d07f845b481cce0225232a2b8fe1b0",
+        "nbody_objects.gcr": "105d47ec2fe0ab5683350d73324249e5c555de373bf45156013e0b13870d0ee2"
+      },
+      "runs": [
+        {
+          "language": "java",
+          "fork": 0,
+          "command": [
+            "java",
+            "-Xms16m",
+            "-Xmx512m",
+            "-XX:+UseG1GC",
+            "-Duser.language=en",
+            "-Duser.country=US",
+            "-cp",
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects",
+            "Runner",
+            "1000000"
+          ],
+          "wall_s": 1.451839542016387,
+          "peak_rss_bytes": 53248000,
+          "records": [
+            {
+              "index": 0,
+              "ns": 57905709,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 43108333,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 42312417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 43236958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 42622125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 42469000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 43789375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 46629417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 44808250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 43519125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 44597042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 44131416,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 44159875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 44470958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 44493708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 44952584,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 43812250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 47027250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 43752625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 44084041,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 44530375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 43999625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 44094791,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 43515125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 44438042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 43425875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 43851208,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 43881500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 43613666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 44315541,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        1.44 real         1.42 user         0.02 sys\n            53248000  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                5814  page reclaims\n                  12  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   1  signals received\n                   1  voluntary context switches\n                 585  involuntary context switches\n         19122777819  instructions retired\n          4791222937  cycles elapsed\n            30344128  peak memory footprint\n"
+        },
+        {
+          "language": "gcr",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects/nbody_objects"
+          ],
+          "wall_s": 3.9119392910506576,
+          "peak_rss_bytes": 2293760,
+          "records": [
+            {
+              "index": 0,
+              "ns": 122764000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 122533000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 126088000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 123892000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 122026000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 122706000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 121416000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 124191000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 124963000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 123941000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 121912000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 124085000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 123346000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 123481000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 123241000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 123641000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 122831000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 123708000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 122487000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 123019000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 122322000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 122372000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 123891000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 122423000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 122215000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 122885000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 124886000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 127019000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 123501000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 124993000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            }
+          ],
+          "stderr": "        3.90 real         3.67 user         0.02 sys\n             2293760  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 304  page reclaims\n                   2  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 396  involuntary context switches\n         40150891368  instructions retired\n         12256021335  cycles elapsed\n             1163624  peak memory footprint\n",
+          "gc": {
+            "gc_minor": 0,
+            "gc_major": 0,
+            "gc_pause_total_ms": 0.0,
+            "gc_pause_max_ms": 0.0,
+            "gc_pause_p50_ms": 0.0,
+            "gc_pause_p99_ms": 0.0,
+            "gc_reclaimed_bytes": 0,
+            "gc_promoted_bytes": 0,
+            "peak_heap_bytes": 0,
+            "alloc_objects": 210,
+            "alloc_bytes": 13680
+          }
+        },
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects/rust",
+            "1000000"
+          ],
+          "wall_s": 1.0683192500146106,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 26605500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 29019084,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 27094208,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 26648166,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 26464167,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 27109667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 27442042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 27681125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 27020167,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 27416500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 27208708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 26402666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 26658042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 27304416,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 28322709,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 26965583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 27500542,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 27494291,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 27017375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 26897459,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 27378500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 27752042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 26660958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 26686458,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 27069667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 27484125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 28772042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 29787625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 27115750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 26921708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        1.06 real         0.81 user         0.00 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 269  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  74  involuntary context switches\n          7579428045  instructions retired\n          2689256338  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "language": "gcr",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects/nbody_objects"
+          ],
+          "wall_s": 3.7474379999912344,
+          "peak_rss_bytes": 2293760,
+          "records": [
+            {
+              "index": 0,
+              "ns": 123412000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 121918000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 128220000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 126661000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 123255000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 122172000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 123224000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 125321000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 122672000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 124309000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 125574000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 123927000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 122162000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 122727000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 122962000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 123730000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 127850000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 133135000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 123617000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 122626000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 124281000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 123336000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 124162000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 123430000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 122218000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 123528000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 125138000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 123316000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 125980000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 135386000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            }
+          ],
+          "stderr": "        3.74 real         3.71 user         0.01 sys\n             2293760  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 304  page reclaims\n                   2  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 433  involuntary context switches\n         40149885241  instructions retired\n         12258436222  cycles elapsed\n             1163624  peak memory footprint\n",
+          "gc": {
+            "gc_minor": 0,
+            "gc_major": 0,
+            "gc_pause_total_ms": 0.0,
+            "gc_pause_max_ms": 0.0,
+            "gc_pause_p50_ms": 0.0,
+            "gc_pause_p99_ms": 0.0,
+            "gc_reclaimed_bytes": 0,
+            "gc_promoted_bytes": 0,
+            "peak_heap_bytes": 0,
+            "alloc_objects": 210,
+            "alloc_bytes": 13680
+          }
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects/rust",
+            "1000000"
+          ],
+          "wall_s": 0.8590410000178963,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 27150750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 30232000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 29943459,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 27406417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 28486625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 29750291,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 29439083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 27554500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 28570041,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 29533583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 27412667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 28311834,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 28894958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 28670375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 27136708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 27889250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 29080416,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 27582875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 27520917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 29275167,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 29185417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 27852083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 27828625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 29757625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 28977875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 27091750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 29274334,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 28724917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 27702209,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 27247875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        0.85 real         0.84 user         0.00 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 269  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  90  involuntary context switches\n          7583971419  instructions retired\n          2694635990  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "language": "java",
+          "fork": 1,
+          "command": [
+            "java",
+            "-Xms16m",
+            "-Xmx512m",
+            "-XX:+UseG1GC",
+            "-Duser.language=en",
+            "-Duser.country=US",
+            "-cp",
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects",
+            "Runner",
+            "1000000"
+          ],
+          "wall_s": 1.4837967079947703,
+          "peak_rss_bytes": 53526528,
+          "records": [
+            {
+              "index": 0,
+              "ns": 58606250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 45137833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 44090333,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 43740916,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 44696416,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 43421292,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 44222792,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 45261583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 45731209,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 45662959,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 45570167,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 44860958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 45402750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 45338500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 44899333,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 44771459,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 44675458,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 46117958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44524833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 45044375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 45577084,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 45585333,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 45621500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 44456375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 45590667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 44900125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 45060834,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 45430625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 45404917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 45274541,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        1.48 real         1.45 user         0.02 sys\n            53526528  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                5830  page reclaims\n                  12  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   1  signals received\n                   0  voluntary context switches\n                 572  involuntary context switches\n         19242103462  instructions retired\n          4785625314  cycles elapsed\n            30622656  peak memory footprint\n"
+        },
+        {
+          "language": "java",
+          "fork": 2,
+          "command": [
+            "java",
+            "-Xms16m",
+            "-Xmx512m",
+            "-XX:+UseG1GC",
+            "-Duser.language=en",
+            "-Duser.country=US",
+            "-cp",
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects",
+            "Runner",
+            "1000000"
+          ],
+          "wall_s": 1.4616301250061952,
+          "peak_rss_bytes": 53510144,
+          "records": [
+            {
+              "index": 0,
+              "ns": 58425833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 43726708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 43324166,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 42679250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 43052708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 42418250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 43042250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 44346917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 44602875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 43723917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 43426750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 44445875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 43681375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 44476916,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 44247125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 44167959,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 44692208,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 43199666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44041083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 43597666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 44281916,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 43833750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 44082583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 47082417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 43687667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 44541958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 44676833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 46628333,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 47295084,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 46354584,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        1.45 real         1.42 user         0.02 sys\n            53510144  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                5835  page reclaims\n                  12  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   1  signals received\n                   0  voluntary context switches\n                 600  involuntary context switches\n         19214920485  instructions retired\n          4783308705  cycles elapsed\n            30639088  peak memory footprint\n"
+        },
+        {
+          "language": "gcr",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects/nbody_objects"
+          ],
+          "wall_s": 3.7506822089781053,
+          "peak_rss_bytes": 2293760,
+          "records": [
+            {
+              "index": 0,
+              "ns": 130670000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 128092000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 129742000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 125555000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 126754000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 125554000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 125447000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 125252000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 123532000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 122043000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 123270000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 122091000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 122884000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 121693000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 122543000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 124029000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 122622000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 125080000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 123278000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 123179000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 123931000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 131805000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 128859000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 124539000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 124309000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 123885000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 124601000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 122665000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 122971000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 122926000,
+              "signature": [
+                "-0.16907516382852447",
+                "-0.16908618459855648"
+              ]
+            }
+          ],
+          "stderr": "        3.74 real         3.71 user         0.02 sys\n             2293760  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 304  page reclaims\n                   2  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 399  involuntary context switches\n         40151188070  instructions retired\n         12265092162  cycles elapsed\n             1163624  peak memory footprint\n",
+          "gc": {
+            "gc_minor": 0,
+            "gc_major": 0,
+            "gc_pause_total_ms": 0.0,
+            "gc_pause_max_ms": 0.0,
+            "gc_pause_p50_ms": 0.0,
+            "gc_pause_p99_ms": 0.0,
+            "gc_reclaimed_bytes": 0,
+            "gc_promoted_bytes": 0,
+            "peak_heap_bytes": 0,
+            "alloc_objects": 210,
+            "alloc_bytes": 13680
+          }
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody_objects/rust",
+            "1000000"
+          ],
+          "wall_s": 0.8616700829588808,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 26917041,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 26551792,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 27199292,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 27514542,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 27014791,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 26830500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 27697750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 27481708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 30991833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 29534958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 28088875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 28610666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 31830333,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 27188500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 27749000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 31334250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 29377125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 27486958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 27195917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 31285042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 30308916,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 26989541,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 30232792,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 29913083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 27013292,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 28199000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 29619292,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 27796417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 27792042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 29555750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        0.85 real         0.84 user         0.00 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 269  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  82  involuntary context switches\n          7582428864  instructions retired\n          2692383914  cycles elapsed\n             1065272  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "gcr": 123.888,
+        "rust": 27.812521,
+        "java": 44.5361665
+      }
+    }
+  }
+}

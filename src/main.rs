@@ -347,7 +347,7 @@ fn main() -> ExitCode {
             prog.sources = sources;
             // `--debug` → full DWARF (debugger P3): unoptimized + local-variable
             // DIEs, so `lldb`'s `frame variable` shows source names/values.
-            // Default stays line-tables-only (P2: stepping/breakpoints under O2).
+            // Default stays line-tables-only (P2: stepping/breakpoints under O3).
             let level = if driver_args.iter().any(|a| a == "--debug") {
                 gcrust::codegen::DebugLevel::Full
             } else {

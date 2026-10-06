@@ -51,3 +51,6 @@ dist/
 
 # Local code-search snapshots
 .gcr-search.index
+
+# Isolated project checkouts
+.worktrees/

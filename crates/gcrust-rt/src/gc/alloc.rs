@@ -370,6 +370,14 @@ impl AtomicBumpAllocator {
         self.cursor.load(Ordering::Acquire).min(self.size)
     }
 
+    /// Identifies the allocation generation. Read while the arena is quiescent
+    /// when retaining metadata about object addresses across collections.
+    pub(crate) fn epoch_ptr(&self) -> *const AtomicUsize { &self.epoch }
+
+    pub(crate) fn epoch(&self) -> usize {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     /// Number of bytes remaining.
     pub fn remaining(&self) -> usize {
         self.size
@@ -484,12 +492,59 @@ struct BufferExtent {
     initialized: AtomicUsize,
 }
 
+/// Owning-mutator allocation window used by compiled code. All fields except
+/// the pointed-to epoch, stress flag, and initialized prefix are owner-only.
+/// Arena reset invalidates cached reservations through the epoch. The prefix
+/// is published before the next safepoint; collectors never read it concurrently
+/// with an allocating mutator. Disabled windows have limit zero.
+#[repr(C)]
+pub struct InlineTlab {
+    pub cursor: usize,
+    pub limit: usize,
+    pub initialized: *const AtomicUsize,
+    pub epoch: *const AtomicUsize,
+    pub expected_epoch: usize,
+    pub base: *mut u8,
+    pub stress: *const core::sync::atomic::AtomicBool,
+    pub counters: *mut super::thread::SiteCounter,
+    pub counters_len: usize,
+}
+impl Default for InlineTlab {
+    fn default() -> Self {
+        Self { cursor: 0, limit: 0, initialized: core::ptr::null(), epoch: core::ptr::null(),
+            expected_epoch: 0, base: core::ptr::null_mut(), stress: core::ptr::null(),
+            counters: core::ptr::null_mut(), counters_len: 0 }
+    }
+}
+pub mod inline_tlab_offsets {
+    pub const CURSOR: usize = 0;
+    pub const LIMIT: usize = 8;
+    pub const INITIALIZED: usize = 16;
+    pub const EPOCH: usize = 24;
+    pub const EXPECTED_EPOCH: usize = 32;
+    pub const BASE: usize = 40;
+    pub const STRESS: usize = 48;
+    pub const COUNTERS: usize = 56;
+    pub const COUNTERS_LEN: usize = 64;
+}
+const _: () = {
+    assert!(core::mem::offset_of!(InlineTlab, cursor) == inline_tlab_offsets::CURSOR);
+    assert!(core::mem::offset_of!(InlineTlab, limit) == inline_tlab_offsets::LIMIT);
+    assert!(core::mem::offset_of!(InlineTlab, initialized) == inline_tlab_offsets::INITIALIZED);
+    assert!(core::mem::offset_of!(InlineTlab, epoch) == inline_tlab_offsets::EPOCH);
+    assert!(core::mem::offset_of!(InlineTlab, expected_epoch) == inline_tlab_offsets::EXPECTED_EPOCH);
+    assert!(core::mem::offset_of!(InlineTlab, base) == inline_tlab_offsets::BASE);
+    assert!(core::mem::offset_of!(InlineTlab, stress) == inline_tlab_offsets::STRESS);
+    assert!(core::mem::offset_of!(InlineTlab, counters) == inline_tlab_offsets::COUNTERS);
+    assert!(core::mem::offset_of!(InlineTlab, counters_len) == inline_tlab_offsets::COUNTERS_LEN);
+};
+
 /// Owning-thread-only allocation state. Descriptors survive thread teardown in
 /// the allocator until reset, so abandoned tails remain accounted for.
 pub(crate) struct Tlab {
     allocator: usize,
     epoch: usize,
-    cursor: usize,
+    pub(crate) window: InlineTlab,
     extent: Option<Arc<BufferExtent>>,
     target_bytes: usize,
 }
@@ -498,7 +553,7 @@ impl Tlab {
         Self {
             allocator: 0,
             epoch: 0,
-            cursor: 0,
+            window: InlineTlab::default(),
             extent: None,
             target_bytes: 2048,
         }
@@ -515,22 +570,29 @@ impl Tlab {
         let Some(size) = info.checked_allocation_size(len) else {
             return core::ptr::null_mut();
         };
-        let align = 1usize << info.align_log2;
-        // Large allocations retain exact shared reservations rather than
-        // monopolizing or wasting an ordinary thread-local buffer.
-        if size > 8192 {
-            return space.alloc(info, len);
-        }
+        // Large allocations use exact shared reservations.
+        if size > 8192 { return space.alloc(info, len); }
+        unsafe { self.alloc_sized(space, size) }
+    }
+
+    /// Allocate a size from a layout already validated against this arena.
+    /// Caller must own this TLAB between safepoints. Size must be positive,
+    /// eight-byte aligned, at most 8192 bytes, and cover the complete object.
+    pub(crate) unsafe fn alloc_sized(&mut self, space: &AtomicBumpAllocator, size: usize) -> *mut u8 {
+        debug_assert!(size > 0 && size <= 8192 && size % 8 == 0);
+        let align = 8;
         let identity = space as *const _ as usize;
         let epoch = space.epoch.load(Ordering::Acquire);
         if self.allocator != identity || self.epoch != epoch {
+            self.window.limit = 0;
             self.extent = None;
+            self.window.expected_epoch = epoch;
             self.allocator = identity;
             self.epoch = epoch;
         }
         loop {
             if let Some(extent) = &self.extent {
-                let aligned = match self.cursor.checked_add(align - 1) {
+                let aligned = match self.window.cursor.checked_add(align - 1) {
                     Some(n) => n & !(align - 1),
                     None => return core::ptr::null_mut(),
                 };
@@ -539,7 +601,7 @@ impl Tlab {
                     unsafe {
                         core::ptr::write_bytes(ptr, 0, size);
                     }
-                    self.cursor = end;
+                    self.window.cursor = end;
                     extent.initialized.store(end, Ordering::Relaxed);
                     return ptr;
                 }
@@ -547,12 +609,17 @@ impl Tlab {
             if self.extent.is_some() {
                 self.target_bytes = (self.target_bytes * 2).min(32768);
             }
+            self.window.limit = 0;
             self.extent = None;
             let extent = match space.reserve_buffer(size, align, self.target_bytes) {
                 Some(extent) => extent,
                 None => return core::ptr::null_mut(),
             };
-            self.cursor = extent.start;
+            self.window.cursor = extent.start;
+            if !self.window.epoch.is_null() {
+                self.window.limit = extent.end;
+                self.window.initialized = &extent.initialized;
+            }
             self.extent = Some(extent);
         }
     }

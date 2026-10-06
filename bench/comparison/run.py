@@ -7,7 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 HERE = ROOT / 'bench/comparison'
 BUILD = ROOT / 'target/performance-comparison'
 CASES = {'nbody': (1000000, 'app'), 'spectralnorm': (1000, 'spectralnorm'),
-         'fannkuchredux': (9, 'fannkuchredux'), 'binarytrees': (14, 'app'), 'scalar': (0, 'Kernel'), 'array': (0, 'Kernel')}
+         'fannkuchredux': (9, 'fannkuchredux'), 'binarytrees': (14, 'app'), 'scalar': (0, 'Kernel'), 'array': (0, 'Kernel'), 'nbody_objects': (1000000, 'app')}
 
 def run(cmd, **kw):
     try:
@@ -26,7 +26,7 @@ def matches(a, b):
 def build(name, size, main, warm, samples, rust_opt, env):
     d = BUILD / name
     d.mkdir(parents=True, exist_ok=True)
-    src = (HERE / 'kernels' if name in ('scalar','array') else ROOT / 'bench/suite') / name
+    src = (HERE / 'kernels' if name in ('scalar','array','nbody_objects') else ROOT / 'bench/suite') / name
     g = (src / (name + '.gcr')).read_text().replace('fn main()', 'fn workload()')
     for old in ['let steps = 5000000;', 'let n = 3000;', 'let n = 11;', 'let n = 16;']:
         if old in g: g = g.replace(old, f'let {"steps" if "steps" in old else "n"} = {size};')
@@ -85,9 +85,13 @@ def main():
     env['GCR_NURSERY_MB'] = str(args.nursery_mb)
     result = {'environment': {'platform': platform.platform(), 'machine': platform.machine(),
         'git': run(['git','rev-parse','HEAD'], cwd=ROOT).stdout.strip(),
+        'git_dirty': bool(run(['git', 'status', '--porcelain'], cwd=ROOT).stdout.strip()),
+        'implementation_sha256': {str(x.relative_to(ROOT)): hashlib.sha256(x.read_bytes()).hexdigest()
+            for directory in (ROOT/'src', ROOT/'crates/gcrust-rt/src')
+            for x in sorted(directory.rglob('*.rs'))},
         'rust': run(['rustc','--version']).stdout.strip(), 'java': run(['java','-version']).stderr.strip(),
         'gcr_workers': args.workers, 'gcr_nursery_mb': args.nursery_mb, 'gcr_tenured_mb': 256,
-        'rust_opt_level': args.rust_opt_level, 'gcr_opt_level': 2, 'order_seed': 20261006,
+        'rust_opt_level': args.rust_opt_level, 'gcr_opt_level': 3, 'order_seed': 20261006,
         'cpu': run(['sysctl','-n','machdep.cpu.brand_string']).stdout.strip(),
         'memory_bytes': int(run(['sysctl','-n','hw.memsize']).stdout.strip()),
         'warmup': args.warmup, 'samples': args.samples, 'forks': args.forks}, 'benchmarks': {}}
@@ -96,7 +100,7 @@ def main():
         size, java_main = CASES[name]
         print('Building', name, flush=True)
         cmds = build(name, size, java_main, args.warmup, args.samples, args.rust_opt_level, env)
-        sources = (HERE/'kernels' if name in ('scalar','array') else ROOT/'bench/suite')/name
+        sources = (HERE/'kernels' if name in ('scalar','array','nbody_objects') else ROOT/'bench/suite')/name
         entry = {'input': size, 'source_sha256': {x.name:hashlib.sha256(x.read_bytes()).hexdigest() for x in sources.iterdir() if x.suffix in ('.rs','.gcr','.java')}, 'runs': []}
         reference = None
         for fork in range(args.forks):

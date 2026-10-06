@@ -9,6 +9,7 @@
 pub mod anf;
 pub mod ast;
 pub mod codegen;
+mod codegen_effects;
 pub mod compile;
 pub mod core;
 pub mod diag;

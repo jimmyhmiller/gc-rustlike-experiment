@@ -1,5 +1,9 @@
 # Performance investigation, 2026-10-06
 
+This describes the baseline at `35b8157`, including historical source locations
+and optimization priorities. Implemented fixes and new measurements are in the
+[optimization follow-up](optimization-2026-10-06/REPORT.md).
+
 The largest measured gap is allocation-heavy binary trees. The strongest concrete
 runtime finding is repeated full-tenured indexing during minor GC. Scalar
 arithmetic is competitive; managed array access and optimized numeric/permutation

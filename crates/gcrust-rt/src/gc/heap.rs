@@ -113,6 +113,7 @@ struct NurseryState {
     /// Card tables for each tenured space — tracks old→young pointer writes.
     /// Index matches the `spaces` array: card_tables[0] covers spaces[0], etc.
     card_tables: [CardTable; 2],
+    object_indexes: [Mutex<super::object_index::ObjectStartIndex>; 2],
     /// Number of minor collections performed.
     minor_collections: AtomicUsize,
 }
@@ -127,6 +128,7 @@ pub struct Heap {
     alloc_window: Box<crate::gc::alloc::AllocWindow>,
     /// Index into `spaces` for the current from-space (0 or 1).
     from_idx: AtomicUsize,
+    relocation_epoch: AtomicUsize,
 
     /// Registered mutator threads. The GC scans their roots during STW.
     threads: Mutex<Vec<Arc<ThreadState>>>,
@@ -280,6 +282,7 @@ impl Heap {
             ],
             alloc_window: Box::new(crate::gc::alloc::AllocWindow::empty()),
             from_idx: AtomicUsize::new(0),
+            relocation_epoch: AtomicUsize::new(0),
             threads: Mutex::new(Vec::new()),
             globals: AtomicRootSet::new(),
             state_slots: Mutex::new(std::collections::HashMap::new()),
@@ -338,6 +341,7 @@ impl Heap {
             spaces,
             alloc_window: Box::new(crate::gc::alloc::AllocWindow::empty()),
             from_idx: AtomicUsize::new(0),
+            relocation_epoch: AtomicUsize::new(0),
             threads: Mutex::new(Vec::new()),
             globals: AtomicRootSet::new(),
             state_slots: Mutex::new(std::collections::HashMap::new()),
@@ -365,6 +369,7 @@ impl Heap {
             nursery_state: Some(NurseryState {
                 nursery: AtomicBumpAllocator::new::<H>(nursery_size),
                 card_tables,
+                object_indexes: std::array::from_fn(|_| Mutex::new(Default::default())),
                 minor_collections: AtomicUsize::new(0),
             }),
             jit_frame_walker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -923,6 +928,9 @@ impl Heap {
     /// their runtime Thread (which owns the flag storage). Registration and
     /// BLOCKED->RUNNING use this same lock, so the release is one census event.
     fn resume_world(&self, snapshot: &[Arc<ThreadState>], excluded: Option<usize>) {
+        // All root updates precede resumption. Compiled callers can retain
+        // working references when no world pause occurred during a call.
+        self.relocation_epoch.fetch_add(1, Ordering::Release);
         let _threads = self.threads.lock().unwrap();
         for state in snapshot {
             if excluded == Some(Arc::as_ptr(state) as usize) { continue; }
@@ -1099,6 +1107,43 @@ impl Heap {
     #[inline(always)]
     pub fn is_tenured(&self, ptr: *const u8) -> bool {
         self.from_space().contains(ptr) || self.to_space().contains(ptr)
+    }
+
+    pub(crate) fn relocation_epoch_ptr(&self) -> *const AtomicUsize { &self.relocation_epoch }
+
+    /// Configure an owning mutator's compiled allocation window once the heap
+    /// and ThreadState are at stable addresses. Only nursery allocation is
+    /// exposed: semispace flips change the active arena and use the runtime.
+    pub(crate) unsafe fn configure_inline_tlab(&self, thread: &ThreadState) -> *mut crate::gc::InlineTlab {
+        let window = unsafe { thread.inline_tlab_ptr() };
+        if let Some(ns) = &self.nursery_state {
+            unsafe {
+                (*window).epoch = ns.nursery.epoch_ptr();
+                (*window).expected_epoch = ns.nursery.epoch();
+                (*window).base = ns.nursery.base();
+                (*window).stress = &self.gc_every_alloc;
+            }
+        }
+        window
+    }
+
+    /// Fixed-layout runtime allocation without revalidating the canonical
+    /// type descriptor on every object. Construction validates the entire
+    /// table; dynamic additions obey the same contract. This fast path never
+    /// collects, so frame publication is needed only on the slow path.
+    /// Caller must be this heap's owning RUNNING mutator, between safepoints.
+    pub(crate) unsafe fn try_alloc_runtime_fixed(&self, thread: &ThreadState, type_id: u16) -> *mut u8 {
+        if self.gc_every_alloc() || !self.header.is::<super::header::Full>() {
+            return core::ptr::null_mut();
+        }
+        let info = self.type_info_by_id(type_id);
+        if info.varlen != VarLenKind::None { return core::ptr::null_mut(); }
+        let size = info.allocation_size(0);
+        if size > 8192 { return core::ptr::null_mut(); }
+        let space = self.nursery_state.as_ref().map_or_else(|| self.from_space(), |ns| &ns.nursery);
+        let ptr = unsafe { thread.alloc_local_sized(space, size) };
+        if !ptr.is_null() { unsafe { crate::gc::field::init_header::<super::header::Full>(ptr, type_id); } }
+        ptr
     }
 
     /// Allocate through the owning thread's local buffer.
@@ -2519,61 +2564,7 @@ impl Heap {
         drop(gc_guard);
     }
 
-    /// Build an object-start index for card scanning.
-    ///
-    /// Returns a Vec where entry[i] is the first object overlapping card i. This allows O(1) lookup of
-    /// where to start scanning for a given dirty card, instead of walking
-    /// from offset 0.
-    ///
-    /// # Safety
-    /// All objects in the tenured space must have valid headers.
-    unsafe fn build_object_start_index(
-        tenured: &AtomicBumpAllocator,
-        tenured_used: usize,
-        card_table: &CardTable,
-        _type_id_offset: usize,
-        type_table: &[TypeInfo],
-    ) -> Vec<usize> {
-        let num_cards = card_table.card_count();
-        // Sentinel: usize::MAX means "no initialized object overlaps this card".
-        let mut obj_starts = vec![usize::MAX; num_cards];
-        let tenured_base = tenured.base() as usize;
-        let card_size = card_table.card_size();
 
-        unsafe {
-            tenured.walk(type_table, &mut |obj, info| {
-                let offset = obj as usize - tenured_base;
-                if offset >= tenured_used { return; }
-                let len = match info.varlen {
-                    VarLenKind::None => 0,
-                    _ => read_varlen_count(obj, info),
-                };
-                let size = info.allocation_size(len);
-                let first = offset / card_size;
-                let last = (offset + size - 1) / card_size;
-                for card in first..=last {
-                    if card < num_cards && obj_starts[card] == usize::MAX {
-                        obj_starts[card] = offset;
-                    }
-                }
-            });
-        }
-
-        // Forward-fill: cards with no objects inherit the previous card's
-        // start offset. Initialized-range traversal skips any intervening tails.
-        // The parallel minor collector walks forward from this offset and checks
-        // overlap, so scanning a few extra pre-card objects is harmless.
-        if num_cards > 0 && obj_starts[0] == usize::MAX {
-            obj_starts[0] = 0;
-        }
-        for i in 1..num_cards {
-            if obj_starts[i] == usize::MAX {
-                obj_starts[i] = obj_starts[i - 1];
-            }
-        }
-
-        obj_starts
-    }
 }
 
 /// Guard returned by [`Heap::pause_world`]. While alive, every other

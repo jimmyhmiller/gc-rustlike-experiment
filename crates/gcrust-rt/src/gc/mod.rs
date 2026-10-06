@@ -6,6 +6,7 @@ mod field;
 mod header;
 mod heap;
 mod mutator;
+mod object_index;
 mod ptr_policy;
 pub mod reflect;
 pub mod roots;
@@ -15,7 +16,7 @@ pub mod statemap;
 mod thread;
 mod type_info;
 
-pub use alloc::{Alloc, AllocWindow, AtomicBumpAllocator, BumpAllocator, HeapWalker, alloc_obj};
+pub use alloc::{InlineTlab, inline_tlab_offsets, Alloc, AllocWindow, AtomicBumpAllocator, BumpAllocator, HeapWalker, alloc_obj};
 pub use barrier::{SATBBuffer, SATBQueue, read_barrier, read_barrier_atomic};
 pub use card_table::CardTable;
 pub use dump::{dump_heap_json, dump_heap_text};

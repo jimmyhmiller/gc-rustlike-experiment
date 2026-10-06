@@ -91,24 +91,25 @@ impl Heap {
     pub(super) unsafe fn parallel_minor<P: PtrPolicy>(&self) {
         let ns = self.nursery_state.as_ref().unwrap();
         let table = &ns.card_tables[self.from_idx.load(Ordering::Acquire)];
+        // An empty remembered set has no tenured slots to enumerate. Keep
+        // overlap metadata lazy: the next dirty collection extends it over all
+        // initialized ranges accumulated since its previous update/reset.
+        let mut dirty = table.iter_dirty().peekable();
+        if dirty.peek().is_none() {
+            unsafe { self.parallel_evacuate::<P>(&[], true, Vec::new()) };
+            return;
+        }
         let space = self.from_space();
         let used = space.used();
-        let starts = unsafe {
-            Self::build_object_start_index(
-                space,
-                used,
-                table,
-                self.type_id_offset,
-                &self.type_table,
-            )
-        };
         let ranges = space.initialized_ranges();
+        let mut starts = ns.object_indexes[self.from_idx.load(Ordering::Acquire)].lock().unwrap();
+        unsafe { starts.update(space, &ranges, &self.type_table, table.card_size()); }
         let mut objects = HashSet::new();
-        for (card, addr) in table.iter_dirty() {
-            let Some(&start) = starts.get(card) else {
+        for (card, addr) in dirty {
+            let Some(start) = starts.get(card) else {
                 continue;
             };
-            let end = addr as usize + 512;
+            let end = addr as usize + table.card_size();
             let mut offset = start;
             let mut region = ranges.partition_point(|range| range.end <= offset);
             while offset < used && region < ranges.len() {
@@ -131,6 +132,7 @@ impl Heap {
                 offset = (offset + size + align - 1) & !(align - 1);
             }
         }
+        drop(starts);
         unsafe {
             self.parallel_evacuate::<P>(&[], true, objects.into_iter().map(Work::Object).collect())
         };

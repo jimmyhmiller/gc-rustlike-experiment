@@ -2151,3 +2151,39 @@ fn type_registration_rejects_exhausted_id_space_without_wrapping() {
     assert_eq!(heap.type_table_len(), u16::MAX as usize + 1);
     assert_eq!(heap.type_info_by_id(u16::MAX).type_id, u16::MAX);
 }
+
+
+#[test]
+fn remembered_edges_survive_clean_pauses_then_late_dirty_cards_after_major() {
+    let parent_info = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_varlen_values(0);
+    let child_info = TypeInfo::for_header(Full::SIZE).with_type_id(1).with_raw_bytes(8);
+    let heap = Heap::new_generational::<Full>(4096, 4096, vec![parent_info, child_info]);
+    let (thread, _) = heap.register_thread();
+    let parent = unsafe { heap.alloc_obj::<Full>(&parent_info, 81) };
+    assert!(!parent.is_null());
+    let root = heap.globals.add(parent as u64);
+    for phase in 0..2 {
+        if phase == 1 {
+            unsafe { heap.mutator_triggered_gc::<IdentityPtrPolicy>(&thread); }
+        }
+        for _ in 0..3 {
+            let garbage = unsafe { heap.alloc_nursery_obj::<Full>(&child_info, 0) };
+            assert!(!garbage.is_null());
+            unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&thread); }
+        }
+        let parent = heap.globals.get(root) as *mut u8;
+        let child = unsafe { heap.alloc_nursery_obj::<Full>(&child_info, 0) };
+        assert!(!child.is_null());
+        let slot = unsafe { parent.add(parent_info.varlen_element_offset(80)) };
+        unsafe {
+            child.add(16).cast::<u64>().write(42 + phase);
+            slot.cast::<*mut u8>().write(child);
+        }
+        heap.mark_card_dirty(slot);
+        unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&thread); }
+        let moved = unsafe { slot.cast::<*mut u8>().read() };
+        assert!(heap.is_tenured(moved));
+        assert_eq!(unsafe { moved.add(16).cast::<u64>().read() }, 42 + phase);
+    }
+    unsafe { heap.safe_deregister_thread(&thread); }
+}
