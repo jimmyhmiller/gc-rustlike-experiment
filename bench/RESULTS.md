@@ -1,12 +1,12 @@
 # Benchmark evidence
 
-This assessment makes no current performance-ratio claim. Earlier summaries
-reported conflicting ratios and mixed heap configurations. They no longer serve
-as the project's status documentation.
+Current measurements are linked below. Earlier summaries reported conflicting
+ratios and mixed heap configurations; those historical summaries no longer serve
+as the project's performance status.
 
 The repository contains `bench/perf_vs_rust.py`, `bench/run_suite.py`,
 `bench/gen_report.py`, benchmark sources, and previously generated JSON/HTML.
-Existing output artifacts do not establish current performance; regenerate them
+Historical output artifacts do not establish current performance; regenerate them
 for a recorded checkout and environment before drawing conclusions.
 
 `run_suite.py` compiles gc-rust/Rust/Go/Java versions of nbody, spectralnorm,
@@ -21,5 +21,16 @@ inputs, correctness checks, warmup, repetitions, raw samples, RSS, and pauses.
 Report JVM startup/warmup treatment. Separate throughput, latency, and allocation
 workloads, and explain differences in algorithms or resource lifetime.
 
-These harnesses were inspected, not rerun in the current assessment. Measure the
+The legacy harnesses were inspected, not rerun for the new comparison. Measure the
 chosen production application before deciding which runtime optimization to build.
+
+## Current measured comparison (2026-10-06)
+
+A new release AOT/Rust O2/Rust O3/OpenJDK 21 comparison is available in
+[comparison/MEASUREMENTS.md](comparison/MEASUREMENTS.md), with
+[methodology](comparison/README.md), [profile-supported findings](comparison/INVESTIGATION.md),
+and raw per-iteration records. It uses three process forks and explicit in-process
+warmup, checks ordered numeric results, and separates workload intervals from
+whole-process wall time. These measurements apply to the documented inputs,
+representations, host, and collector settings; the historical artifacts above
+remain unsuitable for current ratio claims.

@@ -1,0 +1,6274 @@
+{
+  "environment": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "git": "daad37f6db480445c6df2e65c4208d2270511f84",
+    "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "java": "openjdk version \"21.0.1\" 2023-10-17\nOpenJDK Runtime Environment (build 21.0.1+12-29)\nOpenJDK 64-Bit Server VM (build 21.0.1+12-29, mixed mode, sharing)",
+    "gcr_workers": 1,
+    "gcr_nursery_mb": 16,
+    "gcr_tenured_mb": 256,
+    "rust_opt_level": 3,
+    "gcr_opt_level": 2,
+    "order_seed": 20261006,
+    "cpu": "Apple M2 Max",
+    "memory_bytes": 68719476736,
+    "warmup": 20,
+    "samples": 10,
+    "forks": 3
+  },
+  "benchmarks": {
+    "nbody": {
+      "input": 1000000,
+      "source_sha256": {
+        "nbody.java": "fbcbc7bac2b7ff84bc244f8f08f28340c3d07f845b481cce0225232a2b8fe1b0",
+        "nbody.rs": "7b1e5383c53725cf2bb4b0722068b723b6b4e12a4fe83c3ab8b6b120f2360a0d",
+        "nbody.gcr": "955102db922f328f2fec9c020912ac8bab54f877c0b8ba905d15f773c3a5fd55"
+      },
+      "runs": [
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody/rust",
+            "1000000"
+          ],
+          "wall_s": 1.2496259160107002,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 31544542,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 27175083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 32016708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 30177042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 31477750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 31505417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 32048459,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 31893083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 31597792,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 31526625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 30377625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 28031750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 31671958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 32079875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 31556709,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 27253916,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 31606833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 31646167,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 31513834,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 31357042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 31568084,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 28772625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 31782459,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 31963292,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 31959834,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 30645500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 31959625,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 31815708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 31824250,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 31747166,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        1.24 real         0.80 user         0.00 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 269  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 347  involuntary context switches\n          7582472954  instructions retired\n          2709317099  cycles elapsed\n             1048888  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody/rust",
+            "1000000"
+          ],
+          "wall_s": 0.9434748749481514,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 31339584,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 31384583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 32331583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 32143917,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 26756000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 31985500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 31257750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 30828708,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 32019666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 31285291,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 31714750,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 31946709,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 30435166,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 31457083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 32123709,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 31101667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 32016166,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 31276083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 31611875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 27444084,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 31620666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 31818875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 30800042,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 31932166,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 29953500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 31397875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 31629084,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 31282709,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 32526208,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 32210000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        0.94 real         0.80 user         0.00 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 269  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 392  involuntary context switches\n          7582183829  instructions retired\n          2710655297  cycles elapsed\n             1048888  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/nbody/rust",
+            "1000000"
+          ],
+          "wall_s": 0.9440117499907501,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 32084500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 32086875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 28342542,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 31806667,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 31650000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 32084000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 31063125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 30794334,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 31535083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 27336500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 31646833,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 31576916,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 31733875,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 32197083,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 31758292,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 31651125,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 32165209,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 31145500,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 30949583,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 31450791,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 32460958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 31703834,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 31750375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 31866666,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 31929000,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 30792791,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 27125167,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 31217958,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 31954375,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 31844417,
+              "signature": [
+                "-0.169075164",
+                "-0.169086185"
+              ]
+            }
+          ],
+          "stderr": "        0.94 real         0.80 user         0.01 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 271  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 399  involuntary context switches\n          7583348279  instructions retired\n          2717343983  cycles elapsed\n             1048888  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "rust": 31.766416999999997
+      }
+    },
+    "spectralnorm": {
+      "input": 1000,
+      "source_sha256": {
+        "spectralnorm.rs": "b1dbe3dd87a8f7e6cfe3d63a73c291de0cc29b09200401dc83285340a14eda86",
+        "spectralnorm.gcr": "071f16a3c1f986898e4d7a11cea496b4842feebd76e552b5bbc466295a344c40",
+        "spectralnorm.java": "ea8f5dd39e452361f649e776dac1fb63bc336626db07fa9b5e7bf5447184768d"
+      },
+      "runs": [
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/spectralnorm/rust",
+            "1000"
+          ],
+          "wall_s": 1.405248292023316,
+          "peak_rss_bytes": 1703936,
+          "records": [
+            {
+              "index": 0,
+              "ns": 39850875,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 37761458,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 35667666,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 42780375,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 37770500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 38178000,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 39677500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 40238667,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 45414625,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 39900958,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 38757667,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 40019166,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 40051583,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 44805875,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 37663834,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 39841584,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 35459292,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 40281375,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44281583,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 39013708,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 39768792,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 39975208,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 45447875,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 39712792,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 39698542,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 39466334,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 40370416,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 44730500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 40190292,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 40104583,
+              "signature": [
+                "1.274224148"
+              ]
+            }
+          ],
+          "stderr": "        1.40 real         1.05 user         0.01 sys\n             1703936  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 272  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 455  involuntary context switches\n         12036204915  instructions retired\n          3520439270  cycles elapsed\n             1114424  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/spectralnorm/rust",
+            "1000"
+          ],
+          "wall_s": 1.2374649999546818,
+          "peak_rss_bytes": 1720320,
+          "records": [
+            {
+              "index": 0,
+              "ns": 44337791,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 40425833,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 40126916,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 39612167,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 39597750,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 43922125,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 40106750,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 40138417,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 40221791,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 44638334,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 40184458,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 40476791,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 36476333,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 40249041,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 44683667,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 40186834,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 39978792,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 40196625,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44655500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 39230042,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 40472291,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 39732417,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 45633625,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 40590625,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 40044750,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 40518917,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 45376916,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 40267792,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 40017250,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 39766375,
+              "signature": [
+                "1.274224148"
+              ]
+            }
+          ],
+          "stderr": "        1.23 real         1.04 user         0.01 sys\n             1720320  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 273  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 430  involuntary context switches\n         12037462252  instructions retired\n          3532246473  cycles elapsed\n             1130808  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/spectralnorm/rust",
+            "1000"
+          ],
+          "wall_s": 1.2220533340005204,
+          "peak_rss_bytes": 1703936,
+          "records": [
+            {
+              "index": 0,
+              "ns": 40109625,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 38790667,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 36255125,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 40292334,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 45370250,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 36476458,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 40100542,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 39595333,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 36373083,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 44870500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 40147083,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 38178375,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 39568083,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 40327792,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 43070292,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 39463875,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 40184750,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 40310667,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 39712750,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 43659959,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 40314000,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 39490791,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 40375500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 40908500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 40483958,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 40312416,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 39915500,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 40340958,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 45058375,
+              "signature": [
+                "1.274224148"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 40095500,
+              "signature": [
+                "1.274224148"
+              ]
+            }
+          ],
+          "stderr": "        1.21 real         1.04 user         0.01 sys\n             1703936  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 274  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 456  involuntary context switches\n         12038978788  instructions retired\n          3536745733  cycles elapsed\n             1114424  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "rust": 40.290104
+      }
+    },
+    "fannkuchredux": {
+      "input": 9,
+      "source_sha256": {
+        "fannkuchredux.rs": "1343935dddb25ef860229d1664832a212e236a7c640935d4de639ee9096d3606",
+        "fannkuchredux.java": "f55e671f4aab2ac2881f9ab9ada9a67bb08c72de74fef273fd999d8e47237296",
+        "fannkuchredux.gcr": "980fff6279292858cac799ac1e01977283181e068f158ba4d07d46d58c5a4d8f"
+      },
+      "runs": [
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/fannkuchredux/rust",
+            "9"
+          ],
+          "wall_s": 0.6525209579849616,
+          "peak_rss_bytes": 1638400,
+          "records": [
+            {
+              "index": 0,
+              "ns": 12973708,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 18157292,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 13196417,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 13773209,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 13511541,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 12959958,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 18085917,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 13043125,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 18390917,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 13091833,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 18198333,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 13121500,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 18018250,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 13154833,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 13065125,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 18081000,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 13353125,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 17881375,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 13065458,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 18169083,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 13194750,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 18146917,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 13032458,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 17803916,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 12890958,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 16860083,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 13400625,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 13130667,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 17915583,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 12953417,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            }
+          ],
+          "stderr": "        0.64 real         0.39 user         0.00 sys\n             1638400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 268  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 197  involuntary context switches\n          4755893967  instructions retired\n          1323721884  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/fannkuchredux/rust",
+            "9"
+          ],
+          "wall_s": 0.46497650002129376,
+          "peak_rss_bytes": 1638400,
+          "records": [
+            {
+              "index": 0,
+              "ns": 13019708,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 17743250,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 13473208,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 13150333,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 18196416,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 12908750,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 18123000,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 12871834,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 17600083,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 12994709,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 16804167,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 13031250,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 18366375,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 13147334,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 13212167,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 17355125,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 13019167,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 18345417,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 12938416,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 17869875,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 12907875,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 17485625,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 13094625,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 18200666,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 13029833,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 12963042,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 17493792,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 13031250,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 18428875,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 12873292,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            }
+          ],
+          "stderr": "        0.46 real         0.39 user         0.00 sys\n             1638400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 268  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 179  involuntary context switches\n          4753915616  instructions retired\n          1316300320  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/fannkuchredux/rust",
+            "9"
+          ],
+          "wall_s": 0.46322704100748524,
+          "peak_rss_bytes": 1654784,
+          "records": [
+            {
+              "index": 0,
+              "ns": 12958916,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 13030084,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 16900083,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 12809791,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 18445834,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 13177166,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 18155375,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 12947208,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 18116875,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 13045750,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 17538958,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 13047834,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 13081792,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 18432750,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 13135542,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 16038958,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 12849792,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 18177125,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 13030667,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 18179208,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 12919917,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 18020208,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 13191125,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 13825625,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 16540250,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 13091208,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 17409250,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 13094792,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 17781833,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 13044333,
+              "signature": [
+                "8629",
+                "9",
+                "30"
+              ]
+            }
+          ],
+          "stderr": "        0.46 real         0.39 user         0.00 sys\n             1654784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 269  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 200  involuntary context switches\n          4754330143  instructions retired\n          1318824808  cycles elapsed\n             1065272  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "rust": 13.1929375
+      }
+    },
+    "binarytrees": {
+      "input": 14,
+      "source_sha256": {
+        "binarytrees.java": "751f000da838eae9fcb021e1d7a1d8788cc40977b0ce72eb4301149fec0dc94b",
+        "binarytrees.gcr": "cc865367709b517848589ea08b845bdd286c86325fbd5201621e57815eb97879",
+        "binarytrees.rs": "c0e1ac25234ed665bc803f4a77839b11e48aaf5c4e841c09920bab3cdcdce5b3"
+      },
+      "runs": [
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/binarytrees/rust",
+            "14"
+          ],
+          "wall_s": 2.6733422499964945,
+          "peak_rss_bytes": 3801088,
+          "records": [
+            {
+              "index": 0,
+              "ns": 80898459,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 86668167,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 80315542,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 84928167,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 79923791,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 84559375,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 77328916,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 80690791,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 86032333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 81437250,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 85185708,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 81920667,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 85639875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 80001875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 80215125,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 81997000,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 85759334,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 80913333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 86909583,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 79894875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 85344750,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 80662375,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 85695333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 79852708,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 85959083,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 80611500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 85839583,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 80708500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 86540792,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 80466417,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            }
+          ],
+          "stderr": "        2.67 real         2.13 user         0.02 sys\n             3801088  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 400  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 888  involuntary context switches\n         38352160994  instructions retired\n          7180063552  cycles elapsed\n             3244368  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/binarytrees/rust",
+            "14"
+          ],
+          "wall_s": 2.5219272920512594,
+          "peak_rss_bytes": 3801088,
+          "records": [
+            {
+              "index": 0,
+              "ns": 86450875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 80481167,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 84447375,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 80728167,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 85034333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 80370584,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 87616292,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 81150792,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 85887625,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 82360667,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 88463333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 91020500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 82926875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 89404750,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 88454667,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 81902458,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 83875750,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 81675333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 86791083,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 80467833,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 85064542,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 80599625,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 81110000,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 81351833,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 80070542,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 84983708,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 80987750,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 85210125,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 80708750,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 82451000,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            }
+          ],
+          "stderr": "        2.51 real         2.13 user         0.02 sys\n             3801088  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 400  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                1002  involuntary context switches\n         38473201353  instructions retired\n          7110074633  cycles elapsed\n             3244368  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/binarytrees/rust",
+            "14"
+          ],
+          "wall_s": 2.4397129170247354,
+          "peak_rss_bytes": 3801088,
+          "records": [
+            {
+              "index": 0,
+              "ns": 79544292,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 85449875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 78777250,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 84247417,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 79842666,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 83384500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 78242792,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 84221208,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 79280209,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 76109291,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 80814542,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 79948541,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 84883708,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 79274500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 80229250,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 84175333,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 79860583,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 84706708,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 79599042,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 81528125,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 79384500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 84135083,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 79517416,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 83791458,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 75727334,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 78495709,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 84872500,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 80008875,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 83164291,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 80564417,
+              "signature": [
+                "15",
+                "65535",
+                "16384",
+                "4",
+                "507904",
+                "4096",
+                "6",
+                "520192",
+                "1024",
+                "8",
+                "523264",
+                "256",
+                "10",
+                "524032",
+                "64",
+                "12",
+                "524224",
+                "16",
+                "14",
+                "524272",
+                "14",
+                "32767"
+              ]
+            }
+          ],
+          "stderr": "        2.43 real         2.09 user         0.02 sys\n             3801088  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 400  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 878  involuntary context switches\n         38351465250  instructions retired\n          7060768268  cycles elapsed\n             3244368  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "rust": 81.04887500000001
+      }
+    },
+    "scalar": {
+      "input": 0,
+      "source_sha256": {
+        "scalar.java": "8eb3c8554e8a7b584a07488fe01ad4560d63e759b9db3086e9144d4918766e61",
+        "scalar.gcr": "a389cfb373065484c48726a4ed26fb7c3ade01bf60f5abf9a82dbe9e5b7567dd",
+        "scalar.rs": "229c2286bb5ec510ad4ccf20e7904260caec2358dbfbe464e19ce7fcd434ea38"
+      },
+      "runs": [
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/scalar/rust",
+            "0"
+          ],
+          "wall_s": 1.573101082991343,
+          "peak_rss_bytes": 1589248,
+          "records": [
+            {
+              "index": 0,
+              "ns": 44195584,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 49784459,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 44447542,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 43158792,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 49321625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 44669959,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 48667916,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 40635500,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 44763500,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 48934042,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 44650750,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 44683916,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 48281334,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 44199500,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 49367375,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 43309708,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 44520250,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 47538000,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44335750,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 44165166,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 47536541,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 44403041,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 44509916,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 49579875,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 44248083,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 49567958,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 43892625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 43754459,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 48873625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 44720750,
+              "signature": [
+                "703792249"
+              ]
+            }
+          ],
+          "stderr": "        1.56 real         1.17 user         0.01 sys\n             1589248  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 267  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 499  involuntary context switches\n          3026264146  instructions retired\n          3958016593  cycles elapsed\n             1048888  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/scalar/rust",
+            "0"
+          ],
+          "wall_s": 1.3656876250170171,
+          "peak_rss_bytes": 1589248,
+          "records": [
+            {
+              "index": 0,
+              "ns": 48988000,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 43503125,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 48989458,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 45619375,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 44418708,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 47701458,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 40211417,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 42578083,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 48886375,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 44641084,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 42836291,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 44264667,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 42175625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 44229334,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 48765291,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 44389583,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 44043042,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 48359833,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44145750,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 43981291,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 47055750,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 44075333,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 46955250,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 44765584,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 43955125,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 47653417,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 44822917,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 44579625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 48794625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 44351750,
+              "signature": [
+                "703792249"
+              ]
+            }
+          ],
+          "stderr": "        1.36 real         1.17 user         0.01 sys\n             1589248  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 265  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 508  involuntary context switches\n          3025935798  instructions retired\n          3957810835  cycles elapsed\n             1048888  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/scalar/rust",
+            "0"
+          ],
+          "wall_s": 1.3693765840143897,
+          "peak_rss_bytes": 1589248,
+          "records": [
+            {
+              "index": 0,
+              "ns": 50030083,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 43866666,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 44608625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 43948916,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 44172625,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 44740125,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 44105583,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 44179416,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 45311458,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 45772458,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 44656708,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 48540167,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 44572750,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 42709375,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 47992166,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 43167958,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 44801000,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 49325875,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 44967791,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 47325333,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 46269958,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 43833333,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 47445792,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 43598958,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 43574833,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 49387083,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 43875959,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 43523792,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 48736834,
+              "signature": [
+                "703792249"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 44607000,
+              "signature": [
+                "703792249"
+              ]
+            }
+          ],
+          "stderr": "        1.36 real         1.17 user         0.01 sys\n             1589248  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 265  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 504  involuntary context switches\n          3024535002  instructions retired\n          3947260851  cycles elapsed\n             1048888  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "rust": 44.663875000000004
+      }
+    },
+    "array": {
+      "input": 0,
+      "source_sha256": {
+        "array.java": "b0ea835027cfb704be458e729b482210a6c8630430b185c771c2c06f09190511",
+        "array.rs": "d4453f135fc8a80973a2f780585d8acdd45beb4b0250bf750f2d29082bf19105",
+        "array.gcr": "67d35e2265592c3634f49df3444e1b39bd10cbb14cada85dbba458c145530f04"
+      },
+      "runs": [
+        {
+          "language": "rust",
+          "fork": 0,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/array/rust",
+            "0"
+          ],
+          "wall_s": 0.3325990000157617,
+          "peak_rss_bytes": 1638400,
+          "records": [
+            {
+              "index": 0,
+              "ns": 4073250,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 8998875,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 4010000,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 4065917,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 4046458,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 4014916,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 3968875,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 4068500,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 4880708,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 4370292,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 3972791,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 4034333,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 4181500,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 4018084,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 4059500,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 4038125,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 8729792,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 3968458,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 3978291,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 3994750,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 4007667,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 4008208,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 4027125,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 8351125,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 3967417,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 3953208,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 4090500,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 3996208,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 4002084,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 4029458,
+              "signature": [
+                "512458112753"
+              ]
+            }
+          ],
+          "stderr": "        0.32 real         0.12 user         0.00 sys\n             1638400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 268  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  73  involuntary context switches\n          1966533101  instructions retired\n           412409733  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 1,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/array/rust",
+            "0"
+          ],
+          "wall_s": 0.1492513749981299,
+          "peak_rss_bytes": 1638400,
+          "records": [
+            {
+              "index": 0,
+              "ns": 4040916,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 3927209,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 4007375,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 4007625,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 4041666,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 4000584,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 8990542,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 3961500,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 3970791,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 4015292,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 4054917,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 3988000,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 4117416,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 8287708,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 4008667,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 3993375,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 4011875,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 4035292,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 4060834,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 4016125,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 8043750,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 3920833,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 3937417,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 4110750,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 3992417,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 3919625,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 3967959,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 4926042,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 8074250,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 3996333,
+              "signature": [
+                "512458112753"
+              ]
+            }
+          ],
+          "stderr": "        0.14 real         0.12 user         0.00 sys\n             1638400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 268  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  45  involuntary context switches\n          1965349379  instructions retired\n           410613415  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "language": "rust",
+          "fork": 2,
+          "command": [
+            "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/array/rust",
+            "0"
+          ],
+          "wall_s": 0.13929312501568347,
+          "peak_rss_bytes": 1638400,
+          "records": [
+            {
+              "index": 0,
+              "ns": 4007000,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 1,
+              "ns": 3983292,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 2,
+              "ns": 4054000,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 3,
+              "ns": 7380208,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 4,
+              "ns": 3911375,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 5,
+              "ns": 3979708,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 6,
+              "ns": 4018500,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 7,
+              "ns": 4054209,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 8,
+              "ns": 3984459,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 9,
+              "ns": 3987334,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 10,
+              "ns": 4710542,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 11,
+              "ns": 4126458,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 12,
+              "ns": 4423459,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 13,
+              "ns": 3958042,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 14,
+              "ns": 3965625,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 15,
+              "ns": 4016625,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 16,
+              "ns": 4040166,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 17,
+              "ns": 4006625,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 18,
+              "ns": 4891250,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 19,
+              "ns": 7359375,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 20,
+              "ns": 4237750,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 21,
+              "ns": 4088708,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 22,
+              "ns": 4101292,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 23,
+              "ns": 3923542,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 24,
+              "ns": 3950000,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 25,
+              "ns": 4049000,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 26,
+              "ns": 8514583,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 27,
+              "ns": 3973833,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 28,
+              "ns": 4036541,
+              "signature": [
+                "512458112753"
+              ]
+            },
+            {
+              "index": 29,
+              "ns": 3952375,
+              "signature": [
+                "512458112753"
+              ]
+            }
+          ],
+          "stderr": "        0.13 real         0.12 user         0.00 sys\n             1638400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 268  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  53  involuntary context switches\n          1965152085  instructions retired\n           407602508  cycles elapsed\n             1065272  peak memory footprint\n"
+        }
+      ],
+      "median_ms": {
+        "rust": 4.0079375
+      }
+    }
+  }
+}

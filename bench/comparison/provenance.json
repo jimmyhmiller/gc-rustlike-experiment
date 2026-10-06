@@ -1,0 +1,24 @@
+{
+  "cpu": "Apple M2 Max",
+  "memory_bytes": 68719476736,
+  "compiler_runtime_revision": "daad37f6db480445c6df2e65c4208d2270511f84",
+  "source_state": "Compiler/runtime checkout was clean at measurement start. New benchmark harness and artifacts were uncommitted during measurements.",
+  "default_runtime_profile": "release (owned AOT archive cache)",
+  "seed": 20261006,
+  "artifact_sha256": {
+    "run.py": "7abb4ee43242e014e2699ee1f77098c3a2d1c687f3f0effc4b562c4d21cfa709",
+    "workers8.json": "d6732ac366d2603056526a61f97ad3e1a34762f860eac7493bf0a7d3e25a9cf0",
+    "profile.py": "9beeeca37725df586bfe4402f8d660f4fbdc29a4ebd9c118fe60dd02ff82a96b",
+    "results.json": "3f035b6b1406168a7c46d2c3bfcd289a5727a37e6e25a0427900bdb944223559",
+    "nursery64.json": "005ea18599eabbd5d2c95abac05c4714d4fe03c655d947b9cae0545f303dd8a3",
+    "summarize.py": "5b234644cc27a3473b941d9b3c00930168eeef8ed9449fa0a21954a34b42d3cf",
+    "clock.c": "d8b4d6638576da273f5c039f839ef0dafc2e0bc25cb109f5e15e6530fc2a5863",
+    "rust-o3.json": "c2bd0a8304abde5e409896352b335c2b01b99c1da1e3f5c6a1f038c89e792aa3",
+    "kernels/array/array.java": "b0ea835027cfb704be458e729b482210a6c8630430b185c771c2c06f09190511",
+    "kernels/array/array.rs": "d4453f135fc8a80973a2f780585d8acdd45beb4b0250bf750f2d29082bf19105",
+    "kernels/array/array.gcr": "67d35e2265592c3634f49df3444e1b39bd10cbb14cada85dbba458c145530f04",
+    "kernels/scalar/scalar.java": "8eb3c8554e8a7b584a07488fe01ad4560d63e759b9db3086e9144d4918766e61",
+    "kernels/scalar/scalar.gcr": "a389cfb373065484c48726a4ed26fb7c3ade01bf60f5abf9a82dbe9e5b7567dd",
+    "kernels/scalar/scalar.rs": "229c2286bb5ec510ad4ccf20e7904260caec2358dbfbe464e19ce7fcd434ea38"
+  }
+}

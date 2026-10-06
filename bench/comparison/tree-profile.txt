@@ -1,0 +1,361 @@
+Analysis of sampling binarytrees (pid 72068) every 1 millisecond
+Process:         binarytrees [72068]
+Path:            /Users/USER/Documents/*/binarytrees
+Load Address:    0x100b5c000
+Identifier:      binarytrees
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  Python [72067]
+Target Type:     live task
+
+Date/Time:       2026-10-06 17:32:44.584 -0400
+Launch Time:     2026-10-06 17:32:44.538 -0400
+OS Version:      macOS 26.5.2 (25F84)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         132.1M
+Physical footprint (peak):  132.1M
+Idle exit:                  untracked
+----
+
+Call graph:
+    2491 Thread_27603135   DispatchQueue_1: com.apple.main-thread  (serial)
+      2329 main  (in binarytrees) + 40  [0x100b5cc88]
+      + 1090 make  (in binarytrees) + 104  [0x100b5cb5c]  binarytrees.gcr:19
+      + ! 1040 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      + ! : 596 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 344  [0x100b71300]
+      + ! : | 540 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 2384  [0x100b65304]
+      + ! : | + 493 gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees) + 284  [0x100b64248]
+      + ! : | + ! 338 _$LT$gcrust_rt..gc..alloc..AtomicBumpAllocator$u20$as$u20$gcrust_rt..gc..alloc..HeapWalker$GT$::walk::h410d1b106a831007  (in binarytrees) + 284  [0x100b83aac]
+      + ! : | + ! : 338 gcrust_rt::gc::heap::Heap::build_object_start_index::_$u7b$$u7b$closure$u7d$$u7d$::h89167564b3601d01  (in binarytrees) + 180,144,...  [0x100b643f8,0x100b643d4,...]
+      + ! : | + ! 155 _$LT$gcrust_rt..gc..alloc..AtomicBumpAllocator$u20$as$u20$gcrust_rt..gc..alloc..HeapWalker$GT$::walk::h410d1b106a831007  (in binarytrees) + 276,264,...  [0x100b83aa4,0x100b83a98,...]
+      + ! : | + 43 gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees) + 392,352,...  [0x100b642b4,0x100b6428c,...]
+      + ! : | + 4 gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees) + 164  [0x100b641d0]
+      + ! : | +   4 _platform_memset  (in libsystem_platform.dylib) + 72  [0x19042f0d8]
+      + ! : | 37 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 3100  [0x100b655d0]
+      + ! : | + 16 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1688  [0x100b67984]
+      + ! : | + ! 9 gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees) + 136  [0x100b891e0]
+      + ! : | + ! : 9 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_slot_mode::h5e6c14632df6d864  (in binarytrees) + 4,28,...  [0x100b67fdc,0x100b67ff4,...]
+      + ! : | + ! 4 gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees) + 48,8,...  [0x100b89188,0x100b89160,...]
+      + ! : | + ! 3 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_slot_mode::h5e6c14632df6d864  (in binarytrees) + 64,52  [0x100b68018,0x100b6800c]
+      + ! : | + 12 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1816  [0x100b67a04]
+      + ! : | + ! 7 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees) + 784  [0x100b67214]
+      + ! : | + ! : 6 _platform_memmove  (in libsystem_platform.dylib) + 428,0,...  [0x19042f50c,0x19042f360,...]
+      + ! : | + ! : 1 DYLD-STUB$$memcpy  (in binarytrees) + 4  [0x100c2d9e0]
+      + ! : | + ! 3 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees) + 168,512,...  [0x100b66fac,0x100b67104,...]
+      + ! : | + ! 2 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees) + 748  [0x100b671f0]
+      + ! : | + !   2 _platform_memmove  (in libsystem_platform.dylib) + 12,424  [0x19042f36c,0x19042f508]
+      + ! : | + 4 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1828  [0x100b67a10]
+      + ! : | + ! 3 gcrust_rt::gc::heap::parallel::WorkQueue::finish::h5fd898c19a828637  (in binarytrees) + 108  [0x100b9d07c]
+      + ! : | + ! : 3 _$LT$alloc..collections..vec_deque..VecDeque$LT$T$C$A$GT$$u20$as$u20$alloc..collections..vec_deque..spec_extend..SpecExtend$LT$T$C$I$GT$$GT$::spec_extend::h4fa054c6809769bd  (in binarytrees) + 812,824  [0x100b80100,0x100b8010c]
+      + ! : | + ! 1 gcrust_rt::gc::heap::parallel::WorkQueue::finish::h5fd898c19a828637  (in binarytrees) + 128  [0x100b9d090]
+      + ! : | + !   1 _RNvMNtNtNtCsaLOjE9VYtxK_3std4sync6poison7condvarNtB2_7Condvar10notify_all  (in binarytrees) + 32  [0x100bb317c]  condvar.rs:493
+      + ! : | + !     1 _RINvMNtNtNtCsaLOjE9VYtxK_3std3sys4sync8once_boxINtB3_7OnceBoxNtNtNtNtNtB7_3pal4unix4sync7condvar7CondvarE10initializeNCNvMNtNtB5_7condvar7pthreadNtB1W_7Condvar3get0EB9_  (in binarytrees) + 0  [0x100c29cb8]  once_box.rs:62
+      + ! : | + 3 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1552  [0x100b678fc]
+      + ! : | + ! 2 gcrust_rt::gc::heap::parallel::WorkQueue::take::h371c69859a07f41c  (in binarytrees) + 228  [0x100b9cea4]
+      + ! : | + ! : 2 alloc::vec::Vec$LT$T$C$A$GT$::extend_desugared::h864fd612f00b437b  (in binarytrees) + 96  [0x100b793e0]
+      + ! : | + ! 1 gcrust_rt::gc::heap::parallel::WorkQueue::take::h371c69859a07f41c  (in binarytrees) + 388  [0x100b9cf44]
+      + ! : | + !   1 std::sys::sync::once_box::OnceBox$LT$T$GT$::initialize::h0d36d0bd698ef247  (in binarytrees) + 104  [0x100c25260]
+      + ! : | + !     1 _RNvMNtNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4sync5mutexNtB2_5Mutex4init  (in binarytrees) + 60  [0x100bb4854]  mutex.rs:56
+      + ! : | + !       1 pthread_mutex_init  (in libsystem_pthread.dylib) + 236  [0x1904214fc]
+      + ! : | + 1 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1640  [0x100b67954]
+      + ! : | + 1 gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees) + 588  [0x100b893a4]
+      + ! : | 18 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 3216,2524,...  [0x100b65644,0x100b65390,...]
+      + ! : | 1 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 3180  [0x100b65620]
+      + ! : |   1 _xzm_free  (in libsystem_malloc.dylib) + 1560  [0x190243684]
+      + ! : 228 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      + ! : | 69 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 196,256,...  [0x100b60b4c,0x100b60b88,...]
+      + ! : | 62 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 796  [0x100b84914]
+      + ! : | + 52 _platform_memset  (in libsystem_platform.dylib) + 180,208  [0x19042f144,0x19042f160]
+      + ! : | + 10 DYLD-STUB$$bzero  (in binarytrees) + 4  [0x100c2d6bc]
+      + ! : | 47 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 100  [0x100b8465c]
+      + ! : | + 47 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 0,256,...  [0x100b9adc8,0x100b9aec8,...]
+      + ! : | 47 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 32,108,...  [0x100b84618,0x100b84664,...]
+      + ! : | 3 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 564  [0x100b8482c]
+      + ! : |   3 <deduplicated_symbol>  (in binarytrees) + 32  [0x100b975f0]
+      + ! : |     3 _RNvMNtNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4sync5mutexNtB2_5Mutex4lock  (in binarytrees) + 12  [0x100bb498c]  mutex.rs:72
+      + ! : |       3 pthread_mutex_lock  (in libsystem_pthread.dylib) + 0  [0x1904203fc]
+      + ! : 156 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 112  [0x100b71218]
+      + ! : | 102 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 124  [0x100b60f40]
+      + ! : | + 52 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 140,204,...  [0x100b60f50,0x100b60f90,...]
+      + ! : | + 50 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260,48,...  [0x100b9aecc,0x100b9adf8,...]
+      + ! : | 25 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 16,88,...  [0x100b60ed4,0x100b60f1c,...]
+      + ! : | 22 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 292  [0x100b60fe8]
+      + ! : | + 15 _platform_memcmp  (in libsystem_platform.dylib) + 140,280,...  [0x19042cf9c,0x19042d028,...]
+      + ! : | + 7 DYLD-STUB$$memcmp  (in binarytrees) + 4  [0x100c2d9d4]
+      + ! : | 7 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 112  [0x100b71218]
+      + ! : |   7 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 48,60  [0x100b60ef4,0x100b60f00]
+      + ! : 40 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 48,200,...  [0x100b711d8,0x100b71270,...]
+      + ! : 20 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 764,756,...  [0x100b848f4,0x100b848ec,...]
+      + ! 39 ai_gc_alloc_fixed  (in binarytrees) + 44,160,...  [0x100b7393c,0x100b739b0,...]
+      + ! 11 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 680  [0x100b71450]
+      + 996 make  (in binarytrees) + 152  [0x100b5cb8c]  binarytrees.gcr:21
+      + ! 938 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      + ! : 476 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 344  [0x100b71300]
+      + ! : | 420 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 2384  [0x100b65304]
+      + ! : | + 381 gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees) + 284  [0x100b64248]
+      + ! : | + ! 250 _$LT$gcrust_rt..gc..alloc..AtomicBumpAllocator$u20$as$u20$gcrust_rt..gc..alloc..HeapWalker$GT$::walk::h410d1b106a831007  (in binarytrees) + 284  [0x100b83aac]
+      + ! : | + ! : 250 gcrust_rt::gc::heap::Heap::build_object_start_index::_$u7b$$u7b$closure$u7d$$u7d$::h89167564b3601d01  (in binarytrees) + 180,44,...  [0x100b643f8,0x100b64370,...]
+      + ! : | + ! 131 _$LT$gcrust_rt..gc..alloc..AtomicBumpAllocator$u20$as$u20$gcrust_rt..gc..alloc..HeapWalker$GT$::walk::h410d1b106a831007  (in binarytrees) + 264,276,...  [0x100b83a98,0x100b83aa4,...]
+      + ! : | + 38 gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees) + 352,372,...  [0x100b6428c,0x100b642a0,...]
+      + ! : | + 1 gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees) + 164  [0x100b641d0]
+      + ! : | +   1 _platform_memset  (in libsystem_platform.dylib) + 72  [0x19042f0d8]
+      + ! : | 38 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 3100  [0x100b655d0]
+      + ! : | + 17 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1688  [0x100b67984]
+      + ! : | + ! 11 gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees) + 136  [0x100b891e0]
+      + ! : | + ! : 11 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_slot_mode::h5e6c14632df6d864  (in binarytrees) + 104,252,...  [0x100b68040,0x100b680d4,...]
+      + ! : | + ! 5 gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees) + 76,24,...  [0x100b891a4,0x100b89170,...]
+      + ! : | + ! 1 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_slot_mode::h5e6c14632df6d864  (in binarytrees) + 64  [0x100b68018]
+      + ! : | + 14 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1816  [0x100b67a04]
+      + ! : | + ! 6 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees) + 496,168,...  [0x100b670f4,0x100b66fac,...]
+      + ! : | + ! 5 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees) + 784  [0x100b67214]
+      + ! : | + ! : 5 _platform_memmove  (in libsystem_platform.dylib) + 424,428  [0x19042f508,0x19042f50c]
+      + ! : | + ! 3 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees) + 748  [0x100b671f0]
+      + ! : | + !   3 _platform_memmove  (in libsystem_platform.dylib) + 428,424  [0x19042f50c,0x19042f508]
+      + ! : | + 2 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1552  [0x100b678fc]
+      + ! : | + ! 2 gcrust_rt::gc::heap::parallel::WorkQueue::take::h371c69859a07f41c  (in binarytrees) + 228  [0x100b9cea4]
+      + ! : | + !   2 alloc::vec::Vec$LT$T$C$A$GT$::extend_desugared::h864fd612f00b437b  (in binarytrees) + 96,172  [0x100b793e0,0x100b7942c]
+      + ! : | + 2 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1828  [0x100b67a10]
+      + ! : | + ! 1 gcrust_rt::gc::heap::parallel::WorkQueue::finish::h5fd898c19a828637  (in binarytrees) + 108  [0x100b9d07c]
+      + ! : | + ! : 1 _$LT$alloc..collections..vec_deque..VecDeque$LT$T$C$A$GT$$u20$as$u20$alloc..collections..vec_deque..spec_extend..SpecExtend$LT$T$C$I$GT$$GT$::spec_extend::h4fa054c6809769bd  (in binarytrees) + 1068  [0x100b80200]
+      + ! : | + ! :   1 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h5da23e8e1327acd4  (in binarytrees) + 108  [0x100c25878]
+      + ! : | + ! :     1 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7c012c860d59fbb6  (in binarytrees) + 92  [0x100c257b4]
+      + ! : | + ! :       1 _realloc  (in libsystem_malloc.dylib) + 452  [0x190252e90]
+      + ! : | + ! :         1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x190252674]
+      + ! : | + ! :           1 xzm_realloc  (in libsystem_malloc.dylib) + 780  [0x190242e00]
+      + ! : | + ! :             1 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 456  [0x1902423c8]
+      + ! : | + ! :               1 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 504  [0x19022b5c4]
+      + ! : | + ! :                 1 _xzm_segment_group_find_and_allocate_chunk  (in libsystem_malloc.dylib) + 528  [0x19022bc00]
+      + ! : | + ! :                   1 _xzm_segment_group_span_mark_smaller  (in libsystem_malloc.dylib) + 88  [0x19022d080]
+      + ! : | + ! 1 gcrust_rt::gc::heap::parallel::WorkQueue::finish::h5fd898c19a828637  (in binarytrees) + 0  [0x100b9d010]
+      + ! : | + 2 gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_evacuate::h950644807e546bad  (in binarytrees) + 1640,1784  [0x100b67954,0x100b679e4]
+      + ! : | + 1 gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees) + 588  [0x100b893a4]
+      + ! : | 17 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 3216,2524,...  [0x100b65644,0x100b65390,...]
+      + ! : | 1 gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees) + 3488  [0x100b65754]
+      + ! : |   1 mfm_free  (in libsystem_malloc.dylib) + 908  [0x19023751c]
+      + ! : 236 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      + ! : | 69 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 24,256,...  [0x100b60aa0,0x100b60b88,...]
+      + ! : | 60 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 316,184,...  [0x100b84734,0x100b846b0,...]
+      + ! : | 55 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 100  [0x100b8465c]
+      + ! : | + 55 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 0,252,...  [0x100b9adc8,0x100b9aec4,...]
+      + ! : | 51 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 796  [0x100b84914]
+      + ! : | + 36 _platform_memset  (in libsystem_platform.dylib) + 180,208,...  [0x19042f144,0x19042f160,...]
+      + ! : | + 15 DYLD-STUB$$bzero  (in binarytrees) + 4,0  [0x100c2d6bc,0x100c2d6b8]
+      + ! : | 1 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 660  [0x100b8488c]
+      + ! : |   1 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 524  [0x100b84804]
+      + ! : |     1 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 216  [0x1902421ac]
+      + ! : 160 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 112  [0x100b71218]
+      + ! : | 97 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 124  [0x100b60f40]
+      + ! : | + 62 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260,12,...  [0x100b9aecc,0x100b9add4,...]
+      + ! : | + 35 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 172,264,...  [0x100b60f70,0x100b60fcc,...]
+      + ! : | 33 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 4,88,...  [0x100b60ec8,0x100b60f1c,...]
+      + ! : | 22 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 292  [0x100b60fe8]
+      + ! : | + 22 _platform_memcmp  (in libsystem_platform.dylib) + 280,168,...  [0x19042d028,0x19042cfb8,...]
+      + ! : | 8 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 112  [0x100b71218]
+      + ! : |   8 gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 48,60,...  [0x100b60ef4,0x100b60f00,...]
+      + ! : 46 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 48,200,...  [0x100b711d8,0x100b71270,...]
+      + ! : 20 gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees) + 764,756  [0x100b848f4,0x100b848ec]
+      + ! 46 ai_gc_alloc_fixed  (in binarytrees) + 160,44,...  [0x100b739b0,0x100b7393c,...]
+      + ! 12 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 680  [0x100b71450]
+      + 78 check  (in binarytrees) + 68,172,...  [0x100b5cbec,0x100b5cc54,...]  binarytrees.gcr:26
+      + 44 ai_gc_alloc_fixed  (in binarytrees) + 340,324,...  [0x100b73a64,0x100b73a54,...]
+      + 30 make  (in binarytrees) + 44  [0x100b5cb20]  binarytrees.gcr:17
+      + 24 make  (in binarytrees) + 56,80,...  [0x100b5cb2c,0x100b5cb44,...]  binarytrees.gcr:18
+      + 21 check  (in binarytrees) + 64,56,...  [0x100b5cbe8,0x100b5cbe0,...]  binarytrees.gcr:25
+      + 18 make  (in binarytrees) + 128,168,...  [0x100b5cb74,0x100b5cb9c,...]  binarytrees.gcr:21
+      + 7 check  (in binarytrees) + 108  [0x100b5cc14]  binarytrees.gcr:26
+      + ! 7 check  (in binarytrees) + 24,4,...  [0x100b5cbc0,0x100b5cbac,...]  binarytrees.gcr:25
+      + 7 check  (in binarytrees) + 128  [0x100b5cc28]  binarytrees.gcr:26
+      + ! 7 check  (in binarytrees) + 32,4,...  [0x100b5cbc8,0x100b5cbac,...]  binarytrees.gcr:25
+      + 6 make  (in binarytrees) + 64  [0x100b5cb34]  binarytrees.gcr:18
+      + ! 6 make  (in binarytrees) + 28,8  [0x100b5cb10,0x100b5cafc]  binarytrees.gcr:17
+      + 3 check  (in binarytrees) + 160  [0x100b5cc48]  binarytrees.gcr:0
+      + 1 gcrust_entry  (in binarytrees) + 260  [0x100b5c8cc]  binarytrees.gcr:74
+      + ! 1 ai_print_str  (in binarytrees) + 68  [0x100b74110]
+      + !   1 _RNvNtNtCsaLOjE9VYtxK_3std2io5stdio6__print  (in binarytrees) + 100  [0x100bcbc8c]  stdio.rs:1275
+      + !     1 _RNvXse_NtNtCsaLOjE9VYtxK_3std2io5stdioRNtB5_6StdoutNtB7_5Write9write_fmt  (in binarytrees) + 76  [0x100be2e50]  stdio.rs:834
+      + !       1 _RNvNtCs6sq8b9ugfBC_4core3fmt5write  (in binarytrees) + 144  [0x100c11094]  mod.rs:1665
+      + !         1 _RNvXNvNtCsaLOjE9VYtxK_3std2io17default_write_fmtINtB2_7AdapterNtNtB4_5stdio10StdoutLockENtNtCs6sq8b9ugfBC_4core3fmt5Write9write_strB6_  (in binarytrees) + 24  [0x100bd71d4]  mod.rs:610
+      + !           1 _RNvXsh_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB5_10StdoutLockNtB7_5Write9write_all  (in binarytrees) + 136  [0x100be35e4]  stdio.rs:860
+      + !             1 _RNvMs_NtNtNtCsaLOjE9VYtxK_3std2io8buffered9bufwriterINtB4_9BufWriterNtNtB8_5stdio9StdoutRawE9flush_bufBa_  (in binarytrees) + 112  [0x100bc1508]  bufwriter.rs:236
+      + !               1 write  (in libsystem_kernel.dylib) + 8  [0x1903e5834]
+      + 1 workload  (in binarytrees) + 92  [0x100b5c984]  binarytrees.gcr:40
+      + ! 1 ai_print_int  (in binarytrees) + 48  [0x100b740b8]
+      + !   1 _RNvNtNtCsaLOjE9VYtxK_3std2io5stdio6__print  (in binarytrees) + 100  [0x100bcbc8c]  stdio.rs:1275
+      + !     1 _RNvXse_NtNtCsaLOjE9VYtxK_3std2io5stdioRNtB5_6StdoutNtB7_5Write9write_fmt  (in binarytrees) + 76  [0x100be2e50]  stdio.rs:834
+      + !       1 _RNvNtCs6sq8b9ugfBC_4core3fmt5write  (in binarytrees) + 144  [0x100c11094]  mod.rs:1665
+      + !         1 _RNvXNvNtCsaLOjE9VYtxK_3std2io17default_write_fmtINtB2_7AdapterNtNtB4_5stdio10StdoutLockENtNtCs6sq8b9ugfBC_4core3fmt5Write9write_strB6_  (in binarytrees) + 24  [0x100bd71d4]  mod.rs:610
+      + !           1 _RNvXsh_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB5_10StdoutLockNtB7_5Write9write_all  (in binarytrees) + 136  [0x100be35e4]  stdio.rs:860
+      + !             1 _RNvMs_NtNtNtCsaLOjE9VYtxK_3std2io8buffered9bufwriterINtB4_9BufWriterNtNtB8_5stdio9StdoutRawE9flush_bufBa_  (in binarytrees) + 112  [0x100bc1508]  bufwriter.rs:236
+      + !               1 write  (in libsystem_kernel.dylib) + 8  [0x1903e5834]
+      + 1 workload  (in binarytrees) + 120  [0x100b5c9a0]  binarytrees.gcr:41
+      + ! 1 ai_print_int  (in binarytrees) + 48  [0x100b740b8]
+      + !   1 _RNvNtNtCsaLOjE9VYtxK_3std2io5stdio6__print  (in binarytrees) + 100  [0x100bcbc8c]  stdio.rs:1275
+      + !     1 _RNvXse_NtNtCsaLOjE9VYtxK_3std2io5stdioRNtB5_6StdoutNtB7_5Write9write_fmt  (in binarytrees) + 76  [0x100be2e50]  stdio.rs:834
+      + !       1 _RNvNtCs6sq8b9ugfBC_4core3fmt5write  (in binarytrees) + 144  [0x100c11094]  mod.rs:1665
+      + !         1 _RNvXNvNtCsaLOjE9VYtxK_3std2io17default_write_fmtINtB2_7AdapterNtNtB4_5stdio10StdoutLockENtNtCs6sq8b9ugfBC_4core3fmt5Write9write_strB6_  (in binarytrees) + 24  [0x100bd71d4]  mod.rs:610
+      + !           1 _RNvXsh_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB5_10StdoutLockNtB7_5Write9write_all  (in binarytrees) + 136  [0x100be35e4]  stdio.rs:860
+      + !             1 _RNvMs_NtNtNtCsaLOjE9VYtxK_3std2io8buffered9bufwriterINtB4_9BufWriterNtNtB8_5stdio9StdoutRawE9flush_bufBa_  (in binarytrees) + 112  [0x100bc1508]  bufwriter.rs:236
+      + !               1 write  (in libsystem_kernel.dylib) + 8  [0x1903e5834]
+      + 1 workload  (in binarytrees) + 296  [0x100b5ca50]  binarytrees.gcr:51
+      + 1 workload  (in binarytrees) + 172  [0x100b5c9d4]  binarytrees.gcr:57
+      +   1 ai_print_int  (in binarytrees) + 48  [0x100b740b8]
+      +     1 _RNvNtNtCsaLOjE9VYtxK_3std2io5stdio6__print  (in binarytrees) + 100  [0x100bcbc8c]  stdio.rs:1275
+      +       1 _RNvXse_NtNtCsaLOjE9VYtxK_3std2io5stdioRNtB5_6StdoutNtB7_5Write9write_fmt  (in binarytrees) + 76  [0x100be2e50]  stdio.rs:834
+      +         1 _RNvNtCs6sq8b9ugfBC_4core3fmt5write  (in binarytrees) + 144  [0x100c11094]  mod.rs:1665
+      +           1 _RNvXNvNtCsaLOjE9VYtxK_3std2io17default_write_fmtINtB2_7AdapterNtNtB4_5stdio10StdoutLockENtNtCs6sq8b9ugfBC_4core3fmt5Write9write_strB6_  (in binarytrees) + 24  [0x100bd71d4]  mod.rs:610
+      +             1 _RNvXsh_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB5_10StdoutLockNtB7_5Write9write_all  (in binarytrees) + 136  [0x100be35e4]  stdio.rs:860
+      +               1 _RNvMs_NtNtNtCsaLOjE9VYtxK_3std2io8buffered9bufwriterINtB4_9BufWriterNtNtB8_5stdio9StdoutRawE9flush_bufBa_  (in binarytrees) + 112  [0x100bc1508]  bufwriter.rs:236
+      +                 1 write  (in libsystem_kernel.dylib) + 8  [0x1903e5834]
+      66 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      + 66 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +   44 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   ! 44 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260,12,...  [0x100b9aecc,0x100b9add4,...]
+      +   22 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+      +     21 _platform_memcmp  (in libsystem_platform.dylib) + 140,280,...  [0x19042cf9c,0x19042d028,...]
+      +     1 DYLD-STUB$$memcmp  (in binarytrees) + 4  [0x100c2d9d4]
+      49 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      + 49 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260,12,...  [0x100b9aecc,0x100b9add4,...]
+      32 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+      + 25 _platform_memcmp  (in libsystem_platform.dylib) + 280,4,...  [0x19042d028,0x19042cf14,...]
+      + 7 DYLD-STUB$$memcmp  (in binarytrees) + 4  [0x100c2d9d4]
+      1 ???  (in <unknown binary>)  [0x1a30]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+      +   1 _platform_memcmp  (in libsystem_platform.dylib) + 0  [0x19042cf10]
+      1 ???  (in <unknown binary>)  [0x1f0e]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x219b]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x26aa]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x2868]
+      + 1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      +   1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +     1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+      +       1 _platform_memcmp  (in libsystem_platform.dylib) + 0  [0x19042cf10]
+      1 ???  (in <unknown binary>)  [0x2ba1]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x2cf7]
+      + 1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      +   1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +     1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +       1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x2cfd]
+      + 1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      +   1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +     1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +       1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x3036]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 260  [0x100b9aecc]
+      1 ???  (in <unknown binary>)  [0x31ec]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +   1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 12  [0x100b9add4]
+      1 ???  (in <unknown binary>)  [0x35ba]
+      + 1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      +   1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +     1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +       1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 12  [0x100b9add4]
+      1 ???  (in <unknown binary>)  [0x3870]
+      + 1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      +   1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +     1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+      +       1 gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 56  [0x100b9ae00]
+      1 ???  (in <unknown binary>)  [0x3bf1]
+      + 1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+      +   1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+      +     1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+      +       1 _platform_memcmp  (in libsystem_platform.dylib) + 168  [0x19042cfb8]
+      1 ???  (in <unknown binary>)  [0x3ec9]
+      + 1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+      +   1 _platform_memcmp  (in libsystem_platform.dylib) + 272  [0x19042d020]
+      1 ???  (in <unknown binary>)  [0x3fdd]
+        1 ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+          1 gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+            1 gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+              1 _platform_memcmp  (in libsystem_platform.dylib) + 272  [0x19042d020]
+
+Total number in stack (recursive counted multiple, when >=5):
+        16       gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees) + 0  [0x100b9adc8]
+        12       gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 120  [0x100b60b00]
+        10       ai_gc_alloc_fixed  (in binarytrees) + 84  [0x100b73964]
+        10       gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees) + 136  [0x100b71230]
+        9       _platform_memcmp  (in libsystem_platform.dylib) + 0  [0x19042cf10]
+        7       gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees) + 284  [0x100b60ba4]
+        6       gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees) + 0  [0x100b60ec4]
+
+Sort by top of stack, same collapsed (when >= 5):
+        gcrust_rt::gc::heap::Heap::build_object_start_index::_$u7b$$u7b$closure$u7d$$u7d$::h89167564b3601d01  (in binarytrees)        588
+        gcrust_rt::gc::type_info::TypeInfo::checked_allocation_size::h6c15eac3f0c14080  (in binarytrees)        317
+        _$LT$gcrust_rt..gc..alloc..AtomicBumpAllocator$u20$as$u20$gcrust_rt..gc..alloc..HeapWalker$GT$::walk::h410d1b106a831007  (in binarytrees)        286
+        gcrust_rt::gc::heap::Heap::accepts_header::hac6bd0fa2657e6a2  (in binarytrees)        160
+        gcrust_rt::gc::alloc::Tlab::alloc::h0325b304d2d833c2  (in binarytrees)        147
+        gcrust_rt::gc::heap::Heap::alloc_mutator::h4ae62f5006167ca4  (in binarytrees)        138
+        ai_gc_alloc_fixed  (in binarytrees)        129
+        check  (in binarytrees)        116
+        gcrust_rt::runtime::alloc_with_published_frame::hf959d571183e7b1c  (in binarytrees)        109
+        _platform_memset  (in libsystem_platform.dylib)        93
+        _platform_memcmp  (in libsystem_platform.dylib)        88
+        gcrust_rt::gc::heap::Heap::build_object_start_index::he96db862f1ffff09  (in binarytrees)        81
+        make  (in binarytrees)        78
+        gcrust_rt::gc::heap::Heap::mutator_triggered_minor_gc::he9f0291cbc519ea0  (in binarytrees)        35
+        DYLD-STUB$$bzero  (in binarytrees)        25
+        gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::parallel_slot_mode::h5e6c14632df6d864  (in binarytrees)        24
+        _platform_memmove  (in libsystem_platform.dylib)        16
+        DYLD-STUB$$memcmp  (in binarytrees)        15
+        gcrust_rt::gc::scan::scan_object::h8c482e29b1de912c  (in binarytrees)        11
+        gcrust_rt::gc::heap::parallel::_$LT$impl$u20$gcrust_rt..gc..heap..Heap$GT$::publish_batch::h1d02330648c666ed  (in binarytrees)        9
+
+Binary Images:
+       0x100b5c000 -        0x100c77957 +binarytrees (0) <ED36A7F2-C92E-305B-9006-5195A8BAF404> /Users/*/Documents/*/binarytrees
+       0x18ffc0000 -        0x190012b4b  libobjc.A.dylib (951.7) <FF1D8AE4-ABEF-35F1-A30A-1183B9CB414F> /usr/lib/libobjc.A.dylib
+       0x190013000 -        0x190047d07  libdyld.dylib (1378) <B147D877-D0C2-388F-B38D-D3132E39905F> /usr/lib/system/libdyld.dylib
+       0x190048000 -        0x1900ee217  dyld (1.0.0 - 1378) <F924BDD3-4365-3466-9580-8B1B3FA8F857> /usr/lib/dyld
+       0x1900ef000 -        0x1900f2228  libsystem_blocks.dylib (96) <CC947089-488D-316B-A9C7-46DEC0F73145> /usr/lib/system/libsystem_blocks.dylib
+       0x1900f3000 -        0x19014755f  libxpc.dylib (3102.120.13) <C40FCAE8-7A17-3D82-87CB-3DA4802ADEF1> /usr/lib/system/libxpc.dylib
+       0x190148000 -        0x1901689ff  libsystem_trace.dylib (1861.120.4) <D0FABAB3-5AE7-3F10-8C62-60CBF5D70850> /usr/lib/system/libsystem_trace.dylib
+       0x190169000 -        0x1902175f7  libcorecrypto.dylib (1922.121.1) <A01A158D-6FE7-3B1C-A2C4-6BCB90D7314A> /usr/lib/system/libcorecrypto.dylib
+       0x190218000 -        0x1902681d7  libsystem_malloc.dylib (812.100.31) <5FAE4807-4D2B-3A95-A63A-DD96D3DA11B4> /usr/lib/system/libsystem_malloc.dylib
+       0x190269000 -        0x1902b023f  libdispatch.dylib (1542.100.32) <F071EFE4-299F-3089-ACC4-0025B8FFB52A> /usr/lib/system/libdispatch.dylib
+       0x1902b1000 -        0x1902b3ffb  libsystem_featureflags.dylib (103) <71FCFFBD-85F8-3365-AFE0-BECEA4369122> /usr/lib/system/libsystem_featureflags.dylib
+       0x1902b4000 -        0x190334d9f  libsystem_c.dylib (1752.120.2) <694B7881-1BF3-3D0F-8F19-B50AE4E8EF8A> /usr/lib/system/libsystem_c.dylib
+       0x190335000 -        0x1903c5ae7  libc++.1.dylib (2100.43) <5013C0F8-84A9-3B56-9FEB-C353816A750F> /usr/lib/libc++.1.dylib
+       0x1903c6000 -        0x1903e075f  libc++abi.dylib (2100.43) <E482D257-E5A0-3816-BD97-7B39342958DA> /usr/lib/libc++abi.dylib
+       0x1903e1000 -        0x19041e2af  libsystem_kernel.dylib (12377.121.10) <FCA53B98-3D6A-38B2-A0EC-DF0F7E05F171> /usr/lib/system/libsystem_kernel.dylib
+       0x19041f000 -        0x19042bb3b  libsystem_pthread.dylib (539.100.4) <4F33683C-18C8-39A1-800B-2E3BD43BCC13> /usr/lib/system/libsystem_pthread.dylib
+       0x19042c000 -        0x190434963  libsystem_platform.dylib (375.120.2) <160FD864-8D15-36FC-9E97-9725388CFAFE> /usr/lib/system/libsystem_platform.dylib
+       0x190435000 -        0x1904646eb  libsystem_info.dylib (600) <3D62F2D9-F516-31BF-83C7-E203D872300B> /usr/lib/system/libsystem_info.dylib
+       0x1943fc000 -        0x194405e5f  libsystem_darwin.dylib (1752.120.2) <8858F025-745A-388E-9544-080781CC9A69> /usr/lib/system/libsystem_darwin.dylib
+       0x194867000 -        0x1948791b6  libsystem_notify.dylib (348.120.4) <64D76451-1E0C-369B-A631-54DA3140E083> /usr/lib/system/libsystem_notify.dylib
+       0x196b34000 -        0x196b4ef7b  libsystem_networkextension.dylib (2226.121.1) <0331EE20-A1FB-3C0D-990A-F65939CFF505> /usr/lib/system/libsystem_networkextension.dylib
+       0x196bd1000 -        0x196be8fdf  libsystem_asl.dylib (406) <F40838DF-2F15-3F62-970F-DEE25706BF1B> /usr/lib/system/libsystem_asl.dylib
+       0x19878f000 -        0x198797387  libsystem_symptoms.dylib (2169.120.7) <F5029F5C-1BF3-31C7-892E-BC8606AC829E> /usr/lib/system/libsystem_symptoms.dylib
+       0x19ca33000 -        0x19ca6b257  libsystem_containermanager.dylib (725.120.2) <518BE44D-AA31-31E6-B44B-A37AD5E47040> /usr/lib/system/libsystem_containermanager.dylib
+       0x19de44000 -        0x19de485d7  libsystem_configuration.dylib (1405.120.5) <0F7BBC1C-3D50-3E59-A31F-E4672A80BCEB> /usr/lib/system/libsystem_configuration.dylib
+       0x19de49000 -        0x19de4f8cf  libsystem_sandbox.dylib (2680.120.12) <EC3A75EA-44C0-3A0B-9BF7-71C117B0A9C6> /usr/lib/system/libsystem_sandbox.dylib
+       0x19f4a3000 -        0x19f4a61fb  libquarantine.dylib (196.120.2) <5849009B-ACA3-3796-94C4-BBDF8D300EBA> /usr/lib/system/libquarantine.dylib
+       0x19fc42000 -        0x19fc48d03  libsystem_coreservices.dylib (191.4.5) <9576143B-C303-35A3-BA63-1FD06EDA2BB1> /usr/lib/system/libsystem_coreservices.dylib
+       0x1a01cd000 -        0x1a020aa77  libsystem_m.dylib (3312.100.1) <A7E0863C-101A-31A0-922B-ED9B02626151> /usr/lib/system/libsystem_m.dylib
+       0x1a020c000 -        0x1a020f527  libmacho.dylib (1378) <755441B4-C034-3E3A-8E3C-F424FBB28261> /usr/lib/system/libmacho.dylib
+       0x1a0229000 -        0x1a02363a7  libcommonCrypto.dylib (600035) <CE357BB1-2D49-37CC-9FFE-D093936B1475> /usr/lib/system/libcommonCrypto.dylib
+       0x1a0237000 -        0x1a0240ca3  libunwind.dylib (2100.2) <FC8F0C4E-6FB0-3E27-ABEF-B0FA720CD5E4> /usr/lib/system/libunwind.dylib
+       0x1a0249000 -        0x1a02537ff  libcopyfile.dylib (240) <8ACFAC7A-88E9-3EF4-853F-A9140FF110E5> /usr/lib/system/libcopyfile.dylib
+       0x1a0254000 -        0x1a0257987  libcompiler_rt.dylib (103.3) <AA79151F-C19D-3C7C-92F8-B10F04D82C1C> /usr/lib/system/libcompiler_rt.dylib
+       0x1a0258000 -        0x1a025c78b  libsystem_collections.dylib (1752.120.2) <72DB5BE7-EF78-37D0-8AAD-53E37CFE4287> /usr/lib/system/libsystem_collections.dylib
+       0x1a025d000 -        0x1a02604cf  libsystem_secinit.dylib (168.100.7) <E525C566-CDA4-3D99-B12B-1615FD54A1F3> /usr/lib/system/libsystem_secinit.dylib
+       0x1a0261000 -        0x1a0263bf7  libremovefile.dylib (85.100.6) <635E661D-80A7-340D-A165-3F7D318FDFC9> /usr/lib/system/libremovefile.dylib
+       0x1a0264000 -        0x1a0264f27  libkeymgr.dylib (31) <8C08891A-DF1C-3DCC-AB64-4742FD6BE9BA> /usr/lib/system/libkeymgr.dylib
+       0x1a0265000 -        0x1a026de37  libsystem_dnssd.dylib (2881.120.11) <6F45DF3F-233B-3BC3-BA8C-B43E7DA884BF> /usr/lib/system/libsystem_dnssd.dylib
+       0x1a026e000 -        0x1a027309b  libcache.dylib (95) <189B576E-6176-3F82-8FA4-5914B0BEAEE7> /usr/lib/system/libcache.dylib
+       0x1a0274000 -        0x1a0275ce3  libSystem.B.dylib (1356) <BA6A669A-3BB9-3BC7-85E8-8F0C1E68351E> /usr/lib/libSystem.B.dylib
+       0x293530000 -        0x293537349  libRosetta.dylib (367.9) <8651ED4F-6506-3788-B56B-32EE414A85CA> /usr/lib/libRosetta.dylib
+       0x29514d000 -        0x295150a4b  libsystem_darwindirectory.dylib (122) <CF277A2C-C818-3F16-8B3F-3C7B39FCD164> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x295151000 -        0x29515a5d3  libsystem_eligibility.dylib (319.121.1) <DDAC0531-0262-3DDC-8EC8-80EB9438847A> /usr/lib/system/libsystem_eligibility.dylib
+       0x29515b000 -        0x29516288b  libsystem_sanitizers.dylib (26.1) <44C4234F-8B2D-38D3-A774-B4B3C75AF3A7> /usr/lib/system/libsystem_sanitizers.dylib
+       0x295163000 -        0x295163bb7  libsystem_trial.dylib (474.2.18.2) <68C583BA-AFF5-3916-86AE-6E38BFEF98D6> /usr/lib/system/libsystem_trial.dylib
