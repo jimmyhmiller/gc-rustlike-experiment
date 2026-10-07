@@ -1,0 +1,8 @@
+{
+  "workspace_passed": 542,
+  "workspace_ignored": 8,
+  "native_tsan_executions": 20,
+  "runtime_tsan_tests": 7,
+  "original_benchmark_sources_unchanged": true,
+  "implementation_fingerprints_match": true
+}

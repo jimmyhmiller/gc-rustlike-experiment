@@ -21,7 +21,7 @@ use inkwell::module::{FlagBehavior, Module};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, AtomicOrdering, FloatPredicate, IntPredicate};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// DWARF line-table emission state (debugger P2). Present only for AOT builds
 /// (`gcr build`) — JIT-code DWARF needs the LLDB JIT-registration interface
@@ -105,6 +105,14 @@ pub fn codegen_with_debug<'ctx>(
     } else {
         None
     };
+    let private_arrays = if level.is_full() { Default::default() } else { crate::codegen_escape::PrivateArrays::analyze(prog) };
+    let bounded_loops = if level.is_full() { Default::default() } else { crate::codegen_loops::BoundedLoops::analyze(prog, &private_arrays) };
+    let domain = ctx.metadata_node(&[ctx.metadata_string("gcr.private.scalar.arrays").into()]);
+    let array_scopes = private_arrays.origin_sets().into_iter().map(|origins| {
+        let name = format!("gcr.array.origins.{origins:?}");
+        let scope = ctx.metadata_node(&[ctx.metadata_string(&name).into(), domain.into()]);
+        (origins, scope)
+    }).collect();
     let mut cg = Codegen {
         ctx,
         module,
@@ -112,6 +120,10 @@ pub fn codegen_with_debug<'ctx>(
         prog,
         funcs: HashMap::new(),
         nonrelocating: crate::codegen_effects::nonrelocating_functions(prog),
+        private_arrays,
+        bounded_loops,
+        array_scopes,
+        closed_world: !level.is_full(),
         trampolines: HashMap::new(),
         alloc_sites: Vec::new(),
         alloc_site_ids: HashMap::new(),
@@ -504,6 +516,10 @@ struct Codegen<'ctx, 'p> {
     prog: &'p CoreProgram,
     funcs: HashMap<FuncId, FunctionValue<'ctx>>,
     nonrelocating: Vec<bool>,
+    closed_world: bool,
+    private_arrays: crate::codegen_escape::PrivateArrays,
+    bounded_loops: crate::codegen_loops::BoundedLoops,
+    array_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
     /// Cache of synthesized FFI callback trampolines, keyed by the gc-rust
     /// FuncId they wrap (one trampoline per referenced function).
     trampolines: HashMap<FuncId, FunctionValue<'ctx>>,
@@ -662,6 +678,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Load one mutable managed slot in the language's SC order. Bool has
     /// byte storage even though its SSA representation is i1.
     fn managed_load(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        self.managed_load_mode(addr, repr, name, None)
+    }
+
+    fn managed_load_mode(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, array: Option<&CoreExpr>) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let storage = if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.ctx.i8_type().as_basic_type_enum()
         } else { self.llvm_ty(repr).ok_or_else(|| CodegenError("invalid managed scalar load".into()))? };
@@ -673,13 +693,19 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let value = self.builder.build_load(storage, addr, name).unwrap();
         let instruction = value.as_instruction_value().unwrap();
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
-        instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?;
+        let private = array.is_some_and(|array| self.private_arrays.contains(array));
+        if let Some(array) = array { self.set_array_alias_metadata(instruction, array)?; }
+        if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.builder.build_int_truncate(value.into_int_value(), self.ctx.bool_type(), "managed.bool").unwrap().into()
         } else { value })
     }
 
     fn managed_store(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr) -> Result<(), CodegenError> {
+        self.managed_store_mode(addr, value, repr, None)
+    }
+
+    fn managed_store_mode(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, array: Option<&CoreExpr>) -> Result<(), CodegenError> {
         let (stored, alignment) = match repr {
             Repr::Scalar(ScalarRepr::Bool) => (
                 self.builder.build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "managed.bool.byte").unwrap().into(), 1,
@@ -690,7 +716,26 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         };
         let instruction = self.builder.build_store(addr, stored).unwrap();
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
-        instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?;
+        let private = array.is_some_and(|array| self.private_arrays.contains(array));
+        if let Some(array) = array { self.set_array_alias_metadata(instruction, array)?; }
+        if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
+        Ok(())
+    }
+
+    /// Access-scoped provenance: only disjoint allocation-origin sets receive
+    /// noalias metadata. Runtime calls, roots and incoming/escaped references
+    /// carry no such claim, so collectors may still access and move objects.
+    fn set_array_alias_metadata(&self, instruction: inkwell::values::InstructionValue<'ctx>, array: &CoreExpr) -> Result<(), CodegenError> {
+        let Some(origins) = self.private_arrays.origins(array) else { return Ok(()); };
+        let own = self.array_scopes[origins];
+        instruction.set_metadata(self.ctx.metadata_node(&[own.into()]), self.ctx.get_kind_id("alias.scope"))
+            .map_err(|error| CodegenError(error.to_string()))?;
+        let disjoint: Vec<_> = self.array_scopes.iter().filter(|(other,_)| origins.is_disjoint(other))
+            .map(|(_,scope)| (*scope).into()).collect();
+        if !disjoint.is_empty() {
+            instruction.set_metadata(self.ctx.metadata_node(&disjoint), self.ctx.get_kind_id("noalias"))
+                .map_err(|error| CodegenError(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -704,7 +749,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.build_call(f, &[fcx.thread.into()], "").unwrap();
     }
 
-    fn declare_fn(&self, _id: FuncId, f: &CoreFn) -> FunctionValue<'ctx> {
+    fn declare_fn(&self, id: FuncId, f: &CoreFn) -> FunctionValue<'ctx> {
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         // Foreign `extern "C"` function: a plain C declaration with exactly its
         // written signature — NO leading Thread*, no env pointer, name unmangled
@@ -765,7 +810,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Some(rt) => rt.fn_type(&params, false),
             None => self.ctx.void_type().fn_type(&params, false),
         };
-        self.module.add_function(&f.name, fn_ty, None)
+        // Private-array analysis assumes all helper callers are in this module.
+        // Entry parameters and address-taken functions have unknown origins.
+        let linkage = if self.closed_world && self.prog.entry != Some(id) {
+            Some(inkwell::module::Linkage::Internal)
+        } else { None };
+        self.module.add_function(&f.name, fn_ty, linkage)
     }
 
     fn is_closure_fn(f: &CoreFn) -> bool {
@@ -992,17 +1042,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // their stack or move their references during execution. Their callers
         // retain the traced roots across the call. Keep full-debug frame storage
         // for editable reference locals and debugger consistency.
+        let entry_roots_only = !self.debug.as_ref().is_some_and(|d|d.full)
+            && self.bounded_loops.entry_poll(id as usize)
+            && f.locals.iter().all(|repr| !matches!(repr,Repr::Value(v) if value_has_ref(&self.prog.values,*v)))
+            && crate::codegen_effects::body_nonrelocating(&f.body,&self.nonrelocating,&self.bounded_loops);
+        let incoming = f.closure_captures.len()+f.params.len();
         let requires_roots = !self.nonrelocating[id as usize]
             || self.debug.as_ref().is_some_and(|debug| debug.full);
         // Partition locals: Ref-typed locals become GC frame *direct* root slots;
         // all others get plain allocas. Count the refs to size the frame.
-        let num_roots = if requires_roots { f.locals.iter().filter(|r| matches!(r, Repr::Ref(_))).count() } else { 0 };
+        let num_roots = if requires_roots { f.locals.iter().enumerate().filter(|(i,r)| matches!(r, Repr::Ref(_)) && (!entry_roots_only || *i < incoming)).count() } else { 0 };
         // Map: local id -> root index (only for Ref locals).
         let mut root_index: Vec<Option<u32>> = vec![None; f.locals.len()];
         {
             let mut ri = 0u32;
             for (i, r) in f.locals.iter().enumerate() {
-                if requires_roots && matches!(r, Repr::Ref(_)) {
+                if requires_roots && matches!(r, Repr::Ref(_)) && (!entry_roots_only || i < incoming) {
                     root_index[i] = Some(ri);
                     ri += 1;
                 }
@@ -1035,8 +1090,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // any subsequent safepoint. Leaf-return paths can then optimize away
         // frame traffic. Other functions retain entry registration.
         let defer_frame = num_roots > 0 && num_indirect == 0
-            && f.closure_captures.is_empty()
-            && f.params.iter().all(|repr| !self.repr_relocates(repr))
+            && (entry_roots_only || (f.closure_captures.is_empty()
+            && f.params.iter().all(|repr| !self.repr_relocates(repr))))
             && !self.debug.as_ref().is_some_and(|debug| debug.full);
         let frame_active = if defer_frame {
             let active = self.builder.build_alloca(self.ctx.bool_type(), "roots.active").unwrap();
@@ -1175,7 +1230,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     let addr = self.obj_addr(env, cap.offset);
                     let v = self.builder.build_load(lty, addr, "cap").unwrap();
                     self.builder.build_store(slot, v).unwrap();
-                    if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); }
+                    if !entry_roots_only { if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); } }
                 }
             }
         }
@@ -1186,7 +1241,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if let Some(slot) = slots[local] {
                     let arg = func.get_nth_param(llvm_idx).unwrap();
                     self.builder.build_store(slot, arg).unwrap();
-                    if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); }
+                    if !entry_roots_only { if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); } }
                 }
                 llvm_idx += 1;
             }
@@ -1307,6 +1362,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             pending_copy_outs: Vec::new(),
             subprogram,
         };
+        if entry_roots_only { self.emit_entry_only_poll(&mut fcx); }
+        else if self.bounded_loops.entry_poll(id as usize) { self.emit_safepoint_poll(&fcx); }
         let val = self.gen_block(&mut fcx, &f.body)?;
 
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -1570,6 +1627,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             CoreExprKind::Unit => Ok(None),
             CoreExprKind::Local(id) => {
+                if let Repr::Scalar(scalar) = e.repr {
+                    if scalar.is_int() {
+                        if let Some(value) = self.private_arrays.integer(e) {
+                            return Ok(Some(self.scalar_ty(scalar).into_int_type().const_int(value, false).into()));
+                        }
+                    }
+                }
                 let slot = fcx.slots[*id as usize];
                 match slot {
                     Some(slot) => {
@@ -2933,14 +2997,6 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let i64t = self.ctx.i64_type();
         let count_addr = self.obj_addr(obj, Self::HEADER);
         let count_load = self.builder.build_load(i64t, count_addr, "cnt").unwrap();
-        // The array length is immutable after allocation, so the count word never
-        // changes. Mark the load `!invariant.load` so LLVM may coalesce repeated
-        // bounds-check length loads and not treat element stores as clobbering it.
-        if let Some(inst) = count_load.as_instruction_value() {
-            let kind = self.ctx.get_kind_id("invariant.load");
-            let node = self.ctx.metadata_node(&[]);
-            inst.set_metadata(node, kind).ok();
-        }
         let count = count_load.into_int_value();
         let lid = match arr_repr {
             Repr::Ref(l) => *l,
@@ -2954,6 +3010,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.build_int_unsigned_div(count, i64t.const_int(stride, false), "alen").unwrap()
         };
         Ok(len)
+    }
+
+    fn known_array_len(&self, obj: PointerValue<'ctx>, array: &CoreExpr) -> Result<IntValue<'ctx>, CodegenError> {
+        if let Some(length) = self.private_arrays.length(array) {
+            Ok(self.ctx.i64_type().const_int(length, false))
+        } else { self.array_logical_len(obj, &array.repr) }
     }
 
     /// Emit an inlined bounds check: if `idx64 >=u len` (unsigned, so negative
@@ -3050,6 +3112,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let i64t = self.ctx.i64_type();
         let obj = self.gen_expr(fcx, arr)?.unwrap().into_pointer_value();
+        if let Some(length) = self.private_arrays.length(arr) {
+            return Ok(Some(i64t.const_int(length, false).into()));
+        }
         // Count word at HEADER. For Bytes arrays it's byte-length; divide by the
         // element stride (from the array's layout via its element repr).
         let count_addr = self.obj_addr(obj, Self::HEADER);
@@ -3067,7 +3132,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(Some(logical.into()))
     }
 
-    fn load_array_element(&mut self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, idx: IntValue<'ctx>, elem: &Repr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    fn load_array_element(&mut self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, idx: IntValue<'ctx>, elem: &Repr, array: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let (stride, _) = Self::elem_stride(elem);
         let addr = self.array_elem_addr(obj, idx, stride);
         let ty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
@@ -3085,7 +3150,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             if matches!(elem, Repr::Value(_)) {
                 Ok(self.builder.build_load(ty, self.obj_addr(pointer, Self::HEADER), "element.value").unwrap())
             } else { Ok(pointer.into()) }
-        } else { self.managed_load(addr, elem, "element") }
+        } else { self.managed_load_mode(addr, elem, "element", Some(array)) }
     }
 
     /// `array_get(a, i)` yields `Option<T>`: `Some(a[i])` when in bounds, `None`
@@ -3113,7 +3178,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.array_logical_len(obj, &array.repr)?;
+        let len = self.known_array_len(obj, array)?;
         let sty = self.value_struct_ty(option_vid);
 
         let oob = self.builder.build_int_compare(IntPredicate::UGE, idx64, len, "oob").unwrap();
@@ -3124,7 +3189,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         // In bounds: load the element and wrap it in Some.
         self.builder.position_at_end(some_bb);
-        let v = self.load_array_element(fcx, obj, idx64, elem)?;
+        let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
         let some = self.build_value_variant(option_vid, OPTION_SOME_TAG, &[(v, elem.clone())]);
         let some_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge_bb).unwrap();
@@ -3154,9 +3219,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.array_logical_len(obj, &array.repr)?;
+        let len = self.known_array_len(obj, array)?;
         self.emit_bounds_check(fcx, idx64, len);
-        let v = self.load_array_element(fcx, obj, idx64, elem)?;
+        let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
         Ok(Some(v))
     }
 
@@ -3172,9 +3237,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.array_logical_len(obj, &array.repr)?;
+        let len = self.known_array_len(obj, array)?;
         self.emit_bounds_check(fcx, idx64, len);
-        let v = self.load_array_element(fcx, obj, idx64, elem)?;
+        let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
         Ok(Some(v))
     }
 
@@ -3196,14 +3261,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } else { self.gen_expr(fcx, value)?.unwrap() };
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.array_logical_len(obj, &array.repr)?;
+        let len = self.known_array_len(obj, array)?;
         self.emit_bounds_check(fcx, idx64, len);
         let (stride, _) = Self::elem_stride(elem);
         let addr = self.array_elem_addr(obj, idx64, stride);
         let stored_repr = if matches!(elem, Repr::Value(_)) {
             Repr::Scalar(ScalarRepr::Ptr)
         } else { elem.clone() };
-        self.managed_store(addr, val, &stored_repr)?;
+        self.managed_store_mode(addr, val, &stored_repr, Some(array))?;
         // Generational write barrier: a long-lived (tenured) array may receive a
         // young pointer element. `emit_write_barrier` no-ops for scalar elements.
         self.emit_write_barrier(fcx, obj, val);
@@ -4126,6 +4191,39 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(cont_bb);
     }
 
+    /// The remaining body cannot park. Only the slow entry path needs a frame;
+    /// register incoming refs before parking, refresh them and unlink on return.
+    fn emit_entry_only_poll(&self, fcx: &mut FnCtx<'ctx>) {
+        let address = self.thread_field_ptr(fcx.func, crate::runtime::thread_offsets::STATE);
+        let load = self.builder.build_load(self.ctx.i8_type(), address, "gcstate").unwrap();
+        let instruction = load.as_instruction_value().unwrap();
+        instruction.set_alignment(1).unwrap();
+        instruction.set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
+        instruction.set_volatile(true).unwrap();
+        let requested = self.builder.build_int_compare(IntPredicate::NE, load.into_int_value(), self.ctx.i8_type().const_zero(), "gcpoll").unwrap();
+        let slow = self.ctx.append_basic_block(fcx.func, "entry.gc.slow");
+        let ready = self.ctx.append_basic_block(fcx.func, "entry.gc.ready");
+        self.builder.build_conditional_branch(requested, slow, ready).unwrap();
+        self.builder.position_at_end(slow);
+        self.ensure_root_frame_linked(fcx);
+        for (index, root) in fcx.root_slots.iter().enumerate() {
+            if let Some(root) = root {
+                let value = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), fcx.slots[index].unwrap(), "entry.root").unwrap();
+                self.builder.build_store(*root, value).unwrap();
+            }
+        }
+        let poll = self.module.get_function("ai_gc_pollcheck_slow").unwrap();
+        self.builder.build_call(poll, &[fcx.thread.into()], "").unwrap();
+        self.reload_root_mirrors(fcx);
+        self.emit_unlink(fcx);
+        self.builder.build_unconditional_branch(ready).unwrap();
+        self.builder.position_at_end(ready);
+        fcx.root_slots.fill(None);
+        fcx.unlink = None;
+        fcx.frame_active = None;
+        fcx.deferred_frame_origin = None;
+    }
+
     fn gen_loop(
         &mut self,
         fcx: &mut FnCtx<'ctx>,
@@ -4143,7 +4241,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(header_bb);
         // GC safepoint poll at the loop header: atomic acquire, volatile;
         // if non-zero, trap into ai_gc_pollcheck_slow so the mutator parks.
-        self.emit_safepoint_poll(fcx);
+        if !self.bounded_loops.contains(body) { self.emit_safepoint_poll(fcx); }
         self.gen_block(fcx, body)?;
         // Back-edge: if the body fell through, loop again.
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {

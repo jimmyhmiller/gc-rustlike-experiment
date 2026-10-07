@@ -266,3 +266,46 @@ address order different from reservation order. Cards use atomic bitmap words;
 concurrent marks of different cards in a word compose with fetch_or. Collection
 still uses initialized-range metadata to avoid interpreting unused TLAB tails as
 objects. Neither optimization changes which references are traced.
+
+## Private arrays and bounded safepoints
+
+The compiler performs a conservative whole-program inclusion analysis of scalar
+array allocation origins. Origins flow through local aliases, assignments, direct
+call parameters, returns, branches and loop exits. Heap storage, captures,
+foreign buffers and unknown uses escape their reference operands. Address-taken
+parameters, closure captures and incoming execution arguments have unknown
+origins. Unsupported operations prevent specialization. A scalar-array access
+uses ordinary memory operations only if every possible allocation origin is
+known and unescaped. All other managed accesses retain their SC behavior.
+
+Disjoint proven origin sets receive access-scoped LLVM alias metadata. Overlapping
+sets remain potentially aliased; this is not a noalias claim on Thread pointers
+or function arguments. Runtime calls and collector/root memory carry no such
+metadata. Immutable array lengths are propagated only when every possible origin
+has the same proven constant length and none is null or unknown. Integer
+constants likewise require complete compatible dataflow. Optimized whole-program
+helpers have internal linkage; the execution entry remains externally callable,
+and foreign declarations keep their C ABI. Full-debug code disables these proofs
+and retains editable generic roots.
+
+Array-length loads no longer use invariant.load metadata. A managed object's
+length is immutable, but a collector can recycle the physical memory location
+for a different object. Object-origin facts preserve the former property without
+claiming global invariance of the latter.
+
+Small loops may coalesce header polls into a function-entry poll. The proof
+requires an i64 induction variable with a known nonnegative initial range, a
+constant upper bound of at most 32, exactly one final increment by one, no
+counter reset or continue path, and bounded body work of at most 8192 IR steps
+(including nested loops). Unknown calls, allocation and unsupported effects
+reject the proof. Other loops keep atomic acquire/volatile header polls.
+Functions with coalesced loops always poll on entry, including recursive calls,
+so repeated short invocations still cooperate with pending collection.
+
+When a coalesced function's entire remaining body is also proven nonrelocating,
+only its incoming references need entry roots. The fast entry path runs without
+registering a frame. The slow path initializes and links incoming roots before
+parking, reloads their relocated values on return and unlinks the frame before
+executing the bounded body. This specialization excludes value locals containing
+interior references and full-debug code. Potentially collecting callers continue
+to refresh their own working references after the call.

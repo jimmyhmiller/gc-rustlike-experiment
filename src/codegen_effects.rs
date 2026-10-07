@@ -216,3 +216,86 @@ mod tests {
         safe[id]
     }
 }
+
+/// Once entry polling has completed, this body has no possible relocation.
+/// Direct calls use the original call-graph proof; a callee with its own entry
+/// poll is deliberately not considered safe here.
+pub(crate) fn body_nonrelocating(
+    block: &CoreBlock,
+    callees: &[bool],
+    loops: &crate::codegen_loops::BoundedLoops,
+) -> bool {
+    fn block_safe(
+        block: &CoreBlock,
+        callees: &[bool],
+        loops: &crate::codegen_loops::BoundedLoops,
+    ) -> bool {
+        block.stmts.iter().all(|s| {
+            let (CoreStmt::Let(_, e) | CoreStmt::Expr(e)) = s;
+            expression_safe(e, callees, loops)
+        }) && block
+            .tail
+            .as_ref()
+            .is_none_or(|e| expression_safe(e, callees, loops))
+    }
+    fn expression_safe(
+        e: &CoreExpr,
+        callees: &[bool],
+        loops: &crate::codegen_loops::BoundedLoops,
+    ) -> bool {
+        use CoreExprKind::*;
+        match e.kind.as_ref() {
+            Loop(body) => loops.contains(body) && block_safe(body, callees, loops),
+            ArrayLen(array) => expression_safe(array, callees, loops),
+            ArrayGet { array, index, .. }
+            | ArrayGetUnchecked { array, index, .. }
+            | ArrayGetChecked { array, index, .. } => {
+                expression_safe(array, callees, loops) && expression_safe(index, callees, loops)
+            }
+            ArraySet {
+                array,
+                index,
+                value,
+                elem,
+            } => {
+                !matches!(elem, crate::core::Repr::Value(_))
+                    && expression_safe(array, callees, loops)
+                    && expression_safe(index, callees, loops)
+                    && expression_safe(value, callees, loops)
+            }
+            ConstInt(..) | ConstFloat(..) | ConstBool(..) | ConstChar(..) | ConstZero(..)
+            | Unit | Local(..) | Continue => true,
+            Bin(_, a, b) => {
+                expression_safe(a, callees, loops) && expression_safe(b, callees, loops)
+            }
+            Un(_, v)
+            | FloatIntrinsic(_, v)
+            | FloatBits(v)
+            | Cast { value: v, .. }
+            | Assign { value: v, .. }
+            | EnumTag(v)
+            | EnumPayload { scrutinee: v, .. } => expression_safe(v, callees, loops),
+            Return(v) | Break(v) => v
+                .as_ref()
+                .is_none_or(|v| expression_safe(v, callees, loops)),
+            Block(block) => block_safe(block, callees, loops),
+            If(c, a, b) => {
+                expression_safe(c, callees, loops)
+                    && block_safe(a, callees, loops)
+                    && block_safe(b, callees, loops)
+            }
+            Call(f, args) => {
+                callees.get(*f as usize).copied().unwrap_or(false)
+                    && args.iter().all(|e| expression_safe(e, callees, loops))
+            }
+            Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
+                expression_safe(scrutinee, callees, loops)
+                    && arms
+                        .iter()
+                        .all(|a| expression_safe(&a.body, callees, loops))
+            }
+            _ => false,
+        }
+    }
+    block_safe(block, callees, loops)
+}

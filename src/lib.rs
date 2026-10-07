@@ -25,3 +25,7 @@ pub mod parser;
 pub mod resolve;
 pub use gcrust_rt::runtime;
 pub mod types;
+
+mod codegen_escape;
+
+mod codegen_loops;
