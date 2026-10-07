@@ -356,10 +356,11 @@ impl ThreadState {
     }
 
     /// Ask this thread to reach a safepoint by raising its JIT poll flag.
-    /// No-op if the thread has no runtime `Thread` (null flag). The store
-    /// pairs with the JIT's atomic acquire poll. A volatile non-atomic LLVM
-    /// load would still be a data race; both sides must access this byte
-    /// atomically.
+    /// No-op if the thread has no runtime `Thread` (null flag). Generated
+    /// polls read this request hint atomically and volatilely. Root publication
+    /// is ordered by the parked-state release/acquire pair; resumption uses
+    /// the safepoint mutex/condvar. The hint does not publish heap data.
+    /// Release stores also support older callers using acquire hint loads.
     pub fn request_poll(&self) {
         let mut requested = self.poll_registration.lock().unwrap();
         *requested = true;
@@ -369,10 +370,9 @@ impl ThreadState {
         }
     }
 
-    /// Lower this thread's JIT poll flag. Called by the coordinator after
-    /// the thread has been resumed, so a stale `1` doesn't make the next
-    /// poll re-park. (The JIT slow path also clears it; this is the
-    /// belt-and-braces clear for threads that parked some other way.)
+    /// Lower this thread's JIT poll flag before the coordinator resumes it.
+    /// The resume mutex handshake orders this clear before the owner's next
+    /// hint read, preventing an old request from causing another park.
     pub fn clear_poll(&self) {
         let mut requested = self.poll_registration.lock().unwrap();
         *requested = false;
@@ -1019,6 +1019,82 @@ mod poll_registration_tests {
             assert!(result.is_err());
         });
         assert_eq!(state.frame_chain().depth(), 0);
+    }
+
+    #[test]
+    fn poll_hint_publication_and_resume_order_plain_slots() {
+        use std::cell::UnsafeCell;
+        use std::sync::atomic::AtomicUsize;
+        struct Slots(UnsafeCell<[usize; 2]>);
+        impl Slots {
+            unsafe fn read(&self) -> [usize; 2] {
+                unsafe { *self.0.get() }
+            }
+            unsafe fn write(&self, value: [usize; 2]) {
+                unsafe {
+                    *self.0.get() = value;
+                }
+            }
+        }
+        // The owner writes while RUNNING; the coordinator accesses slots only
+        // after the parked-state acquire, before the resume mutex release.
+        unsafe impl Sync for Slots {}
+        let slots = Slots(UnsafeCell::new([0, 0]));
+        let ready = AtomicUsize::new(0);
+        let state = ThreadState::new();
+        let flag = AtomicU8::new(0);
+        unsafe {
+            state.set_poll_flag(&flag as *const AtomicU8 as *mut AtomicU8);
+        }
+        std::thread::scope(|scope| {
+            // Borrow the owner's state; never transfer its thread-affine roots.
+            let coordinator = scope.spawn(|| {
+                let mut errors = 0;
+                for round in 1..=256usize {
+                    while ready.load(Ordering::Relaxed) < round {
+                        std::thread::yield_now();
+                    }
+                    state.request_poll();
+                    while !state.is_safely_at_safepoint() {
+                        std::thread::yield_now();
+                    }
+                    if unsafe { slots.read() } != [round, !round] {
+                        errors += 1;
+                    }
+                    unsafe {
+                        slots.write([round + 1000, !(round + 1000)]);
+                    }
+                    // Clearing before resume is ordered by the resume mutex
+                    // handshake, so an old hint cannot cause another park.
+                    state.clear_poll();
+                    unsafe {
+                        state.resume();
+                    }
+                }
+                errors
+            });
+            let mut errors = 0;
+            for round in 1..=256usize {
+                unsafe {
+                    slots.write([round, !round]);
+                }
+                // Scheduling only: this deliberately does not publish slots.
+                ready.store(round, Ordering::Relaxed);
+                while flag.load(Ordering::Relaxed) == 0 {
+                    std::thread::yield_now();
+                }
+                unsafe {
+                    state.enter_safepoint();
+                }
+                if unsafe { slots.read() } != [round + 1000, !(round + 1000)] {
+                    errors += 1;
+                }
+            }
+            unsafe {
+                state.set_poll_flag(std::ptr::null_mut());
+            }
+            assert_eq!(errors + coordinator.join().unwrap(), 0);
+        });
     }
 
     #[test]

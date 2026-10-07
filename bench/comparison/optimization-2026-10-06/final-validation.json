@@ -1,0 +1,23 @@
+{
+  "workspace": {
+    "passed": 560,
+    "failed": 0,
+    "ignored": 8
+  },
+  "thread_sanitizer": {
+    "native_executions": 26,
+    "runtime_tests": 8,
+    "passed": true
+  },
+  "release_build": true,
+  "production_checkpoint": "6bb0bdd",
+  "production_poll_ordering": "acquire; ABI v3 unchanged",
+  "discarded_experiment": "relaxed poll hint pilot; no meaningful performance improvement",
+  "retained": "256-round plain-slot publication/resume regression and protocol comments",
+  "parity_reached": false,
+  "remaining": [
+    "fannkuchredux",
+    "binarytrees"
+  ],
+  "stopped_at_user_request": true
+}
