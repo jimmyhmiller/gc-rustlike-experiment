@@ -1,0 +1,93 @@
+--- src/codegen.rs	2026-10-06 22:15:40
++++ /tmp/gcr-recursive-hooks.rs	2026-10-06 22:15:40
+@@ -98,6 +98,10 @@
+     prog: &CoreProgram,
+     level: DebugLevel,
+ ) -> Result<Compiled<'ctx>, CodegenError> {
++    let expanded = if level.is_full() {
++        crate::codegen_inline::Expanded { program: prog.clone(), wrappers: HashMap::new() }
++    } else { crate::codegen_inline::expand(prog) };
++    let prog = &expanded.program;
+     let module = ctx.create_module("gcr");
+     let builder = ctx.create_builder();
+     let debug = if level.emits_dwarf() {
+@@ -125,6 +129,7 @@
+         array_scopes,
+         closed_world: !level.is_full(),
+         physical_layouts: physical_layouts(prog),
++        inline_wrappers: expanded.wrappers.clone(),
+         trampolines: HashMap::new(),
+         alloc_sites: Vec::new(),
+         alloc_site_ids: HashMap::new(),
+@@ -519,6 +524,7 @@
+     nonrelocating: Vec<bool>,
+     closed_world: bool,
+     physical_layouts: PhysicalLayouts,
++    inline_wrappers: HashMap<FuncId, String>,
+     private_arrays: crate::codegen_escape::PrivateArrays,
+     bounded_loops: crate::codegen_loops::BoundedLoops,
+     array_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
+@@ -817,7 +823,13 @@
+         let linkage = if self.closed_world && self.prog.entry != Some(id) {
+             Some(inkwell::module::Linkage::Internal)
+         } else { None };
+-        self.module.add_function(&f.name, fn_ty, linkage)
++        let function = self.module.add_function(&f.name, fn_ty, linkage);
++        if self.inline_wrappers.contains_key(&id) {
++            let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("alwaysinline");
++            function.add_attribute(inkwell::attributes::AttributeLoc::Function,
++                self.ctx.create_enum_attribute(kind, 0));
++        }
++        function
+     }
+ 
+     fn is_closure_fn(f: &CoreFn) -> bool {
+@@ -2218,8 +2230,10 @@
+     }
+ 
+     /// The current function's compiled symbol name (the site label).
+-    fn current_fn_name(fcx: &FnCtx<'ctx>) -> String {
+-        fcx.func.get_name().to_string_lossy().into_owned()
++    fn current_fn_name(&self, fcx: &FnCtx<'ctx>) -> String {
++        let id = self.funcs.iter().find_map(|(&id, &function)| (function == fcx.func).then_some(id));
++        id.and_then(|id| self.inline_wrappers.get(&id)).cloned()
++            .unwrap_or_else(|| fcx.func.get_name().to_string_lossy().into_owned())
+     }
+ 
+     fn declare_runtime_externs(&self) {
+@@ -2732,7 +2746,7 @@
+             vals.push((self.gen_expr(fcx, fe)?, fe.repr.clone()));
+         }
+ 
+-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
++        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
+         let physical = if fields.is_empty() && tag.is_some_and(|tag| {
+             matches!(&self.prog.layouts[layout as usize].meta.kind,
+                 crate::gc::TypeKind::Enum { variants, .. }
+@@ -3071,7 +3085,7 @@
+         let lid = match repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("string repr".into())) };
+         let bytes = s.as_bytes();
+         let n = bytes.len() as u64;
+-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), lid as u16, span);
++        let site = self.alloc_site_id(&self.current_fn_name(fcx), lid as u16, span);
+         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
+         let obj = call_result(self.build_managed_call(fcx,
+             alloc,
+@@ -3115,7 +3129,7 @@
+             fcx.thread.into(), n64.into(), i64t.const_int(stride, false).into(),
+             i32t.const_int(traced as u64, false).into(),
+         ], "array.allocation.len").unwrap()).into_int_value();
+-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
++        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
+         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
+         let obj = call_result(self.build_managed_call(fcx,
+             alloc,
+@@ -3320,7 +3334,7 @@
+         for c in captures {
+             vals.push((self.gen_expr(fcx, c)?, c.repr.clone()));
+         }
+-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), env as u16, span);
++        let site = self.alloc_site_id(&self.current_fn_name(fcx), env as u16, span);
+         let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
+         let obj = call_result(
+             self.build_managed_call(fcx,

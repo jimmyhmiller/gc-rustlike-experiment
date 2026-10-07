@@ -1,0 +1,61 @@
+--- /tmp/gcr-before-inline-hint.rs	2026-10-06 22:05:15
++++ src/codegen.rs	2026-10-06 22:05:15
+@@ -817,7 +817,13 @@
+         let linkage = if self.closed_world && self.prog.entry != Some(id) {
+             Some(inkwell::module::Linkage::Internal)
+         } else { None };
+-        self.module.add_function(&f.name, fn_ty, linkage)
++        let function = self.module.add_function(&f.name, fn_ty, linkage);
++        if self.closed_world && self.prog.entry != Some(id) {
++            let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("inlinehint");
++            function.add_attribute(inkwell::attributes::AttributeLoc::Function,
++                self.ctx.create_enum_attribute(kind, 0));
++        }
++        function
+     }
+ 
+     fn is_closure_fn(f: &CoreFn) -> bool {
+@@ -2597,6 +2603,16 @@
+     /// rejects buffers invalidated by nursery reset. Stress always takes the
+     /// collecting runtime path. The prefix is published before any safepoint;
+     /// construction stores below initialize fields before the object escapes.
++    fn likely_branch(&self, condition: IntValue<'ctx>, likely: BasicBlock<'ctx>, unlikely: BasicBlock<'ctx>) {
++        let branch = self.builder.build_conditional_branch(condition, likely, unlikely).unwrap();
++        let weights = self.ctx.metadata_node(&[
++            self.ctx.metadata_string("branch_weights").into(),
++            self.ctx.i32_type().const_int(1024, false).into(),
++            self.ctx.i32_type().const_int(1, false).into(),
++        ]);
++        branch.set_metadata(weights, self.ctx.get_kind_id("prof")).unwrap();
++    }
++
+     fn gen_fixed_allocation(&mut self, fcx: &mut FnCtx<'ctx>, layout: LayoutId, site: u32) -> Result<PointerValue<'ctx>, CodegenError> {
+         use crate::gc::{Full, ObjHeader, TypeInfo, inline_tlab_offsets as off};
+         let ptr = self.ctx.ptr_type(AddressSpace::default());
+@@ -2624,7 +2640,7 @@
+         let fast = self.ctx.append_basic_block(fcx.func, "alloc.fast");
+         let slow = self.ctx.append_basic_block(fcx.func, "alloc.slow");
+         let merge = self.ctx.append_basic_block(fcx.func, "alloc.merge");
+-        self.builder.build_conditional_branch(available, check, slow).unwrap();
++        self.likely_branch(available, check, slow);
+         self.builder.position_at_end(check);
+         let stress_addr = self.obj_addr(window, off::STRESS as u64);
+         let stress_ptr = self.builder.build_load(ptr, stress_addr, "tlab.stress_ptr").unwrap().into_pointer_value();
+@@ -2632,7 +2648,7 @@
+         stress.as_instruction_value().unwrap().set_alignment(1).unwrap();
+         stress.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
+         let normal = self.builder.build_int_compare(IntPredicate::EQ, stress.into_int_value(), self.ctx.i8_type().const_zero(), "tlab.normal").unwrap();
+-        self.builder.build_conditional_branch(normal, fast, slow).unwrap();
++        self.likely_branch(normal, fast, slow);
+         self.builder.position_at_end(fast);
+         let base_addr = self.obj_addr(window, off::BASE as u64);
+         let base = self.builder.build_load(ptr, base_addr, "tlab.base").unwrap().into_pointer_value();
+@@ -2655,7 +2671,7 @@
+         let count_len_addr = self.obj_addr(window, off::COUNTERS_LEN as u64);
+         let count_len = self.builder.build_load(i64t, count_len_addr, "alloc.counter_len").unwrap().into_int_value();
+         let known_site = self.builder.build_int_compare(IntPredicate::ULT, i64t.const_int(site as u64, false), count_len, "alloc.known_site").unwrap();
+-        self.builder.build_conditional_branch(known_site, count_fast, count_slow).unwrap();
++        self.likely_branch(known_site, count_fast, count_slow);
+         self.builder.position_at_end(count_fast);
+         let counters_addr = self.obj_addr(window, off::COUNTERS as u64);
+         let counters = self.builder.build_load(ptr, counters_addr, "alloc.counters").unwrap().into_pointer_value();

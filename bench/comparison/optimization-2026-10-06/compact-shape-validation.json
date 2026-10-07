@@ -1,0 +1,33 @@
+{
+  "workspace": {
+    "passed": 547,
+    "failed": 0,
+    "ignored": 8,
+    "log": "/tmp/gcr-shapes-workspace.log",
+    "note": "Before startup symbol versioning; same collector and compiler hot paths."
+  },
+  "additional_gates": {
+    "passed": 4,
+    "failed": 0,
+    "log": "/tmp/gcr-shapes-abi-tests.log",
+    "coverage": [
+      "older custom archive rejected",
+      "concurrent archive ownership",
+      "dead-root snapshots in JIT/native/debug with normal/stress collection"
+    ]
+  },
+  "sanitizer": {
+    "native_runs": 22,
+    "runtime_tests": 7,
+    "log": "/tmp/gcr-shapes-tsan.log",
+    "note": "Before startup symbol versioning; same collector and generated allocation/root protocols."
+  },
+  "comparison": {
+    "forks": 3,
+    "warmup": 20,
+    "samples": 10,
+    "all_ordered_outputs_match": true,
+    "original_source_hashes_unchanged": true,
+    "implementation_hashes_match": true
+  }
+}

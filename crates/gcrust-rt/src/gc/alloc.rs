@@ -494,7 +494,8 @@ struct BufferExtent {
 
 /// Owning-mutator allocation window used by compiled code. All fields except
 /// the pointed-to epoch, stress flag, and initialized prefix are owner-only.
-/// Arena reset invalidates cached reservations through the epoch. The prefix
+/// The pause coordinator closes generated windows before resumption; native
+/// allocation validates arena epochs before reopening them. The prefix
 /// is published before the next safepoint; collectors never read it concurrently
 /// with an allocating mutator. Disabled windows have limit zero.
 #[repr(C)]
@@ -602,6 +603,11 @@ impl Tlab {
                         core::ptr::write_bytes(ptr, 0, size);
                     }
                     self.window.cursor = end;
+                    if !self.window.epoch.is_null() {
+                        // A pause may close a still-current reservation. Native
+                        // epoch validation above makes reopening it safe.
+                        self.window.limit = extent.end;
+                    }
                     extent.initialized.store(end, Ordering::Relaxed);
                     return ptr;
                 }

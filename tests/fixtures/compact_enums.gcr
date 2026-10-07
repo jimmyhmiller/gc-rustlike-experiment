@@ -1,0 +1,47 @@
+// Header-only empty variants retain tags, nominal identity and GC shape.
+enum Tree { Leaf, Empty, Node(Tree, Tree) }
+enum Data { None, Num(i64), Flag(bool) }
+#[value] struct Wrapped { tree: Tree, n: i64 }
+enum Pack { Empty, Wrapped(Wrapped) }
+fn make(depth: i64) -> Tree {
+    if depth == 0 { Tree::Leaf }
+    else { Tree::Node(make(depth-1), make(depth-1)) }
+}
+fn check(tree: Tree) -> i64 {
+    match tree { Tree::Leaf => 1, Tree::Empty => 2,
+        Tree::Node(left, right) => 1 + check(left) + check(right) }
+}
+fn value(data: Data) -> i64 {
+    match data { Data::None => 0, Data::Num(n) => n,
+        Data::Flag(b) => if b { 1 } else { 0 } }
+}
+fn unpack(pack: Pack) -> i64 {
+    match pack { Pack::Empty => 0, Pack::Wrapped(w) => check(w.tree)+w.n }
+}
+fn churn() -> i64 {
+    let mut i = 0;
+    let mut sum = 0;
+    while i < 400 { sum = sum + check(make(5)); i = i+1; }
+    sum
+}
+fn main() -> i64 {
+    let held = make(5);
+    let empty = Tree::Empty;
+    let number = Data::Num(42);
+    let flag = Data::Flag(true);
+    let none = Data::None;
+    let pack = Pack::Wrapped(Wrapped { tree: make(4), n: 13 });
+    let pack_empty = Pack::Empty;
+    let identity = if type_id_of(empty) == type_id_of(held)
+        && type_id_of(none) == type_id_of(number)
+        && type_id_of(flag) == type_id_of(number)
+        && type_id_of(pack_empty) == type_id_of(pack) { 1000 } else { -10000 };
+    let names = if str_eq(type_name_of(empty), "Tree") && str_eq(type_name_of(pack_empty), "Pack") { 164 } else { -10000 };
+    heap_snapshot();
+    let worker = thread_spawn(|| churn());
+    let own = churn();
+    let child = thread_join(worker);
+    print_int(own + child + check(held) + check(empty) + value(number)
+        + value(flag) + value(none) + unpack(pack) + unpack(pack_empty) + identity + names);
+    0
+}

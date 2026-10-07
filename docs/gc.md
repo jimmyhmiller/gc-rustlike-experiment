@@ -214,7 +214,8 @@ policy and root-enumeration contracts.
 The release compiler uses LLVM O3 and reports optimization failures. Fixed Full
 header objects of at most 8192 bytes can allocate directly in the owning
 mutator's nursery TLAB. The generated path checks capacity, unsigned overflow,
-the arena reset epoch and stress mode. It zeroes the object, initializes its
+the published reservation limit and stress mode. Native allocation validates
+the arena reset epoch. It initializes the object, writes its
 header, advances the shared native/generated cursor and publishes the initialized
 extent before any safepoint. Refill, unsupported layouts, stress allocation and
 collection retain the runtime path. The runtime validates canonical registered
@@ -225,7 +226,7 @@ pointer remains owned by the TLAB until refill closes the old window. Epoch,
 stress and extent publication are atomic; cursor, limit and allocation-site
 counters belong exclusively to the owning mutator. Generated allocations update
 the same exact site counts and byte totals as runtime allocations. Counter-vector
-growth uses a noncollecting runtime helper. Non-generational allocation windows
+growth occurs on the native first-use allocation path. Non-generational allocation windows
 stay disabled.
 
 Optimized reference locals use private working slots and escaped traced mirrors.
@@ -309,3 +310,56 @@ parking, reloads their relocated values on return and unlinks the frame before
 executing the bounded body. This specialization excludes value locals containing
 interior references and full-debug code. Potentially collecting callers continue
 to refresh their own working references after the call.
+
+### Reference-enum shapes
+
+Reference enums store their `u32` tag in the low 32 bits of the Full header's
+first word. Its forwarding bit remains clear in live objects. The parallel
+collector claims the second header word and copies the first word unchanged;
+the legacy copying collector copies the original header before forwarding the
+source. Neither collector changes a destination's tag. Pointer payload slots
+start at byte 16; scalar and inline-value payloads follow the pointer region.
+
+Payload-free constructions can allocate a separate header-only physical shape.
+The compiler appends these descriptors after the nominal Core layouts using one
+deterministic expansion shared by generated allocation code, JIT tables and AOT
+metadata. Physical IDs describe allocation extent and tracing; `type_id_of`
+maps the extra shape back to its nominal source layout. Both shapes retain the
+same type name and variant metadata. Allocation-site labels remain nominal,
+while counters record the actual allocated bytes. Exhaustion of the physical
+`u16` namespace retains the union representation.
+
+An empty reflection field list alone does not prove an empty payload: some
+inline value payloads are intentionally omitted from scalar reflection. Codegen
+also requires an empty construction argument list before selecting the smaller
+shape. Every construction still allocates a distinct object. Debug mode uses
+the same layout, so full-debug, optimized native and JIT executions agree on
+physical sizes and nominal reflection.
+
+Before a collection resumes its census, it closes every generated TLAB window,
+including the triggering collector and BLOCKED workers. This happens under the
+registration/retirement lock before clearing the collection request. The
+compiled capacity check therefore rejects a stale reservation without loading
+an arena epoch on every allocation. The owning native allocation path still
+checks arena identity and epoch before reusing or reopening a reservation.
+Initialized-prefix publication and the acquire stress-mode check remain intact.
+
+Fast constructors write the complete Full header as one native-layout aggregate.
+Scalar/reference stores cover known payload byte ranges; only uncovered bytes
+are cleared. Inline values retain conservative full payload clearing. These
+stores precede initialized-prefix publication. Collecting slow paths reload
+relocatable operands from roots before constructing the payload. A zero tag
+already present in a freshly cleared native allocation needs no extra store.
+
+Backward liveness clears a direct traced mirror once when its local value dies.
+Branch successor sets are united, loops iterate to a fixed point, break and
+continue use their corresponding loop successors, and returns end continuation
+liveness. New definitions are included when clearing unused assigned values.
+Private working slots remain untouched; indirect value roots retain their prior
+lifetimes. Full-debug keeps lexical roots for inspection. A snapshot regression
+checks both optimized reachability and full-debug preservation.
+
+New native objects require the `gcr_runtime_main_v2` startup symbol. An older
+custom archive therefore fails to link rather than silently violating generated
+allocation-window assumptions. The current runtime keeps the legacy startup
+entry for programs that use the older per-allocation epoch check.

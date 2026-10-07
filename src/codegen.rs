@@ -124,6 +124,8 @@ pub fn codegen_with_debug<'ctx>(
         bounded_loops,
         array_scopes,
         closed_world: !level.is_full(),
+        physical_layouts: physical_layouts(prog),
+        root_liveness: if level.is_full() { Default::default() } else { crate::codegen_liveness::RootLiveness::analyze(prog) },
         trampolines: HashMap::new(),
         alloc_sites: Vec::new(),
         alloc_site_ids: HashMap::new(),
@@ -517,6 +519,8 @@ struct Codegen<'ctx, 'p> {
     funcs: HashMap<FuncId, FunctionValue<'ctx>>,
     nonrelocating: Vec<bool>,
     closed_world: bool,
+    physical_layouts: PhysicalLayouts,
+    root_liveness: crate::codegen_liveness::RootLiveness,
     private_arrays: crate::codegen_escape::PrivateArrays,
     bounded_loops: crate::codegen_loops::BoundedLoops,
     array_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
@@ -1534,12 +1538,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     /// Pointer to a field of the Thread struct at `offset` (via ptr arithmetic).
     fn thread_field_ptr(&self, func: FunctionValue<'ctx>, offset: usize) -> PointerValue<'ctx> {
-        let thread = func.get_nth_param(0).unwrap().into_pointer_value();
-        let i64t = self.ctx.i64_type();
-        let ptr = self.ctx.ptr_type(AddressSpace::default());
-        let base = self.builder.build_ptr_to_int(thread, i64t, "t.i").unwrap();
-        let addr = self.builder.build_int_add(base, i64t.const_int(offset as u64, false), "t.fa").unwrap();
-        self.builder.build_int_to_ptr(addr, ptr, "t.fp").unwrap()
+        self.obj_addr(func.get_nth_param(0).unwrap().into_pointer_value(), offset as u64)
     }
 
     /// A private constant `FrameOrigin { num_roots, pad, name }` global.
@@ -1556,6 +1555,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             ptr.const_null().into(),
         ]));
         g.as_pointer_value()
+    }
+
+    fn clear_dead_roots(&self, fcx: &FnCtx<'ctx>, statement: &CoreStmt) {
+        let Some(dead) = self.root_liveness.dead(statement) else { return; };
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        for (local, root) in fcx.root_slots.iter().enumerate() {
+            if dead.contains(&(local as LocalId)) {
+                if let Some(root) = root { self.builder.build_store(*root, ptr.const_null()).unwrap(); }
+            }
+        }
+        // Indirect value roots retain their original lifetime for now. Clearing
+        // their inline bytes would also affect the private working aggregate.
     }
 
     fn gen_block(
@@ -1579,6 +1590,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             if self.builder.get_insert_block().unwrap().get_terminator().is_some() {
                 return Ok(None);
             }
+            self.clear_dead_roots(fcx, s);
         }
         match &b.tail {
             Some(e) => self.gen_expr(fcx, e),
@@ -1791,7 +1803,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let i16t = self.ctx.i16_type();
                 let i64t = self.ctx.i64_type();
                 let addr = self.obj_addr(ov, 8);
-                let tid = self.builder.build_load(i16t, addr, "tid").unwrap().into_int_value();
+                let mut tid = self.builder.build_load(i16t, addr, "tid").unwrap().into_int_value();
+                // Collector shape IDs may differ between variants of one source
+                // enum; the language exposes its stable nominal LayoutId.
+                if let Repr::Ref(logical) = obj.repr {
+                    if let Some(physical) = self.physical_layouts.empty_variants.get(&logical) {
+                        let is_empty = self.builder.build_int_compare(IntPredicate::EQ,
+                            tid, i16t.const_int(*physical as u64, false), "tid.compact").unwrap();
+                        tid = self.builder.build_select(is_empty,
+                            i16t.const_int(logical as u64, false), tid, "tid.nominal").unwrap().into_int_value();
+                    }
+                }
                 let r = self.builder.build_int_z_extend(tid, i64t, "tid64").unwrap();
                 Ok(Some(r.into()))
             }
@@ -2152,7 +2174,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         self.builder.build_extract_value(value.into_struct_value(), tag_index, "vetag").unwrap()
                     }
                     Repr::Ref(lid) => {
-                        let tag_off = Self::HEADER + self.prog.layouts[*lid as usize].ptr_fields as u64 * 8;
+                        let tag_off = self.enum_tag_offset(*lid);
                         self.builder.build_load(self.ctx.i32_type(), self.obj_addr(value.into_pointer_value(), tag_off), "etag").unwrap()
                     }
                     _ => return Err(CodegenError("EnumTag on non-enum".into())),
@@ -2165,8 +2187,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let val = match &scrutinee.repr {
                     Repr::Value(id) => self.load_value_enum_payload(value, *id, *field as usize, payload_reprs)?,
                     Repr::Ref(lid) => {
-                        let tag_off = Self::HEADER + self.prog.layouts[*lid as usize].ptr_fields as u64 * 8;
-                        self.load_enum_payload(value.into_pointer_value(), tag_off, *field as usize, payload_reprs)?
+                        let raw_base = self.enum_raw_base(*lid);
+                        self.load_enum_payload(value.into_pointer_value(), raw_base, *field as usize, payload_reprs)?
                     }
                     _ => return Err(CodegenError("EnumPayload on non-enum".into())),
                 };
@@ -2212,11 +2234,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     /// The current function's compiled symbol name (the site label).
     fn current_fn_name(fcx: &FnCtx<'ctx>) -> String {
-        fcx.func
-            .get_name()
-            .to_str()
-            .unwrap_or("<unknown-fn>")
-            .to_string()
+        fcx.func.get_name().to_string_lossy().into_owned()
     }
 
     fn declare_runtime_externs(&self) {
@@ -2585,18 +2603,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// rejects buffers invalidated by nursery reset. Stress always takes the
     /// collecting runtime path. The prefix is published before any safepoint;
     /// construction stores below initialize fields before the object escapes.
-    fn gen_fixed_allocation(&mut self, fcx: &mut FnCtx<'ctx>, layout: LayoutId, site: u32) -> Result<PointerValue<'ctx>, CodegenError> {
+    fn gen_fixed_allocation(&mut self, fcx: &mut FnCtx<'ctx>, layout: LayoutId, site: u32, logical: LayoutId, tag: Option<u32>,
+        fields: &[CoreExpr], vals: &[(Option<BasicValueEnum<'ctx>>, Repr)]) -> Result<PointerValue<'ctx>, CodegenError> {
         use crate::gc::{Full, ObjHeader, TypeInfo, inline_tlab_offsets as off};
+        let header_tag = tag.filter(|_| self.enum_tag_offset(logical) == Full::ENUM_TAG_OFFSET as u64);
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
-        let lay = &self.prog.layouts[layout as usize];
+        let lay = &self.physical_layouts.layouts[layout as usize];
         let size = TypeInfo::for_header(Full::SIZE).with_fields(lay.ptr_fields).with_raw_bytes(lay.raw_bytes)
             .checked_allocation_size(0).ok_or_else(|| CodegenError("invalid fixed allocation layout".into()))? as u64;
         let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
         let args = [fcx.thread.into(), i32t.const_int(layout as u64, false).into(), i32t.const_int(site as u64, false).into()];
         if size > 8192 || !matches!(lay.varlen, crate::core::VarLen::None) {
-            return Ok(call_result(self.build_managed_call(fcx, alloc, &args, "obj").unwrap()).into_pointer_value());
+            let object = call_result(self.build_managed_call(fcx, alloc, &args, "obj").unwrap()).into_pointer_value();
+            let restored = self.reload_allocation_values(fcx, fields, vals)?;
+            self.store_allocation_fields(object, logical, tag, &restored, tag.is_some_and(|tag| tag != 0));
+            return Ok(object);
         }
         let window_addr = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::TLAB_WINDOW as u64);
         let window = self.builder.build_load(ptr, window_addr, "tlab.window").unwrap().into_pointer_value();
@@ -2606,54 +2629,65 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let limit = self.builder.build_load(i64t, limit_addr, "tlab.limit").unwrap().into_int_value();
         let end = self.builder.build_int_add(cursor, i64t.const_int(size, false), "tlab.end").unwrap();
         let within = self.builder.build_int_compare(IntPredicate::ULE, end, limit, "tlab.within").unwrap();
-        let no_wrap = self.builder.build_int_compare(IntPredicate::UGE, end, cursor, "tlab.no_wrap").unwrap();
-        let available = self.builder.build_and(within, no_wrap, "tlab.available").unwrap();
+        // Native reservations fit a Rust allocation (<= isize::MAX), and size
+        // is <= 8192, so adding size to the cached offset cannot wrap usize.
+        let capacity = within;
+        let count_len_addr = self.obj_addr(window, off::COUNTERS_LEN as u64);
+        let count_len = self.builder.build_load(i64t, count_len_addr, "alloc.counter_len").unwrap().into_int_value();
+        let known_site = self.builder.build_int_compare(IntPredicate::ULT,
+            i64t.const_int(site as u64, false), count_len, "alloc.known_site").unwrap();
+        let available = self.builder.build_and(capacity, known_site, "tlab.available").unwrap();
         let check = self.ctx.append_basic_block(fcx.func, "alloc.check");
         let fast = self.ctx.append_basic_block(fcx.func, "alloc.fast");
         let slow = self.ctx.append_basic_block(fcx.func, "alloc.slow");
         let merge = self.ctx.append_basic_block(fcx.func, "alloc.merge");
         self.builder.build_conditional_branch(available, check, slow).unwrap();
         self.builder.position_at_end(check);
-        let epoch_addr = self.obj_addr(window, off::EPOCH as u64);
-        let epoch_ptr = self.builder.build_load(ptr, epoch_addr, "tlab.epoch_ptr").unwrap().into_pointer_value();
-        let epoch = self.builder.build_load(i64t, epoch_ptr, "tlab.epoch").unwrap();
-        epoch.as_instruction_value().unwrap().set_alignment(8).unwrap();
-        epoch.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
-        let expected_addr = self.obj_addr(window, off::EXPECTED_EPOCH as u64);
-        let expected = self.builder.build_load(i64t, expected_addr, "tlab.expected_epoch").unwrap().into_int_value();
-        let fresh = self.builder.build_int_compare(IntPredicate::EQ, epoch.into_int_value(), expected, "tlab.fresh").unwrap();
         let stress_addr = self.obj_addr(window, off::STRESS as u64);
         let stress_ptr = self.builder.build_load(ptr, stress_addr, "tlab.stress_ptr").unwrap().into_pointer_value();
         let stress = self.builder.build_load(self.ctx.i8_type(), stress_ptr, "tlab.stress").unwrap();
         stress.as_instruction_value().unwrap().set_alignment(1).unwrap();
         stress.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
         let normal = self.builder.build_int_compare(IntPredicate::EQ, stress.into_int_value(), self.ctx.i8_type().const_zero(), "tlab.normal").unwrap();
-        let valid = self.builder.build_and(fresh, normal, "tlab.valid").unwrap();
-        self.builder.build_conditional_branch(valid, fast, slow).unwrap();
+        self.builder.build_conditional_branch(normal, fast, slow).unwrap();
         self.builder.position_at_end(fast);
         let base_addr = self.obj_addr(window, off::BASE as u64);
         let base = self.builder.build_load(ptr, base_addr, "tlab.base").unwrap().into_pointer_value();
         let object = unsafe { self.builder.build_in_bounds_gep(self.ctx.i8_type(), base, &[cursor], "tlab.object").unwrap() };
-        self.builder.build_memset(object, 8, self.ctx.i8_type().const_zero(), i64t.const_int(size, false)).unwrap();
-        let type_addr = self.obj_addr(object, Full::TYPE_ID_OFFSET as u64);
-        self.builder.build_store(type_addr, self.ctx.i16_type().const_int(layout as u64, false)).unwrap();
+        // Initialize the Full header once, including a known enum tag. A
+        // typed aggregate store preserves native endianness and padding.
+        let header_type = self.ctx.struct_type(&[i64t.into(), self.ctx.i16_type().into(),
+            self.ctx.i16_type().into(), i32t.into()], false);
+        let header = header_type.const_named_struct(&[
+            i64t.const_int(header_tag.unwrap_or(0) as u64, false).into(),
+            self.ctx.i16_type().const_int(layout as u64, false).into(),
+            self.ctx.i16_type().const_zero().into(), i32t.const_zero().into(),
+        ]);
+        self.builder.build_store(object, header).unwrap().set_alignment(8).unwrap();
+        let mut initialized = Full::SIZE as u64;
+        for (start, stop) in self.constructor_ranges(logical, tag, vals) {
+            if start > initialized {
+                self.builder.build_memset(self.obj_addr(object, initialized), 1,
+                    self.ctx.i8_type().const_zero(), i64t.const_int(start - initialized, false)).unwrap();
+            }
+            initialized = initialized.max(stop);
+        }
+        if initialized < size {
+            self.builder.build_memset(self.obj_addr(object, initialized), 1,
+                self.ctx.i8_type().const_zero(), i64t.const_int(size - initialized, false)).unwrap();
+        }
+        // Complete constructor stores before publishing the initialized extent.
+        // This path cannot collect; pre-allocation reference values remain valid.
+        self.store_allocation_fields(object, logical, tag, vals, header_tag.is_none());
         self.builder.build_store(cursor_addr, end).unwrap();
         let initialized_addr = self.obj_addr(window, off::INITIALIZED as u64);
         let initialized = self.builder.build_load(ptr, initialized_addr, "tlab.initialized").unwrap().into_pointer_value();
         let publication = self.builder.build_store(initialized, end).unwrap();
         publication.set_alignment(8).unwrap();
         publication.set_atomic_ordering(AtomicOrdering::Monotonic).unwrap();
-        // Keep exact per-site observability without a native call on every
-        // object. The runtime grows the owner-only counter vector on first use
-        // and refreshes its pointer/length after each relocation.
-        let count_fast = self.ctx.append_basic_block(fcx.func, "alloc.record");
-        let count_slow = self.ctx.append_basic_block(fcx.func, "alloc.record_grow");
-        let count_done = self.ctx.append_basic_block(fcx.func, "alloc.record_done");
-        let count_len_addr = self.obj_addr(window, off::COUNTERS_LEN as u64);
-        let count_len = self.builder.build_load(i64t, count_len_addr, "alloc.counter_len").unwrap().into_int_value();
-        let known_site = self.builder.build_int_compare(IntPredicate::ULT, i64t.const_int(site as u64, false), count_len, "alloc.known_site").unwrap();
-        self.builder.build_conditional_branch(known_site, count_fast, count_slow).unwrap();
-        self.builder.position_at_end(count_fast);
+        // First use goes through the native allocator, which grows the
+        // counter vector before returning. The initialized fast path contains
+        // no native calls after constructing its object.
         let counters_addr = self.obj_addr(window, off::COUNTERS as u64);
         let counters = self.builder.build_load(ptr, counters_addr, "alloc.counters").unwrap().into_pointer_value();
         let count_addr = self.obj_addr(counters, site as u64 * 16);
@@ -2663,15 +2697,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let next = self.builder.build_int_add(old, i64t.const_int(increment, false), "alloc.counter_next").unwrap();
             self.builder.build_store(addr, next).unwrap();
         }
-        self.builder.build_unconditional_branch(count_done).unwrap();
-        self.builder.position_at_end(count_slow);
-        let record = self.module.get_function("ai_gc_record_alloc").unwrap();
-        self.build_managed_call(fcx, record, &[fcx.thread.into(), i32t.const_int(site as u64, false).into(), i64t.const_int(size, false).into()], "").unwrap();
-        self.builder.build_unconditional_branch(count_done).unwrap();
-        self.builder.position_at_end(count_done);
+        let count_done = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).unwrap();
         self.builder.position_at_end(slow);
         let allocated = call_result(self.build_managed_call(fcx, alloc, &args, "obj.slow").unwrap()).into_pointer_value();
+        let restored = self.reload_allocation_values(fcx, fields, vals)?;
+        self.store_allocation_fields(allocated, logical, tag, &restored, tag.is_some_and(|tag| tag != 0));
         let slow_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).unwrap();
         self.builder.position_at_end(merge);
@@ -2680,58 +2711,38 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(object_phi.as_basic_value().into_pointer_value())
     }
 
-    /// Allocate a heap object of `layout`, store `tag` (for enums) + `fields`,
-    /// and return the pointer. The fields are evaluated and stored; pointer
-    /// fields go in the leading pointer slots, raw fields at their byte offset.
-    fn gen_alloc(
-        &mut self,
-        fcx: &mut FnCtx<'ctx>,
-        layout: LayoutId,
-        tag: Option<u32>,
-        fields: &[CoreExpr],
-        span: crate::core::SpanId,
-    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+    fn enum_tag_offset(&self, layout: LayoutId) -> u64 {
+        match &self.prog.layouts[layout as usize].meta.kind {
+            crate::gc::TypeKind::Enum { tag_offset, .. } => *tag_offset as u64,
+            // Hand-written Core IR may omit reflection metadata and retains
+            // the historical payload tag representation.
+            _ => Self::HEADER + self.prog.layouts[layout as usize].ptr_fields as u64 * 8,
+        }
+    }
+
+    fn enum_raw_base(&self, layout: LayoutId) -> u64 {
+        Self::HEADER + self.prog.layouts[layout as usize].ptr_fields as u64 * 8
+            + if self.enum_tag_offset(layout) >= Self::HEADER { 8 } else { 0 }
+    }
+
+    /// Allocate a heap object and initialize its tag and payload, with pointer
+    /// fields in leading slots and scalar/value fields in the raw region.
+    fn store_allocation_fields(&mut self, obj: PointerValue<'ctx>, layout: LayoutId,
+        tag: Option<u32>, vals: &[(Option<BasicValueEnum<'ctx>>, Repr)], write_tag: bool) {
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         let i32t = self.ctx.i32_type();
-        let i64t = self.ctx.i64_type();
-
-        // Evaluate field values FIRST (they may allocate; their own roots are
-        // Evaluate field values FIRST. Then allocate, then store. The allocation
-        // is a SAFEPOINT: a GC there relocates every rooted local, so any GC value
-        // we cached in a register before the alloc is now STALE (it points at the
-        // pre-relocation address). ANF guarantees every GC field is an atomic
-        // local (or null), so after the alloc we RELOAD those fields from their
-        // (now-relocated) slots — a side-effect-free load — before storing them.
-        // Scalar/POD-value fields don't relocate, so their cached values stand.
-        let mut vals = Vec::with_capacity(fields.len());
-        for fe in fields {
-            vals.push((self.gen_expr(fcx, fe)?, fe.repr.clone()));
-        }
-
-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
-        let obj = self.gen_fixed_allocation(fcx, layout, site)?;
-
-        // Reload GC-valued fields from their slots post-allocation (see above).
-        for (fe, slot) in fields.iter().zip(vals.iter_mut()) {
-            if self.repr_relocates(&fe.repr) {
-                slot.0 = self.gen_expr(fcx, fe)?;
-            }
-        }
-
         let lay = &self.prog.layouts[layout as usize];
-        // Tag (for enums) at raw offset 0.
-        if let Some(t) = tag {
-            let raw_base = Self::HEADER + (lay.ptr_fields as u64) * 8;
-            let addr = self.obj_addr(obj, raw_base);
+        // The metadata selects the physical tag location.
+        if let Some(t) = tag.filter(|_| write_tag) {
+            let addr = self.obj_addr(obj, self.enum_tag_offset(layout));
             self.builder.build_store(addr, i32t.const_int(t as u64, false)).unwrap();
         }
 
-        // Store fields. For an enum, payload fields go after the tag; we place
-        // pointer payloads in the pointer slots and raw payloads after the tag
-        // word. For a struct, use the layout's field_map.
+        // Pointer payloads occupy the leading pointer region; scalar/value
+        // payloads follow it. The enum tag normally lives in the header.
         let mut ptr_slot = 0u64;
-        let mut raw_cursor = Self::HEADER + (lay.ptr_fields as u64) * 8 + if tag.is_some() { 8 } else { 0 };
-        for (v, repr) in &vals {
+        let mut raw_cursor = if tag.is_some() { self.enum_raw_base(layout) } else { Self::HEADER + lay.ptr_fields as u64 * 8 };
+        for (v, repr) in vals {
             match repr {
                 Repr::Ref(_) => {
                     let off = Self::HEADER + ptr_slot * 8;
@@ -2781,7 +2792,77 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 }
             }
         }
-        let _ = i64t;
+    }
+
+    fn reload_allocation_values(&mut self, fcx: &mut FnCtx<'ctx>, fields: &[CoreExpr],
+        vals: &[(Option<BasicValueEnum<'ctx>>, Repr)]) -> Result<Vec<(Option<BasicValueEnum<'ctx>>, Repr)>, CodegenError> {
+        let mut vals = vals.to_vec();
+        for (field, value) in fields.iter().zip(&mut vals) {
+            if self.repr_relocates(&field.repr) { value.0 = self.gen_expr(fcx, field)?; }
+        }
+        Ok(vals)
+    }
+
+    /// Bytes overwritten completely by non-value constructor stores. Inline
+    /// aggregates retain conservative clearing because their padding and nested
+    /// pointer regions require a separate initialization proof.
+    fn constructor_ranges(&self, layout: LayoutId, tag: Option<u32>,
+        vals: &[(Option<BasicValueEnum<'ctx>>, Repr)]) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut pointer_slot = 0;
+        let mut raw = if tag.is_some() { self.enum_raw_base(layout) }
+            else { Self::HEADER + self.prog.layouts[layout as usize].ptr_fields as u64 * 8 };
+        if let Some(_) = tag {
+            let offset = self.enum_tag_offset(layout);
+            if offset >= Self::HEADER { ranges.push((offset, offset + 4)); }
+        }
+        for (value, repr) in vals {
+            let (start, size) = match repr {
+                Repr::Ref(_) => {
+                    let start = Self::HEADER + pointer_slot * 8; pointer_slot += 1; (start, 8)
+                }
+                Repr::Scalar(s) => {
+                    let size = s.bits().max(8) as u64 / 8;
+                    raw = align_up64(raw, size); let start = raw; raw += size; (start, size)
+                }
+                Repr::Value(_) => return Vec::new(),
+                Repr::Unit => continue,
+            };
+            if value.is_some() { ranges.push((start, start + size)); }
+        }
+        ranges.sort_unstable();
+        ranges
+    }
+
+    fn gen_alloc(
+        &mut self,
+        fcx: &mut FnCtx<'ctx>,
+        layout: LayoutId,
+        tag: Option<u32>,
+        fields: &[CoreExpr],
+        span: crate::core::SpanId,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        // Evaluate field values FIRST. Then allocate, then store. The allocation
+        // is a SAFEPOINT: a GC there relocates every rooted local, so any GC value
+        // we cached in a register before the alloc is now STALE (it points at the
+        // pre-relocation address). ANF guarantees every GC field is an atomic
+        // local (or null), so after the alloc we RELOAD those fields from their
+        // (now-relocated) slots — a side-effect-free load — before storing them.
+        // Scalar/POD-value fields don't relocate, so their cached values stand.
+        let mut vals = Vec::with_capacity(fields.len());
+        for fe in fields {
+            vals.push((self.gen_expr(fcx, fe)?, fe.repr.clone()));
+        }
+
+        let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
+        let physical = if fields.is_empty() && tag.is_some_and(|tag| {
+            matches!(&self.prog.layouts[layout as usize].meta.kind,
+                crate::gc::TypeKind::Enum { variants, .. }
+                    if variants.iter().any(|v| v.tag == tag && v.fields.is_empty()))
+        }) {
+            self.physical_layouts.empty_variants.get(&layout).copied().unwrap_or(layout)
+        } else { layout };
+        let obj = self.gen_fixed_allocation(fcx, physical, site, layout, tag, fields, &vals)?;
         Ok(Some(obj.into()))
     }
 
@@ -2915,11 +2996,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Address of a payload field at `byte_off` within the value-enum's byte
     /// region (an `[N x i8]` base pointer).
     fn payload_field_addr(&self, payload_base: PointerValue<'ctx>, byte_off: u64) -> PointerValue<'ctx> {
-        let i64t = self.ctx.i64_type();
-        let ptr = self.ctx.ptr_type(AddressSpace::default());
-        let base = self.builder.build_ptr_to_int(payload_base, i64t, "pl.i").unwrap();
-        let addr = self.builder.build_int_add(base, i64t.const_int(byte_off, false), "pl.a").unwrap();
-        self.builder.build_int_to_ptr(addr, ptr, "pl.p").unwrap()
+        self.obj_addr(payload_base, byte_off)
     }
 
     /// Byte size + alignment of a repr (for laying out value-enum payloads).
@@ -2933,11 +3010,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     fn obj_addr(&self, obj: PointerValue<'ctx>, byte_off: u64) -> PointerValue<'ctx> {
-        let i64t = self.ctx.i64_type();
-        let ptr = self.ctx.ptr_type(AddressSpace::default());
-        let base = self.builder.build_ptr_to_int(obj, i64t, "o.i").unwrap();
-        let addr = self.builder.build_int_add(base, i64t.const_int(byte_off, false), "o.fa").unwrap();
-        self.builder.build_int_to_ptr(addr, ptr, "o.fp").unwrap()
+        // Preserve the base pointer's provenance and expose byte offsets to
+        // LLVM alias analysis. Plain GEP adds no inbounds/nonnull assumption.
+        unsafe { self.builder.build_gep(self.ctx.i8_type(), obj,
+            &[self.ctx.i64_type().const_int(byte_off, false)], "object.field").unwrap() }
     }
 
     /// Emit a generational write barrier: `ai_gc_write_barrier(thread, obj, new)`
@@ -3611,11 +3687,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let obj = self.gen_expr(fcx, scrutinee)?.unwrap().into_pointer_value();
         let lid = match &scrutinee.repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("match on non-ref enum".into())) };
-        let lay = &self.prog.layouts[lid as usize];
-        let ptr_fields = lay.ptr_fields as u64;
         let i32t = self.ctx.i32_type();
-        // Load the tag (raw u32 at start of the raw section).
-        let tag_off = Self::HEADER + ptr_fields * 8;
+        let tag_off = self.enum_tag_offset(lid);
+        let raw_base = self.enum_raw_base(lid);
         let tag_addr = self.obj_addr(obj, tag_off);
         let tag = self.builder.build_load(i32t, tag_addr, "tag").unwrap().into_int_value();
 
@@ -3652,7 +3726,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
             for (field, &local) in arm.binds.iter().enumerate() {
                 if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
-                let value = self.load_enum_payload(obj, tag_off, field, &payload_reprs)?;
+                let value = self.load_enum_payload(obj, raw_base, field, &payload_reprs)?;
                 if let Some(slot) = fcx.slots[local as usize] {
                     self.builder.build_store(slot, value).unwrap();
                     if let Some(root) = fcx.root_slots[local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, value).unwrap(); }
@@ -3680,17 +3754,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Load payload field `field` from a reference enum object, replicating the
     /// physical slot layout the tag-switch binding path uses: pointer payloads
     /// occupy the leading pointer slots (`HEADER + k*8`), raw payloads are packed
-    /// (aligned) after the tag word at `tag_off + 8`. `payload_reprs` is the full
+    /// (aligned) from the metadata-derived `raw_base`. `payload_reprs` is the full
     /// ordered payload list so we can find `field`'s slot.
     fn load_enum_payload(
         &mut self,
         obj: PointerValue<'ctx>,
-        tag_off: u64,
+        raw_base: u64,
         field: usize,
         payload_reprs: &[Repr],
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let mut pointer_slot = 0;
-        let mut raw_cursor = tag_off + 8;
+        let mut raw_cursor = raw_base;
         for (index, repr) in payload_reprs.iter().enumerate() {
             let mut interiors = Vec::new();
             if let Repr::Value(id) = repr {
@@ -4410,12 +4484,45 @@ fn optimize_module(module: &Module) -> Result<(), CodegenError> {
         .map_err(|e| CodegenError(format!("LLVM optimization failed: {e}")))
 }
 
+/// Collector shapes are separate from nominal Core layout IDs. Payload-free
+/// enum constructions can use a header-only shape while ordinary variants use
+/// the union shape. Both keep the same reflection name and variant metadata.
+/// This single deterministic expansion is shared by codegen, JIT and AOT.
+struct PhysicalLayouts {
+    layouts: Vec<Layout>,
+    empty_variants: HashMap<LayoutId, LayoutId>,
+}
+
+fn physical_layouts(prog: &CoreProgram) -> PhysicalLayouts {
+    let mut result = PhysicalLayouts { layouts: prog.layouts.clone(), empty_variants: HashMap::new() };
+    for (logical, layout) in prog.layouts.iter().enumerate() {
+        let crate::gc::TypeKind::Enum { tag_offset, variants } = &layout.meta.kind else { continue };
+        if *tag_offset as usize != crate::gc::Full::ENUM_TAG_OFFSET
+            || (layout.ptr_fields == 0 && layout.raw_bytes == 0)
+            || !matches!(layout.varlen, VarLen::None)
+            || !variants.iter().any(|variant| variant.fields.is_empty())
+        { continue; }
+        // Exhausting the physical u16 namespace simply retains the valid union
+        // representation; nominal IDs and program semantics never change.
+        let Ok(physical) = u16::try_from(result.layouts.len()) else { break };
+        let mut compact = layout.clone();
+        compact.ptr_fields = 0;
+        compact.raw_bytes = 0;
+        compact.interior_ptrs.clear();
+        compact.field_map.clear();
+        result.layouts.push(compact);
+        result.empty_variants.insert(logical as LayoutId, physical as LayoutId);
+    }
+    result
+}
+
 /// Convert the program's core [`Layout`]s into `gc::TypeInfo`s, one per
-/// `LayoutId` (index = `type_id`). This is the bridge to the collector: pointer
+/// physical shape (index = `type_id`). Nominal layouts precede compact enum
+/// shapes. This is the bridge to the collector: pointer
 /// fields first (traced), then raw bytes, then any varlen tail.
 pub fn layouts_to_type_infos(prog: &CoreProgram) -> Vec<crate::gc::TypeInfo> {
     use crate::gc::{Full, ObjHeader, TypeInfo};
-    prog.layouts
+    physical_layouts(prog).layouts
         .iter()
         .enumerate()
         .map(|(i, l)| {
@@ -4501,12 +4608,12 @@ fn value_interior_offsets(values: &[crate::core::ValueLayout], vid: u32, base: u
 }
 
 /// Collect the program's per-layout reflection metadata into a runtime
-/// [`gc::TypeMeta`] table, one entry per `LayoutId` (index = `type_id`). The
+/// [`gc::TypeMeta`] table, one entry per physical shape (index = `type_id`). The
 /// metadata is built during layout lowering (see `src/layout.rs`) and travels
 /// inside each `Layout`; here we just clone it out and stamp the `type_id` from
 /// its table position. Parallel to [`layouts_to_type_infos`].
 pub fn layouts_to_type_meta(prog: &CoreProgram) -> Vec<crate::gc::TypeMeta> {
-    prog.layouts
+    physical_layouts(prog).layouts
         .iter()
         .enumerate()
         .map(|(i, l)| {
@@ -4780,7 +4887,7 @@ pub fn jit_run_i64(prog: &CoreProgram) -> Result<i64, CodegenError> {
 /// the JIT path derives `TypeInfo`s from). `varlen`: 0=None, 1=Values, 2=Bytes.
 /// The runtime's `gcr_runtime_main` rebuilds the `TypeInfo` table from these.
 fn layouts_to_aot_records(prog: &CoreProgram) -> Vec<(u16, u16, u8)> {
-    prog.layouts
+    physical_layouts(prog).layouts
         .iter()
         .map(|l| {
             let varlen = match l.varlen {
@@ -4914,7 +5021,7 @@ pub fn codegen_aot_object_level(
     // Encoded by `gc::reflect::encode`; decoded by `gcr_runtime_main` at startup
     // into the heap's TypeMeta table (type/field names + field types). Nameless
     // programs (no reflection) still get a valid empty-table blob.
-    let interior: Vec<Vec<u16>> = prog.layouts.iter().map(|l| l.interior_ptrs.clone()).collect();
+    let interior: Vec<Vec<u16>> = physical_layouts(prog).layouts.iter().map(|l| l.interior_ptrs.clone()).collect();
     let meta_bytes = crate::gc::reflect::encode(
         &layouts_to_type_meta(prog),
         &layouts_to_value_meta(prog),
@@ -4942,7 +5049,7 @@ pub fn codegen_aot_object_level(
         false,
     );
     let runtime_main = module.add_function(
-        "gcr_runtime_main",
+        "gcr_runtime_main_v2",
         runtime_main_ty,
         Some(inkwell::module::Linkage::External),
     );

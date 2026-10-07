@@ -506,6 +506,7 @@ mod tests {
             let mut roots = RootSet::new();
             for (i, &obj) in objects.iter().enumerate() {
                 unsafe {
+                    if full { obj.add(Full::ENUM_TAG_OFFSET).cast::<u32>().write(u32::MAX - i as u32); }
                     obj.add(info.value_field_offset(0))
                         .cast::<u64>()
                         .write(objects[(i + 1) % count] as u64);
@@ -531,6 +532,7 @@ mod tests {
                             obj.add(info.value_field_offset(0)).cast::<u64>().read(),
                             roots.get((i + 1) % count)
                         );
+                        if full { assert_eq!(obj.add(Full::ENUM_TAG_OFFSET).cast::<u32>().read(), u32::MAX - i as u32); }
                         assert_eq!(
                             obj.add(info.value_field_offset(1)).cast::<u64>().read(),
                             roots.get(0)

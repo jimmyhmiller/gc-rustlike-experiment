@@ -102,3 +102,22 @@ fn runtime_build_failure_is_fatal_without_falling_back_to_an_existing_archive() 
     );
     assert_eq!(std::fs::read(&bin).unwrap(), existing);
 }
+
+#[test]
+fn older_custom_runtime_cannot_silently_link_new_allocation_contract() {
+    let fixture = Fixture::new("abi-version");
+    let source = fixture.0.join("main.gcr");
+    std::fs::write(&source, "fn main() -> i64 { 0 }").unwrap();
+    let legacy = fixture.0.join("legacy.c");
+    std::fs::write(&legacy, "long gcr_runtime_main(void*a,long b,void*c,long d,void*e){return 0;}").unwrap();
+    let object = fixture.0.join("legacy.o");
+    let archive = fixture.0.join("legacy.a");
+    assert!(Command::new("clang").arg("-c").arg(&legacy).arg("-o").arg(&object).status().unwrap().success());
+    assert!(Command::new("ar").arg("rcs").arg(&archive).arg(&object).status().unwrap().success());
+    let result = support::run_with_timeout(Command::new(env!("CARGO_BIN_EXE_gcr"))
+        .arg("build").arg(&source).arg("-o").arg(fixture.0.join("app"))
+        .env("GCRUST_RUNTIME_LIB", &archive), 60);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("gcr_runtime_main_v2"),
+        "{}", String::from_utf8_lossy(&result.stderr));
+}

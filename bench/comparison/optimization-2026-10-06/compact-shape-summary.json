@@ -1,0 +1,51 @@
+[
+  {
+    "workload": "nbody",
+    "gcr_ms": 40.181,
+    "rust_ms": 26.755,
+    "jvm_ms": 43.589,
+    "gcr_over_jvm": 0.922
+  },
+  {
+    "workload": "spectralnorm",
+    "gcr_ms": 36.508,
+    "rust_ms": 35.06,
+    "jvm_ms": 61.956,
+    "gcr_over_jvm": 0.589
+  },
+  {
+    "workload": "fannkuchredux",
+    "gcr_ms": 17.168,
+    "rust_ms": 12.943,
+    "jvm_ms": 16.363,
+    "gcr_over_jvm": 1.049
+  },
+  {
+    "workload": "binarytrees",
+    "gcr_ms": 13.422,
+    "rust_ms": 70.416,
+    "jvm_ms": 9.365,
+    "gcr_over_jvm": 1.433
+  },
+  {
+    "workload": "scalar",
+    "gcr_ms": 39.367,
+    "rust_ms": 38.879,
+    "jvm_ms": 44.824,
+    "gcr_over_jvm": 0.878
+  },
+  {
+    "workload": "array",
+    "gcr_ms": 4.859,
+    "rust_ms": 4.033,
+    "jvm_ms": 6.454,
+    "gcr_over_jvm": 0.753
+  },
+  {
+    "workload": "nbody_objects (diagnostic)",
+    "gcr_ms": 120.519,
+    "rust_ms": 26.873,
+    "jvm_ms": 43.94,
+    "gcr_over_jvm": 2.743
+  }
+]

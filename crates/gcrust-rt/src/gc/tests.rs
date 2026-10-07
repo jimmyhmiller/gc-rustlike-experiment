@@ -2094,6 +2094,7 @@ fn legacy_full_header_forwarding_uses_reserved_first_word() {
     let mut gc = SemiSpace::new::<Full>(4096);
     let obj = gc.alloc_obj::<Full>(&info, 0);
     unsafe {
+        *(obj.add(Full::ENUM_TAG_OFFSET) as *mut u32) = u32::MAX;
         *(obj.add(Full::SIZE) as *mut u64) = obj as u64;
     }
     let root = SingleRoot(Cell::new(obj as u64));
@@ -2101,6 +2102,7 @@ fn legacy_full_header_forwarding_uses_reserved_first_word() {
         gc.collect::<IdentityPtrPolicy>(&table, &mut [&root]);
     }
     let moved = root.0.get() as *mut u8;
+    assert_eq!(unsafe { *(moved.add(Full::ENUM_TAG_OFFSET) as *const u32) }, u32::MAX);
     assert_eq!(unsafe { follow_forwarding(obj) }, moved as *const u8);
     assert_eq!(unsafe { read_type_id(moved, Full::TYPE_ID_OFFSET) }, 1);
     assert_eq!(
@@ -2186,4 +2188,41 @@ fn remembered_edges_survive_clean_pauses_then_late_dirty_cards_after_major() {
         assert_eq!(unsafe { moved.add(16).cast::<u64>().read() }, 42 + phase);
     }
     unsafe { heap.safe_deregister_thread(&thread); }
+}
+
+#[test]
+fn collection_closes_triggering_and_blocked_generated_windows() {
+    use std::sync::{Arc, mpsc};
+    let info = TypeInfo::for_header(Full::SIZE).with_raw_bytes(8);
+    let heap = Arc::new(Heap::new_generational::<Full>(65536, 65536, vec![info]));
+    let (main, _) = heap.register_thread();
+    let main_window = unsafe { heap.configure_inline_tlab(&main) };
+    let first = unsafe { heap.try_alloc_runtime_fixed(&main, 0) };
+    assert!(!first.is_null());
+    assert!(unsafe { (*main_window).limit } > 0);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let worker_heap = heap.clone();
+    let worker = std::thread::spawn(move || {
+        let (state, _) = worker_heap.register_thread();
+        let window = unsafe { worker_heap.configure_inline_tlab(&state) };
+        assert!(!unsafe { worker_heap.try_alloc_runtime_fixed(&state, 0) }.is_null());
+        assert!(unsafe { (*window).limit } > 0);
+        unsafe { state.enter_blocked(); }
+        ready_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+        unsafe { state.exit_blocked(&worker_heap); }
+        assert_eq!(unsafe { (*window).limit }, 0);
+        assert!(!unsafe { worker_heap.try_alloc_runtime_fixed(&state, 0) }.is_null());
+        assert!(unsafe { (*window).limit } > 0);
+        unsafe { worker_heap.safe_deregister_thread(&state); }
+    });
+    ready_rx.recv().unwrap();
+    unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&main); }
+    assert_eq!(unsafe { (*main_window).limit }, 0);
+    assert!(!unsafe { heap.try_alloc_runtime_fixed(&main, 0) }.is_null());
+    assert!(unsafe { (*main_window).limit } > 0);
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap();
+    unsafe { heap.safe_deregister_thread(&main); }
 }

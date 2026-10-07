@@ -992,7 +992,7 @@ pub fn configured_gc_stress() -> bool {
 /// `meta_len` bytes produced by `gc::reflect::encode`, and `entry` must be the
 /// compiled program entry with signature `extern "C" fn(*mut Thread) -> i64`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gcr_runtime_main(
+pub unsafe extern "C" fn gcr_runtime_main_v2(
     layouts: *const AotLayout,
     ti_count: usize,
     meta: *const u8,
@@ -1125,6 +1125,21 @@ pub unsafe extern "C" fn gcr_runtime_main(
         let _ = std::fs::write(&path, rt.heap().metrics_json());
     }
     result
+}
+
+/// Legacy AOT startup symbol. Older generated code retains its per-allocation
+/// arena-epoch checks and works with the current runtime. New generated code
+/// requires `gcr_runtime_main_v2`, whose contract closes all generated windows
+/// before collection resumption.
+///
+/// # Safety
+/// Same layout, metadata and entry-pointer requirements as `gcr_runtime_main_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gcr_runtime_main(
+    layouts: *const AotLayout, ti_count: usize, meta: *const u8, meta_len: usize,
+    entry: extern "C" fn(*mut Thread) -> i64,
+) -> i64 {
+    unsafe { gcr_runtime_main_v2(layouts, ti_count, meta, meta_len, entry) }
 }
 
 // =============================================================================

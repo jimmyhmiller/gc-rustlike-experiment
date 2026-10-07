@@ -175,9 +175,9 @@ impl<'a> LayoutRegistry<'a> {
         self.ref_ids.insert(key.clone(), id);
         self.layouts.push(placeholder_layout(&key));
 
-        // A reference enum is one heap object: [tag: u32 raw][union of variant
-        // payloads]. We give it the max over variants of (ptr_fields, raw_bytes)
-        // so any variant fits. The tag is a raw scalar field. Pointer payload
+        // A reference enum is one heap object: [header with u32 tag][union of
+        // variant payloads]. We give it the max over variants of (ptr_fields, raw_bytes)
+        // so any variant fits. Pointer payload
         // fields go in the pointer region (traced); a variant with fewer ptr
         // fields than the max simply leaves trailing ptr slots null (safe to
         // trace — null is skipped).
@@ -189,11 +189,11 @@ impl<'a> LayoutRegistry<'a> {
             max_ptrs = max_ptrs.max(ptrs);
             max_raw = max_raw.max(raw);
         }
-        if HEADER as u32 + max_ptrs as u32 * 8 + max_raw as u32 + 8 > u16::MAX as u32 {
+        if HEADER as u32 + max_ptrs as u32 * 8 + max_raw as u32 > u16::MAX as u32 {
             return Err(LayoutError("enum payload exceeds layout size limit".into()));
         }
-        // tag occupies 4 bytes within the raw region; reserve 8 for alignment.
-        let raw_bytes = max_raw + 8;
+        // The tag is stored in the Full header, outside the payload regions.
+        let raw_bytes = max_raw;
         // Reflection metadata: one VariantMeta per source variant, with payload
         // field offsets matching codegen's placement. Tag = variant index.
         let mut variants_meta = Vec::with_capacity(e.variants.len());
@@ -207,15 +207,14 @@ impl<'a> LayoutRegistry<'a> {
         let meta = TypeMeta {
             type_id: 0,
             name: key.clone(),
-            kind: TypeKind::Enum { tag_offset: HEADER + max_ptrs * 8, variants: variants_meta },
+            kind: TypeKind::Enum { tag_offset: crate::gc::Full::ENUM_TAG_OFFSET as u16, variants: variants_meta },
         };
         let layout = Layout {
             ptr_fields: max_ptrs,
             raw_bytes,
             varlen: VarLen::None,
-            // field_map for an enum is per-variant; we store the tag at raw
-            // offset 0 and let codegen compute payload locations per variant.
-            field_map: vec![FieldLoc::Raw { offset: 0, repr: ScalarRepr::U32 }],
+            // Fields are described per variant; the header tag is not a payload field.
+            field_map: vec![],
             name: key,
             elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
@@ -252,7 +251,7 @@ impl<'a> LayoutRegistry<'a> {
             max_ptrs = max_ptrs.max(ptrs);
             max_raw = max_raw.max(raw);
         }
-        if HEADER as u32 + max_ptrs as u32 * 8 + max_raw as u32 + 8 > u16::MAX as u32 {
+        if HEADER as u32 + max_ptrs as u32 * 8 + max_raw as u32 > u16::MAX as u32 {
             return Err(LayoutError("enum payload exceeds layout size limit".into()));
         }
         let mut variants_meta = Vec::with_capacity(variants.len());
@@ -265,13 +264,13 @@ impl<'a> LayoutRegistry<'a> {
         let meta = TypeMeta {
             type_id: 0,
             name: key.clone(),
-            kind: TypeKind::Enum { tag_offset: HEADER + max_ptrs * 8, variants: variants_meta },
+            kind: TypeKind::Enum { tag_offset: crate::gc::Full::ENUM_TAG_OFFSET as u16, variants: variants_meta },
         };
         let layout = Layout {
             ptr_fields: max_ptrs,
-            raw_bytes: max_raw + 8,
+            raw_bytes: max_raw,
             varlen: VarLen::None,
-            field_map: vec![FieldLoc::Raw { offset: 0, repr: ScalarRepr::U32 }],
+            field_map: vec![],
             name: key,
             elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
@@ -495,7 +494,7 @@ impl<'a> LayoutRegistry<'a> {
                 }
                 Repr::Unit => {}
             }
-            if HEADER as u32 + ptrs * 8 + align_up(raw, 8) + 8 > u16::MAX as u32 {
+            if HEADER as u32 + ptrs * 8 + align_up(raw, 8) > u16::MAX as u32 {
                 return Err(LayoutError("enum payload exceeds layout size limit".into()));
             }
         }
@@ -635,7 +634,7 @@ impl<'a> LayoutRegistry<'a> {
     /// Reflection field metadata for one enum variant, matching codegen's
     /// payload placement (`gen_alloc` / `load_enum_payload`): pointer payloads
     /// fill the shared pointer region (slots `0..`) in declaration order; scalar
-    /// payloads fill the raw region after the tag word (at `HEADER +
+    /// payloads fill the raw region after the pointer slots (at `HEADER +
     /// max_ptrs*8`). Offsets are absolute (header included). Value payloads
     /// advance both cursors but remain omitted from reflection: their nested
     /// references live separately in leading slots, which a contiguous ValueMeta
@@ -646,9 +645,8 @@ impl<'a> LayoutRegistry<'a> {
         names: &[String],
         max_ptrs: u16,
     ) -> Vec<FieldMeta> {
-        let tag_off = HEADER + max_ptrs * 8;
         let mut ptr_slot = 0u16;
-        let mut raw_cursor = tag_off + 8;
+        let mut raw_cursor = HEADER + max_ptrs * 8;
         let mut out = Vec::new();
         for (i, r) in reprs.iter().enumerate() {
             let fname = names.get(i).cloned().unwrap_or_else(|| i.to_string());

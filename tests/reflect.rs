@@ -452,3 +452,36 @@ fn heap_dump_renders_object_graph() {
     // Versioned snapshot header with the measured STW pause.
     assert!(json.contains("\"snapshot_pause_ns\""), "json was:\n{json}");
 }
+
+#[test]
+fn enum_header_tag_and_physical_shapes_have_consistent_metadata() {
+    use gcrust::codegen::layouts_to_type_infos;
+    use gcrust::gc::{Full, ObjHeader};
+    let prog = lower(r#"
+        enum Tree { Leaf, Empty, Node(Tree, Tree) }
+        enum Data { None, Number(i64) }
+        fn main() -> i64 {
+            let tree = Tree::Node(Tree::Leaf, Tree::Empty);
+            let number = Data::Number(42);
+            field_i64(number, 0) + field_count(tree)
+        }
+    "#);
+    let infos = layouts_to_type_infos(&prog);
+    let metas = layouts_to_type_meta(&prog);
+    assert_eq!(infos.len(), metas.len());
+    let trees: Vec<_> = metas.iter().filter(|m| m.name == "Tree").collect();
+    assert_eq!(trees.len(), 2);
+    assert_eq!(infos[trees[0].type_id as usize].allocation_size(0), 32);
+    assert_eq!(infos[trees[1].type_id as usize].allocation_size(0), Full::SIZE);
+    assert_eq!(infos[trees[1].type_id as usize].value_field_count, 0);
+    for tree in trees {
+        let TypeKind::Enum { tag_offset, variants } = &tree.kind else { panic!() };
+        assert_eq!(*tag_offset as usize, Full::ENUM_TAG_OFFSET);
+        assert!(*tag_offset as usize + 4 <= Full::TYPE_ID_OFFSET);
+        assert_eq!(variants[2].fields.iter().map(|f| f.offset).collect::<Vec<_>>(), [16, 24]);
+    }
+    let data = metas.iter().find(|m| m.name == "Data").unwrap();
+    let TypeKind::Enum { variants, .. } = &data.kind else { panic!() };
+    assert_eq!(variants[1].fields[0].offset, 16);
+    assert_eq!(jit_run_i64_gc(&prog, true).unwrap(), 44);
+}

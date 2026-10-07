@@ -91,6 +91,12 @@ unsafe impl ObjHeader for Full {
 }
 
 impl Full {
+    /// A live reference-enum tag occupies the low 32 bits of the first word.
+    /// Copying collectors preserve this word in the destination before using
+    /// the source for forwarding. Bit 63 remains reserved for forwarding.
+    pub const ENUM_TAG_OFFSET: usize = core::mem::offset_of!(Full, gc_word)
+        + if cfg!(target_endian = "big") { 4 } else { 0 };
+
     #[inline(always)]
     pub fn gc_word(&self) -> u64 {
         self.gc_word

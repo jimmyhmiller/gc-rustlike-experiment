@@ -208,6 +208,14 @@ impl ThreadState {
         unsafe { core::ptr::addr_of_mut!((*self.tlab.get()).window) }
     }
 
+    /// Close a generated allocation reservation before the world resumes.
+    /// The caller owns the collection/pause census: this mutator is quiescent
+    /// or is the triggering collector, and registration/retirement are locked.
+    /// Keep the extent alive until the owner validates its native arena epoch.
+    pub(crate) unsafe fn invalidate_inline_tlab(&self) {
+        unsafe { (*self.tlab.get()).window.limit = 0; }
+    }
+
     /// Record one allocation at `site_id` of `bytes` bytes (Target-1b
     /// allocation-site profiling). Called by `ai_gc_alloc_*` on the owning
     /// thread's slow path. Non-atomic, owning-thread-only; grows the counter

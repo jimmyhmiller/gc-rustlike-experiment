@@ -930,8 +930,15 @@ impl Heap {
     fn resume_world(&self, snapshot: &[Arc<ThreadState>], excluded: Option<usize>) {
         // All root updates precede resumption. Compiled callers can retain
         // working references when no world pause occurred during a call.
-        self.relocation_epoch.fetch_add(1, Ordering::Release);
         let _threads = self.threads.lock().unwrap();
+        // Arena resets can retire a generated reservation. Invalidate every
+        // census member, including the triggering collector and BLOCKED workers,
+        // before any thread can allocate or deregister. Generated capacity checks
+        // then force native epoch validation without a per-object atomic read.
+        for state in snapshot {
+            unsafe { state.invalidate_inline_tlab(); }
+        }
+        self.relocation_epoch.fetch_add(1, Ordering::Release);
         for state in snapshot {
             if excluded == Some(Arc::as_ptr(state) as usize) { continue; }
             state.clear_poll();

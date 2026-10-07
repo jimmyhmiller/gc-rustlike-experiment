@@ -1,0 +1,27 @@
+--- /tmp/gcr-compact-before-root-reload.rs	2026-10-06 22:01:03
++++ src/codegen.rs	2026-10-06 22:01:03
+@@ -1479,12 +1479,10 @@
+         let has_roots = fcx.root_slots.iter().any(Option::is_some);
+         // ffi_leave begins BLOCKED, after native callbacks may already have
+         // moved roots. Reload unconditionally after it returns RUNNING.
+-        let before = if has_roots && !no_relocation && symbol != "ai_ffi_leave" {
+-            self.prepare_root_reload(fcx)
+-        } else { None };
+         let call = self.builder.build_call(callee, args, name)?;
+-        if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active); }
+-        else if has_roots && symbol == "ai_ffi_leave" { self.reload_active_root_mirrors(fcx); }
++        if has_roots && (!no_relocation || symbol == "ai_ffi_leave") {
++            self.reload_active_root_mirrors(fcx);
++        }
+         Ok(call)
+     }
+ 
+@@ -3424,7 +3422,7 @@
+         };
+         let before = self.prepare_root_reload(fcx);
+         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
+-        if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active); }
++        self.reload_active_root_mirrors(fcx);
+         Ok(match cs.try_as_basic_value() {
+             inkwell::values::ValueKind::Basic(v) => Some(v),
+             inkwell::values::ValueKind::Instruction(_) => None,

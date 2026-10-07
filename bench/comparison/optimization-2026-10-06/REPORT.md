@@ -48,3 +48,5 @@ After restoring the production sources and rebuilding, a separate three-fork tre
 With `GCR_GC_WORKERS` unset and the same heap sizes, the automatic-worker control measured tree medians of 279.36 ms at baseline and 25.75 ms in production (10.85× improvement). It checks complete ordered output and unchanged object/byte allocation totals across three forks per build. The default policy uses available parallelism capped at eight for large cycles and the coordinator for small cycles. Parallel scheduling adds overhead for this workload. This is a separate configuration; do not substitute its timing into the one-worker table or describe it as a same-run Java ratio. See [raw automatic-worker control](default-workers.json). Reproduce with `python3 bench/comparison/control_default_workers.py` after building the wrapper binaries identified in its input records.
 
 The continuation milestone is recorded in [PRIVATE-ARRAYS.md](PRIVATE-ARRAYS.md); original nbody now beats Java with unchanged benchmark sources.
+
+The next verified checkpoint is [compact enum shapes and root lifetimes](COMPACT-SHAPES.md).
