@@ -128,8 +128,6 @@ pub struct Heap {
     alloc_window: Box<crate::gc::alloc::AllocWindow>,
     /// Index into `spaces` for the current from-space (0 or 1).
     from_idx: AtomicUsize,
-    relocation_epoch: AtomicUsize,
-
     /// Registered mutator threads. The GC scans their roots during STW.
     threads: Mutex<Vec<Arc<ThreadState>>>,
 
@@ -282,7 +280,6 @@ impl Heap {
             ],
             alloc_window: Box::new(crate::gc::alloc::AllocWindow::empty()),
             from_idx: AtomicUsize::new(0),
-            relocation_epoch: AtomicUsize::new(0),
             threads: Mutex::new(Vec::new()),
             globals: AtomicRootSet::new(),
             state_slots: Mutex::new(std::collections::HashMap::new()),
@@ -341,7 +338,6 @@ impl Heap {
             spaces,
             alloc_window: Box::new(crate::gc::alloc::AllocWindow::empty()),
             from_idx: AtomicUsize::new(0),
-            relocation_epoch: AtomicUsize::new(0),
             threads: Mutex::new(Vec::new()),
             globals: AtomicRootSet::new(),
             state_slots: Mutex::new(std::collections::HashMap::new()),
@@ -936,9 +932,9 @@ impl Heap {
         // before any thread can allocate or deregister. Generated capacity checks
         // then force native epoch validation without a per-object atomic read.
         for state in snapshot {
-            unsafe { state.invalidate_inline_tlab(); }
+            unsafe { state.invalidate_inline_tlab(); state.advance_relocation_epoch();
+            }
         }
-        self.relocation_epoch.fetch_add(1, Ordering::Release);
         for state in snapshot {
             if excluded == Some(Arc::as_ptr(state) as usize) { continue; }
             state.clear_poll();
@@ -1115,8 +1111,6 @@ impl Heap {
     pub fn is_tenured(&self, ptr: *const u8) -> bool {
         self.from_space().contains(ptr) || self.to_space().contains(ptr)
     }
-
-    pub(crate) fn relocation_epoch_ptr(&self) -> *const AtomicUsize { &self.relocation_epoch }
 
     /// Configure an owning mutator's compiled allocation window once the heap
     /// and ThreadState are at stable addresses. Only nursery allocation is
@@ -1387,7 +1381,8 @@ impl Heap {
             let reclaimed: u64 = events
                 .iter()
                 .filter(|e| e.kind == kind)
-                .map(|e| e.before_bytes.saturating_sub(e.after_bytes).saturating_sub(e.promoted_bytes))
+                .map(|e| {
+                    e.before_bytes.saturating_sub(e.after_bytes).saturating_sub(e.promoted_bytes)})
                 .sum();
             let promoted: u64 =
                 events.iter().filter(|e| e.kind == kind).map(|e| e.promoted_bytes).sum();

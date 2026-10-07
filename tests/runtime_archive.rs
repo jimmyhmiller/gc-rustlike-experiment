@@ -109,7 +109,7 @@ fn older_custom_runtime_cannot_silently_link_new_allocation_contract() {
     let source = fixture.0.join("main.gcr");
     std::fs::write(&source, "fn main() -> i64 { 0 }").unwrap();
     let legacy = fixture.0.join("legacy.c");
-    std::fs::write(&legacy, "long gcr_runtime_main(void*a,long b,void*c,long d,void*e){return 0;}").unwrap();
+    std::fs::write(&legacy, "long gcr_runtime_main(void*a,long b,void*c,long d,void*e){return 0;} long gcr_runtime_main_v2(void*a,long b,void*c,long d,void*e){return 0;}").unwrap();
     let object = fixture.0.join("legacy.o");
     let archive = fixture.0.join("legacy.a");
     assert!(Command::new("clang").arg("-c").arg(&legacy).arg("-o").arg(&object).status().unwrap().success());
@@ -118,6 +118,6 @@ fn older_custom_runtime_cannot_silently_link_new_allocation_contract() {
         .arg("build").arg(&source).arg("-o").arg(fixture.0.join("app"))
         .env("GCRUST_RUNTIME_LIB", &archive), 60);
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("gcr_runtime_main_v2"),
+    assert!(String::from_utf8_lossy(&result.stderr).contains("gcr_runtime_main_v3"),
         "{}", String::from_utf8_lossy(&result.stderr));
 }

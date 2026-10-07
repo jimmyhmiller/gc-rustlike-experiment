@@ -1,0 +1,102 @@
+{
+  "diagnostic_only": true,
+  "warmup": 20,
+  "samples": 10,
+  "runtime": "target/gcr-aot-runtime/release/libgcrust_rt.a, same for all",
+  "cases": [
+    {
+      "case": "compact",
+      "median_ms": 4.8855,
+      "samples_ms": [
+        5.068,
+        4.908,
+        4.934,
+        4.936,
+        4.963,
+        4.863,
+        4.824,
+        4.821,
+        4.827,
+        4.79
+      ],
+      "checksum": 512458112753
+    },
+    {
+      "case": "ordinary",
+      "median_ms": 30.857999999999997,
+      "samples_ms": [
+        30.414,
+        30.991,
+        30.935,
+        29.85,
+        30.784,
+        31.166,
+        30.727,
+        30.518,
+        31.09,
+        30.932
+      ],
+      "checksum": 512458112753
+    },
+    {
+      "case": "noinline",
+      "median_ms": 30.692999999999998,
+      "samples_ms": [
+        30.09,
+        30.764,
+        30.833,
+        29.874,
+        31.186,
+        30.955,
+        30.573,
+        30.622,
+        31.004,
+        30.396
+      ],
+      "checksum": 512458112753
+    },
+    {
+      "case": "no-root-refresh-hint",
+      "median_ms": 31.1645,
+      "samples_ms": [
+        32.246,
+        29.365,
+        30.169,
+        31.123,
+        30.92,
+        31.206,
+        31.664,
+        30.894,
+        31.508,
+        32.135
+      ],
+      "checksum": 512458112753
+    },
+    {
+      "case": "all-root-slots",
+      "median_ms": 4.8585,
+      "samples_ms": [
+        4.782,
+        4.802,
+        4.788,
+        4.791,
+        4.813,
+        4.983,
+        4.986,
+        4.939,
+        4.904,
+        4.921
+      ],
+      "checksum": 512458112753
+    }
+  ],
+  "binary_sha256": {
+    "compact": "0048b759057a23a9e64960a32f81e53e6f8f901cb8f4ff93fc97976e99645d0f",
+    "ordinary": "f25b688b6b3b51dbe916511742e7a776a1a554759af258f23d64ea2a74aff2a3",
+    "noinline": "0bc5bf660e8a2cafea09eae10222fb85a97d6e6f26d665e30f9e3caa8ee69fe9",
+    "nohint": "f9de450a4c9477db5d0fafde9a4ccdb49ca94f6e789e484a5674f7536109ae89",
+    "allroots": "7d1aaf488439dae73a22b265c7b2b5d1e3c33ed7ae661d3a8af33c96cb33a4d4"
+  },
+  "runtime_sha256": "4c6faffe71fb82062796160a88b7bb19b58cc4c716fcdac2e2c1782183067140",
+  "conclusion": "Drop root-slot selection and operation-budgeted polling. CPU mechanism of root-slot regression remains unresolved; no dummy stores introduced."
+}

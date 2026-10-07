@@ -29,4 +29,7 @@ pub mod types;
 mod codegen_escape;
 mod codegen_liveness;
 
+mod codegen_outline;
+mod codegen_tail;
+
 mod codegen_loops;

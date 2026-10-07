@@ -1,0 +1,17 @@
+{
+  "diagnostic_only": true,
+  "base": "1e589a3",
+  "change": "Noncollecting inline array/field effect classification, without Core tail normalization or backend tail prohibition",
+  "source": "tests/fixtures/poll_budget.gcr",
+  "timeout_seconds": 10,
+  "timed_out": true,
+  "returncode": -9,
+  "wall_seconds": 10.002920333005022,
+  "stdout": "",
+  "stderr": "",
+  "source_sha256": "a8cbfad77f31348b10db76745109f13f32e830d06d9885e5d54c7bf6ce4bb7aa",
+  "effects_sha256": "7642bc52203137ba172cbd102c0bc8db8a1f849382bd43381978004c90897f11",
+  "runtime_archive": "target/aot-test-runtime/debug/libgcrust_rt.a",
+  "runtime_archive_sha256": "2b2a56dc584dcd05d98b3c27b87123298be7adfd04f6683509192ecbd1467f3f",
+  "current_fixture": "tests/fixtures/recursive_poll.gcr"
+}

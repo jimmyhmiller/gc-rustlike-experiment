@@ -1,0 +1,15 @@
+{
+  "workspace": {
+    "passed": 557,
+    "failed": 0,
+    "ignored": 8
+  },
+  "thread_sanitizer": {
+    "native_executions": 24,
+    "runtime_tests": 7,
+    "passed": true
+  },
+  "negative_control": "unpolled-tail-negative-control.json",
+  "positive_regression": "tests/poll_budget.rs, JIT/native/debug \u00d7 normal/stress \u00d7 workers 1/4",
+  "parity": "Repeat measurement pending"
+}

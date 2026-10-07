@@ -2192,10 +2192,12 @@ fn remembered_edges_survive_clean_pauses_then_late_dirty_cards_after_major() {
 
 #[test]
 fn collection_closes_triggering_and_blocked_generated_windows() {
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, mpsc};
     let info = TypeInfo::for_header(Full::SIZE).with_raw_bytes(8);
     let heap = Arc::new(Heap::new_generational::<Full>(65536, 65536, vec![info]));
     let (main, _) = heap.register_thread();
+    let epoch = unsafe { (*main.relocation_epoch_ptr()).load(Ordering::Relaxed) };
     let main_window = unsafe { heap.configure_inline_tlab(&main) };
     let first = unsafe { heap.try_alloc_runtime_fixed(&main, 0) };
     assert!(!first.is_null());
@@ -2209,16 +2211,26 @@ fn collection_closes_triggering_and_blocked_generated_windows() {
         assert!(!unsafe { worker_heap.try_alloc_runtime_fixed(&state, 0) }.is_null());
         assert!(unsafe { (*window).limit } > 0);
         unsafe { state.enter_blocked(); }
-        ready_tx.send(()).unwrap();
+        let epoch = unsafe { (*state.relocation_epoch_ptr()).load(Ordering::Relaxed) };
+        ready_tx.send(state.relocation_epoch_ptr()as usize).unwrap();
         resume_rx.recv().unwrap();
         unsafe { state.exit_blocked(&worker_heap); }
+        assert_eq!(
+            unsafe { (*state.relocation_epoch_ptr()).load(Ordering::Relaxed) },
+            epoch + 1
+        );
         assert_eq!(unsafe { (*window).limit }, 0);
         assert!(!unsafe { worker_heap.try_alloc_runtime_fixed(&state, 0) }.is_null());
         assert!(unsafe { (*window).limit } > 0);
         unsafe { worker_heap.safe_deregister_thread(&state); }
     });
-    ready_rx.recv().unwrap();
+    let worker_epoch_ptr = ready_rx.recv().unwrap();
+    assert_ne!(worker_epoch_ptr, main.relocation_epoch_ptr() as usize);
     unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&main); }
+    assert_eq!(
+        unsafe { (*main.relocation_epoch_ptr()).load(Ordering::Relaxed) },
+        epoch + 1
+    );
     assert_eq!(unsafe { (*main_window).limit }, 0);
     assert!(!unsafe { heap.try_alloc_runtime_fixed(&main, 0) }.is_null());
     assert!(unsafe { (*main_window).limit } > 0);

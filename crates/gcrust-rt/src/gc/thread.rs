@@ -111,6 +111,11 @@ pub struct ThreadState {
     /// raised after registration but before the runtime Thread is constructed.
     poll_registration: Mutex<bool>,
 
+    /// Updated only by a world-pause coordinator while this owner is
+    /// quiescent, or by the owner acting as collector. Generated code reads
+    /// it ordinarily while RUNNING; resume establishes the happens-before.
+    relocation_epoch: std::sync::atomic::AtomicUsize,
+
     /// The OS thread that owns (and registered) this state. Recorded at
     /// construction — registration always happens on the owning thread.
     /// Used by [`Heap::pause_world`](crate::gc::Heap::pause_world) to
@@ -164,6 +169,7 @@ impl ThreadState {
             parked_jit_fp: AtomicPtr::new(std::ptr::null_mut()),
             poll_flag: AtomicPtr::new(std::ptr::null_mut()),
             poll_registration: Mutex::new(false),
+            relocation_epoch: std::sync::atomic::AtomicUsize::new(0),
             os_thread: std::thread::current().id(),
             gc_scratch: Default::default(),
             scratch_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -206,6 +212,18 @@ impl ThreadState {
     /// alive and allocation may only be performed by this state's mutator.
     pub(crate) unsafe fn inline_tlab_ptr(&self) -> *mut crate::gc::InlineTlab {
         unsafe { core::ptr::addr_of_mut!((*self.tlab.get()).window) }
+    }
+
+    /// Stable address for the owning generated mutator.
+    pub(crate) fn relocation_epoch_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        &self.relocation_epoch
+    }
+
+    /// # Safety
+    /// The owner is quiescent under the world-pause protocol, or is the
+    /// calling collector itself. No generated read may execute concurrently.
+    pub(crate) unsafe fn advance_relocation_epoch(&self) {
+        self.relocation_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Close a generated allocation reservation before the world resumes.

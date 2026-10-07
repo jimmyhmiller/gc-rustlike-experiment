@@ -213,7 +213,7 @@ policy and root-enumeration contracts.
 
 The release compiler uses LLVM O3 and reports optimization failures. Fixed Full
 header objects of at most 8192 bytes can allocate directly in the owning
-mutator's nursery TLAB. The generated path checks capacity, unsigned overflow,
+mutator's nursery TLAB. The generated path checks capacity,
 the published reservation limit and stress mode. Native allocation validates
 the arena reset epoch. It initializes the object, writes its
 header, advances the shared native/generated cursor and publishes the initialized
@@ -237,8 +237,9 @@ mirrors are initialized when registration occurs, before the new reference is
 published and before any subsequent safepoint. Inactive frames skip relocation
 checks, mirror reads and unlinking. Full-debug functions register on entry.
 Before returning mutators to RUNNING, every world
-pause publishes a relocation epoch after collector root updates. Potentially
-collecting or parking calls compare acquire-loaded epochs and refresh working
+pause advances each census member's owner-local relocation epoch after collector
+root updates and before resuming that owner. Potentially collecting or parking
+calls compare ordinary epoch loads and refresh working
 references if the epoch changed. Loop-poll fast paths leave private references
 available to LLVM register promotion. Unknown calls are treated conservatively;
 only explicitly known noncollecting runtime routines, LLVM intrinsics and
@@ -359,7 +360,50 @@ Private working slots remain untouched; indirect value roots retain their prior
 lifetimes. Full-debug keeps lexical roots for inspection. A snapshot regression
 checks both optimized reachability and full-debug preservation.
 
-New native objects require the `gcr_runtime_main_v2` startup symbol. An older
+Native objects using only allocation-window invalidation require at least the
+`gcr_runtime_main_v2` startup contract. Current generated objects require v3. An older
 custom archive therefore fails to link rather than silently violating generated
 allocation-window assumptions. The current runtime keeps the legacy startup
 entry for programs that use the older per-allocation epoch check.
+
+
+### Owner-local epoch and recursive branch outlining
+
+The v3 AOT startup contract stores each relocation epoch in its ThreadState.
+The coordinator advances it only while that owner is quiescent (including
+BLOCKED threads), or on the collecting owner's own call stack. Resume's
+release/acquire handshake orders those writes before generated reads. A
+nonmoving world pause that excludes its requesting owner does not write that
+owner's epoch. Generated calls can therefore compare ordinary loads without a
+shared atomic read. The epoch remains atomic storage for legacy generated
+callers. `gcr_runtime_main_v3` prevents linking this code against older archives;
+the v1 and v2 entry symbols remain compatibility wrappers in the new runtime.
+FFI leave still reloads traced mirrors unconditionally.
+
+Release code generation can split an allocating recursive branch from a small
+base case. The helper is noinline, but the original wrapper can inline at its
+callers, exposing base-case allocations without recursive stack setup. The
+current eligibility proof permits straight-line blocks and requires every
+non-parameter read to refer to a definition within the extracted branch.
+Assignment, control transfer, loops, closures, and unsupported expressions
+retain their original bodies. The ordinary root protocol is generated for the
+helper; allocation-site labels and source spans retain the source function.
+Full debug code generation leaves source functions intact.
+
+### GC-aware self tail calls
+
+Direct self tail calls are normalized into Core loops before all of these
+analyses, including adjacent ANF call results returned immediately. Arguments
+are evaluated into fresh temporaries before parallel parameter assignment.
+Nonrecursive exits retain their return values. Closure functions and tail
+returns inside existing loops are left as ordinary calls. LLVM tail-call
+elimination is disabled for managed functions: the backend must not create
+backedges after the compiler has placed its safepoints. This constraint applies
+to full-debug too; recognized direct self recursion keeps one logical frame
+with the original parameter and local names.
+
+Inline array reads, including immutable value-box loads, scalar/reference array
+writes and scalar/reference fields cannot collect or park. Call-effect analysis
+recognizes those operations and inline aggregate
+construction. Mutable aggregate field snapshots and boxed value-array writes
+retain their relocation checks and roots.

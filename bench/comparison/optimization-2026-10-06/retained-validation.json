@@ -1,0 +1,24 @@
+{
+  "workspace": {
+    "passed": 554,
+    "failed": 0,
+    "ignored": 8
+  },
+  "thread_sanitizer": {
+    "native_executions": 24,
+    "runtime_tests": 7,
+    "passed": true
+  },
+  "release_build": true,
+  "discarded_optimizations": [
+    "operation-budgeted polling",
+    "root-slot selection"
+  ],
+  "comparison": "retained-results.json",
+  "parity_reached": false,
+  "remaining": [
+    "fannkuchredux",
+    "binarytrees",
+    "nbody_objects diagnostic"
+  ]
+}

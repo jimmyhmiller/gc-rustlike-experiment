@@ -1,0 +1,77 @@
+diff --git a/src/codegen_effects.rs b/src/codegen_effects.rs
+index 406534b..0c23b99 100644
+--- a/src/codegen_effects.rs
++++ b/src/codegen_effects.rs
+@@ -73,6 +73,24 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
+                 .iter()
+                 .all(|argument| expression_is_nonrelocating(argument, calls))
+         }
++        // Array reads (including immutable value boxes) and scalar/reference
++        // writes use inline operations and noncollecting failure/barrier paths.
++        // Inline aggregate construction also cannot park or allocate.
++        ArrayLen(array) | TypeIdOf(array) => expression_is_nonrelocating(array, calls),
++        ArrayGet { array, index, .. } | ArrayGetUnchecked { array, index, .. }
++        | ArrayGetChecked { array, index, .. } =>
++            expression_is_nonrelocating(array, calls) && expression_is_nonrelocating(index, calls),
++        ArraySet { array, index, value, elem } =>
++            !matches!(elem, crate::core::Repr::Value(_))
++            && expression_is_nonrelocating(array, calls)
++            && expression_is_nonrelocating(index, calls)
++            && expression_is_nonrelocating(value, calls),
++        Field { base, loc } => !matches!(loc, crate::core::FieldLoc::ValueAt { .. })
++            && expression_is_nonrelocating(base, calls),
++        SetField { base, value, loc } => matches!(loc, crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. })
++            && expression_is_nonrelocating(base, calls) && expression_is_nonrelocating(value, calls),
++        MakeValue { fields, .. } | MakeValueVariant { fields, .. } =>
++            fields.iter().all(|field| expression_is_nonrelocating(field, calls)),
+         // Reference enums are immutable after construction. Their tag and
+         // payload extraction (including nested value payloads) use loads and
+         // stack temporaries, with no managed snapshot lock or allocation.
+@@ -130,6 +148,34 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn inline_memory_reads_are_safe_but_boxing_and_snapshot_locks_are_not() {
++        let source = r#"
++            #[value] struct Pair { x: i64 }
++            struct Holder { x: i64, pair: Pair }
++            fn inspect(values: Array<Pair>, refs: Array<Holder>, h: Holder) -> i64 {
++                values[0].x + refs[0].x + h.x
++            }
++            fn copy(nums: Array<i64>) -> i64 { nums[0] + array_len(nums) }
++            fn snapshot(h: Holder) -> i64 { h.pair.x }
++            fn write_values(mut a: Array<Pair>) -> i64 { array_set(a, 0, Pair { x: 7 }); 0 }
++            fn main() -> i64 {
++                let mut values: Array<Pair> = array_new(1);
++                write_values(values);
++                let h = Holder { x: 3, pair: Pair { x: 2 } };
++                let mut refs: Array<Holder> = array_new(1);
++                array_set(refs, 0, h);
++                let mut nums: Array<i64> = array_new(1);
++                array_set(nums, 0, 4);
++                inspect(values, refs, h) + copy(nums) + snapshot(h)
++            }
++        "#;
++        let (program, safe) = analyze(source);
++        for name in ["inspect", "copy"] { assert!(effect(&program, &safe, name), "{name}"); }
++        for name in ["snapshot", "write_values", "main"] { assert!(!effect(&program, &safe, name), "{name}"); }
++        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 20);
++    }
++
+     #[test]
+     fn callers_keep_checks_only_for_potential_relocation() {
+         use inkwell::values::AnyValue;
+@@ -182,7 +228,11 @@ mod tests {
+         let (program, _) = analyze(source);
+         let context = inkwell::context::Context::create();
+         let compiled = crate::codegen::codegen(&context, &program).unwrap();
+-        for (name, deferred) in [("make", true), ("with_param", false)] {
++        let outlined = crate::codegen_outline::outline(&program);
++        let helper = outlined.helpers.iter().find_map(|(id, source)|
++            (source == "make").then(|| outlined.program.funcs[*id as usize].name.as_str())
++        ).unwrap();
++        for (name, deferred) in [(helper, true), ("with_param", false)] {
+             let ir = compiled
+                 .module
+                 .get_function(name)

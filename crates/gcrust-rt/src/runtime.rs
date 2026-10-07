@@ -37,8 +37,8 @@ pub(crate) mod managed;
 pub use managed::{ai_managed_lock, ai_managed_unlock};
 
 use crate::gc::{AllocWindow, Full, Heap, IdentityPtrPolicy, ThreadState, TypeInfo};
-use std::sync::Arc;
 use std::cell::Cell;
+use std::sync::Arc;
 
 thread_local! {
     /// THIS thread's current mutator `Thread*`. Set when a thread's gc-rust entry
@@ -107,6 +107,9 @@ pub struct Thread {
     /// Owning-mutator aggregate critical section; never live at a safepoint.
     managed_lock: Option<usize>,
     pub tlab_window: *mut crate::gc::InlineTlab,
+    /// Owner-local epoch, advanced only under the world-pause handshake.
+    /// Older generated callers may read it atomically; v3 callers read it
+    /// ordinarily while RUNNING, when coordinator writes are excluded.
     pub relocation_epoch: *const std::sync::atomic::AtomicUsize,
 }
 
@@ -307,7 +310,7 @@ impl RuntimeContext {
                 arguments: Arc::new(std::env::args_os().collect()),
                 managed_lock: None,
                 tlab_window: unsafe { heap.configure_inline_tlab(&dyna) },
-                relocation_epoch: heap.relocation_epoch_ptr(),
+                relocation_epoch: dyna.relocation_epoch_ptr(),
             }),
             heap,
             dyna,
@@ -493,7 +496,7 @@ pub unsafe extern "C" fn ai_thread_spawn(parent: *mut Thread, env: *mut u8, code
             arguments,
             managed_lock: None,
                 tlab_window: unsafe { heap.configure_inline_tlab(&dyna) },
-                relocation_epoch: heap.relocation_epoch_ptr(),
+                relocation_epoch: dyna.relocation_epoch_ptr(),
         });
         unsafe { dyna.set_poll_flag(&mut thread.state as *mut std::sync::atomic::AtomicU8); }
         let tptr = &mut *thread as *mut Thread;
@@ -992,7 +995,7 @@ pub fn configured_gc_stress() -> bool {
 /// `meta_len` bytes produced by `gc::reflect::encode`, and `entry` must be the
 /// compiled program entry with signature `extern "C" fn(*mut Thread) -> i64`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gcr_runtime_main_v2(
+pub unsafe extern "C" fn gcr_runtime_main_v3(
     layouts: *const AotLayout,
     ti_count: usize,
     meta: *const u8,
@@ -1127,10 +1130,24 @@ pub unsafe extern "C" fn gcr_runtime_main_v2(
     result
 }
 
+/// Startup compatibility for code using atomic relocation-epoch loads.
+/// # Safety
+/// Same requirements as `gcr_runtime_main_v3`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gcr_runtime_main_v2(
+    layouts: *const AotLayout,
+    ti_count: usize,
+    meta: *const u8,
+    meta_len: usize,
+    entry: extern "C" fn(*mut Thread) -> i64,
+) -> i64 {
+    unsafe { gcr_runtime_main_v3(layouts, ti_count, meta, meta_len, entry) }
+}
+
 /// Legacy AOT startup symbol. Older generated code retains its per-allocation
-/// arena-epoch checks and works with the current runtime. New generated code
-/// requires `gcr_runtime_main_v2`, whose contract closes all generated windows
-/// before collection resumption.
+/// arena-epoch checks and works with the current runtime. Version 2 requires
+/// closing generated allocation windows before resumption; version 3 also
+/// permits ordinary loads from owner-local relocation epochs.
 ///
 /// # Safety
 /// Same layout, metadata and entry-pointer requirements as `gcr_runtime_main_v2`.

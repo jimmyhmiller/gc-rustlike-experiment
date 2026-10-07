@@ -1,0 +1,28 @@
+// A scalar-array spinner performs no allocations or native calls. Its held
+// references must move safely while another mutator repeatedly collects.
+fn recursive_wait(control: Array<i64>, held: Array<i64>) -> i64 {
+    if control[1] == 0 { recursive_wait(control, held) } else { held[0] }
+}
+fn wait(mut control: Array<i64>, held: Array<i64>) -> i64 {
+    array_set(control, 0, 1);
+    recursive_wait(control, held)
+}
+fn main() -> i64 {
+    let mut control: Array<i64> = array_new(2);
+    let mut held: Array<i64> = array_new(1);
+    array_set(held, 0, 42);
+    let worker = thread_spawn(|| wait(control, held));
+    while control[0] == 0 {}
+    let mut i = 0;
+    let mut sum = 0;
+    while i < 2000 {
+        let mut scratch: Array<i64> = array_new(4096);
+        array_set(scratch, 0, i);
+        sum = sum + scratch[0];
+        i = i + 1;
+    }
+    array_set(control, 1, 1);
+    let child = thread_join(worker);
+    print_int(sum + child + held[0]);
+    0
+}

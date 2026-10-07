@@ -16,7 +16,7 @@ cargo build -p gc-rust --bin gcr --target-dir target/tsan-compiler
 RUSTFLAGS='-Zsanitizer=thread -Zexternal-clangrt -Cforce-frame-pointers=yes' \
   cargo "+$toolchain" build -Zbuild-std --release -p gcrust-rt \
   --target aarch64-apple-darwin --target-dir target/tsan-runtime
-for fixture in managed_memory channel_contract app_payloads csv_limits inline_allocation root_mirror_callback private_arrays compact_enums; do
+for fixture in managed_memory channel_contract app_payloads csv_limits inline_allocation root_mirror_callback private_arrays compact_enums recursive_poll; do
   GCR_CODEGEN_TSAN=1 \
   GCRUST_RUNTIME_LIB="$PWD/target/tsan-runtime/aarch64-apple-darwin/release/libgcrust_rt.a" \
     ./target/tsan-compiler/debug/gcr build "tests/fixtures/$fixture.gcr" \
@@ -29,7 +29,7 @@ for app in gcr-csvreport gcr-buildplan gcr-routes; do
 done
 python3 - <<'PYTSAN'
 import json, os, subprocess
-for fixture in ('managed_memory', 'channel_contract', 'app_payloads', 'csv_limits', 'inline_allocation', 'root_mirror_callback', 'private_arrays', 'compact_enums'):
+for fixture in ('managed_memory', 'channel_contract', 'app_payloads', 'csv_limits', 'inline_allocation', 'root_mirror_callback', 'private_arrays', 'compact_enums', 'recursive_poll'):
     for stress in ('0', '1'):
         env = os.environ.copy()
         env.update(GCR_GC_STRESS=stress, GCR_GC_VERIFY='1', GCR_GC_WORKERS='4',

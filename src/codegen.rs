@@ -98,6 +98,16 @@ pub fn codegen_with_debug<'ctx>(
     prog: &CoreProgram,
     level: DebugLevel,
 ) -> Result<Compiled<'ctx>, CodegenError> {
+    let mut outlined = if level.is_full() {
+        crate::codegen_outline::Outlined {
+            program: prog.clone(),
+            helpers: HashMap::new(),
+        }
+    } else {
+        crate::codegen_outline::outline(prog)
+    };
+    crate::codegen_tail::eliminate(&mut outlined.program);
+    let prog = &outlined.program;
     let module = ctx.create_module("gcr");
     let builder = ctx.create_builder();
     let debug = if level.emits_dwarf() {
@@ -113,19 +123,22 @@ pub fn codegen_with_debug<'ctx>(
         let scope = ctx.metadata_node(&[ctx.metadata_string(&name).into(), domain.into()]);
         (origins, scope)
     }).collect();
+    let nonrelocating = crate::codegen_effects::nonrelocating_functions(prog);
+    let root_liveness= if level.is_full() { Default::default() } else { crate::codegen_liveness::RootLiveness::analyze(prog) };
     let mut cg = Codegen {
         ctx,
         module,
         builder,
         prog,
         funcs: HashMap::new(),
-        nonrelocating: crate::codegen_effects::nonrelocating_functions(prog),
+        outlined_helpers: outlined.helpers,
+        nonrelocating,
         private_arrays,
         bounded_loops,
         array_scopes,
         closed_world: !level.is_full(),
         physical_layouts: physical_layouts(prog),
-        root_liveness: if level.is_full() { Default::default() } else { crate::codegen_liveness::RootLiveness::analyze(prog) },
+        root_liveness,
         trampolines: HashMap::new(),
         alloc_sites: Vec::new(),
         alloc_site_ids: HashMap::new(),
@@ -136,6 +149,21 @@ pub fn codegen_with_debug<'ctx>(
     // Declare every function first (so calls can reference forward decls).
     for (i, f) in prog.funcs.iter().enumerate() {
         let fv = cg.declare_fn(i as FuncId, f);
+        if !f.is_extern {
+            // Backend-created recursive loops would bypass Core safepoint
+            // analysis. Supported self tail calls are lowered before codegen.
+            fv.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_string_attribute("disable-tail-calls", "true"),
+            );
+        }
+        if cg.outlined_helpers.contains_key(&(i as FuncId)) {
+            let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("noinline");
+            fv.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_enum_attribute(kind, 0),
+            );
+        }
         cg.funcs.insert(i as FuncId, fv);
     }
     // Define bodies.
@@ -317,9 +345,8 @@ impl<'a, 'ctx> DiTypeBuilder<'a, 'ctx> {
         }
         let kind = match &layout.meta.kind {
             crate::gc::TypeKind::Struct { fields } => Kind::Struct(fields.clone()),
-            crate::gc::TypeKind::Enum { tag_offset, variants } => {
-                Kind::Enum(*tag_offset, variants.clone())
-            }
+            crate::gc::TypeKind::Enum { tag_offset, variants } => Kind::Enum(*tag_offset, variants.clone())
+            ,
             crate::gc::TypeKind::Opaque => return None,
         };
         self.layout_inprog[i] = true;
@@ -517,6 +544,7 @@ struct Codegen<'ctx, 'p> {
     builder: Builder<'ctx>,
     prog: &'p CoreProgram,
     funcs: HashMap<FuncId, FunctionValue<'ctx>>,
+    outlined_helpers: HashMap<FuncId, String>,
     nonrelocating: Vec<bool>,
     closed_world: bool,
     physical_layouts: PhysicalLayouts,
@@ -1055,13 +1083,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             || self.debug.as_ref().is_some_and(|debug| debug.full);
         // Partition locals: Ref-typed locals become GC frame *direct* root slots;
         // all others get plain allocas. Count the refs to size the frame.
-        let num_roots = if requires_roots { f.locals.iter().enumerate().filter(|(i,r)| matches!(r, Repr::Ref(_)) && (!entry_roots_only || *i < incoming)).count() } else { 0 };
+        let num_roots = if requires_roots { f.locals.iter().enumerate().filter(|(i,r)| {
+                    matches!(r, Repr::Ref(_)) && (!entry_roots_only || *i < incoming)}).count() } else { 0 };
         // Map: local id -> root index (only for Ref locals).
         let mut root_index: Vec<Option<u32>> = vec![None; f.locals.len()];
         {
             let mut ri = 0u32;
             for (i, r) in f.locals.iter().enumerate() {
-                if requires_roots && matches!(r, Repr::Ref(_)) && (!entry_roots_only || i < incoming) {
+                if requires_roots && matches!(r, Repr::Ref(_))
+ && (!entry_roots_only || i < incoming) {
                     root_index[i] = Some(ri);
                     ri += 1;
                 }
@@ -1348,9 +1378,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
         }
 
-        let unlink = frame.map(|(frame_ptr, frame_ty, _, _, _, _, tf_ptr)| {
-            (frame_ptr, frame_ty, tf_ptr)
-        });
+        let unlink = frame.map(|(frame_ptr, frame_ty, _, _, _, _, tf_ptr)| (frame_ptr, frame_ty, tf_ptr)
+        );
 
         let mut fcx = FnCtx {
             func,
@@ -1405,7 +1434,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let epoch = self.builder.build_load(ptr, address, "gc.epoch_ptr").unwrap().into_pointer_value();
         let value = self.builder.build_load(self.ctx.i64_type(), epoch, "gc.epoch").unwrap();
         value.as_instruction_value().unwrap().set_alignment(8).unwrap();
-        value.as_instruction_value().unwrap().set_atomic_ordering(AtomicOrdering::Acquire).unwrap();
+        // The v3 runtime updates this owner-local word only while the owner
+        // is quiescent. The call/poll that resumes execution orders relocation.
         value.into_int_value()
     }
 
@@ -1431,7 +1461,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// epoch loads on those paths; these loads otherwise survive LLVM DCE.
     fn prepare_root_reload(&self, fcx: &FnCtx<'ctx>) -> Option<(IntValue<'ctx>, Option<IntValue<'ctx>>)> {
         if !fcx.root_slots.iter().any(Option::is_some) { return None; }
-        let active = fcx.frame_active.map(|flag| self.builder.build_load(self.ctx.bool_type(), flag, "roots.were_active").unwrap().into_int_value());
+        let active = fcx.frame_active.map(|flag| {
+            self.builder.build_load(self.ctx.bool_type(), flag, "roots.were_active").unwrap().into_int_value()});
         let before = if let Some(active) = active {
             let inactive = self.builder.get_insert_block().unwrap();
             let read = self.ctx.append_basic_block(fcx.func, "roots.epoch.read");
@@ -1458,7 +1489,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let after = self.load_relocation_epoch(fcx);
         let changed = self.builder.build_int_compare(IntPredicate::NE, before, after, "gc.relocated").unwrap();
         let reload = self.ctx.append_basic_block(fcx.func, "roots.reload");
-        self.builder.build_conditional_branch(changed, reload, ready).unwrap();
+        let branch = self.builder.build_conditional_branch(changed, reload, ready)
+            .unwrap();
+        let weights = self.ctx.metadata_node(&[
+            self.ctx.metadata_string("branch_weights").into(),
+            self.ctx.i32_type().const_int(1, false).into(),
+            self.ctx.i32_type().const_int(1024, false).into(),
+        ]);
+        branch
+            .set_metadata(weights, self.ctx.get_kind_id("prof")).unwrap();
         self.builder.position_at_end(reload);
         self.reload_root_mirrors(fcx);
         self.builder.build_unconditional_branch(ready).unwrap();
@@ -1623,9 +1662,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let t = self.scalar_ty(*sr).into_float_type();
                 Ok(Some(t.const_float(*f).into()))
             }
-            CoreExprKind::ConstBool(b) => {
-                Ok(Some(self.ctx.bool_type().const_int(*b as u64, false).into()))
-            }
+            CoreExprKind::ConstBool(b) => Ok(Some(self.ctx.bool_type().const_int(*b as u64, false).into()))
+            ,
             CoreExprKind::ConstChar(c) => {
                 Ok(Some(self.ctx.i32_type().const_int(*c as u64, false).into()))
             }
@@ -1658,7 +1696,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             CoreExprKind::Bin(op, l, r) => self.gen_bin(fcx, *op, l, r),
             CoreExprKind::Un(op, inner) => self.gen_un(fcx, *op, inner),
-            CoreExprKind::FloatIntrinsic(intr, inner) => self.gen_float_intrinsic(fcx, *intr, inner),
+            CoreExprKind::FloatIntrinsic(intr, inner) => {
+                self.gen_float_intrinsic(fcx, *intr, inner)}
             CoreExprKind::Print(inner) => {
                 let v = self.gen_expr(fcx, inner)?.unwrap();
                 let is_float = matches!(&inner.repr, Repr::Scalar(s) if s.is_float());
@@ -2049,7 +2088,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into()], "tid").unwrap());
                 Ok(Some(r))
             }
-            CoreExprKind::If(cond, then_b, else_b) => self.gen_if(fcx, cond, then_b, else_b, &e.repr),
+            CoreExprKind::If(cond, then_b, else_b) => {
+                self.gen_if(fcx, cond, then_b, else_b, &e.repr)}
             CoreExprKind::Block(b) => self.gen_block(fcx, b),
             CoreExprKind::Loop(body) => self.gen_loop(fcx, body),
             CoreExprKind::Break(v) => {
@@ -2097,11 +2137,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::MakeValueVariant { value, tag, fields } => {
                 self.gen_make_value_variant(fcx, *value, *tag, fields)
             }
-            CoreExprKind::ValueMatch { scrutinee, arms } => self.gen_value_match(fcx, scrutinee, arms, &e.repr),
-            CoreExprKind::New { layout, fields } => self.gen_alloc(fcx, *layout, None, fields, e.span),
-            CoreExprKind::MakeVariant { layout, tag, fields } => {
-                self.gen_alloc(fcx, *layout, Some(*tag), fields, e.span)
-            }
+            CoreExprKind::ValueMatch { scrutinee, arms } => {
+                self.gen_value_match(fcx, scrutinee, arms, &e.repr)}
+            CoreExprKind::New { layout, fields } => {
+                self.gen_alloc(fcx, *layout, None, fields, e.span)}
+            CoreExprKind::MakeVariant { layout, tag, fields } => self.gen_alloc(fcx, *layout, Some(*tag), fields, e.span)
+            ,
             CoreExprKind::Field { base, loc } => self.gen_field(fcx, base, loc),
             CoreExprKind::SetField { base, loc, value } => {
                 let mut obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
@@ -2115,7 +2156,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         let lay = &self.prog.layouts[lid as usize];
                         Self::HEADER + (lay.ptr_fields as u64) * 8 + *offset as u64
                     }
-                    FieldLoc::ValueField { .. } => return Err(CodegenError("value-struct field is immutable".into())),
+                    FieldLoc::ValueField { .. } => {
+                        return Err(CodegenError("value-struct field is immutable".into()));
+                    }
                 };
                 let addr = self.obj_addr(obj, off);
                 if aggregate { self.builder.build_store(addr, v).unwrap(); }
@@ -2163,7 +2206,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if aggregate { self.managed_unlock(fcx); }
                 Ok(Some(self.ctx.i64_type().const_zero().into()))
             }
-            CoreExprKind::Match { scrutinee, arms } => self.gen_match(fcx, scrutinee, arms, &e.repr),
+            CoreExprKind::Match { scrutinee, arms } => {
+                self.gen_match(fcx, scrutinee, arms, &e.repr)}
             CoreExprKind::EnumTag(scrut) => {
                 let value = self.gen_expr(fcx, scrut)?.unwrap();
                 let tag = match &scrut.repr {
@@ -2185,7 +2229,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let value = self.gen_expr(fcx, scrutinee)?.unwrap();
                 if matches!(repr, Repr::Unit) { return Ok(None); }
                 let val = match &scrutinee.repr {
-                    Repr::Value(id) => self.load_value_enum_payload(value, *id, *field as usize, payload_reprs)?,
+                    Repr::Value(id) => {
+                        self.load_value_enum_payload(value, *id, *field as usize, payload_reprs)?}
                     Repr::Ref(lid) => {
                         let raw_base = self.enum_raw_base(*lid);
                         self.load_enum_payload(value.into_pointer_value(), raw_base, *field as usize, payload_reprs)?
@@ -2194,14 +2239,19 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 };
                 Ok(Some(val))
             }
-            CoreExprKind::ArrayNew { layout, len, elem } => self.gen_array_new(fcx, *layout, len, elem, e.span),
+            CoreExprKind::ArrayNew { layout, len, elem } => {
+                self.gen_array_new(fcx, *layout, len, elem, e.span)}
             CoreExprKind::ArrayLen(arr) => self.gen_array_len(fcx, arr),
-            CoreExprKind::ArrayGet { array, index, elem } => self.gen_array_get(fcx, array, index, elem, &e.repr),
-            CoreExprKind::ArrayGetUnchecked { array, index, elem } => self.gen_array_get_unchecked(fcx, array, index, elem),
-            CoreExprKind::ArrayGetChecked { array, index, elem } => self.gen_array_get_checked(fcx, array, index, elem),
+            CoreExprKind::ArrayGet { array, index, elem } => {
+                self.gen_array_get(fcx, array, index, elem, &e.repr)}
+            CoreExprKind::ArrayGetUnchecked { array, index, elem } => {
+                self.gen_array_get_unchecked(fcx, array, index, elem)}
+            CoreExprKind::ArrayGetChecked { array, index, elem } => {
+                self.gen_array_get_checked(fcx, array, index, elem)}
             CoreExprKind::ArraySet { array, index, value, elem } => self.gen_array_set(fcx, array, index, value, elem),
             CoreExprKind::MakeClosure { code, env, captures } => self.gen_make_closure(fcx, *code, *env, captures, e.span),
-            CoreExprKind::CallClosure { callee, args } => self.gen_call_closure(fcx, callee, args, &e.repr),
+            CoreExprKind::CallClosure { callee, args } => {
+                self.gen_call_closure(fcx, callee, args, &e.repr)}
             other => Err(CodegenError(format!("codegen unsupported in v0 slice: {:?}", core_disc(other)))),
         }
     }
@@ -2232,9 +2282,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         id
     }
 
-    /// The current function's compiled symbol name (the site label).
-    fn current_fn_name(fcx: &FnCtx<'ctx>) -> String {
-        fcx.func.get_name().to_string_lossy().into_owned()
+    /// Keep source allocation labels when a branch has a synthesized helper.
+    fn current_fn_name(&self, fcx: &FnCtx<'ctx>) -> String {
+        self.funcs
+            .iter()
+            .find_map(|(id, function)| {
+                if *function == fcx.func {
+                    self.outlined_helpers.get(id).cloned()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| fcx.func.get_name().to_string_lossy().into_owned())
     }
 
     fn declare_runtime_externs(&self) {
@@ -2854,7 +2913,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             vals.push((self.gen_expr(fcx, fe)?, fe.repr.clone()));
         }
 
-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
         let physical = if fields.is_empty() && tag.is_some_and(|tag| {
             matches!(&self.prog.layouts[layout as usize].meta.kind,
                 crate::gc::TypeKind::Enum { variants, .. }
@@ -3122,7 +3181,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let lid = match repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("string repr".into())) };
         let bytes = s.as_bytes();
         let n = bytes.len() as u64;
-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), lid as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), lid as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
         let obj = call_result(self.build_managed_call(fcx,
             alloc,
@@ -3166,7 +3225,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             fcx.thread.into(), n64.into(), i64t.const_int(stride, false).into(),
             i32t.const_int(traced as u64, false).into(),
         ], "array.allocation.len").unwrap()).into_int_value();
-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), layout as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
         let obj = call_result(self.build_managed_call(fcx,
             alloc,
@@ -3249,7 +3308,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         const OPTION_SOME_TAG: u32 = 1;
         let option_vid = match result_repr {
             Repr::Value(v) => *v,
-            _ => return Err(CodegenError("array_get result is not an Option value enum".into())),
+            _ => {
+                return Err(CodegenError("array_get result is not an Option value enum".into()));
+            }
         };
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
@@ -3371,7 +3432,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         for c in captures {
             vals.push((self.gen_expr(fcx, c)?, c.repr.clone()));
         }
-        let site = self.alloc_site_id(&Self::current_fn_name(fcx), env as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), env as u16, span);
         let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
         let obj = call_result(
             self.build_managed_call(fcx,
@@ -3696,9 +3757,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let func = fcx.func;
         let cont_bb = self.ctx.append_basic_block(func, "match.cont");
         // Result slot (if non-unit).
-        let result_slot = self.llvm_ty(repr).map(|t| {
-            self.entry_alloca(t, "match.res")
-        });
+        let result_slot = self.llvm_ty(repr).map(|t| self.entry_alloca(t, "match.res")
+        );
 
         // Build arm blocks. A wildcard (tag u32::MAX) becomes the default.
         let mut default_bb = None;
@@ -3969,9 +4029,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let v = self.gen_expr(fcx, inner)?.unwrap();
         let res: BasicValueEnum = match op {
             UnOp::Neg => match &inner.repr {
-                Repr::Scalar(s) if s.is_float() => {
-                    self.builder.build_float_neg(v.into_float_value(), "fneg").unwrap().into()
-                }
+                Repr::Scalar(s) if s.is_float() => self.builder.build_float_neg(v.into_float_value(), "fneg").unwrap().into()
+                ,
                 _ => self.builder.build_int_neg(v.into_int_value(), "neg").unwrap().into(),
             },
             UnOp::Not => {
@@ -4422,10 +4481,14 @@ fn int_pred(op: BinOp, signed: bool) -> IntPredicate {
     match op {
         Eq => IntPredicate::EQ,
         Ne => IntPredicate::NE,
-        Lt => if signed { IntPredicate::SLT } else { IntPredicate::ULT },
-        Le => if signed { IntPredicate::SLE } else { IntPredicate::ULE },
-        Gt => if signed { IntPredicate::SGT } else { IntPredicate::UGT },
-        Ge => if signed { IntPredicate::SGE } else { IntPredicate::UGE },
+        Lt => {
+            if signed { IntPredicate::SLT } else { IntPredicate::ULT }}
+        Le => {
+            if signed { IntPredicate::SLE } else { IntPredicate::ULE }}
+        Gt => {
+            if signed { IntPredicate::SGT } else { IntPredicate::UGT }}
+        Ge => {
+            if signed { IntPredicate::SGE } else { IntPredicate::UGE }},
         _ => unreachable!(),
     }
 }
@@ -4496,7 +4559,8 @@ struct PhysicalLayouts {
 fn physical_layouts(prog: &CoreProgram) -> PhysicalLayouts {
     let mut result = PhysicalLayouts { layouts: prog.layouts.clone(), empty_variants: HashMap::new() };
     for (logical, layout) in prog.layouts.iter().enumerate() {
-        let crate::gc::TypeKind::Enum { tag_offset, variants } = &layout.meta.kind else { continue };
+        let crate::gc::TypeKind::Enum { tag_offset, variants } = &layout.meta.kind else { continue ;
+        };
         if *tag_offset as usize != crate::gc::Full::ENUM_TAG_OFFSET
             || (layout.ptr_fields == 0 && layout.raw_bytes == 0)
             || !matches!(layout.varlen, VarLen::None)
@@ -4504,7 +4568,8 @@ fn physical_layouts(prog: &CoreProgram) -> PhysicalLayouts {
         { continue; }
         // Exhausting the physical u16 namespace simply retains the valid union
         // representation; nominal IDs and program semantics never change.
-        let Ok(physical) = u16::try_from(result.layouts.len()) else { break };
+        let Ok(physical) = u16::try_from(result.layouts.len()) else { break ;
+        };
         let mut compact = layout.clone();
         compact.ptr_fields = 0;
         compact.raw_bytes = 0;
@@ -4974,7 +5039,8 @@ pub fn codegen_aot_object_level(
     // known symbol.
     let entry_fn = module
         .get_function(&compiled.entry_name)
-        .ok_or_else(|| CodegenError(format!("entry `{}` not found in module", compiled.entry_name)))?;
+        .ok_or_else(|| {
+        CodegenError(format!("entry `{}` not found in module", compiled.entry_name))})?;
     entry_fn.as_global_value().set_name("gcrust_entry");
 
     let i16t = ctx.i16_type();
@@ -5049,7 +5115,7 @@ pub fn codegen_aot_object_level(
         false,
     );
     let runtime_main = module.add_function(
-        "gcr_runtime_main_v2",
+        "gcr_runtime_main_v3",
         runtime_main_ty,
         Some(inkwell::module::Linkage::External),
     );
