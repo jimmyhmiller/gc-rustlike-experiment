@@ -1,9 +1,10 @@
-//! Whole-program, flow-insensitive escape analysis for scalar arrays.
+//! Whole-program, flow-insensitive escape analysis for managed heap graphs.
 //!
-//! Allocation sites flow through local aliases, direct-call arguments and
-//! returns. Heap storage, closures, native/unknown calls and unsupported uses
-//! escape their reference operands. An unknown origin prevents specialization.
-//! This intentionally does not attempt heap-field or indirect-call analysis.
+//! Allocation sites flow through locals, direct-call arguments, returns and
+//! field-insensitive heap contents. Loads and stores are solved together until
+//! both reference origins and memory-flow edges stabilize. Escaping containers
+//! transitively escape their contents, including cyclic graphs. Closures,
+//! native/unknown calls and unsupported aggregates stay conservative.
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::core::{CoreBlock, CoreExpr, CoreExprKind, CoreProgram, CoreStmt, Repr};
@@ -19,14 +20,14 @@ struct Points {
 }
 
 #[derive(Default)]
-pub(crate) struct PrivateArrays {
+pub(crate) struct PrivateHeap {
     expressions: BTreeSet<usize>,
     lengths: HashMap<usize, u64>,
     integers: HashMap<usize, u64>,
     origins: HashMap<usize, BTreeSet<usize>>,
 }
 
-impl PrivateArrays {
+impl PrivateHeap {
     pub(crate) fn analyze(program: &CoreProgram) -> Self {
         Analysis::new(program).finish()
     }
@@ -66,6 +67,9 @@ struct Analysis<'p> {
     expressions: HashMap<usize, Node>,
     escaping: BTreeSet<Node>,
     allocation_lengths: Vec<Option<Node>>,
+    contents: Vec<Node>,
+    stores: Vec<(Node, Node)>,
+    loads: Vec<(Node, Node)>,
     breaks: Vec<Option<Node>>,
 }
 
@@ -80,6 +84,9 @@ impl<'p> Analysis<'p> {
             expressions: HashMap::new(),
             escaping: BTreeSet::new(),
             allocation_lengths: Vec::new(),
+            contents: Vec::new(),
+            stores: Vec::new(),
+            loads: Vec::new(),
             breaks: Vec::new(),
         };
         for function in &program.funcs {
@@ -188,14 +195,18 @@ impl<'p> Analysis<'p> {
             }
             ArrayNew { len, elem, .. } => {
                 let length = self.expression(id, len);
-                if let Some(result) = result {
-                    if matches!(elem, Repr::Scalar(_)) {
-                        self.points[result]
-                            .allocations
-                            .insert(self.allocation_lengths.len());
-                        self.allocation_lengths.push(length);
-                    } else {
-                        self.points[result].unknown = true;
+                if matches!(elem, Repr::Scalar(_) | Repr::Ref(_)) {
+                    self.allocate(result, length);
+                } else {
+                    self.unknown(result);
+                }
+            }
+            New { fields, .. } | MakeVariant { fields, .. } => {
+                self.allocate(result, None);
+                for field in fields {
+                    let value = self.expression(id, field);
+                    if matches!(field.repr, Repr::Ref(_)) {
+                        self.store(result, value);
                     }
                 }
             }
@@ -253,13 +264,24 @@ impl<'p> Analysis<'p> {
                 self.expression(id, array);
                 self.unknown(result);
             }
-            ArrayGet { array, index, .. }
-            | ArrayGetUnchecked { array, index, .. }
-            | ArrayGetChecked { array, index, .. } => {
-                self.expression(id, array);
+            ArrayGet { array, index, elem } => {
+                let owner = self.expression(id, array);
                 self.expression(id, index);
-                if let Some(result) = result {
-                    self.points[result].unknown = true;
+                // Option aggregates are deliberately outside this reference
+                // graph. Their contained references must not become invisible
+                // to a later capture, native call or heap publication.
+                if matches!(elem, Repr::Ref(_) | Repr::Value(_)) {
+                    self.escape(owner);
+                }
+                self.unknown(result);
+            }
+            ArrayGetUnchecked { array, index, .. } | ArrayGetChecked { array, index, .. } => {
+                let owner = self.expression(id, array);
+                self.expression(id, index);
+                if matches!(e.repr, Repr::Ref(_)) {
+                    self.load(owner, result);
+                } else {
+                    self.unknown(result);
                 }
             }
             ArraySet {
@@ -268,13 +290,39 @@ impl<'p> Analysis<'p> {
                 value,
                 ..
             } => {
-                self.expression(id, array);
+                let owner = self.expression(id, array);
                 self.expression(id, index);
-                let value = self.expression(id, value);
-                self.escape(value);
+                let reference = self.expression(id, value);
+                if matches!(value.repr, Repr::Ref(_)) {
+                    self.store(owner, reference);
+                }
                 if let Some(result) = result {
                     self.points[result].integers.insert(0);
                 }
+            }
+            Field { base, loc } => {
+                let owner = self.expression(id, base);
+                match loc {
+                    crate::core::FieldLoc::Ptr { .. } => self.load(owner, result),
+                    crate::core::FieldLoc::Raw { .. } => self.unknown(result),
+                    _ => {
+                        self.escape(owner);
+                        self.unknown(result);
+                    }
+                }
+            }
+            SetField { base, value, loc } => {
+                let owner = self.expression(id, base);
+                let reference = self.expression(id, value);
+                match loc {
+                    crate::core::FieldLoc::Ptr { .. } => self.store(owner, reference),
+                    crate::core::FieldLoc::Raw { .. } => {}
+                    _ => {
+                        self.escape(owner);
+                        self.escape(reference);
+                    }
+                }
+                self.unknown(result);
             }
             Bin(_, a, b) => {
                 self.expression(id, a);
@@ -287,11 +335,17 @@ impl<'p> Analysis<'p> {
                 self.unknown(result);
             }
             Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
-                let value = self.expression(id, scrutinee);
-                self.escape(value);
+                let owner = self.expression(id, scrutinee);
                 for arm in arms {
                     for &local in &arm.binds {
-                        self.points[self.locals[id][local as usize]].unknown = true;
+                        let destination = self.locals[id][local as usize];
+                        if matches!(scrutinee.repr, Repr::Ref(_))
+                            && matches!(self.program.funcs[id].locals[local as usize], Repr::Ref(_))
+                        {
+                            self.load(owner, Some(destination));
+                        } else {
+                            self.points[destination].unknown = true;
+                        }
                     }
                     let value = self.expression(id, &arm.body);
                     self.flow(value, result);
@@ -337,18 +391,21 @@ impl<'p> Analysis<'p> {
             ChanRecv { buf, ctrl, .. } => {
                 self.unknown_use(id, result, [buf.as_ref(), ctrl.as_ref()])
             }
-            Field { base, .. } => self.unknown_use(id, result, [base.as_ref()]),
-            SetField { base, value, .. } => {
-                self.unknown_use(id, result, [base.as_ref(), value.as_ref()])
+            EnumPayload { scrutinee, .. } => {
+                let owner = self.expression(id, scrutinee);
+                if matches!(e.repr, Repr::Ref(_)) {
+                    self.load(owner, result);
+                } else {
+                    self.escape(owner);
+                    self.unknown(result);
+                }
             }
-            EnumPayload { scrutinee, .. } => self.unknown_use(id, result, [scrutinee.as_ref()]),
             HostCall { args, .. } | RuntimeCall { args, .. } | StrJoin { args, .. } => {
                 self.unknown_use(id, result, args.iter())
             }
-            New { fields, .. }
-            | MakeValue { fields, .. }
-            | MakeVariant { fields, .. }
-            | MakeValueVariant { fields, .. } => self.unknown_use(id, result, fields.iter()),
+            MakeValue { fields, .. } | MakeValueVariant { fields, .. } => {
+                self.unknown_use(id, result, fields.iter())
+            }
             CallClosure { callee, args } => self.unknown_use(
                 id,
                 result,
@@ -358,6 +415,41 @@ impl<'p> Analysis<'p> {
         result
     }
 
+    fn allocate(&mut self, result: Option<Node>, length: Option<Node>) {
+        if let Some(result) = result {
+            let allocation = self.contents.len();
+            let contents = self.node();
+            self.contents.push(contents);
+            self.allocation_lengths.push(length);
+            self.points[result].allocations.insert(allocation);
+        }
+    }
+    fn store(&mut self, owner: Option<Node>, value: Option<Node>) {
+        if let Some(value) = value {
+            if let Some(owner) = owner {
+                self.stores.push((owner, value));
+            } else {
+                self.escape(Some(value));
+            }
+        }
+    }
+    fn load(&mut self, owner: Option<Node>, result: Option<Node>) {
+        if let Some(result) = result {
+            if let Some(owner) = owner {
+                self.loads.push((owner, result));
+            } else {
+                self.unknown(Some(result));
+            }
+        }
+    }
+    fn link(&mut self, source: Node, destination: Node) -> bool {
+        if self.edges[source].contains(&destination) {
+            false
+        } else {
+            self.edges[source].push(destination);
+            true
+        }
+    }
     fn unknown(&mut self, result: Option<Node>) {
         if let Some(result) = result {
             self.points[result].unknown = true;
@@ -377,44 +469,84 @@ impl<'p> Analysis<'p> {
         self.unknown(result);
     }
 
-    fn finish(mut self) -> PrivateArrays {
+    fn finish(mut self) -> PrivateHeap {
         for (id, function) in self.program.funcs.iter().enumerate() {
             if !function.is_extern {
                 let value = self.block(id, &function.body);
                 self.flow(value, Some(self.returns[id]));
             }
         }
-        let mut queued = vec![true; self.points.len()];
-        let mut queue: VecDeque<_> = (0..self.points.len()).collect();
-        while let Some(source) = queue.pop_front() {
-            queued[source] = false;
-            for &destination in &self.edges[source] {
-                let mut changed = false;
-                if self.points[source].unknown && !self.points[destination].unknown {
-                    self.points[destination].unknown = true;
+        loop {
+            let mut queued = vec![true; self.points.len()];
+            let mut queue: VecDeque<_> = (0..self.points.len()).collect();
+            while let Some(source) = queue.pop_front() {
+                queued[source] = false;
+                for &destination in &self.edges[source] {
+                    let mut changed = false;
+                    if self.points[source].unknown && !self.points[destination].unknown {
+                        self.points[destination].unknown = true;
+                        changed = true;
+                    }
+                    if self.points[source].nullable && !self.points[destination].nullable {
+                        self.points[destination].nullable = true;
+                        changed = true;
+                    }
+                    let integers: Vec<_> = self.points[source].integers.iter().copied().collect();
+                    for integer in integers {
+                        changed |= self.points[destination].integers.insert(integer);
+                    }
+                    let values: Vec<_> = self.points[source].allocations.iter().copied().collect();
+                    for allocation in values {
+                        changed |= self.points[destination].allocations.insert(allocation);
+                    }
+                    if changed && !queued[destination] {
+                        queued[destination] = true;
+                        queue.push_back(destination);
+                    }
+                }
+            }
+            // Refine memory-flow edges as owner origins become known. Reads
+            // and writes are flow-insensitive, including cycles and stores
+            // occurring after reads in source order.
+            let mut changed = false;
+            for (owner, value) in self.stores.clone() {
+                if self.points[owner].unknown {
+                    self.escape(Some(value));
+                }
+                let allocations: Vec<_> = self.points[owner].allocations.iter().copied().collect();
+                for allocation in allocations {
+                    changed |= self.link(value, self.contents[allocation]);
+                }
+            }
+            for (owner, result) in self.loads.clone() {
+                if self.points[owner].unknown && !self.points[result].unknown {
+                    self.points[result].unknown = true;
                     changed = true;
                 }
-                if self.points[source].nullable && !self.points[destination].nullable {
-                    self.points[destination].nullable = true;
-                    changed = true;
+                let allocations: Vec<_> = self.points[owner].allocations.iter().copied().collect();
+                for allocation in allocations {
+                    changed |= self.link(self.contents[allocation], result);
                 }
-                let integers: Vec<_> = self.points[source].integers.iter().copied().collect();
-                for integer in integers {
-                    changed |= self.points[destination].integers.insert(integer);
-                }
-                let values: Vec<_> = self.points[source].allocations.iter().copied().collect();
-                for allocation in values {
-                    changed |= self.points[destination].allocations.insert(allocation);
-                }
-                if changed && !queued[destination] {
-                    queued[destination] = true;
-                    queue.push_back(destination);
-                }
+            }
+            if !changed {
+                break;
             }
         }
         let mut escaped = BTreeSet::new();
+        let mut queue = VecDeque::new();
         for &node in &self.escaping {
-            escaped.extend(self.points[node].allocations.iter().copied());
+            for &allocation in &self.points[node].allocations {
+                if escaped.insert(allocation) {
+                    queue.push_back(allocation);
+                }
+            }
+        }
+        while let Some(allocation) = queue.pop_front() {
+            for &child in &self.points[self.contents[allocation]].allocations {
+                if escaped.insert(child) {
+                    queue.push_back(child);
+                }
+            }
         }
         let known_integer = |node: Node| {
             let points = &self.points[node];
@@ -475,7 +607,7 @@ impl<'p> Analysis<'p> {
                 .then_some(expression)
             })
             .collect();
-        PrivateArrays {
+        PrivateHeap {
             expressions,
             lengths,
             integers,
@@ -527,16 +659,124 @@ mod tests {
     }
 
     #[test]
-    fn captured_and_heap_stored_arrays_keep_shared_accesses() {
+    fn captured_arrays_and_captured_containers_keep_shared_accesses() {
         for source in [
             "fn use_array(mut a: Array<i64>) -> i64 { array_set(a,0,4); a[0] } fn main() -> i64 { let mut a: Array<i64> = array_new(2); let closure = || use_array(a); closure() }",
-            "struct Holder { a: Array<i64> } fn use_array(mut a: Array<i64>) -> i64 { array_set(a,0,4); a[0] } fn main() -> i64 { let mut a: Array<i64> = array_new(2); let mut h = Holder { a: a }; use_array(h.a) }",
+            "struct Holder { a: Array<i64> } fn use_array(mut a: Array<i64>) -> i64 { array_set(a,0,4); a[0] } fn main() -> i64 { let mut a: Array<i64> = array_new(2); let mut h = Holder { a: a }; let closure = || use_array(h.a); closure() }",
         ] {
             let ir = function_ir(source, "use_array");
             assert!(ir.contains("store atomic i64"), "{ir}");
             assert!(ir.contains("load atomic i64"), "{ir}");
             assert_eq!(crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(), 4);
         }
+    }
+
+    #[test]
+    fn private_reference_arrays_and_fields_keep_mutation_and_aliasing_correct() {
+        let source = "
+            struct Item { x: i64 }
+            struct Holder { items: Array<Item> }
+            fn update(h: Holder) -> i64 {
+                let mut items = h.items;
+                let mut first = items[0];
+                let mut second = items[1];
+                first.x = first.x+3;
+                second.x = second.x+5;
+                first.x+second.x+array_len(items)
+            }
+            fn main() -> i64 {
+                let mut items: Array<Item> = array_new(2);
+                let item = Item { x: 7 };
+                array_set(items,0,item); array_set(items,1,item);
+                let h = Holder { items: items };
+                update(h)
+            }
+        ";
+        let ir = function_ir(source, "update");
+        assert!(
+            !ir.contains("load atomic") && !ir.contains("store atomic"),
+            "{ir}"
+        );
+        assert_eq!(
+            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            32
+        );
+    }
+
+    #[test]
+    fn cyclic_containers_escape_their_children_and_late_stores_reach_earlier_reads() {
+        let source = "
+            struct Link { next: Link, values: Array<i64> }
+            fn use_array(mut a: Array<i64>) -> i64 { array_set(a,0,a[0]+1); a[0] }
+            fn main() -> i64 {
+                let mut a: Array<i64> = array_new(1);
+                let mut b: Array<i64> = array_new(1);
+                let mut link: Link;
+                link = Link { next: link, values: a };
+                link.next = link;
+                let earlier = link.values;
+                link.values = b;
+                let closure = || use_array(link.next.values);
+                closure()+use_array(earlier)
+            }
+        ";
+        let ir = function_ir(source, "use_array");
+        assert!(
+            ir.contains("load atomic i64") && ir.contains("store atomic i64"),
+            "{ir}"
+        );
+        assert_eq!(
+            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn opaque_option_payloads_and_unknown_container_stores_escape_references() {
+        let source = "
+            struct Item { x: i64 }
+            fn touch(mut item: Item) -> i64 { item.x = item.x+1; item.x }
+            fn main() -> i64 {
+                let mut items: Array<Item> = array_new(1);
+                array_set(items,0,Item { x: 7 });
+                let option = array_get(items,0);
+                let closure = || match option { Option::Some(item) => touch(item), Option::None => 0 };
+                closure()
+            }
+        ";
+        let ir = function_ir(source, "touch");
+        assert!(
+            ir.contains("load atomic i64") && ir.contains("store atomic i64"),
+            "{ir}"
+        );
+        assert_eq!(
+            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            8
+        );
+        let source = "
+            struct Holder { values: Array<i64> }
+            fn publish(mut a: Array<i64>) -> i64 { array_set(a,0,5); a[0] }
+            fn main() -> i64 {
+                let mut old: Array<i64> = array_new(1);
+                let mut h = Holder { values: old };
+                let closure = || {
+                    let mut fresh: Array<i64> = array_new(1);
+                    let mut target = h;
+                    target.values = fresh;
+                    publish(fresh)
+                };
+                closure()
+            }
+        ";
+        let ir = function_ir(source, "publish");
+        assert!(
+            ir.contains("load atomic i64") && ir.contains("store atomic i64"),
+            "{ir}"
+        );
+        assert_eq!(
+            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            5
+        );
     }
 
     #[test]

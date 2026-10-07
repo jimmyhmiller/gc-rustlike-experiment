@@ -1,0 +1,20 @@
+{
+  "workspace": {
+    "passed": 559,
+    "failed": 0,
+    "ignored": 8
+  },
+  "thread_sanitizer": {
+    "native_executions": 26,
+    "runtime_tests": 7,
+    "passed": true
+  },
+  "release_build": true,
+  "private_graph_regression": "tests/private_heap.rs: all 12 JIT/native/debug \u00d7 normal/stress \u00d7 one/four-worker configurations",
+  "comparison": "private-graph-results.json",
+  "parity_reached": false,
+  "remaining": [
+    "fannkuchredux",
+    "binarytrees"
+  ]
+}

@@ -57,7 +57,7 @@ fn mixed_sc_and_racing_snapshots_survive_gc_in_jit_and_aot() {
 }
 
 #[test]
-fn generated_shared_accesses_remain_atomic_and_snapshot_regions_cannot_collect() {
+fn generated_accesses_are_atomic_or_proven_private_and_snapshots_cannot_collect() {
     use gcrust::compile::parse_with_prelude;
     use gcrust::lower::lower_program;
     use gcrust::resolve::resolve_module;
@@ -74,10 +74,22 @@ fn generated_shared_accesses_remain_atomic_and_snapshot_regions_cannot_collect()
             if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot")
             {
                 assert!(
-                    line.contains("load atomic"),
-                    "non-atomic mutable field: {line}"
+                    line.contains("load atomic") || line.contains("!alias.scope"),
+                    "mutable field has neither SC ordering nor private provenance: {line}"
                 );
             }
+        }
+    }
+    // Full debug permits edited references and disables the closed-world
+    // privacy proof, so every scalar/reference field must stay atomic.
+    let context = inkwell::context::Context::create();
+    let compiled = gcrust::codegen::codegen_with_debug(
+        &context, &program, gcrust::codegen::DebugLevel::Full,
+    ).unwrap();
+    let ir = compiled.module.print_to_string().to_string();
+    for line in ir.lines() {
+        if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot") {
+            assert!(line.contains("load atomic"), "non-atomic full-debug field: {line}");
         }
     }
 }

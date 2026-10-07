@@ -4,7 +4,7 @@
 //! (including recursion) cannot starve a pending collection. Other loops retain
 //! their header polls. Unknown calls, allocation and continue paths are rejected.
 use crate::ast::{BinOp, UnOp};
-use crate::codegen_escape::PrivateArrays;
+use crate::codegen_escape::PrivateHeap;
 use crate::core::{CoreBlock, CoreExpr, CoreExprKind, CoreProgram, CoreStmt, Repr};
 use std::collections::{BTreeSet, HashMap};
 
@@ -37,7 +37,7 @@ pub(crate) struct BoundedLoops {
     functions: BTreeSet<usize>,
 }
 impl BoundedLoops {
-    pub(crate) fn analyze(program: &CoreProgram, constants: &PrivateArrays) -> Self {
+    pub(crate) fn analyze(program: &CoreProgram, constants: &PrivateHeap) -> Self {
         let mut analysis = Analysis {
             constants,
             result: Self::default(),
@@ -62,7 +62,7 @@ impl BoundedLoops {
 }
 
 struct Analysis<'a> {
-    constants: &'a PrivateArrays,
+    constants: &'a PrivateHeap,
     result: BoundedLoops,
     function: usize,
 }
@@ -306,6 +306,11 @@ impl Analysis<'_> {
                     .collect::<Vec<_>>();
                 (None, total(costs))
             }
+            Field { loc, .. } | SetField { loc, .. }
+                if matches!(loc, crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. }) => {
+                let costs = children(e).into_iter().map(|e| self.expression(e, env).1).collect::<Vec<_>>();
+                (None, total(costs))
+            }
             ArraySet { elem, .. } if !matches!(elem, Repr::Value(_)) => {
                 let costs = children(e)
                     .into_iter()
@@ -444,7 +449,7 @@ mod tests {
         let program =
             crate::lower::lower_program(&crate::resolve::resolve_module(module).unwrap().globals)
                 .unwrap();
-        let constants = PrivateArrays::analyze(&program);
+        let constants = PrivateHeap::analyze(&program);
         let loops = BoundedLoops::analyze(&program, &constants);
         (program, loops)
     }

@@ -236,6 +236,39 @@ mod tests {
     }
 
     #[test]
+    fn bounded_object_accesses_need_only_entry_roots_but_snapshots_keep_polls() {
+        let source = "
+            struct Item { x: i64 }
+            #[value] struct Pair { x: i64 }
+            struct Holder { pair: Pair }
+            fn bounded(a: Array<Item>) -> i64 {
+                let mut i = 0;
+                while i < 3 { let mut item = a[i]; item.x = item.x+1; i = i+1; }
+                a[0].x
+            }
+            fn snapshot(h: Holder) -> i64 {
+                let mut i = 0; let mut sum = 0;
+                while i < 3 { sum = sum+h.pair.x; i = i+1; }
+                sum
+            }
+            fn main() -> i64 {
+                let mut items: Array<Item> = array_new(3);
+                let item = Item { x: 1 };
+                array_set(items,0,item); array_set(items,1,item); array_set(items,2,item);
+                bounded(items)+snapshot(Holder { pair: Pair { x: 3 } })
+            }
+        ";
+        let (program, safe) = analyze(source);
+        let private = crate::codegen_escape::PrivateHeap::analyze(&program);
+        let loops = crate::codegen_loops::BoundedLoops::analyze(&program, &private);
+        for (name, expected) in [("bounded", true), ("snapshot", false)] {
+            let f = program.funcs.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(body_nonrelocating(&f.body, &safe, &loops), expected, "{name}");
+        }
+        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 13);
+    }
+
+    #[test]
     fn deferred_frames_protect_recursive_children_and_retained_caller_roots() {
         use inkwell::values::AnyValue;
         let source = "
@@ -325,6 +358,15 @@ pub(crate) fn body_nonrelocating(
             | ArrayGetUnchecked { array, index, .. }
             | ArrayGetChecked { array, index, .. } => {
                 expression_safe(array, callees, loops) && expression_safe(index, callees, loops)
+            }
+            Field { base, loc } => {
+                !matches!(loc, crate::core::FieldLoc::ValueAt { .. })
+                    && expression_safe(base, callees, loops)
+            }
+            SetField { base, value, loc } => {
+                matches!(loc, crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. })
+                    && expression_safe(base, callees, loops)
+                    && expression_safe(value, callees, loops)
             }
             ArraySet {
                 array,

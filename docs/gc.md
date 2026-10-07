@@ -269,16 +269,22 @@ concurrent marks of different cards in a word compose with fetch_or. Collection
 still uses initialized-range metadata to avoid interpreting unused TLAB tails as
 objects. Neither optimization changes which references are traced.
 
-## Private arrays and bounded safepoints
+## Private heap graphs and bounded safepoints
 
-The compiler performs a conservative whole-program inclusion analysis of scalar
-array allocation origins. Origins flow through local aliases, assignments, direct
-call parameters, returns, branches and loop exits. Heap storage, captures,
-foreign buffers and unknown uses escape their reference operands. Address-taken
-parameters, closure captures and incoming execution arguments have unknown
-origins. Unsupported operations prevent specialization. A scalar-array access
-uses ordinary memory operations only if every possible allocation origin is
-known and unescaped. All other managed accesses retain their SC behavior.
+The compiler performs a conservative whole-program inclusion analysis of managed
+allocation origins. Origins flow through local aliases, assignments, direct
+call parameters, returns, branches and loop exits. Reference arrays and object
+fields also propagate their contained references. Memory-flow edges and origin
+sets are solved together to a fixed point, including cyclic graphs and stores
+that follow loads in source order. Escaping containers transitively escape their
+contents. Captures, foreign buffers, unknown owners and unsupported aggregates
+remain conservative; opaque option payloads cannot hide private references.
+Address-taken parameters, closure captures and incoming execution arguments have
+unknown origins. Scalar/reference array slots and scalar/reference object fields
+use ordinary memory operations only when every possible owner allocation is
+known and unescaped. Other managed accesses retain their SC behavior. Pointer
+stores retain their generational write barriers, including private old-to-young
+edges. Mutable aggregate field snapshots still use the managed lock protocol.
 
 Disjoint proven origin sets receive access-scoped LLVM alias metadata. Overlapping
 sets remain potentially aliased; this is not a noalias claim on Thread pointers

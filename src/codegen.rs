@@ -115,11 +115,11 @@ pub fn codegen_with_debug<'ctx>(
     } else {
         None
     };
-    let private_arrays = if level.is_full() { Default::default() } else { crate::codegen_escape::PrivateArrays::analyze(prog) };
-    let bounded_loops = if level.is_full() { Default::default() } else { crate::codegen_loops::BoundedLoops::analyze(prog, &private_arrays) };
-    let domain = ctx.metadata_node(&[ctx.metadata_string("gcr.private.scalar.arrays").into()]);
-    let array_scopes = private_arrays.origin_sets().into_iter().map(|origins| {
-        let name = format!("gcr.array.origins.{origins:?}");
+    let private_heap = if level.is_full() { Default::default() } else { crate::codegen_escape::PrivateHeap::analyze(prog) };
+    let bounded_loops = if level.is_full() { Default::default() } else { crate::codegen_loops::BoundedLoops::analyze(prog, &private_heap) };
+    let domain = ctx.metadata_node(&[ctx.metadata_string("gcr.private.heap").into()]);
+    let heap_scopes = private_heap.origin_sets().into_iter().map(|origins| {
+        let name = format!("gcr.heap.origins.{origins:?}");
         let scope = ctx.metadata_node(&[ctx.metadata_string(&name).into(), domain.into()]);
         (origins, scope)
     }).collect();
@@ -133,9 +133,9 @@ pub fn codegen_with_debug<'ctx>(
         funcs: HashMap::new(),
         outlined_helpers: outlined.helpers,
         nonrelocating,
-        private_arrays,
+        private_heap,
         bounded_loops,
-        array_scopes,
+        heap_scopes,
         closed_world: !level.is_full(),
         physical_layouts: physical_layouts(prog),
         root_liveness,
@@ -549,9 +549,9 @@ struct Codegen<'ctx, 'p> {
     closed_world: bool,
     physical_layouts: PhysicalLayouts,
     root_liveness: crate::codegen_liveness::RootLiveness,
-    private_arrays: crate::codegen_escape::PrivateArrays,
+    private_heap: crate::codegen_escape::PrivateHeap,
     bounded_loops: crate::codegen_loops::BoundedLoops,
-    array_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
+    heap_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
     /// Cache of synthesized FFI callback trampolines, keyed by the gc-rust
     /// FuncId they wrap (one trampoline per referenced function).
     trampolines: HashMap<FuncId, FunctionValue<'ctx>>,
@@ -709,11 +709,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     /// Load one mutable managed slot in the language's SC order. Bool has
     /// byte storage even though its SSA representation is i1.
-    fn managed_load(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        self.managed_load_mode(addr, repr, name, None)
-    }
-
-    fn managed_load_mode(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, array: Option<&CoreExpr>) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    fn managed_load(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let storage = if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.ctx.i8_type().as_basic_type_enum()
         } else { self.llvm_ty(repr).ok_or_else(|| CodegenError("invalid managed scalar load".into()))? };
@@ -725,19 +721,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let value = self.builder.build_load(storage, addr, name).unwrap();
         let instruction = value.as_instruction_value().unwrap();
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
-        let private = array.is_some_and(|array| self.private_arrays.contains(array));
-        if let Some(array) = array { self.set_array_alias_metadata(instruction, array)?; }
+        let private = self.private_heap.contains(owner);
+        self.set_heap_alias_metadata(instruction, owner)?;
         if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.builder.build_int_truncate(value.into_int_value(), self.ctx.bool_type(), "managed.bool").unwrap().into()
         } else { value })
     }
 
-    fn managed_store(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr) -> Result<(), CodegenError> {
-        self.managed_store_mode(addr, value, repr, None)
-    }
-
-    fn managed_store_mode(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, array: Option<&CoreExpr>) -> Result<(), CodegenError> {
+    fn managed_store(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, owner: &CoreExpr) -> Result<(), CodegenError> {
         let (stored, alignment) = match repr {
             Repr::Scalar(ScalarRepr::Bool) => (
                 self.builder.build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "managed.bool.byte").unwrap().into(), 1,
@@ -748,8 +740,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         };
         let instruction = self.builder.build_store(addr, stored).unwrap();
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
-        let private = array.is_some_and(|array| self.private_arrays.contains(array));
-        if let Some(array) = array { self.set_array_alias_metadata(instruction, array)?; }
+        let private = self.private_heap.contains(owner);
+        self.set_heap_alias_metadata(instruction, owner)?;
         if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(())
     }
@@ -757,12 +749,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Access-scoped provenance: only disjoint allocation-origin sets receive
     /// noalias metadata. Runtime calls, roots and incoming/escaped references
     /// carry no such claim, so collectors may still access and move objects.
-    fn set_array_alias_metadata(&self, instruction: inkwell::values::InstructionValue<'ctx>, array: &CoreExpr) -> Result<(), CodegenError> {
-        let Some(origins) = self.private_arrays.origins(array) else { return Ok(()); };
-        let own = self.array_scopes[origins];
+    fn set_heap_alias_metadata(&self, instruction: inkwell::values::InstructionValue<'ctx>, owner: &CoreExpr) -> Result<(), CodegenError> {
+        let Some(origins) = self.private_heap.origins(owner) else { return Ok(()); };
+        let own = self.heap_scopes[origins];
         instruction.set_metadata(self.ctx.metadata_node(&[own.into()]), self.ctx.get_kind_id("alias.scope"))
             .map_err(|error| CodegenError(error.to_string()))?;
-        let disjoint: Vec<_> = self.array_scopes.iter().filter(|(other,_)| origins.is_disjoint(other))
+        let disjoint: Vec<_> = self.heap_scopes.iter().filter(|(other,_)| origins.is_disjoint(other))
             .map(|(_,scope)| (*scope).into()).collect();
         if !disjoint.is_empty() {
             instruction.set_metadata(self.ctx.metadata_node(&disjoint), self.ctx.get_kind_id("noalias"))
@@ -1679,7 +1671,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::Local(id) => {
                 if let Repr::Scalar(scalar) = e.repr {
                     if scalar.is_int() {
-                        if let Some(value) = self.private_arrays.integer(e) {
+                        if let Some(value) = self.private_heap.integer(e) {
                             return Ok(Some(self.scalar_ty(scalar).into_int_type().const_int(value, false).into()));
                         }
                     }
@@ -2162,7 +2154,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 };
                 let addr = self.obj_addr(obj, off);
                 if aggregate { self.builder.build_store(addr, v).unwrap(); }
-                else { self.managed_store(addr, v, &value.repr)?; }
+                else { self.managed_store(addr, v, &value.repr, base)?; }
                 // Generational write barrier. A direct pointer store (FieldLoc::Ptr)
                 // may create an old→young edge. So may a flattened value-with-
                 // references store (FieldLoc::ValueAt): each reference embedded in
@@ -3148,7 +3140,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     fn known_array_len(&self, obj: PointerValue<'ctx>, array: &CoreExpr) -> Result<IntValue<'ctx>, CodegenError> {
-        if let Some(length) = self.private_arrays.length(array) {
+        if let Some(length) = self.private_heap.length(array) {
             Ok(self.ctx.i64_type().const_int(length, false))
         } else { self.array_logical_len(obj, &array.repr) }
     }
@@ -3247,7 +3239,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let i64t = self.ctx.i64_type();
         let obj = self.gen_expr(fcx, arr)?.unwrap().into_pointer_value();
-        if let Some(length) = self.private_arrays.length(arr) {
+        if let Some(length) = self.private_heap.length(arr) {
             return Ok(Some(i64t.const_int(length, false).into()));
         }
         // Count word at HEADER. For Bytes arrays it's byte-length; divide by the
@@ -3272,7 +3264,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let addr = self.array_elem_addr(obj, idx, stride);
         let ty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
         if matches!(elem, Repr::Value(_) | Repr::Ref(_)) {
-            let pointer = self.managed_load(addr, &Repr::Scalar(ScalarRepr::Ptr), "element.pointer")?.into_pointer_value();
+            let pointer = self.managed_load(addr, &Repr::Scalar(ScalarRepr::Ptr), "element.pointer", array)?.into_pointer_value();
             let empty = self.ctx.append_basic_block(fcx.func, "element.uninitialized");
             let present = self.ctx.append_basic_block(fcx.func, "element.present");
             let is_null = self.builder.build_is_null(pointer, "element.unset").unwrap();
@@ -3285,7 +3277,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             if matches!(elem, Repr::Value(_)) {
                 Ok(self.builder.build_load(ty, self.obj_addr(pointer, Self::HEADER), "element.value").unwrap())
             } else { Ok(pointer.into()) }
-        } else { self.managed_load_mode(addr, elem, "element", Some(array)) }
+        } else { self.managed_load(addr, elem, "element", array) }
     }
 
     /// `array_get(a, i)` yields `Option<T>`: `Some(a[i])` when in bounds, `None`
@@ -3405,7 +3397,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let stored_repr = if matches!(elem, Repr::Value(_)) {
             Repr::Scalar(ScalarRepr::Ptr)
         } else { elem.clone() };
-        self.managed_store_mode(addr, val, &stored_repr, Some(array))?;
+        self.managed_store(addr, val, &stored_repr, array)?;
         // Generational write barrier: a long-lived (tenured) array may receive a
         // young pointer element. `emit_write_barrier` no-ops for scalar elements.
         self.emit_write_barrier(fcx, obj, val);
@@ -3584,7 +3576,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 FieldLoc::Ptr { .. } => Repr::Scalar(ScalarRepr::Ptr),
                 _ => unreachable!(),
             };
-            self.managed_load(addr, &repr, "fld")?
+            self.managed_load(addr, &repr, "fld", base)?
         };
         Ok(Some(v))
     }
