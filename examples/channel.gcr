@@ -4,12 +4,10 @@
 // while full, recv blocks while empty (no busy-spin). See docs/threads.md.
 
 fn produce(ch: Channel<Vec<i64>>, base: i64, n: i64) -> i64 {
-    let mut i = 0;
-    while i < n {
+    for i in 0..n {
         let mut v: Vec<i64> = Vec::new();
         v.push(base + i);
         let _s = ch.send(v);
-        i += 1;
     }
     0
 }
@@ -22,11 +20,9 @@ fn main() -> i64 {
     let t2 = Thread::spawn(|| produce(ch, 1000, 100));
 
     let mut total = 0;
-    let mut got = 0;
-    while got < 200 {
+    for got in 0..200 {
         let item = ch.recv_value();
         total += item[0];
-        got += 1;
     }
     let _a = t1.join();
     let _b = t2.join();

@@ -34,8 +34,7 @@ fn main() -> i64 {
   let score = 7;
   let px = 380.0;
 
-  let mut frame = 0;
-  while frame < 80 {
+  for frame in 0..80 {
     spawn_timer += 1;
     if spawn_timer >= 8 {
       spawn_timer = 0;
@@ -71,7 +70,6 @@ fn main() -> i64 {
     DrawText(as_c_bytes("gc-rust + raylib FFI (no shim)"), 12, 44, 20, rgb(150, 150, 160));
     EndDrawing();
 
-    frame += 1;
   }
 
   TakeScreenshot(as_c_bytes("dodge_shot.png"));

@@ -6,10 +6,8 @@
 // contention. See docs/threads.md.
 
 fn bump(a: Atom<i64>, iters: i64) -> i64 {
-    let mut i = 0;
-    while i < iters {
+    for i in 0..iters {
         let _n = a.swap(|x| x + 1);
-        i += 1;
     }
     0
 }

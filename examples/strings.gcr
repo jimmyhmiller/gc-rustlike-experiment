@@ -19,10 +19,8 @@ fn main() -> i64 {
     // Build a longer string in a loop; each concat allocates, the running
     // accumulator stays rooted and survives every collection.
     let mut acc = "";
-    let mut i = 0;
-    while i < 5 {
+    for i in 0..5 {
         acc = acc + "ab";
-        i += 1;
     }
     println(acc);                        // "ababababab"
 

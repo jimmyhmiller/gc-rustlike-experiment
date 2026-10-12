@@ -20,11 +20,9 @@ struct Holder { s: Slot }
 // `Holder` survives and is promoted to tenured).
 fn churn(n: i64) -> i64 {
     let mut acc = 0;
-    let mut i = 0;
-    while i < n {
+    for i in 0..n {
         let b = Box { val: i };
         acc += b.val;
-        i += 1;
     }
     acc
 }

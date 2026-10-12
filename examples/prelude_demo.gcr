@@ -13,23 +13,21 @@ fn gcd(a: i64, b: i64) -> i64 {
 }
 
 fn safe_div(a: i64, b: i64) -> Result<i64, i64> {
-    if b == 0 { Err(0 - 1) } else { Ok(a / b) }
+    if b == 0 { Err(-1) } else { Ok(a / b) }
 }
 
 fn first_even(n: i64) -> Option<i64> {
-    let mut i = 0;
-    while i < n {
+    for i in 0..n {
         if i % 2 == 0 {
             return Some(i);
         }
-        i += 1;
     }
     None
 }
 
 fn main() -> i64 {
     let q = safe_div(84, 2).unwrap_or(0);      // 42
-    let e = first_even(5).unwrap_or(0 - 1);        // 0
+    let e = first_even(5).unwrap_or(-1);        // 0
     let m = q.max(10);                              // 42
     let p = 2.pow(5);                               // 32
     let g = gcd(48, 36);                                 // 12

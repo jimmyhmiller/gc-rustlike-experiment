@@ -1,37 +1,26 @@
-struct IntVec { data: Array<i64>, len: i64, cap: i64 }
+// A growable vector written in user code: an `impl` with `mut self` methods
+// that update the struct in place (the prelude's `Vec<T>` works the same way).
+struct IntVec { data: Array<i64>, len: i64 }
 
-fn ivec_new() -> IntVec {
-    IntVec { data: Array::new(4), len: 0, cap: 4 }
-}
+impl IntVec {
+    fn new() -> IntVec { IntVec { data: Array::new(4), len: 0 } }
 
-fn ivec_get(v: IntVec, i: i64) -> i64 {
-    v.data[i]
-}
+    fn get(self, i: i64) -> i64 { self.data[i] }
 
-fn ivec_push(mut v: IntVec, x: i64) -> IntVec {
-    if v.len < v.cap {
-        v.data[v.len] = x;
-        IntVec { data: v.data, len: v.len + 1, cap: v.cap }
-    } else {
-        let new_cap = v.cap * 2;
-        let mut new_data: Array<i64> = Array::new(new_cap);
-        let mut i = 0;
-        while i < v.len {
-            new_data[i] = v.data[i];
-            i += 1;
+    fn push(mut self, x: i64) {
+        if self.len == self.data.len() {
+            let mut grown: Array<i64> = Array::new(self.data.len() * 2);
+            for i in 0..self.len { grown[i] = self.data[i]; }
+            self.data = grown;
         }
-        new_data[v.len] = x;
-        IntVec { data: new_data, len: v.len + 1, cap: new_cap }
+        self.data[self.len] = x;
+        self.len += 1;
     }
 }
 
 fn main() -> i64 {
-    let mut v = ivec_new();
-    let mut i = 0;
-    while i < 20 {
-        v = ivec_push(v, i * i);
-        i += 1;
-    }
+    let mut v = IntVec::new();
+    for i in 0..20 { v.push(i * i); }
     print_int(v.len);
-    ivec_get(v, 5) + ivec_get(v, 19)
+    v.get(5) + v.get(19)
 }

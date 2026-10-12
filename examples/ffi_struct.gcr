@@ -20,7 +20,7 @@ fn main() -> i64 {
     let mut tv = TimeVal { tv_sec: 0, tv_usec: 0 };
     let rc = gettimeofday(tv, 0);
     if rc != 0 {
-        return 0 - 1;
+        return -1;
     }
     // The current Unix time in seconds is well past 1_700_000_000 (Nov 2023),
     // so this proves C actually wrote our struct. Return 1 on success.

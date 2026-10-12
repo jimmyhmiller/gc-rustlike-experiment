@@ -21,11 +21,9 @@ fn main() -> i64 {
     // HashMap: word -> length.
     let mut lengths: HashMap<String, i64> = HashMap::new();
     let words = "the quick brown fox".split(" ");   // split on space
-    let mut i = 0;
-    while i < words.len() {
+    for i in 0..words.len() {
         let w = words[i];
         lengths.insert(w, w.len());
-        i += 1;
     }
     println!("len(quick) = {}", lengths.get("quick").unwrap_or(0));
 

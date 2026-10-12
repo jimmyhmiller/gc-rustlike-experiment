@@ -4,12 +4,10 @@ struct Sentinel { sequence: i64, text: String }
 extern "C" fn qsort(mut base: RawPtr, n: i64, size: i64, compar: extern fn(RawPtr, RawPtr) -> i32);
 
 fn compare(a: RawPtr, b: RawPtr) -> i32 {
-    let mut i = 0;
-    while i < 32 {
+    for i in 0..32 {
         let mut scratch: Array<i64> = Array::new(8192);
         scratch[8191] = i;
         if scratch[8191] != i { panic("callback array corrupted"); }
-        i += 1;
     }
     let x = ptr_read_i64(a);
     let y = ptr_read_i64(b);

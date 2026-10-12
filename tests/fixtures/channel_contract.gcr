@@ -1,10 +1,8 @@
 #[value] enum Message { Pair(i64, String), Empty }
 struct Record { n: i64, text: String }
 fn pipeline(ch: Channel<i64>) -> i64 {
-    let mut n = 0;
-    while n < 100 {
+    for n in 0..100 {
         match ch.send(n) { Ok(_) => (), Err(_) => return 1 };
-        n += 1;
     }
     ch.close();
     0
@@ -78,8 +76,7 @@ fn main() -> i64 {
     }
     if expected != 100 || producer.join() != 0 { return 22; }
 
-    let mut round = 0;
-    while round < 64 {
+    for round in 0..64 {
         let racing: Channel<i64> = Channel::new(1);
         let sender = Thread::spawn(|| racing.send(round));
         let closer = Thread::spawn(|| racing.close());
@@ -96,7 +93,6 @@ fn main() -> i64 {
             }
         }
         match racing.recv() { Some(_) => return 27, None => () };
-        round += 1;
     }
     0
 }

@@ -13,7 +13,7 @@ extern "C" fn qsort(mut base: RawPtr, n: i64, size: i64, compar: extern fn(RawPt
 fn cmp(a: RawPtr, b: RawPtr) -> i32 {
     let x = ptr_read_i64(a);
     let y = ptr_read_i64(b);
-    if x < y { (0 - 1) as i32 } else if x > y { 1i32 } else { 0i32 }
+    if x < y { (-1) as i32 } else if x > y { 1i32 } else { 0i32 }
 }
 
 fn main() -> i64 {

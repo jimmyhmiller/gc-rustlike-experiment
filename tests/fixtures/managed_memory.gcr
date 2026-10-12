@@ -17,8 +17,7 @@ fn check(s: State) -> i64 {
     }
 }
 fn write(mut shared: Shared, mut values: Array<State>, mut words: Array<i64>, count: i64) -> i64 {
-    let mut n = 0;
-    while n < count {
+    for n in 0..count {
         let text = if n % 2 == 0 { "even" + "λ" } else { "odd" + "λ" };
         let state = if n % 3 == 0 { State::Text("text" + "λ") } else { State::Pair(n, 0 - n, text) };
         shared.state = state;
@@ -29,14 +28,12 @@ fn write(mut shared: Shared, mut values: Array<State>, mut words: Array<i64>, co
         shared.boolean = n % 2 == 0;
         shared.float = if n % 2 == 0 { 1.5 } else { -2.25 };
         words[0] = if n % 2 == 0 { 123456789 } else { -987654321 };
-        n += 1;
     }
     0
 }
 fn main() -> i64 {
     // Mixed aggregate/scalar store-buffering must never observe both zero.
-    let mut iteration = 0;
-    while iteration < 128 {
+    for iteration in 0..128 {
         let flags = Flags { x: Flag { n: 0 }, y: 0 };
         let start = AtomicI64::new(0);
         let a = Thread::spawn(|| {
@@ -54,7 +51,6 @@ fn main() -> i64 {
         start.store(1);
         let ra = a.join(); let rb = b.join();
         if ra == 0 && rb == 0 { return 10; }
-        iteration += 1;
     }
     let shared = Shared { state: State::Pair(0, 0, "evenλ"), scalar: 123456789,
         reference: "evenλ", narrow: -128 as i8, boolean: true, float: 1.5 };
@@ -65,8 +61,7 @@ fn main() -> i64 {
     let a = Thread::spawn(|| write(shared, values, words, 160));
     let b = Thread::spawn(|| write(shared, values, words, 160));
     let reader = Thread::spawn(|| {
-        let mut n = 0;
-        while n < 640 {
+        for n in 0..640 {
             let error = check(shared.state);
             if error != 0 { return 20 + error; }
             let array_error = check(values[0]);
@@ -84,7 +79,6 @@ fn main() -> i64 {
             // Allocate while snapshots and references are live, checking roots.
             let pressure = "snapshot" + "λ";
             if pressure.len() != 10 || check(shared.state) != 0 { return 45; }
-            n += 1;
         }
         0
     });

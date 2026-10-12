@@ -30,7 +30,7 @@ fn id<T>(x: T) -> T { x }
 
 // Error handling with `?`.
 fn checked_div(a: i64, b: i64) -> Result<i64, i64> {
-    if b == 0 { Result::Err(0 - 1) } else { Result::Ok(a / b) }
+    if b == 0 { Result::Err(-1) } else { Result::Ok(a / b) }
 }
 
 fn compute(x: i64, d: i64) -> Result<i64, i64> {

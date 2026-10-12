@@ -121,11 +121,9 @@ fn main() -> i64 {
     ClearBackground(rgb(18, 18, 28));
 
     let n2 = blocks.len();
-    let mut j = 0;
-    while j < n2 {
+    for j in 0..n2 {
       let b = blocks[j];
       DrawRectangle(b.x as i32, b.y as i32, b.w as i32, b.w as i32, rgb(90, 170, 240));
-      j += 1;
     }
 
     DrawCircle(px as i32, player_y as i32, player_r as f32, rgb(245, 205, 80));
