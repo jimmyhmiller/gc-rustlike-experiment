@@ -89,6 +89,10 @@ pub struct MethodEntry {
     pub self_ty: Type,
     /// The impl block's own generic parameter names (`impl<T> ... for Foo<T>`).
     pub impl_generics: Vec<String>,
+    /// The trait this method implements (`impl Add for T` → `Some("Add")`),
+    /// or `None` for an inherent impl. Operator and indexing desugaring only
+    /// accept a method from the matching trait impl.
+    pub trait_name: Option<String>,
     pub method: Rc<FnDef>,
 }
 
@@ -116,6 +120,7 @@ impl TyCtx {
                     MethodEntry {
                         self_ty: imp.self_ty.clone(),
                         impl_generics: impl_generics.clone(),
+                        trait_name: imp.trait_ref.as_ref().map(|t| t.path.last().to_string()),
                         method: Rc::new(m.clone()),
                     },
                 );

@@ -10,45 +10,46 @@ struct Item { n: i64, label: String }
 struct Nested { head: i8, item: Item, tail: i64 }
 #[value]
 enum Envelope { Empty, Full(Nested), Text(String) }
-fn keep(value: Option<Envelope>, trigger: String) -> Envelope { opt_expect(value, trigger) }
+fn keep(value: Option<Envelope>, trigger: String) -> Envelope { value.expect(trigger) }
 fn identity<T>(value: T) -> T { value }
 fn main() -> i64 {
-    let mut items: Vec<Item> = vec_new();
+    let mut items: Vec<Item> = Vec::new();
     let mut i = 0;
-    while i < 11 { items = vec_push(items, Item { n: i, label: "λ" }); i = i + 1; }
+    while i < 11 { items.push(Item { n: i, label: "λ" }); i = i + 1; }
     let active = AtomicI64::new(0);
     let peak = AtomicI64::new(0);
-    let mapped = match vec_parallel_map(items, 3, |item: Item| {
+    let mapped = match items.parallel_map(3, |item: Item| {
         let count = active.fetch_add(1) + 1;
         let mut observed = peak.load();
         while count > observed && !peak.compare_and_set(observed, count) { observed = peak.load(); }
         Thread::sleep(2);
-        let result = str_concat(to_string(item.n), item.label);
+        let result = item.n.to_string() + item.label;
         active.fetch_add(0 - 1);
         result
     }) { Result::Ok(v) => v, Result::Err(_) => return 90 };
     let mut j = 0;
-    while j < vec_len(mapped) {
-        if !str_eq(vec_at(mapped, j), str_concat(to_string(j), "λ")) { return 91; }
+    while j < mapped.len() {
+        if !(mapped[j] == (j.to_string() + "λ")) { return 91; }
         j = j + 1;
     }
-    let envelopes = match vec_parallel_map(items, 2, |item: Item| { let nested = Nested { head: 7, item: item, tail: 99 }; Envelope::Full(nested) }) { Result::Ok(v) => v, Result::Err(_) => return 101 };
+    let envelopes = match items.parallel_map(2, |item: Item| { let nested = Nested { head: 7, item: item, tail: 99 }; Envelope::Full(nested) }) { Result::Ok(v) => v, Result::Err(_) => return 101 };
     let mut k = 0;
-    while k < vec_len(envelopes) {
-        match vec_at(envelopes, k) { Envelope::Full(v) => if v.head != 7 || v.item.n != k || !str_eq(v.item.label, "λ") || v.tail != 99 { return 102; }, _ => return 103 };
+    while k < envelopes.len() {
+        match envelopes[k] { Envelope::Full(v) => if v.head != 7 || v.item.n != k || !(v.item.label == "λ") || v.tail != 99 { return 102; }, _ => return 103 };
         k = k + 1;
     }
     if active.load() != 0 || peak.load() < 1 || peak.load() > 3 { return 96; }
     let nested = Nested { head: 7, item: Item { n: 42, label: "λ" }, tail: 99 };
-    let envelope = keep(Option::Some(Envelope::Full(nested)), str_concat("trigger", "collection"));
-    match envelope { Envelope::Full(v) => if v.head != 7 || v.item.n != 42 || !str_eq(v.item.label, "λ") || v.tail != 99 { return 97; }, _ => return 98 };
-    let values: Vec<i64> = vec_push(vec_new(), 8);
-    let identities = match vec_parallel_map(values, 1, identity) { Result::Ok(v) => v, Result::Err(_) => return 99 };
-    if vec_at(identities, 0) != 8 { return 100; }
-    let empty: Vec<i64> = vec_new();
-    match vec_parallel_map(empty, 1, |n: i64| n) { Result::Ok(v) => if vec_len(v) != 0 { return 92; }, Result::Err(_) => return 93 };
-    match vec_parallel_map(empty, 0, |n: i64| n) { Result::Err(_) => {}, Result::Ok(_) => return 94 };
-    match vec_parallel_map(empty, 65, |n: i64| n) { Result::Err(_) => {}, Result::Ok(_) => return 95 };
+    let envelope = keep(Option::Some(Envelope::Full(nested)), "trigger" + "collection");
+    match envelope { Envelope::Full(v) => if v.head != 7 || v.item.n != 42 || !(v.item.label == "λ") || v.tail != 99 { return 97; }, _ => return 98 };
+    let mut values: Vec<i64> = Vec::new();
+    values.push(8);
+    let identities = match values.parallel_map(1, identity) { Result::Ok(v) => v, Result::Err(_) => return 99 };
+    if identities[0] != 8 { return 100; }
+    let empty: Vec<i64> = Vec::new();
+    match empty.parallel_map(1, |n: i64| n) { Result::Ok(v) => if v.len() != 0 { return 92; }, Result::Err(_) => return 93 };
+    match empty.parallel_map(0, |n: i64| n) { Result::Err(_) => {}, Result::Ok(_) => return 94 };
+    match empty.parallel_map(65, |n: i64| n) { Result::Err(_) => {}, Result::Ok(_) => return 95 };
     11
 }
 "#;

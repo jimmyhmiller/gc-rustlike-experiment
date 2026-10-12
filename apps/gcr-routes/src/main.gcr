@@ -1,147 +1,149 @@
 struct Edge { target: i64, cost: i64 }
 struct Node { name: String, edges: Vec<Edge> }
-struct Graph { nodes: Vec<Node>, names: MapStr<i64>, edges: i64 }
+struct Graph { nodes: Vec<Node>, names: HashMap<String, i64>, edges: i64 }
 struct Candidate { node: i64, distance: i64 }
 struct Route { reachable: bool, distance: i64, path: Vec<String> }
 impl Ord for Candidate {
-    fn cmp(self, other: Candidate) -> i64 {
-        if self.distance < other.distance { 0 - 1 } else if self.distance > other.distance { 1 }
-        else if self.node < other.node { 0 - 1 } else if self.node > other.node { 1 } else { 0 }
+    fn cmp(self, other: Candidate) -> Ordering {
+        match self.distance.cmp(other.distance) {
+            Ordering::Equal => self.node.cmp(other.node),
+            order => order,
+        }
     }
 }
-fn failure(message: String) -> i64 { stderr_line(str_concat("gcr-routes: ", message)); 1 }
+fn failure(message: String) -> i64 { stderr_line("gcr-routes: " + message); 1 }
 fn node(mut graph: Graph, name: String) -> Result<i64, String> {
-    match mapstr_get(graph.names, name) {
-        Option::Some(index) => Result::Ok(index),
-        Option::None => {
-            let index = vec_len(graph.nodes);
-            if index >= 5000 { return Result::Err("node count exceeds 5000"); }
-            graph.names = mapstr_insert(graph.names, name, index);
-            graph.nodes = vec_push(graph.nodes, Node { name: name, edges: vec_new() });
-            Result::Ok(index)
+    match graph.names.get(name) {
+        Some(index) => Ok(index),
+        None => {
+            let index = graph.nodes.len();
+            if index >= 5000 { return Err("node count exceeds 5000"); }
+            graph.names.insert(name, index);
+            graph.nodes.push(Node { name: name, edges: Vec::new() });
+            Ok(index)
         }
     }
 }
 fn load(text: String) -> Result<Graph, String> {
-    let rows = match csv_parse(text, 10001, 3) { Result::Ok(r) => r, Result::Err(e) => { return Result::Err(csv_error_message(e)); } };
-    if vec_len(rows) == 0 { return Result::Err("missing from,to,cost header"); }
-    let header = vec_at(rows, 0);
-    if vec_len(header) != 3 || str_eq(vec_at(header, 0), "from") == false || str_eq(vec_at(header, 1), "to") == false || str_eq(vec_at(header, 2), "cost") == false { return Result::Err("expected from,to,cost header"); }
-    let mut graph = Graph { nodes: vec_new(), names: mapstr_new(), edges: 0 };
+    let rows = match csv_parse(text, 10001, 3) { Ok(r) => r, Err(e) => { return Err(e.to_string()); } };
+    if rows.is_empty() { return Err("missing from,to,cost header"); }
+    let header = rows[0];
+    if header.len() != 3 || header[0] != "from" || header[1] != "to" || header[2] != "cost" { return Err("expected from,to,cost header"); }
+    let mut graph = Graph { nodes: Vec::new(), names: HashMap::new(), edges: 0 };
     let mut i = 1;
-    while i < vec_len(rows) {
-        let row = vec_at(rows, i);
-        if vec_len(row) != 3 { return Result::Err(str_concat("wrong field count at record ", to_string(i + 1))); }
-        let from = vec_at(row, 0);
-        let to = vec_at(row, 1);
-        if str_len(from) == 0 || str_len(to) == 0 { return Result::Err("node names must be nonempty"); }
-        let cost = match parse_int(str_trim(vec_at(row, 2))) { Option::Some(n) => n, Option::None => { return Result::Err(str_concat("invalid cost at record ", to_string(i + 1))); } };
-        if cost < 0 { return Result::Err("edge costs must be nonnegative"); }
+    while i < rows.len() {
+        let row = rows[i];
+        if row.len() != 3 { return Err("wrong field count at record " + (i + 1).to_string()); }
+        let from = row[0];
+        let to = row[1];
+        if from.is_empty() || to.is_empty() { return Err("node names must be nonempty"); }
+        let cost = match row[2].trim().parse_i64() { Some(n) => n, None => { return Err("invalid cost at record " + (i + 1).to_string()); } };
+        if cost < 0 { return Err("edge costs must be nonnegative"); }
         let source = node(graph, from)?;
         let target = node(graph, to)?;
-        let mut source_node = vec_at(graph.nodes, source);
-        source_node.edges = vec_push(source_node.edges, Edge { target: target, cost: cost });
-        graph.edges = graph.edges + 1;
-        i = i + 1;
+        let mut source_node = graph.nodes[source];
+        source_node.edges.push(Edge { target: target, cost: cost });
+        graph.edges += 1;
+        i += 1;
     }
-    Result::Ok(graph)
+    Ok(graph)
 }
 fn connected(graph: Graph, from: i64, to: i64) -> bool {
-    let mut seen: Array<bool> = array_new(vec_len(graph.nodes));
-    let mut queue: Vec<i64> = vec_new();
-    queue = vec_push(queue, from);
-    array_set(seen, from, true);
+    let mut seen: Array<bool> = Array::new(graph.nodes.len());
+    let mut queue: Vec<i64> = Vec::new();
+    queue.push(from);
+    seen[from] = true;
     let mut head = 0;
-    while head < vec_len(queue) {
-        let current = vec_at(queue, head);
+    while head < queue.len() {
+        let current = queue[head];
         if current == to { return true; }
-        let edges = vec_at(graph.nodes, current).edges;
+        let edges = graph.nodes[current].edges;
         let mut i = 0;
-        while i < vec_len(edges) {
-            let target = vec_at(edges, i).target;
-            if array_get_unchecked(seen, target) == false {
-                array_set(seen, target, true);
-                queue = vec_push(queue, target);
+        while i < edges.len() {
+            let target = edges[i].target;
+            if !seen[target] {
+                seen[target] = true;
+                queue.push(target);
             }
-            i = i + 1;
+            i += 1;
         }
-        head = head + 1;
+        head += 1;
     }
     false
 }
 fn route(graph: Graph, from: String, to: String) -> Result<Route, String> {
-    let source = match mapstr_get(graph.names, from) { Option::Some(n) => n, Option::None => { return Result::Err(str_concat("unknown source: ", from)); } };
-    let target = match mapstr_get(graph.names, to) { Option::Some(n) => n, Option::None => { return Result::Err(str_concat("unknown destination: ", to)); } };
-    let mut distances: Array<i64> = array_new(vec_len(graph.nodes));
-    let mut reached: Array<bool> = array_new(vec_len(graph.nodes));
-    let mut previous: Array<i64> = array_new(vec_len(graph.nodes));
-    let mut queue: MinHeap<Candidate> = heap_new();
-    array_set(reached, source, true);
-    array_set(previous, source, 0 - 1);
-    heap_push(queue, Candidate { node: source, distance: 0 });
-    while heap_len(queue) > 0 {
-        let current = opt_expect(heap_pop(queue), "route queue invariant");
-        if current.distance != array_get_unchecked(distances, current.node) { continue; }
+    let source = match graph.names.get(from) { Some(n) => n, None => { return Err("unknown source: " + from); } };
+    let target = match graph.names.get(to) { Some(n) => n, None => { return Err("unknown destination: " + to); } };
+    let mut distances: Array<i64> = Array::new(graph.nodes.len());
+    let mut reached: Array<bool> = Array::new(graph.nodes.len());
+    let mut previous: Array<i64> = Array::new(graph.nodes.len());
+    let mut queue: MinHeap<Candidate> = MinHeap::new();
+    reached[source] = true;
+    previous[source] = 0 - 1;
+    queue.push(Candidate { node: source, distance: 0 });
+    while !queue.is_empty() {
+        let current = queue.pop().expect("route queue invariant");
+        if current.distance != distances[current.node] { continue; }
         if current.node == target { break; }
-        let edges = vec_at(graph.nodes, current.node).edges;
+        let edges = graph.nodes[current.node].edges;
         let mut i = 0;
-        while i < vec_len(edges) {
-            let edge = vec_at(edges, i);
+        while i < edges.len() {
+            let edge = edges[i];
             // Ignore candidates outside i64; a separate reachability check
             // distinguishes an unreachable target from an unrepresentable path.
-            match checked_add_i64(current.distance, edge.cost) {
-                Option::Some(distance) => {
-                    if array_get_unchecked(reached, edge.target) == false || distance < array_get_unchecked(distances, edge.target) {
-                        array_set(reached, edge.target, true);
-                        array_set(distances, edge.target, distance);
-                        array_set(previous, edge.target, current.node);
-                        heap_push(queue, Candidate { node: edge.target, distance: distance });
+            match current.distance.checked_add(edge.cost) {
+                Some(distance) => {
+                    if !reached[edge.target] || distance < distances[edge.target] {
+                        reached[edge.target] = true;
+                        distances[edge.target] = distance;
+                        previous[edge.target] = current.node;
+                        queue.push(Candidate { node: edge.target, distance: distance });
                     }
                 },
-                Option::None => {}
+                None => {}
             };
-            i = i + 1;
+            i += 1;
         }
     }
-    if array_get_unchecked(reached, target) == false {
-        if connected(graph, source, target) { return Result::Err("shortest route cost exceeds i64 range"); }
-        return Result::Ok(Route { reachable: false, distance: 0, path: vec_new() });
+    if !reached[target] {
+        if connected(graph, source, target) { return Err("shortest route cost exceeds i64 range"); }
+        return Ok(Route { reachable: false, distance: 0, path: Vec::new() });
     }
-    let mut reverse: Vec<String> = vec_new();
+    let mut reverse: Vec<String> = Vec::new();
     let mut index = target;
     while index >= 0 {
-        if vec_len(reverse) >= vec_len(graph.nodes) { return Result::Err("predecessor cycle invariant"); }
-        reverse = vec_push(reverse, vec_at(graph.nodes, index).name);
-        index = array_get_unchecked(previous, index);
+        if reverse.len() >= graph.nodes.len() { return Err("predecessor cycle invariant"); }
+        reverse.push(graph.nodes[index].name);
+        index = previous[index];
     }
-    let mut path: Vec<String> = vec_new();
-    index = vec_len(reverse);
-    while index > 0 { index = index - 1; path = vec_push(path, vec_at(reverse, index)); }
-    Result::Ok(Route { reachable: true, distance: array_get_unchecked(distances, target), path: path })
+    let mut path: Vec<String> = Vec::new();
+    index = reverse.len();
+    while index > 0 { index -= 1; path.push(reverse[index]); }
+    Ok(Route { reachable: true, distance: distances[target], path: path })
 }
 fn render(result: Route, graph: Graph, from: String, to: String) -> String {
-    let mut parts: Vec<String> = vec_new();
-    parts = vec_push(parts, str_concat3("{\"from\":", json_quote(from), ",\"to\":"));
-    parts = vec_push(parts, json_quote(to));
-    parts = vec_push(parts, if result.reachable { ",\"reachable\":true,\"distance\":" } else { ",\"reachable\":false,\"distance\":" });
-    parts = vec_push(parts, if result.reachable { to_string(result.distance) } else { "null" });
-    parts = vec_push(parts, ",\"path\":[");
+    let mut parts: Vec<String> = Vec::new();
+    parts.push("{\"from\":" + json_quote(from) + ",\"to\":");
+    parts.push(json_quote(to));
+    parts.push(if result.reachable { ",\"reachable\":true,\"distance\":" } else { ",\"reachable\":false,\"distance\":" });
+    parts.push(if result.reachable { result.distance.to_string() } else { "null" });
+    parts.push(",\"path\":[");
     let mut i = 0;
-    while i < vec_len(result.path) { if i > 0 { parts = vec_push(parts, ","); } parts = vec_push(parts, json_quote(vec_at(result.path, i))); i = i + 1; }
-    parts = vec_push(parts, str_concat3("],\"nodes\":", to_string(vec_len(graph.nodes)), ",\"edges\":"));
-    parts = vec_push(parts, str_concat(to_string(graph.edges), "}"));
-    str_join(parts, "")
+    while i < result.path.len() { if i > 0 { parts.push(","); } parts.push(json_quote(result.path[i])); i += 1; }
+    parts.push("],\"nodes\":" + graph.nodes.len().to_string() + ",\"edges\":");
+    parts.push(graph.edges.to_string() + "}");
+    parts.join("")
 }
 fn main() -> i64 {
-    let args = match process_args() { Result::Ok(a) => a, Result::Err(e) => { return failure(io_error_message(e)); } };
-    if array_len(args) != 5 { stderr_line("usage: gcr-routes <edges.csv> <from> <to> <output.json|->"); return 2; }
-    let text = match fs_read_text(array_get_unchecked(args, 1), 1048576) { Result::Ok(s) => s, Result::Err(e) => { return failure(io_error_message(e)); } };
-    let graph = match load(text) { Result::Ok(g) => g, Result::Err(e) => { return failure(e); } };
-    let from = array_get_unchecked(args, 2);
-    let to = array_get_unchecked(args, 3);
-    let result = match route(graph, from, to) { Result::Ok(r) => r, Result::Err(e) => { return failure(e); } };
+    let args = match process_args() { Ok(a) => a, Err(e) => { return failure(e.to_string()); } };
+    if args.len() != 5 { stderr_line("usage: gcr-routes <edges.csv> <from> <to> <output.json|->"); return 2; }
+    let text = match fs_read_text(args[1], 1048576) { Ok(s) => s, Err(e) => { return failure(e.to_string()); } };
+    let graph = match load(text) { Ok(g) => g, Err(e) => { return failure(e); } };
+    let from = args[2];
+    let to = args[3];
+    let result = match route(graph, from, to) { Ok(r) => r, Err(e) => { return failure(e); } };
     let json = render(result, graph, from, to);
-    let output = array_get_unchecked(args, 4);
-    let written = if str_eq(output, "-") { stdout_line(json) } else { fs_write_text_atomic(output, str_concat(json, "\n")) };
-    match written { Result::Ok(_) => 0, Result::Err(e) => failure(io_error_message(e)) }
+    let output = args[4];
+    let written = if output == "-" { stdout_line(json) } else { fs_write_text_atomic(output, json + "\n") };
+    match written { Ok(_) => 0, Err(e) => failure(e.to_string()) }
 }

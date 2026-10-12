@@ -127,13 +127,13 @@ fn jit_array_copy_out_buffer() {
         extern "C" fn memset(mut buf: RawPtr, c: i32, n: i64) -> RawPtr;
         extern "C" fn memcmp(a: RawPtr, b: RawPtr, n: i64) -> i32;
         fn main() -> i64 {
-            let mut buf: Array<u8> = array_new(5);
+            let mut buf: Array<u8> = Array::new(5);
             memset(as_c_bytes(buf), 7, 5);
-            let sum = (array_get_unchecked(buf, 0) as i64) + (array_get_unchecked(buf, 4) as i64);
-            let mut a: Array<u8> = array_new(2);
-            array_set(a, 0, 9); array_set(a, 1, 9);
-            let mut b: Array<u8> = array_new(2);
-            array_set(b, 0, 9); array_set(b, 1, 9);
+            let sum = (buf[0] as i64) + (buf[4] as i64);
+            let mut a: Array<u8> = Array::new(2);
+            a[0] = 9; a[1] = 9;
+            let mut b: Array<u8> = Array::new(2);
+            b[0] = 9; b[1] = 9;
             sum + (memcmp(as_c_bytes(a), as_c_bytes(b), 2) as i64)
         }
     "#;
@@ -151,11 +151,11 @@ fn jit_c_callback_into_gcrust() {
             if x < y { (0 - 1) as i32 } else if x > y { 1i32 } else { 0i32 }
         }
         fn main() -> i64 {
-            let mut arr: Array<i64> = array_new(5);
-            array_set(arr, 0, 30); array_set(arr, 1, 10); array_set(arr, 2, 50);
-            array_set(arr, 3, 20); array_set(arr, 4, 40);
+            let mut arr: Array<i64> = Array::new(5);
+            arr[0] = 30; arr[1] = 10; arr[2] = 50;
+            arr[3] = 20; arr[4] = 40;
             qsort(as_c_bytes(arr), 5, 8, cmp);
-            array_get_unchecked(arr, 0) * 100 + array_get_unchecked(arr, 4)
+            arr[0] * 100 + arr[4]
         }
     "#;
     assert_eq!(jit(src), 1050);
@@ -177,7 +177,7 @@ fn as_c_bytes_rejects_array_of_non_scalars() {
     let src = r#"
         extern "C" fn f(p: RawPtr) -> i64;
         fn main() -> i64 {
-            let mut a: Array<String> = array_new(1);
+            let mut a: Array<String> = Array::new(1);
             f(as_c_bytes(a))
         }
     "#;

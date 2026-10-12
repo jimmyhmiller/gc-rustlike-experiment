@@ -20,7 +20,7 @@ fn scalar_allocation_operands_do_not_leave_stale_heap_addresses() {
         fn main() -> i64 {
             let mut c = Cell { n: 0 };
             c.n = allocate(42);
-            let mut a: Array<i64> = array_new(2);
+            let mut a: Array<i64> = Array::new(2);
             a[allocate(1)] = allocate(7);
             let x = a[allocate(1)];
             read(c, allocate(3)) + x
@@ -110,8 +110,8 @@ fn foreign_buffers_preserve_argument_evaluation_order() {
         extern "C" fn memcmp(a: RawPtr, b: RawPtr, n: i64) -> i32;
         fn change(mut a: Array<i64>) -> i64 { a[0] = 1; 8 }
         fn main() -> i64 {
-            let a: Array<i64> = array_new(1);
-            let b: Array<i64> = array_new(1);
+            let a: Array<i64> = Array::new(1);
+            let b: Array<i64> = Array::new(1);
             memcmp(as_c_bytes(a), as_c_bytes(b), change(a)) as i64
         }
     "#,
@@ -131,7 +131,7 @@ fn native_callback_reloads_relocated_copy_out_destination() {
             if x < y { (0 - c.n) as i32 } else if x > y { c.n as i32 } else { 0i32 }
         }
         fn main() -> i64 {
-            let mut a: Array<i64> = array_new(3);
+            let mut a: Array<i64> = Array::new(3);
             a[0] = 30; a[1] = 10; a[2] = 20;
             qsort(as_c_bytes(a), 3, 8, cmp);
             a[0] * 100 + a[2]

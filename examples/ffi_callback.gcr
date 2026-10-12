@@ -18,15 +18,15 @@ fn cmp(a: RawPtr, b: RawPtr) -> i32 {
 
 fn main() -> i64 {
     // An unsorted i64 array; qsort it in place via the copy-out buffer.
-    let mut arr: Array<i64> = array_new(5);
-    array_set(arr, 0, 30);
-    array_set(arr, 1, 10);
-    array_set(arr, 2, 50);
-    array_set(arr, 3, 20);
-    array_set(arr, 4, 40);
+    let mut arr: Array<i64> = Array::new(5);
+    arr[0] = 30;
+    arr[1] = 10;
+    arr[2] = 50;
+    arr[3] = 20;
+    arr[4] = 40;
 
     qsort(as_c_bytes(arr), 5, 8, cmp);
 
     // After sorting: [10,20,30,40,50]. Return arr[0]*100 + arr[4] = 1050.
-    array_get_unchecked(arr, 0) * 100 + array_get_unchecked(arr, 4)
+    arr[0] * 100 + arr[4]
 }

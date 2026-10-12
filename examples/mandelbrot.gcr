@@ -20,7 +20,7 @@ fn iter_count(cr: f64, ci: f64, max: i64) -> i64 {
                 zi = new_zi;
             }
         }
-        i = i + 1;
+        i += 1;
     }
     if done == 0 { max } else { done }
 }
@@ -38,9 +38,9 @@ fn main() -> i64 {
             let cr = -2.5 + (px as f64) * 3.5 / 80.0;
             let ci = -1.25 + (py as f64) * 2.5 / 50.0;
             checksum = checksum + iter_count(cr, ci, max_iter);
-            px = px + 1;
+            px += 1;
         }
-        py = py + 1;
+        py += 1;
     }
     checksum
 }

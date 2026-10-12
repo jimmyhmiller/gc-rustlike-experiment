@@ -62,9 +62,9 @@ fn checked_multiply_rejects_minimum_times_minus_one_in_both_orders() {
         run(r#"
         fn main() -> i64 {
             let min = 0 - 9223372036854775807 - 1;
-            let a = match checked_mul_i64(min, 0 - 1) { Option::None => 1, Option::Some(x) => 0 };
-            let b = match checked_mul_i64(0 - 1, min) { Option::None => 1, Option::Some(x) => 0 };
-            let c = match checked_mul_i64(min, 1) { Option::Some(x) => if x == min { 1 } else { 0 }, Option::None => 0 };
+            let a = match min.checked_mul(0 - 1) { Option::None => 1, Option::Some(x) => 0 };
+            let b = match (0 - 1).checked_mul(min) { Option::None => 1, Option::Some(x) => 0 };
+            let c = match min.checked_mul(1) { Option::Some(x) => if x == min { 1 } else { 0 }, Option::None => 0 };
             a + b + c
         }
     "#),

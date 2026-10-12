@@ -52,11 +52,11 @@ fn multi_thread_alloc_under_stress() {
 // heavily AFTER main has already entered join.
 const JOIN_DEADLOCK_SRC: &str = r#"
     fn alloc_heavy(n: i64) -> i64 {
-        let v: Vec<i64> = vec_new();
+        let v: Vec<i64> = Vec::new();
         let mut acc = v;
         let mut i = 0;
-        while i < n { acc = vec_push(acc, i); i = i + 1; }
-        vec_len(acc)
+        while i < n { acc.push(i); i = i + 1; }
+        acc.len()
     }
     fn main() -> i64 {
         let t = Thread::spawn(|| alloc_heavy(20000));
@@ -81,22 +81,22 @@ fn join_does_not_deadlock_under_stress() {
 // the Vec, and read correct data on resume — not a dangling from-space pointer.
 const JOIN_LIVE_ROOTS_SRC: &str = r#"
     fn alloc_heavy(n: i64) -> i64 {
-        let v: Vec<i64> = vec_new();
+        let v: Vec<i64> = Vec::new();
         let mut acc = v;
         let mut i = 0;
-        while i < n { acc = vec_push(acc, i); i = i + 1; }
-        vec_len(acc)
+        while i < n { acc.push(i); i = i + 1; }
+        acc.len()
     }
     fn main() -> i64 {
-        let mine: Vec<i64> = vec_new();
+        let mine: Vec<i64> = Vec::new();
         let mut m = mine;
         let mut k = 0;
-        while k < 100 { m = vec_push(m, k * 2); k = k + 1; }
+        while k < 100 { m.push(k * 2); k = k + 1; }
         let t = Thread::spawn(|| alloc_heavy(20000));
         let child = t.join();
         let mut s = 0;
         let mut j = 0;
-        while j < vec_len(m) { s = s + vec_get_unchecked(m, j); j = j + 1; }
+        while j < m.len() { s = s + m[j]; j = j + 1; }
         s + child
     }
 "#;
@@ -111,11 +111,11 @@ fn live_roots_survive_relocation_across_join() {
 // from multiple threads at once.
 const NESTED_SRC: &str = r#"
     fn work(n: i64) -> i64 {
-        let v: Vec<i64> = vec_new();
+        let v: Vec<i64> = Vec::new();
         let mut acc = v;
         let mut i = 0;
-        while i < n { acc = vec_push(acc, i); i = i + 1; }
-        vec_len(acc)
+        while i < n { acc.push(i); i = i + 1; }
+        acc.len()
     }
     fn spawner(_x: i64) -> i64 {
         let a = Thread::spawn(|| work(2000));
@@ -179,16 +179,16 @@ fn spawn_closure_capturing_value_struct_under_stress() {
 fn thread_returns_vec() {
     let src = r#"
         fn build(n: i64) -> Vec<i64> {
-            let v: Vec<i64> = vec_new();
+            let v: Vec<i64> = Vec::new();
             let mut acc = v; let mut i = 0;
-            while i < n { acc = vec_push(acc, i); i = i + 1; }
+            while i < n { acc.push(i); i = i + 1; }
             acc
         }
         fn main() -> i64 {
             let t = Thread::spawn(|| build(100));
             let r = t.join();
             let mut s = 0; let mut j = 0;
-            while j < vec_len(r) { s = s + vec_get_unchecked(r, j); j = j + 1; }
+            while j < r.len() { s = s + r[j]; j = j + 1; }
             s
         }
     "#;
@@ -201,16 +201,16 @@ fn thread_returns_vec_under_stress() {
     // keeps it rooted. Collect on every allocation.
     let src = r#"
         fn build(n: i64) -> Vec<i64> {
-            let v: Vec<i64> = vec_new();
+            let v: Vec<i64> = Vec::new();
             let mut acc = v; let mut i = 0;
-            while i < n { acc = vec_push(acc, i); i = i + 1; }
+            while i < n { acc.push(i); i = i + 1; }
             acc
         }
         fn main() -> i64 {
             let t = Thread::spawn(|| build(80));
             let r = t.join();
             let mut s = 0; let mut j = 0;
-            while j < vec_len(r) { s = s + vec_get_unchecked(r, j); j = j + 1; }
+            while j < r.len() { s = s + r[j]; j = j + 1; }
             s
         }
     "#;

@@ -152,14 +152,14 @@ fn full_debug_emits_named_local_and_param_dies() {
 
 #[test]
 fn aot_object_line_table_is_multi_source() {
-    // A program that allocates via the prelude (vec_new) must produce line-table
+    // A program that allocates via the prelude (Vec::new) must produce line-table
     // rows for BOTH the user file AND the prelude (<std>) — proving per-source
     // DIFiles (the source-id foundation carried into DWARF).
     let dir = std::env::temp_dir().join(format!("gcr_dwarf2_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let obj = dir.join("prog.o");
     let prog = lower_named(
-        "fn main() -> i64 {\n  let v: Vec<i64> = vec_new();\n  vec_len(vec_push(v, 7))\n}\n",
+        "fn main() -> i64 {\n  let mut v: Vec<i64> = Vec::new();\n  v.push(7);\n  v.len()\n}\n",
         "prog.gcr",
     );
     codegen_aot_object(&prog, &obj).expect("aot object");

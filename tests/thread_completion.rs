@@ -9,7 +9,7 @@ mod support;
 const REPEAT: &str = r#"
 struct Payload { n: i64, text: String }
 fn start() -> Thread<Payload> {
-    let original = Thread::spawn(|| Payload { n: 42, text: str_concat("moved", "λ") });
+    let original = Thread::spawn(|| Payload { n: 42, text: ("moved" + "λ") });
     let surviving_alias = original;
     surviving_alias
 }
@@ -19,8 +19,8 @@ fn main() -> i64 {
     let mut p = t.join();
     // Force collections after completion and before observing the alias.
     let mut i = 0;
-    while i < 100 { let text = str_concat("pressure", "λ"); i = i + str_len(text) / 10; }
-    if !str_eq(alias.join().text, "movedλ") { return 1; }
+    while i < 100 { let text = "pressure" + "λ"; i = i + text.len() / 10; }
+    if !(alias.join().text == "movedλ") { return 1; }
     // Reference results retain identity on every observation.
     p.n = 81;
     if alias.join().n != 81 { return 2; }
@@ -33,13 +33,13 @@ fn main() -> i64 {
 const CONCURRENT: &str = r#"
 #[value] enum Outcome { Text(String), Number(i64) }
 fn measure(value: Outcome) -> i64 {
-    match value { Outcome::Text(text) => str_len(text), Outcome::Number(n) => n }
+    match value { Outcome::Text(text) => text.len(), Outcome::Number(n) => n }
 }
 fn main() -> i64 {
     let gate = AtomicI64::new(0);
     let target = Thread::spawn(|| {
         while gate.load() == 0 { Thread::sleep(1); }
-        Outcome::Text(str_concat("result", "λ"))
+        Outcome::Text("result" + "λ")
     });
     let entered = AtomicI64::new(0);
     let a = Thread::spawn(|| { entered.fetch_add(1); measure(target.join()) });
@@ -60,12 +60,12 @@ fn main() -> i64 {
         let nested = Thread::spawn(|| {
             Thread::sleep(10);
             let mut i = 0;
-            while i < 40 { let s = str_concat("retire", "λ"); i = i + 1; }
+            while i < 40 { let s = "retire" + "λ"; i = i + 1; }
             println("grandchild completed");
             42
         });
         let mut i = 0;
-        while i < 40 { let s = str_concat("retire", "λ"); i = i + 1; }
+        while i < 40 { let s = "retire" + "λ"; i = i + 1; }
         println("child completed");
         0
     });
@@ -77,22 +77,22 @@ const INFERENCE: &str = r#"
 struct Payload { n: i64, text: String }
 impl Sync for Payload {}
 fn main() -> i64 {
-    let initial = Payload { n: 11, text: str_concat("start", "λ") };
+    let initial = Payload { n: 11, text: ("start" + "λ") };
     let child = Thread::spawn(|| {
-        if initial.n != 11 || !str_eq(initial.text, "startλ") { return 81; }
+        if initial.n != 11 || !(initial.text == "startλ") { return 81; }
         let mut p = initial;
         p.n = 12;
-        p.text = str_concat("join", "λ");
+        p.text = "join" + "λ";
         0
     });
-    if child.join() != 0 || initial.n != 12 || !str_eq(initial.text, "joinλ") { return 1; }
+    if child.join() != 0 || initial.n != 12 || !(initial.text == "joinλ") { return 1; }
     let both = Thread::spawn(|| { if true { return 17; } else { return 18; } });
     if both.join() != 17 { return 2; }
     // Nested closure inference must restore the enclosing return constraint.
     let nested = Thread::spawn(|| {
         if false { return 3; }
         let f = || { if true { return "nested"; } "other" };
-        str_len(f())
+        f().len()
     });
     if nested.join() != 6 { return 3; }
     0

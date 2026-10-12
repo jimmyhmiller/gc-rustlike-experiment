@@ -12,16 +12,16 @@ extern "C" fn memcmp(a: RawPtr, b: RawPtr, n: i64) -> i32;
 
 fn main() -> i64 {
     // Copy-out: ask C to fill 5 bytes with 0x07.
-    let mut buf: Array<u8> = array_new(5);
+    let mut buf: Array<u8> = Array::new(5);
     memset(as_c_bytes(buf), 7, 5);
     // The write-back means buf now holds [7,7,7,7,7].
-    let sum = (array_get_unchecked(buf, 0) as i64) + (array_get_unchecked(buf, 4) as i64); // 7 + 7 = 14
+    let sum = (buf[0] as i64) + (buf[4] as i64); // 7 + 7 = 14
 
     // Read-only: compare two equal byte arrays -> memcmp returns 0.
-    let mut a: Array<u8> = array_new(3);
-    array_set(a, 0, 1); array_set(a, 1, 2); array_set(a, 2, 3);
-    let mut b: Array<u8> = array_new(3);
-    array_set(b, 0, 1); array_set(b, 1, 2); array_set(b, 2, 3);
+    let mut a: Array<u8> = Array::new(3);
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    let mut b: Array<u8> = Array::new(3);
+    b[0] = 1; b[1] = 2; b[2] = 3;
     let eq = memcmp(as_c_bytes(a), as_c_bytes(b), 3); // 0 when equal
 
     sum + (eq as i64) // 14 + 0 = 14

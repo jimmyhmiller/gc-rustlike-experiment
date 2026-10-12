@@ -112,12 +112,12 @@ fn module_types_in_nested_struct_enum_and_container_fields_use_canonical_layouts
         pub enum Choice { Item(Document), Empty }
         pub fn total() -> i64 {
             let d = Document { n: 7 };
-            let mut docs: Vec<Document> = vec_new();
-            docs = vec_push(docs, d);
+            let mut docs: Vec<Document> = Vec::new();
+            docs.push(d);
             let index = Index { documents: docs };
             let entry = Entry { document: d };
             let choice = Choice::Item(d);
-            vec_at(index.documents, 0).n + entry.document.n + match choice { Choice::Item(x) => x.n, Choice::Empty => 0 }
+            index.documents[0].n + entry.document.n + match choice { Choice::Item(x) => x.n, Choice::Empty => 0 }
         }
     "#);
     write(&dir, "main.gcr", "mod model; fn main() -> i64 { model::total() }");

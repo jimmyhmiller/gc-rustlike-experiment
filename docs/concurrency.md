@@ -32,7 +32,7 @@ may use immutable boxes and atomic slot replacement or locks. Several separate
 field operations are not a transaction. Consequently `counter.n = counter.n + 1`
 can lose updates. Atomics or a lock are required for a compound invariant. A
 collection's individual fields being safe does not make push/remove/iteration
-linearizable. Ordinary Vec and Map/HashMap/MapStr are unsynchronized collections,
+linearizable. Ordinary Vec and HashMap are unsynchronized collections,
 following the JVM collection model: callers must synchronize access when any
 participant mutates shared storage. This includes aliases of their backing arrays.
 Concurrent reads of a safely published collection are supported when that storage

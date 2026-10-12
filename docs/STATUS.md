@@ -845,7 +845,7 @@ stress. `git diff --check` is clean. Exact commands/logs are in the status pad.
 
 ## Allocator/collector contracts and collection policy — 2026-10-06
 
-Ordinary Vec/Map/HashMap/MapStr remain unsynchronized collections. Shared mutation,
+Ordinary Vec/HashMap remain unsynchronized collections. Shared mutation,
 including through backing-array aliases, requires external synchronization.
 Concurrent reads require safe publication and unchanged storage. Unsynchronized
 operations have no collection-level consistency guarantee; the managed-access

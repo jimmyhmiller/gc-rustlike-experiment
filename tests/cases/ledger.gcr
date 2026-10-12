@@ -5,8 +5,8 @@ enum Tx { Deposit(i64, i64), Withdraw(i64, i64), Transfer(i64, i64, i64) }
 
 fn find(accts: Vec<Account>, id: i64) -> i64 {
     let mut i = 0;
-    while i < vec_len(accts) {
-        let a = vec_get_unchecked(accts, i);
+    while i < accts.len() {
+        let a = accts[i];
         if a.id == id { return a.balance; }
         i = i + 1;
     }
@@ -14,10 +14,10 @@ fn find(accts: Vec<Account>, id: i64) -> i64 {
 }
 
 fn apply(mut accts: Vec<Account>, t: Tx) -> Vec<Account> {
-    let mut out = vec_new();
+    let mut out = Vec::new();
     let mut i = 0;
-    while i < vec_len(accts) {
-        let a = vec_get_unchecked(accts, i);
+    while i < accts.len() {
+        let a = accts[i];
         let nb = match t {
             Tx::Deposit(id, amt) => if a.id == id { a.balance + amt } else { a.balance },
             Tx::Withdraw(id, amt) => if a.id == id { a.balance - amt } else { a.balance },
@@ -26,21 +26,21 @@ fn apply(mut accts: Vec<Account>, t: Tx) -> Vec<Account> {
                 else { if a.id == to { a.balance + amt } else { a.balance } }
             }
         };
-        out = vec_push(out, Account { id: a.id, balance: nb });
+        out.push(Account { id: a.id, balance: nb });
         i = i + 1;
     }
     out
 }
 
 fn main() -> i64 {
-    let mut accts = vec_new();
-    accts = vec_push(accts, Account { id: 1, balance: 100 });
-    accts = vec_push(accts, Account { id: 2, balance: 50 });
+    let mut accts = Vec::new();
+    accts.push(Account { id: 1, balance: 100 });
+    accts.push(Account { id: 2, balance: 50 });
 
-    let mut txs = vec_new();
-    txs = vec_push(txs, Tx::Deposit(1, 20));
-    txs = vec_push(txs, Tx::Withdraw(2, 10));
-    txs = vec_push(txs, Tx::Transfer(1, 2, 30));
+    let mut txs = Vec::new();
+    txs.push(Tx::Deposit(1, 20));
+    txs.push(Tx::Withdraw(2, 10));
+    txs.push(Tx::Transfer(1, 2, 30));
 
     for t in txs { accts = apply(accts, t); }
 
@@ -49,12 +49,12 @@ fn main() -> i64 {
     let bal2 = find(accts, 2);
 
     // closures + higher-order over the balances
-    let mut bals = vec_new();
+    let mut bals = Vec::new();
     let mut j = 0;
-    while j < vec_len(accts) { let a = vec_get_unchecked(accts, j); bals = vec_push(bals, a.balance); j = j + 1; }
+    while j < accts.len() { let a = accts[j]; bals.push(a.balance); j = j + 1; }
     let scale = 1;
-    let scaled = vec_map(bals, |b: i64| b * scale);
-    let total = vec_fold(scaled, 0, |acc: i64, b: i64| acc + b);   // 90 + 70 = 160
+    let scaled = bals.map(|b: i64| b * scale);
+    let total = scaled.fold(0, |acc: i64, b: i64| acc + b);   // 90 + 70 = 160
 
     bal1 + bal2 - total + 42   // 90 + 70 - 160 + 42 = 42
 }

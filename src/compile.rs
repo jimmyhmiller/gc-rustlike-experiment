@@ -128,9 +128,18 @@ fn inject_prelude(user: Module, sources: &mut SourceMap) -> Module {
     let mut items: Vec<Item> = prelude
         .items
         .into_iter()
-        .filter(|i| match item_name(i) {
-            Some(n) => !user_names.contains(n),
-            None => true, // impls/uses always kept
+        .filter(|i| match &i.kind {
+            // A prelude impl belongs to the prelude's type and trait. When the
+            // user declares their own type or trait of that name, the impl
+            // would attach to the user's item instead, so drop it.
+            ItemKind::Impl(imp) => {
+                !user_names.contains(&crate::types::type_base_name(&imp.self_ty))
+                    && imp.trait_ref.as_ref().is_none_or(|t| !user_names.contains(t.path.last()))
+            }
+            _ => match item_name(i) {
+                Some(n) => !user_names.contains(n),
+                None => true,
+            },
         })
         .collect();
     items.extend(user.items);
@@ -183,28 +192,25 @@ mod tests {
     #[test]
     fn prelude_option_available_without_declaration() {
         // No `enum Option` declared by the user — it comes from the prelude.
-        // `opt_unwrap_or(Option::None, 8)` infers `T=i64` from the `8` argument
-        // (two-pass argument inference).
-        let src = "fn main() -> i64 { opt_unwrap_or(Option::Some(42), 0) + opt_unwrap_or(Option::None, 8) }";
+        let src = "fn main() -> i64 { let none: Option<i64> = Option::None; Option::Some(42).unwrap_or(0) + none.unwrap_or(8) }";
         assert_eq!(run(src), 50);
     }
 
     #[test]
     fn prelude_numeric_helpers() {
-        assert_eq!(run("fn main() -> i64 { max_i64(3, 9) + min_i64(3, 9) }"), 12);
-        assert_eq!(run("fn main() -> i64 { pow_i64(2, 10) }"), 1024);
-        assert_eq!(run("fn main() -> i64 { gcd_i64(48, 36) }"), 12);
-        assert_eq!(run("fn main() -> i64 { abs_i64(0 - 7) }"), 7);
+        assert_eq!(run("fn main() -> i64 { 3.max(9) + 3.min(9) }"), 12);
+        assert_eq!(run("fn main() -> i64 { 2.pow(10) }"), 1024);
+        assert_eq!(run("fn main() -> i64 { (0 - 7).abs() }"), 7);
     }
 
     #[test]
     fn prelude_vec_grows() {
         // The prelude Vec<T> reallocates past its initial capacity of 4.
         let src = "fn main() -> i64 { \
-                     let mut v: Vec<i64> = vec_new(); \
+                     let mut v: Vec<i64> = Vec::new(); \
                      let mut i = 0; \
-                     while i < 30 { v = vec_push(v, i * i); i = i + 1; } \
-                     vec_get_unchecked(v, 5) + vec_get_unchecked(v, 29) + vec_len(v) \
+                     while i < 30 { v.push(i * i); i = i + 1; } \
+                     v[5] + v[29] + v.len() \
                    }";
         // 25 + 841 + 30 = 896
         assert_eq!(run(src), 896);
@@ -213,11 +219,11 @@ mod tests {
     #[test]
     fn prelude_vec_with_capacity_and_set() {
         let src = "fn main() -> i64 { \
-                     let mut v: Vec<i64> = vec_with_capacity(8); \
+                     let mut v: Vec<i64> = Vec::with_capacity(8); \
                      let mut i = 0; \
-                     while i < 8 { v = vec_push(v, i); i = i + 1; } \
-                     v = vec_set(v, 0, 100); \
-                     vec_get_unchecked(v, 0) + vec_get_unchecked(v, 7) + vec_len(v) \
+                     while i < 8 { v.push(i); i = i + 1; } \
+                     v[0] = 100; \
+                     v[0] + v[7] + v.len() \
                    }";
         // 100 + 7 + 8 = 115
         assert_eq!(run(src), 115);
@@ -236,10 +242,10 @@ mod tests {
     #[test]
     fn prelude_str_trim_and_prefix() {
         let src = "fn main() -> i64 { \
-                     let t = str_trim(\"  hi there  \"); \
-                     let p = if str_starts_with(t, \"hi\") { 1 } else { 0 }; \
-                     let e = if str_ends_with(t, \"there\") { 1 } else { 0 }; \
-                     str_len(t) * 10 + p + e \
+                     let t = \"  hi there  \".trim(); \
+                     let p = if t.starts_with(\"hi\") { 1 } else { 0 }; \
+                     let e = if t.ends_with(\"there\") { 1 } else { 0 }; \
+                     t.len() * 10 + p + e \
                    }";
         // trimmed \"hi there\" len 8 -> 80 + 1 + 1 = 82
         assert_eq!(run(src), 82);
@@ -247,20 +253,20 @@ mod tests {
 
     #[test]
     fn prelude_parse_int() {
-        assert_eq!(run("fn main() -> i64 { opt_unwrap_or(parse_int(\"12345\"), 0) }"), 12345);
-        assert_eq!(run("fn main() -> i64 { opt_unwrap_or(parse_int(\"-42\"), 0) }"), 0 - 42);
+        assert_eq!(run("fn main() -> i64 { (\"12345\".parse_i64()).unwrap_or(0) }"), 12345);
+        assert_eq!(run("fn main() -> i64 { (\"-42\".parse_i64()).unwrap_or(0) }"), 0 - 42);
         // Malformed -> None -> the default.
-        assert_eq!(run("fn main() -> i64 { opt_unwrap_or(parse_int(\"12x\"), 0 - 1) }"), 0 - 1);
-        assert_eq!(run("fn main() -> i64 { opt_unwrap_or(parse_int(\"\"), 0 - 7) }"), 0 - 7);
+        assert_eq!(run("fn main() -> i64 { (\"12x\".parse_i64()).unwrap_or(0 - 1) }"), 0 - 1);
+        assert_eq!(run("fn main() -> i64 { (\"\".parse_i64()).unwrap_or(0 - 7) }"), 0 - 7);
     }
 
     #[test]
     fn prelude_split_and_join_roundtrip() {
         // Split on ',' then join with '|' — count pieces and total length.
         let src = "fn main() -> i64 { \
-                     let parts = str_split_byte(\"a,bb,ccc\", 44); \
-                     let joined = str_join(parts, \"|\"); \
-                     vec_len(parts) * 100 + str_len(joined) \
+                     let parts = \"a,bb,ccc\".split(\",\"); \
+                     let joined = parts.join(\"|\"); \
+                     parts.len() * 100 + joined.len() \
                    }";
         // 3 pieces; \"a|bb|ccc\" len 8 -> 308
         assert_eq!(run(src), 308);
@@ -268,7 +274,7 @@ mod tests {
 
     #[test]
     fn prelude_replace_byte() {
-        let src = "fn main() -> i64 { str_len(str_replace_byte(\"a-b-c\", 45, \"__\")) }";
+        let src = "fn main() -> i64 { (\"a-b-c\".replace(\"-\", \"__\")).len() }";
         // \"a__b__c\" -> length 7
         assert_eq!(run(src), 7);
     }
@@ -284,18 +290,18 @@ mod tests {
 
     #[test]
     fn checked_add_detects_overflow() {
-        // checked_add_i64 returns None at the boundary, Some otherwise.
-        let over = "fn main() -> i64 { if opt_is_some(checked_add_i64(9223372036854775807, 1)) { 1 } else { 0 } }";
+        // checked_add returns None at the boundary, Some otherwise.
+        let over = "fn main() -> i64 { if 9223372036854775807.checked_add(1).is_some() { 1 } else { 0 } }";
         assert_eq!(run(over), 0);
-        let ok = "fn main() -> i64 { opt_unwrap_or(checked_add_i64(100, 200), 0) }";
+        let ok = "fn main() -> i64 { 100.checked_add(200).unwrap_or(0) }";
         assert_eq!(run(ok), 300);
     }
 
     #[test]
     fn checked_mul_detects_overflow() {
-        let over = "fn main() -> i64 { if opt_is_some(checked_mul_i64(9223372036854775807, 2)) { 1 } else { 0 } }";
+        let over = "fn main() -> i64 { if 9223372036854775807.checked_mul(2).is_some() { 1 } else { 0 } }";
         assert_eq!(run(over), 0);
-        let ok = "fn main() -> i64 { opt_unwrap_or(checked_mul_i64(6, 7), 0) }";
+        let ok = "fn main() -> i64 { 6.checked_mul(7).unwrap_or(0) }";
         assert_eq!(run(ok), 42);
     }
 
@@ -304,10 +310,10 @@ mod tests {
     #[test]
     fn prelude_vec_sort_and_search() {
         let src = "fn main() -> i64 { \
-                     let mut v: Vec<i64> = vec_new(); \
-                     v = vec_push(v, 5); v = vec_push(v, 3); v = vec_push(v, 8); v = vec_push(v, 1); \
-                     let s = vec_sort_i64(vec_copy(v)); \
-                     vec_get_unchecked(s, 0) * 1000 + vec_get_unchecked(s, 3) * 100 + vec_index_of_i64(v, 8) * 10 + vec_sum_i64(v) \
+                     let mut v: Vec<i64> = Vec::new(); \
+                     v.push(5); v.push(3); v.push(8); v.push(1); \
+                     let mut s = v.clone(); s.sort(); \
+                     s[0] * 1000 + s[3] * 100 + v.position(|x: i64| x == 8).unwrap() * 10 + v.sum() \
                    }";
         // sorted[0]=1, sorted[3]=8, index_of(8)=2, sum=17 -> 1000+800+20+17 = 1837
         assert_eq!(run(src), 1837);
@@ -316,30 +322,30 @@ mod tests {
     #[test]
     fn prelude_vec_pop_last_reverse() {
         let src = "fn main() -> i64 { \
-                     let mut v: Vec<i64> = vec_new(); \
-                     v = vec_push(v, 1); v = vec_push(v, 2); v = vec_push(v, 3); \
-                     let last = opt_unwrap_or(vec_last(v), 0); \
-                     let rev = vec_reverse(v); \
-                     let popped = vec_pop(v); \
-                     last * 100 + vec_get_unchecked(rev, 0) * 10 + vec_len(popped) \
+                     let mut v: Vec<i64> = Vec::new(); \
+                     v.push(1); v.push(2); v.push(3); \
+                     let last = v.last().unwrap_or(0); \
+                     let mut rev = v.clone(); rev.reverse(); \
+                     let popped = v.pop().unwrap(); \
+                     last * 1000 + rev[0] * 100 + popped * 10 + v.len() \
                    }";
-        // last=3, rev[0]=3, pop len=2 -> 300 + 30 + 2 = 332
-        assert_eq!(run(src), 332);
+        // last=3, rev[0]=3, popped=3, len after pop=2 -> 3000 + 300 + 30 + 2
+        assert_eq!(run(src), 3332);
     }
 
-    // ---- MapStr (String-keyed hash map) ------------------------------------
+    // ---- HashMap with String keys -------------------------------------------
 
     #[test]
     fn prelude_mapstr_basic() {
         let src = "fn main() -> i64 { \
-                     let mut m: MapStr<i64> = mapstr_new(); \
-                     m = mapstr_insert(m, \"one\", 1); \
-                     m = mapstr_insert(m, \"two\", 2); \
-                     m = mapstr_insert(m, \"two\", 22); \
-                     let g = opt_unwrap_or(mapstr_get(m, \"two\"), 0); \
-                     let c = if mapstr_contains(m, \"one\") { 1 } else { 0 }; \
-                     let miss = if mapstr_contains(m, \"x\") { 1 } else { 0 }; \
-                     g * 100 + mapstr_len(m) * 10 + c + miss \
+                     let mut m: HashMap<String, i64> = HashMap::new(); \
+                     m.insert(\"one\", 1); \
+                     m.insert(\"two\", 2); \
+                     m.insert(\"two\", 22); \
+                     let g = m.get(\"two\").unwrap_or(0); \
+                     let c = if m.contains_key(\"one\") { 1 } else { 0 }; \
+                     let miss = if m.contains_key(\"x\") { 1 } else { 0 }; \
+                     g * 100 + m.len() * 10 + c + miss \
                    }";
         // get(two)=22, len=2 (one+two), contains(one)=1, miss=0 -> 2200+20+1 = 2221
         assert_eq!(run(src), 2221);
@@ -348,11 +354,12 @@ mod tests {
     #[test]
     fn prelude_iterator_combinators() {
         let src = "fn main() -> i64 { \
-                     let v = vec_range(1, 6); \
-                     let doubled = vec_map(v, |x: i64| x * 2); \
-                     let evens = vec_filter(v, |x: i64| x % 2 == 0); \
-                     let total = vec_fold(v, 0, |acc: i64, x: i64| acc + x); \
-                     vec_sum_i64(doubled) * 1000 + vec_sum_i64(evens) * 100 + total * 1 + vec_count(v, |x: i64| x > 3) \
+                     let mut v: Vec<i64> = Vec::new(); \
+                     for i in 1..6 { v.push(i); } \
+                     let doubled = v.map(|x: i64| x * 2); \
+                     let evens = v.filter(|x: i64| x % 2 == 0); \
+                     let total = v.fold(0, |acc: i64, x: i64| acc + x); \
+                     doubled.sum() * 1000 + evens.sum() * 100 + total * 1 + v.filter(|x: i64| x > 3).len() \
                    }";
         // doubled sum=30, evens sum=6, fold total=15, count(>3)=2 -> 30000+600+15+2 = 30617
         assert_eq!(run(src), 30617);
@@ -360,13 +367,13 @@ mod tests {
 
     #[test]
     fn prelude_generic_trait_ops() {
-        // vec_contains / vec_sort / vec_max via the Eq/Ord traits on i64.
+        // contains / sort / max via the Eq/Ord traits on i64.
         let src = "fn main() -> i64 { \
-                     let mut v: Vec<i64> = vec_new(); \
-                     v = vec_push(v, 30); v = vec_push(v, 10); v = vec_push(v, 20); \
-                     let s = vec_sort(vec_copy(v)); \
-                     let c = if vec_contains(v, 20) { 1 } else { 0 }; \
-                     vec_get_unchecked(s, 0) * 100 + vec_get_unchecked(s, 2) + opt_unwrap_or(vec_max(v), 0) + c \
+                     let mut v: Vec<i64> = Vec::new(); \
+                     v.push(30); v.push(10); v.push(20); \
+                     let mut s = v.clone(); s.sort(); \
+                     let c = if v.contains(20) { 1 } else { 0 }; \
+                     s[0] * 100 + s[2] + v.max().unwrap_or(0) + c \
                    }";
         // sorted[0]=10, sorted[2]=30, max=30, contains=1 -> 1000+30+30+1 = 1061
         assert_eq!(run(src), 1061);
@@ -374,18 +381,16 @@ mod tests {
 
     #[test]
     fn prelude_user_type_implements_ord() {
-        // A user struct implementing Ord is sorted by the generic vec_sort.
+        // A user struct implementing Ord is sorted by the generic `sort`.
         let src = "struct P { level: i64 } \
                    impl Ord for P { \
-                     fn cmp(self, other: P) -> i64 { \
-                       if self.level < other.level { 0 - 1 } else { if self.level > other.level { 1 } else { 0 } } \
-                     } \
+                     fn cmp(self, other: P) -> Ordering { self.level.cmp(other.level) } \
                    } \
                    fn main() -> i64 { \
-                     let mut v: Vec<P> = vec_new(); \
-                     v = vec_push(v, P { level: 3 }); v = vec_push(v, P { level: 1 }); v = vec_push(v, P { level: 2 }); \
-                     let s = vec_sort(v); \
-                     vec_get_unchecked(s, 0).level * 100 + vec_get_unchecked(s, 1).level * 10 + vec_get_unchecked(s, 2).level \
+                     let mut v: Vec<P> = Vec::new(); \
+                     v.push(P { level: 3 }); v.push(P { level: 1 }); v.push(P { level: 2 }); \
+                     v.sort(); \
+                     v[0].level * 100 + v[1].level * 10 + v[2].level \
                    }";
         // sorted levels: 1, 2, 3 -> 123
         assert_eq!(run(src), 123);
@@ -394,10 +399,11 @@ mod tests {
     #[test]
     fn prelude_iterator_any_all() {
         let src = "fn main() -> i64 { \
-                     let v = vec_range(1, 5); \
-                     let a = if vec_any(v, |x: i64| x > 3) { 1 } else { 0 }; \
-                     let b = if vec_all(v, |x: i64| x > 0) { 1 } else { 0 }; \
-                     let c = if vec_all(v, |x: i64| x > 2) { 1 } else { 0 }; \
+                     let mut v: Vec<i64> = Vec::new(); \
+                     for i in 1..5 { v.push(i); } \
+                     let a = if v.any(|x: i64| x > 3) { 1 } else { 0 }; \
+                     let b = if v.all(|x: i64| x > 0) { 1 } else { 0 }; \
+                     let c = if v.all(|x: i64| x > 2) { 1 } else { 0 }; \
                      a * 100 + b * 10 + c \
                    }";
         // any(>3)=1, all(>0)=1, all(>2)=0 -> 110
@@ -409,14 +415,14 @@ mod tests {
         // Insert past the initial capacity (8) to force at least two rehashes;
         // every key must remain findable, including the earliest insert.
         let src = "fn main() -> i64 { \
-                     let mut m: MapStr<i64> = mapstr_new(); \
-                     m = mapstr_insert(m, \"first\", 7); \
+                     let mut m: HashMap<String, i64> = HashMap::new(); \
+                     m.insert(\"first\", 7); \
                      let mut i = 0; \
-                     while i < 60 { m = mapstr_insert(m, to_string(i), i * 10); i = i + 1; } \
-                     opt_unwrap_or(mapstr_get(m, \"k\"), 0) + \
-                       opt_unwrap_or(mapstr_get(m, \"first\"), 0) * 1 + \
-                       opt_unwrap_or(mapstr_get(m, \"37\"), 0) + \
-                       mapstr_len(m) \
+                     while i < 60 { m.insert(i.to_string(), i * 10); i = i + 1; } \
+                     m.get(\"k\").unwrap_or(0) + \
+                       m.get(\"first\").unwrap_or(0) * 1 + \
+                       m.get(\"37\").unwrap_or(0) + \
+                       m.len() \
                    }";
         // get(k)=0(absent), first=7, get(37)=370, len=61 -> 0+7+370+61 = 438
         assert_eq!(run(src), 438);

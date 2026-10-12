@@ -125,7 +125,7 @@ pub fn reflect_view(prog: &CoreProgram) -> Value {
 /// The `mono` stage: the monomorphization table. Every monomorphic function
 /// instance, grouped by its generic *base* name (the mangling is `base$Args`),
 /// so you can see at a glance which generics were instantiated and how many
-/// times. Answers "what did `vec_map` get specialized to?" without reading the
+/// times. Answers "what did `Vec::map` get specialized to?" without reading the
 /// lowerer.
 pub fn mono_table(prog: &CoreProgram) -> Value {
     use std::collections::BTreeMap;

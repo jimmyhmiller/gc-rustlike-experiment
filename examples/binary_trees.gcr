@@ -27,8 +27,8 @@ fn main() -> i64 {
     // Build 40 trees of the max depth and sum their node counts.
     while iter < 40 {
         let t = make(max_depth);
-        total = total + check(t);
-        iter = iter + 1;
+        total += check(t);
+        iter += 1;
     }
     total
 }

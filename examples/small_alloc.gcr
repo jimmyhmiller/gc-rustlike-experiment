@@ -10,8 +10,8 @@ fn main() -> i64 {
     let mut acc = 0;
     while i < 5000000 {
         let p = Pair { a: i, b: i + 1 };
-        acc = acc + p.a + p.b;
-        i = i + 1;
+        acc += p.a + p.b;
+        i += 1;
     }
     acc
 }

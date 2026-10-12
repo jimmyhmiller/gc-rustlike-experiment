@@ -1,6 +1,6 @@
 # Ordered parallel mapping
 
-`vec_parallel_map<T: Sync, U: Sync>(items, workers, callback)` returns
+`items.parallel_map(workers, callback)` (for `Vec<T>` with `T: Sync, U: Sync`) returns
 `Result<Vec<U>, String>`. Worker counts must be 1–64; invalid counts return an
 error even for empty inputs. Results preserve input order. Each batch is fully
 joined before the next starts, so at most `workers` OS threads run at a time and
@@ -8,10 +8,10 @@ all workers finish before return. This implementation creates threads per batch;
 it is not a persistent worker pool.
 
 ```rust
-let mut values: Vec<i64> = vec_new();
-values = vec_push(values, 2);
-values = vec_push(values, 3);
-let doubled = vec_parallel_map(values, 2, |n: i64| n * 2);
+let mut values: Vec<i64> = Vec::new();
+values.push(2);
+values.push(3);
+let doubled = values.parallel_map(2, |n: i64| n * 2);
 ```
 
 Inputs and outputs currently must satisfy structural `Sync`. Direct spawn
@@ -28,10 +28,11 @@ callers processing large inputs should invoke this helper on bounded batches.
 
 The search app processes four documents at a time. Workers produce match offsets;
 the main thread renders and writes matching lines in order. It avoids retaining
-all rendered output. Searches use `str_find_range(text, needle, from, end)`, which
-restricts literal byte search to `[from, end)` and returns an absolute byte offset.
-Negative bounds clamp to zero, end clamps to string length, and reversed ranges
-or starts beyond the string return -1. Empty needles match at a valid start.
+all rendered output. Searches use `text.find_between(needle, from, end)`, which
+restricts literal byte search to `[from, end)` and returns `Option` of an absolute
+byte offset. Negative bounds clamp to zero, end clamps to string length, and
+reversed ranges or starts beyond the string return `None`. Empty needles match at
+a valid start.
 
 Value arrays now store each written value in a GC-traced box. Embedded references
 are traced, copying an element preserves value semantics, and unset reference/inline-value elements fail rather than fabricating values. This costs an allocation per value-element store.

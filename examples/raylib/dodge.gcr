@@ -39,7 +39,7 @@ struct Block { x: f64, y: f64, w: f64, speed: f64 }
 // Overflow-safe LCG (state stays < 2^31, so state*1103515245 < 2^61 < i64::MAX).
 fn rand_next(s: i64) -> i64 { (s * 1103515245 + 12345) % 2147483648 }
 
-fn clampf(v: f64, lo: f64, hi: f64) -> f64 { max_f64(lo, min_f64(v, hi)) }
+fn clampf(v: f64, lo: f64, hi: f64) -> f64 { lo.max(v.min(hi)) }
 
 // Circle (cx,cy,r) vs axis-aligned rect (bx,by,bw,bh).
 fn hits(cx: f64, cy: f64, r: f64, bx: f64, by: f64, bw: f64, bh: f64) -> bool {
@@ -59,7 +59,7 @@ fn main() -> i64 {
   let player_y = 600.0;
   let player_r = 18.0;
 
-  let mut blocks: Vec<Block> = vec_new();
+  let mut blocks: Vec<Block> = Vec::new();
   let mut score = 0;
   let mut best = 0;
   let mut rng = 987654321;
@@ -67,39 +67,39 @@ fn main() -> i64 {
   let mut alive = true;
   let mut px = 400.0;
 
-  while WindowShouldClose() == false {
+  while !WindowShouldClose() {
     px = clampf(GetMouseX() as f64, 0.0, width as f64);
 
     if alive {
       // Spawn a new block every ~22 frames at a random x with a random speed.
-      spawn_timer = spawn_timer + 1;
+      spawn_timer += 1;
       if spawn_timer >= 22 {
         spawn_timer = 0;
         rng = rand_next(rng);
         let bx = (rng % 760) as f64;
         rng = rand_next(rng);
         let spd = 3.0 + ((rng % 400) as f64) / 100.0;
-        blocks = vec_push(blocks, Block { x: bx, y: 0.0 - 40.0, w: 40.0, speed: spd });
+        blocks.push(Block { x: bx, y: 0.0 - 40.0, w: 40.0, speed: spd });
       }
 
       // Advance every block; keep on-screen ones (rebuild the Vec — off-screen
       // blocks become GC garbage). Score a point per block dodged off the bottom.
-      let mut next: Vec<Block> = vec_new();
-      let n = vec_len(blocks);
+      let mut next: Vec<Block> = Vec::new();
+      let n = blocks.len();
       let mut i = 0;
       let mut hit = false;
       while i < n {
-        let mut b = vec_get_unchecked(blocks, i);
-        b.y = b.y + b.speed;
+        let mut b = blocks[i];
+        b.y += b.speed;
         if hits(px, player_y, player_r, b.x, b.y, b.w, b.w) {
           hit = true;
         }
         if b.y < height as f64 {
-          next = vec_push(next, b);
+          next.push(b);
         } else {
-          score = score + 1;
+          score += 1;
         }
-        i = i + 1;
+        i += 1;
       }
       blocks = next;
       if hit {
@@ -109,7 +109,7 @@ fn main() -> i64 {
     } else {
       // Game over: press R (key 82) to restart.
       if IsKeyDown(82) {
-        blocks = vec_new();
+        blocks = Vec::new();
         score = 0;
         spawn_timer = 0;
         alive = true;
@@ -120,20 +120,20 @@ fn main() -> i64 {
     BeginDrawing();
     ClearBackground(rgb(18, 18, 28));
 
-    let n2 = vec_len(blocks);
+    let n2 = blocks.len();
     let mut j = 0;
     while j < n2 {
-      let b = vec_get_unchecked(blocks, j);
+      let b = blocks[j];
       DrawRectangle(b.x as i32, b.y as i32, b.w as i32, b.w as i32, rgb(90, 170, 240));
-      j = j + 1;
+      j += 1;
     }
 
     DrawCircle(px as i32, player_y as i32, player_r as f32, rgb(245, 205, 80));
 
-    DrawText(as_c_bytes(str_concat("Score: ", to_string(score))), 12, 12, 26, rgb(235, 235, 235));
-    DrawText(as_c_bytes(str_concat("Best: ", to_string(best))), 12, 44, 20, rgb(150, 150, 160));
+    DrawText(as_c_bytes("Score: " + score.to_string()), 12, 12, 26, rgb(235, 235, 235));
+    DrawText(as_c_bytes("Best: " + best.to_string()), 12, 44, 20, rgb(150, 150, 160));
 
-    if alive == false {
+    if !alive {
       DrawText(as_c_bytes("GAME OVER"), 300, 280, 44, rgb(245, 90, 90));
       DrawText(as_c_bytes("press R to restart"), 300, 336, 24, rgb(220, 220, 220));
     }

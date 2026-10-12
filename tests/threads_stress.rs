@@ -61,12 +61,12 @@ fn gen_program(rng: &mut Rng) -> (String, i64) {
     let mut src = String::new();
     src.push_str(
         "fn build_and_sum(n: i64) -> i64 {\n\
-         \x20 let v: Vec<i64> = vec_new();\n\
+         \x20 let v: Vec<i64> = Vec::new();\n\
          \x20 let mut acc = v;\n\
          \x20 let mut i = 0;\n\
-         \x20 while i < n { acc = vec_push(acc, i); i = i + 1; }\n\
+         \x20 while i < n { acc.push(i); i = i + 1; }\n\
          \x20 let mut s = 0; let mut j = 0;\n\
-         \x20 while j < vec_len(acc) { s = s + vec_get_unchecked(acc, j); j = j + 1; }\n\
+         \x20 while j < acc.len() { s = s + acc[j]; j = j + 1; }\n\
          \x20 s\n\
          }\n\
          fn accum(a: Atom<i64>, n: i64) -> i64 {\n\
@@ -77,9 +77,9 @@ fn gen_program(rng: &mut Rng) -> (String, i64) {
     );
     src.push_str("fn main() -> i64 {\n");
     // main's own live root, held across the spawns/joins.
-    src.push_str("  let mine: Vec<i64> = vec_new();\n  let mut m = mine;\n  let mut mk = 0;\n");
+    src.push_str("  let mine: Vec<i64> = Vec::new();\n  let mut m = mine;\n  let mut mk = 0;\n");
     src.push_str(&format!(
-        "  while mk < {} {{ m = vec_push(m, mk); mk = mk + 1; }}\n",
+        "  while mk < {} {{ m.push(mk); mk = mk + 1; }}\n",
         main_live
     ));
     if use_atom {
@@ -121,7 +121,7 @@ fn gen_program(rng: &mut Rng) -> (String, i64) {
     }
     src.push_str(
         "  let mut ms = 0; let mut mj = 0;\n\
-         \x20 while mj < vec_len(m) { ms = ms + vec_get_unchecked(m, mj); mj = mj + 1; }\n\
+         \x20 while mj < m.len() { ms = ms + m[mj]; mj = mj + 1; }\n\
          \x20 total + ms\n}\n",
     );
 
@@ -197,11 +197,11 @@ fn concurrent_atom_swap_captured_under_stress() {
 fn spawn_join_churn_stress() {
     let src = r#"
         fn work(n: i64) -> i64 {
-            let v: Vec<i64> = vec_new();
+            let v: Vec<i64> = Vec::new();
             let mut acc = v;
             let mut i = 0;
-            while i < n { acc = vec_push(acc, i); i = i + 1; }
-            vec_len(acc)
+            while i < n { acc.push(i); i = i + 1; }
+            acc.len()
         }
         fn main() -> i64 {
             let mut total = 0;

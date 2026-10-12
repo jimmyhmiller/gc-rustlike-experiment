@@ -21,7 +21,7 @@ fn unpack(pack: Pack) -> i64 {
 fn churn() -> i64 {
     let mut i = 0;
     let mut sum = 0;
-    while i < 400 { sum = sum + check(make(5)); i = i+1; }
+    while i < 400 { sum += check(make(5)); i = i+1; }
     sum
 }
 fn main() -> i64 {
@@ -36,7 +36,7 @@ fn main() -> i64 {
         && type_id_of(none) == type_id_of(number)
         && type_id_of(flag) == type_id_of(number)
         && type_id_of(pack_empty) == type_id_of(pack) { 1000 } else { -10000 };
-    let names = if str_eq(type_name_of(empty), "Tree") && str_eq(type_name_of(pack_empty), "Pack") { 164 } else { -10000 };
+    let names = if type_name_of(empty) == "Tree" && type_name_of(pack_empty) == "Pack" { 164 } else { -10000 };
     heap_snapshot();
     let worker = thread_spawn(|| churn());
     let own = churn();

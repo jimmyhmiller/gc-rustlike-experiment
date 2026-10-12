@@ -12,6 +12,6 @@ fn check(t: Tree) -> i64 { match t { Tree::Leaf => 1, Tree::Node(l, r) => 1 + ch
 fn main() -> i64 {
     let mut total = 0;
     let mut i = 0;
-    while i < 60 { total = total + check(make(13)); i = i + 1; }
+    while i < 60 { total += check(make(13)); i += 1; }
     total
 }

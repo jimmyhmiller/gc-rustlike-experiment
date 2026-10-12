@@ -23,7 +23,7 @@ validate row width; callers validate headers and schemas.
 Input is capped at 16 MiB and a decoded field at 1 MiB. Caller limits bound
 records and fields per record. `CsvError` carries a 1-based logical record and
 1-based UTF-8 byte position plus a message. EOF diagnostics use input length + 1;
-records count quoted multiline fields once. `csv_error_message` renders these.
+records count quoted multiline fields once. `e.to_string()` renders these.
 
 `csv_encode(rows)` returns `Result<String, CsvError>`. It emits CRLF after every
 record, escaping commas, quotes, and line endings. A record with one empty field
@@ -35,32 +35,32 @@ strings and encoder pieces are ordinary managed collections.
 
 ## Minimum heap
 
-`heap_new<T>() -> MinHeap<T>` creates an empty heap; an expected type annotation
-supplies `T`. `heap_len` reports its size, and `heap_peek` returns `Option<T>` for
-the smallest item without removing it. `heap_push` mutates the heap and returns
-its new size. `heap_pop` mutates it and returns the minimum or `None` when empty.
+`MinHeap::new()` creates an empty heap; an expected type annotation supplies `T`.
+`len` reports its size, and `peek` returns `Option<T>` for the smallest item
+without removing it. `push` adds an item in place. `pop` removes and returns the
+minimum, or `None` when empty.
 Push/pop require `T: Ord` and take O(log n) comparisons. No ordering of equal
 items is promised. Reference elements remain references; inline elements retain
 value-copy semantics. Comparison methods must define a consistent ordering.
 
-`MinHeap`, Vec, MapStr, and HashMap have no implicit synchronization. Own a heap
+`MinHeap`, Vec, and HashMap have no implicit synchronization. Own a heap
 in one thread or protect shared mutation externally; mutation through aliases
 has the same requirement. Do not change an inserted item's comparison key while
 it is in the heap. Concurrent collection variants are separate future APIs.
 
-`str_compare(left,right)` and String's `Ord` implementation compare unsigned
+String's `Ord` implementation (`a.cmp(b)`, `a < b`) compares unsigned
 UTF-8 bytes lexicographically. This is deterministic ordering, not locale-aware
 collation or Unicode normalization.
 
 ## Checked integer parsing
 
-`parse_int(text) -> Option<i64>` accepts ASCII decimal digits with an optional
-leading minus. Leading zeroes and negative zero are allowed. Empty strings,
-lone minus, plus, whitespace, non-ASCII digits, and out-of-range values return
+`text.parse_i64() -> Option<i64>` accepts ASCII decimal digits with an optional
+leading `-` or `+`. Leading zeroes and negative zero are allowed. Empty strings,
+a lone sign, whitespace, non-ASCII digits, and out-of-range values return
 `None`. Both i64 endpoints are supported. Trim explicitly when the input schema
 permits surrounding whitespace. Plain integer arithmetic retains the language's
-wrapping semantics; checked sum/time operations must use `checked_add_i64` and
-other checked arithmetic helpers.
+wrapping semantics; checked sum/time operations must use `checked_add` and the
+other checked arithmetic methods.
 
 Regression tests cover CSV round trips and errors, signed integer boundaries,
 heap growth/reuse with inline/reference elements, contextual match inference,

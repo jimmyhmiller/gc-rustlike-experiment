@@ -1,14 +1,14 @@
 // Private array aliases, dynamic lengths and bounded-body entry roots survive
 // native/generated allocations and another mutator's moving collections.
-fn make(n: i64) -> Array<i64> { array_new(n) }
+fn make(n: i64) -> Array<i64> { Array::new(n) }
 fn mutate(mut a: Array<i64>, alias: Array<i64>, n: i64) -> i64 {
     let mut j = 0;
-    while j < n { array_set(a, j, j+1); j = j+1; }
-    a[0]+alias[n-1]+array_len(a)
+    while j < n { a[j] = j+1; j = j+1; }
+    a[0]+alias[n-1]+a.len()
 }
 fn pressure(i: i64) -> i64 {
-    let mut scratch: Array<i64> = array_new(4096);
-    array_set(scratch, 0, i);
+    let mut scratch: Array<i64> = Array::new(4096);
+    scratch[0] = i;
     scratch[0]
 }
 fn churn() -> i64 {
@@ -25,12 +25,12 @@ fn churn() -> i64 {
 }
 fn bounded(mut a: Array<i64>) -> i64 {
     let mut j = 0;
-    while j < 7 { array_set(a, j, j+42); j = j+1; }
+    while j < 7 { a[j] = j+42; j = j+1; }
     a[0]
 }
 fn main() -> i64 {
-    let mut held: Array<i64> = array_new(7);
-    array_set(held,0,42);
+    let mut held: Array<i64> = Array::new(7);
+    held[0] = 42;
     let worker = thread_spawn(|| churn());
     let mut i = 0;
     while i < 1000 { bounded(held); i = i+1; }

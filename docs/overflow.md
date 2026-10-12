@@ -1,7 +1,8 @@
 # Arithmetic behavior
 
 Integer addition, subtraction, and multiplication wrap at the operand width.
-The prelude supplies `checked_add_i64` and `checked_mul_i64`, returning Option.
+The prelude supplies `i64::checked_add`, `checked_sub`, and `checked_mul`,
+returning Option.
 Checked multiplication rejects signed minimum times minus one in either order.
 
 Integer division and remainder by zero print a diagnostic and abort, consistent

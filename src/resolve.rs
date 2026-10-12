@@ -144,8 +144,28 @@ pub fn resolve_module(module: Module) -> Result<Resolved, ResolveError> {
     collect_items(&module.items, &mut Vec::new(), &mut globals)?;
     globals.apply_uses();
     validate_types(&globals)?;
+    validate_methods(&globals)?;
     validate_visibility(&module.items, &mut Vec::new(), &globals)?;
     Ok(Resolved { module, globals })
+}
+
+/// Reject two methods with the same name on the same receiver type. Methods are
+/// indexed by (receiver base name, method name), so a second definition would
+/// otherwise silently replace the first.
+fn validate_methods(g: &GlobalTable) -> Result<(), ResolveError> {
+    let mut seen = std::collections::HashSet::new();
+    for imp in &g.impls {
+        let base = crate::types::type_base_name(&imp.self_ty);
+        for m in &imp.items {
+            if !seen.insert((base.clone(), m.name.clone())) {
+                return Err(ResolveError {
+                    msg: format!("duplicate method `{}` on `{}`: another impl block already defines it", m.name, base),
+                    span: m.span,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Can code in module `from_mod` reference the symbol at fully-qualified path

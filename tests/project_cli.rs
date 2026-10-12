@@ -103,10 +103,10 @@ fn program_arguments_are_not_compiler_options() {
     let source = source.replace("let mut i = 0;", r#"
         let args = process_args();
         let values = match args { Result::Ok(values) => values, Result::Err(_) => return 90 };
-        if array_len(values) != 4 { return 91; }
-        if !str_eq(opt_expect(array_get(values, 1), "missing argument"), "--link-arg") { return 92; }
-        if !str_eq(opt_expect(array_get(values, 2), "missing argument"), "--gc-stress") { return 93; }
-        if !str_eq(opt_expect(array_get(values, 3), "missing argument"), "-o") { return 94; }
+        if values.len() != 4 { return 91; }
+        if !(values.get(1).expect("missing argument") == "--link-arg") { return 92; }
+        if !(values.get(2).expect("missing argument") == "--gc-stress") { return 93; }
+        if !(values.get(3).expect("missing argument") == "-o") { return 94; }
         let mut i = 0;
     "#);
     std::fs::write(p.0.join("src/main.gcr"), source).unwrap();
@@ -121,9 +121,9 @@ fn jit_project_arguments_and_exit_status_match_native() {
     std::fs::write(p.0.join("src/main.gcr"), r#"
     fn argument_score() -> i64 {
         let a = match process_args() { Result::Ok(v) => v, Result::Err(e) => return e.kind };
-        if array_len(a) != 3 { return 91; }
-        if !str_eq(opt_expect(array_get(a, 1), "arg"), "λ") { return 92; }
-        if !str_eq(opt_expect(array_get(a, 2), "arg"), "--gc-stress") { return 93; }
+        if a.len() != 3 { return 91; }
+        if !(a.get(1).expect("arg") == "λ") { return 92; }
+        if !(a.get(2).expect("arg") == "--gc-stress") { return 93; }
         7
     }
     fn main() -> i64 { let worker = Thread::spawn(argument_score); argument_score() + worker.join() }

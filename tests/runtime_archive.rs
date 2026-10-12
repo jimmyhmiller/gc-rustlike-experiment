@@ -19,7 +19,7 @@ impl Drop for Fixture {
 fn concurrent_native_builds_ignore_an_unrelated_cargo_target_dir() {
     let f = Fixture::new("concurrent");
     let source = f.0.join("main.gcr");
-    std::fs::write(&source,"fn main()->i64 { let mut i=0; while i<100 { let s=str_concat(\"λ\",to_string(i)); i=i+1; } 0 }").unwrap();
+    std::fs::write(&source,"fn main()->i64 { let mut i=0; while i<100 { let s=\"λ\" + i.to_string(); i=i+1; } 0 }").unwrap();
     // This path deliberately is a file. The AOT producer must select its own
     // cache rather than honor a caller target directory its consumer won't use.
     let unrelated = f.0.join("unrelated-target");

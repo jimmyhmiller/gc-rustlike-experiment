@@ -38,7 +38,7 @@ fn checked_io_preserves_errors_and_unicode_across_collections() {
         fn main() -> i64 {{
             let mut score = 0;
             match fs_write_text_atomic({path}, "hello λ\n") {{ Result::Ok(n) => score = score + 1, Result::Err(e) => score = 0 }};
-            match fs_read_text({path}, 100) {{ Result::Ok(s) => if str_eq(s, "hello λ\n") {{ score = score + 1; }}, Result::Err(e) => score = 0 }};
+            match fs_read_text({path}, 100) {{ Result::Ok(s) => if s == "hello λ\n" {{ score = score + 1; }}, Result::Err(e) => score = 0 }};
             match fs_read_text({missing}, 100) {{ Result::Err(e) => if e.kind == 1 {{ score = score + 1; }}, Result::Ok(s) => score = 0 }};
             match fs_read_text({path}, 2) {{ Result::Err(e) => if e.kind == 3 {{ score = score + 1; }}, Result::Ok(s) => score = 0 }};
             score
@@ -55,12 +55,12 @@ fn string_join_handles_empty_prefix_and_unicode_without_quadratic_growth() {
     assert_eq!(
         run(r#"
         fn main() -> i64 {
-            let mut v: Vec<String> = vec_new();
+            let mut v: Vec<String> = Vec::new();
             let mut i = 0;
-            while i < 200 { v = vec_push(v, "λ"); i = i + 1; }
-            let s = str_join(v, "|");
-            let empty: Vec<String> = vec_new();
-            if str_len(s) == 599 && str_eq(str_join(empty, "|"), "") && str_eq(str_join_array(v.data, 1, "|"), "λ") { 1 } else { 0 }
+            while i < 200 { v.push("λ"); i = i + 1; }
+            let s = v.join("|");
+            let empty: Vec<String> = Vec::new();
+            if s.len() == 599 && empty.join("|") == "" && str_join_array(v.data, 1, "|") == "λ" { 1 } else { 0 }
         }
     "#),
         1
@@ -72,11 +72,11 @@ fn literal_search_and_json_encoding_cover_byte_and_control_boundaries() {
     assert_eq!(
         run(r#"
         fn main() -> i64 {
-            let a = str_find_from("λλxλ", "λ", 2);
-            let b = str_find_from("abc", "", 3);
-            let c = str_find_from("abc", "a", 4);
+            let a = "λλxλ".find_from("λ", 2);
+            let b = "abc".find_from("", 3);
+            let c = "abc".find_from("a", 4);
             let d = json_quote("λ\n\t\"\\");
-            if a == 2 && b == 3 && c == 0 - 1 && str_eq(d, "\"λ\\u000a\\u0009\\\"\\\\\"") { 1 } else { 0 }
+            if a == Some(2) && b == Some(3) && c.is_none() && d == "\"λ\\u000a\\u0009\\\"\\\\\"" { 1 } else { 0 }
         }
     "#),
         1
@@ -106,13 +106,13 @@ fn bounded_string_search_clamps_ranges_and_preserves_absolute_offsets() {
     assert_eq!(run(r#"
         fn main() -> i64 {
             let s = "aλneedle\nneedle";
-            if str_find_range(s, "needle", 0, 9) != 3 { return 1; }
-            if str_find_range(s, "needle", 0, 8) != 0 - 1 { return 2; }
-            if str_find_range(s, "needle", 10, 100) != 10 { return 3; }
-            if str_find_range(s, "", 10, 9) != 0 - 1 { return 4; }
-            if str_find_range(s, "", 100, 100) != 0 - 1 { return 5; }
-            if str_find_range(s, "a", 0 - 1, 1) != 0 { return 6; }
-            if str_find_range(s, "", 0, 0 - 1) != 0 { return 7; }
+            if s.find_between("needle", 0, 9) != Some(3) { return 1; }
+            if s.find_between("needle", 0, 8).is_some() { return 2; }
+            if s.find_between("needle", 10, 100) != Some(10) { return 3; }
+            if s.find_between("", 10, 9).is_some() { return 4; }
+            if s.find_between("", 100, 100).is_some() { return 5; }
+            if s.find_between("a", 0 - 1, 1) != Some(0) { return 6; }
+            if s.find_between("", 0, 0 - 1) != Some(0) { return 7; }
             0
         }
     "#), 0);
@@ -124,8 +124,8 @@ fn embedded_jit_arguments_are_independent_and_inherited_by_threads() {
     let source = r#"
         fn score() -> i64 {
             let args = match process_args() { Result::Ok(v) => v, Result::Err(e) => return e.kind };
-            if array_len(args) != 2 { return 99; }
-            str_len(opt_expect(array_get(args, 1), "argument"))
+            if args.len() != 2 { return 99; }
+            args.get(1).expect("argument").len()
         }
         fn main() -> i64 { let worker = Thread::spawn(score); score() + worker.join() }
     "#;

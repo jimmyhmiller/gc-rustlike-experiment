@@ -15,7 +15,7 @@ fn main() -> i64 {
     let mut i = 0;
     let mut bytes = 0;
     while i < 100000 {
-        bytes = bytes + str_len(str_concat("allocation", "pressure"));
+        bytes = bytes + ("allocation" + "pressure").len();
         i = i + 1;
     }
     stop.store(1);

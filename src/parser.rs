@@ -114,8 +114,12 @@ impl Parser {
         let start = self.span();
         let attrs = self.attributes()?;
         // `#[value]` selects the inline value-type representation on a struct/enum.
-        let is_value = attrs.iter().any(|a| a == "value");
+        let is_value = attrs.iter().any(|(a, _)| a == "value");
         let vis = self.eat_kw(Kw::Pub);
+        if is_value && !matches!(self.peek(), TokKind::Keyword(Kw::Struct) | TokKind::Keyword(Kw::Enum)) {
+            let (_, span) = attrs.iter().find(|(a, _)| a == "value").unwrap();
+            return Err(ParseError { msg: "`#[value]` applies only to a struct or enum".into(), span: *span });
+        }
         let kind = match self.peek() {
             TokKind::Keyword(Kw::Extern) => ItemKind::Fn(self.extern_fn(vis)?),
             TokKind::Keyword(Kw::Fn) => ItemKind::Fn(self.fn_def(vis)?),
@@ -134,29 +138,28 @@ impl Parser {
         Ok(Item { kind, span: start.to(self.prev_span()) })
     }
 
-    /// Parse zero or more leading attributes `#[ name ]`. Returns the attribute
-    /// names (e.g. `["value"]`, `["repr"]`). Currently only `#[value]` is acted
-    /// on; unknown attributes are accepted and ignored (forward-compatible).
-    fn attributes(&mut self) -> PResult<Vec<String>> {
+    /// Parse zero or more leading attributes `#[ name ]`, returning each name
+    /// with its span. `#[value]` is the only attribute; any other name is an
+    /// error rather than being silently ignored.
+    fn attributes(&mut self) -> PResult<Vec<(String, Span)>> {
         let mut attrs = Vec::new();
         while self.at(&TokKind::Hash) {
+            let start = self.span();
             self.bump(); // `#`
             self.expect(&TokKind::LBracket)?;
-            attrs.push(self.ident()?);
-            // Tolerate (and skip) attribute arguments like `repr(C)` for the
-            // future, by consuming a balanced paren group if present.
-            if self.eat(&TokKind::LParen) {
-                let mut depth = 1;
-                while depth > 0 && !self.at(&TokKind::Eof) {
-                    match self.peek() {
-                        TokKind::LParen => depth += 1,
-                        TokKind::RParen => depth -= 1,
-                        _ => {}
-                    }
-                    self.bump();
-                }
+            let name_span = self.span();
+            let name = self.ident()?;
+            if name != "value" {
+                return Err(ParseError {
+                    msg: format!("unknown attribute `#[{}]` (only `#[value]` is supported)", name),
+                    span: name_span,
+                });
+            }
+            if self.at(&TokKind::LParen) {
+                return Err(self.error("`#[value]` takes no arguments"));
             }
             self.expect(&TokKind::RBracket)?;
+            attrs.push((name, start.to(self.prev_span())));
         }
         Ok(attrs)
     }

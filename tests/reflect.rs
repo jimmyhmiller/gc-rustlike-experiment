@@ -32,8 +32,8 @@ fn type_id_and_name_consistent() {
         fn main() -> i64 {
             let p = Point { x: 1, y: 2 };
             let o = Other { a: 3 };
-            let same_name = if str_eq(type_name_of(p), "Point") { 1 } else { 0 };
-            let other_name = if str_eq(type_name_of(o), "Other") { 1 } else { 0 };
+            let same_name = if type_name_of(p) == "Point" { 1 } else { 0 };
+            let other_name = if type_name_of(o) == "Other" { 1 } else { 0 };
             let differ = if type_id_of(p) == type_id_of(o) { 0 } else { 1 };
             // type_name_of must agree with a fresh instance of the same type.
             let p2 = Point { x: 9, y: 9 };
@@ -147,24 +147,24 @@ fn held_values_survive_collection_during_construction() {
     let prog = lower(r#"
         fn main() -> i64 {
             // `keep` (0..99) is held across all the churn below.
-            let keep: Vec<i64> = vec_new();
+            let keep: Vec<i64> = Vec::new();
             let mut k = keep;
             let mut i = 0;
-            while i < 100 { k = vec_push(k, i); i = i + 1; }
+            while i < 100 { k.push(i); i = i + 1; }
             // Churn: build and discard many vecs to force space-full collections
             // while `k` stays live (a frame root that must relocate correctly).
             let mut j = 0;
             while j < 80 {
-                let tmp: Vec<i64> = vec_new();
+                let tmp: Vec<i64> = Vec::new();
                 let mut t = tmp;
                 let mut m = 0;
-                while m < 60 { t = vec_push(t, m); m = m + 1; }
+                while m < 60 { t.push(m); m = m + 1; }
                 j = j + 1;
             }
             // Sum `keep` — 0+1+…+99 = 4950 iff it survived relocation intact.
             let mut s = 0;
             let mut p = 0;
-            while p < vec_len(k) { s = s + vec_get_unchecked(k, p); p = p + 1; }
+            while p < k.len() { s = s + k[p]; p = p + 1; }
             s
         }
     "#);

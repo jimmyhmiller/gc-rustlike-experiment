@@ -47,22 +47,22 @@ fn tri(n: i64) -> i64 { n * (n - 1) / 2 } // sum 0..n
 /// Common prelude-side helpers shared by the generated programs.
 const HELPERS: &str = r#"
     fn bsum(n: i64) -> i64 {
-        let v: Vec<i64> = vec_new();
+        let v: Vec<i64> = Vec::new();
         let mut acc = v; let mut i = 0;
-        while i < n { acc = vec_push(acc, i); i = i + 1; }
+        while i < n { acc.push(i); i = i + 1; }
         let mut s = 0; let mut j = 0;
-        while j < vec_len(acc) { s = s + vec_get_unchecked(acc, j); j = j + 1; }
+        while j < acc.len() { s = s + acc[j]; j = j + 1; }
         s
     }
     fn bvec(n: i64) -> Vec<i64> {
-        let v: Vec<i64> = vec_new();
+        let v: Vec<i64> = Vec::new();
         let mut acc = v; let mut i = 0;
-        while i < n { acc = vec_push(acc, i); i = i + 1; }
+        while i < n { acc.push(i); i = i + 1; }
         acc
     }
     fn vsum(v: Vec<i64>) -> i64 {
         let mut s = 0; let mut j = 0;
-        while j < vec_len(v) { s = s + vec_get_unchecked(v, j); j = j + 1; }
+        while j < v.len() { s = s + v[j]; j = j + 1; }
         s
     }
 "#;
@@ -125,7 +125,7 @@ fn gen_prog(rng: &mut Rng) -> (String, i64) {
             let cap = rng.range(1, 8);
             let per = rng.range(50, 300);
             body.push_str(
-                "fn prod(ch: Channel<Vec<i64>>, base: i64, n: i64) -> i64 { let mut i = 0; while i < n { let v: Vec<i64> = vec_new(); let _s = ch.send(vec_push(v, base + i)); i = i + 1; } 0 }\n");
+                "fn prod(ch: Channel<Vec<i64>>, base: i64, n: i64) -> i64 { let mut i = 0; while i < n { let mut v: Vec<i64> = Vec::new(); v.push(base + i); let _s = ch.send(v); i = i + 1; } 0 }\n");
             body.push_str(&format!("fn main() -> i64 {{\n  let ch: Channel<Vec<i64>> = Channel::new({});\n", cap));
             let mut bases = Vec::new();
             for i in 0..k {
@@ -135,7 +135,7 @@ fn gen_prog(rng: &mut Rng) -> (String, i64) {
             }
             let n_total = per * k;
             body.push_str(&format!(
-                "  let mut total = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }}\n",
+                "  let mut total = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv_value(); total = total + item[0]; got = got + 1; }}\n",
                 n_total));
             for i in 0..k { body.push_str(&format!("  let _j{} = t{}.join();\n", i, i)); }
             body.push_str("  total\n}\n");
@@ -150,7 +150,7 @@ fn gen_prog(rng: &mut Rng) -> (String, i64) {
             body.push_str(
                 "fn bump(a: Atom<i64>, n: i64) -> i64 { let mut i = 0; while i < n { let _x = a.swap(|v| v + 1); i = i + 1; } 0 }\n");
             body.push_str(
-                "fn prod(ch: Channel<Vec<i64>>, n: i64) -> i64 { let mut i = 0; while i < n { let v: Vec<i64> = vec_new(); let _s = ch.send(vec_push(v, i)); i = i + 1; } 0 }\n");
+                "fn prod(ch: Channel<Vec<i64>>, n: i64) -> i64 { let mut i = 0; while i < n { let mut v: Vec<i64> = Vec::new(); v.push(i); let _s = ch.send(v); i = i + 1; } 0 }\n");
             body.push_str("fn main() -> i64 {\n");
             body.push_str("  let a: Atom<i64> = Atom::new(0);\n");
             body.push_str("  let ch: Channel<Vec<i64>> = Channel::new(3);\n");
@@ -158,7 +158,7 @@ fn gen_prog(rng: &mut Rng) -> (String, i64) {
             body.push_str(&format!("  let tp = Thread::spawn(|| prod(ch, {}));\n", per));
             body.push_str(&format!("  let tv = Thread::spawn(|| bvec({}));\n", vn));
             body.push_str(&format!(
-                "  let mut csum = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv_value(); csum = csum + vec_get_unchecked(item, 0); got = got + 1; }}\n",
+                "  let mut csum = 0; let mut got = 0;\n  while got < {} {{ let item = ch.recv_value(); csum = csum + item[0]; got = got + 1; }}\n",
                 per));
             body.push_str("  let _ja = ta.join();\n  let _jp = tp.join();\n  let vres = vsum(tv.join());\n");
             body.push_str("  a.deref() + csum + vres\n}\n");

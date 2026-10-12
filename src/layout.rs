@@ -107,7 +107,7 @@ impl<'a> LayoutRegistry<'a> {
             }
             "Option" | "Result" => {
                 // Built-in enums. Honour a `#[value]` declaration (the prelude
-                // declares `Option` as a value enum so `array_get`/`vec_get` can
+                // declares `Option` as a value enum so `Array::get`/`Vec::get` can
                 // return it without per-access heap allocation); otherwise fall
                 // back to the structural reference-enum layout.
                 if let Some(e) = self.ctx.enums.get(name).cloned() {

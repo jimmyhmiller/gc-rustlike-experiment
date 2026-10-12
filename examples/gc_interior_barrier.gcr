@@ -23,8 +23,8 @@ fn churn(n: i64) -> i64 {
     let mut i = 0;
     while i < n {
         let b = Box { val: i };
-        acc = acc + b.val;
-        i = i + 1;
+        acc += b.val;
+        i += 1;
     }
     acc
 }

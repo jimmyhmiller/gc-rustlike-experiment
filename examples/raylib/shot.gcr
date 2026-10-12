@@ -28,7 +28,7 @@ fn main() -> i64 {
   InitWindow(800, 640, as_c_bytes("gc-rust + raylib — screenshot"));
   SetTargetFPS(60);
 
-  let mut blocks: Vec<Block> = vec_new();
+  let mut blocks: Vec<Block> = Vec::new();
   let mut rng = 424242;
   let mut spawn_timer = 0;
   let score = 7;
@@ -36,45 +36,45 @@ fn main() -> i64 {
 
   let mut frame = 0;
   while frame < 80 {
-    spawn_timer = spawn_timer + 1;
+    spawn_timer += 1;
     if spawn_timer >= 8 {
       spawn_timer = 0;
       rng = rand_next(rng);
       let bx = (rng % 760) as f64;
       rng = rand_next(rng);
       let spd = 3.0 + ((rng % 400) as f64) / 100.0;
-      blocks = vec_push(blocks, Block { x: bx, y: 0.0 - 40.0, w: 40.0, speed: spd });
+      blocks.push(Block { x: bx, y: 0.0 - 40.0, w: 40.0, speed: spd });
     }
 
-    let mut next: Vec<Block> = vec_new();
-    let n = vec_len(blocks);
+    let mut next: Vec<Block> = Vec::new();
+    let n = blocks.len();
     let mut i = 0;
     while i < n {
-      let mut b = vec_get_unchecked(blocks, i);
-      b.y = b.y + b.speed;
-      if b.y < 640.0 { next = vec_push(next, b); }
-      i = i + 1;
+      let mut b = blocks[i];
+      b.y += b.speed;
+      if b.y < 640.0 { next.push(b); }
+      i += 1;
     }
     blocks = next;
 
     BeginDrawing();
     ClearBackground(rgb(18, 18, 28));
-    let n2 = vec_len(blocks);
+    let n2 = blocks.len();
     let mut j = 0;
     while j < n2 {
-      let b = vec_get_unchecked(blocks, j);
+      let b = blocks[j];
       DrawRectangle(b.x as i32, b.y as i32, b.w as i32, b.w as i32, rgb(90, 170, 240));
-      j = j + 1;
+      j += 1;
     }
     DrawCircle(px as i32, 600, 18.0, rgb(245, 205, 80));
-    DrawText(as_c_bytes(str_concat("Score: ", to_string(score))), 12, 12, 26, rgb(235, 235, 235));
+    DrawText(as_c_bytes("Score: " + score.to_string()), 12, 12, 26, rgb(235, 235, 235));
     DrawText(as_c_bytes("gc-rust + raylib FFI (no shim)"), 12, 44, 20, rgb(150, 150, 160));
     EndDrawing();
 
-    frame = frame + 1;
+    frame += 1;
   }
 
   TakeScreenshot(as_c_bytes("dodge_shot.png"));
   CloseWindow();
-  vec_len(blocks)
+  blocks.len()
 }

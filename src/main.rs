@@ -1334,7 +1334,7 @@ fn run_new(args: &[String]) -> ExitCode {
          # frameworks = [\"Cocoa\", \"OpenGL\"]\n"
     );
     let main_src = format!(
-        "fn main() -> i64 {{\n  print_line(\"hello from {name}\");\n  0\n}}\n"
+        "fn main() -> i64 {{\n  println(\"hello from {name}\");\n  0\n}}\n"
     );
     if let Err(e) = std::fs::write(dir.join("gcr.toml"), toml) {
         eprintln!("gcr: {}", e);

@@ -170,7 +170,7 @@ fn alloc_profile_prelude_allocs_resolve_to_std_even_in_large_files() {
     // prelude's offset range (the residual's total-failure regime).
     let pad = "// padding ".to_string() + &"x".repeat(60) + "\n";
     let src = format!(
-        "{}fn main() -> i64 {{\n  let v: Vec<i64> = vec_new();\n  let v2 = vec_push(v, 7);\n  vec_len(v2)\n}}\n",
+        "{}fn main() -> i64 {{\n  let mut v: Vec<i64> = Vec::new();\n  v.push(7);\n  v.len()\n}}\n",
         pad.repeat(900) // ~55 KB
     );
     assert!(src.len() > 44_000, "test needs a >44KB file to exercise the residual");

@@ -38,7 +38,7 @@ fn channel_producer_consumer() {
     let src = r#"
         fn produce(ch: Channel<Vec<i64>>, n: i64) -> i64 {
             let mut i = 0;
-            while i < n { let v: Vec<i64> = vec_new(); let _s = ch.send(vec_push(v, i)); i = i + 1; }
+            while i < n { let mut v: Vec<i64> = Vec::new(); v.push(i); let _s = ch.send(v); i = i + 1; }
             let _c = ch.close();
             0
         }
@@ -46,7 +46,7 @@ fn channel_producer_consumer() {
             let ch: Channel<Vec<i64>> = Channel::new(2);
             let t = Thread::spawn(|| produce(ch, 5));
             let mut total = 0; let mut got = 0;
-            while got < 5 { let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
+            while got < 5 { let item = ch.recv_value(); total = total + item[0]; got = got + 1; }
             let _j = t.join();
             total
         }
@@ -59,14 +59,14 @@ fn channel_under_gc_stress() {
     let src = r#"
         fn produce(ch: Channel<Vec<i64>>, n: i64) -> i64 {
             let mut i = 0;
-            while i < n { let v: Vec<i64> = vec_new(); let _s = ch.send(vec_push(v, i)); i = i + 1; }
+            while i < n { let mut v: Vec<i64> = Vec::new(); v.push(i); let _s = ch.send(v); i = i + 1; }
             0
         }
         fn main() -> i64 {
             let ch: Channel<Vec<i64>> = Channel::new(2);
             let t = Thread::spawn(|| produce(ch, 5));
             let mut total = 0; let mut got = 0;
-            while got < 5 { let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
+            while got < 5 { let item = ch.recv_value(); total = total + item[0]; got = got + 1; }
             let _j = t.join();
             total
         }
@@ -79,7 +79,7 @@ fn channel_multi_producer_fan_in() {
     let src = r#"
         fn produce(ch: Channel<Vec<i64>>, base: i64, n: i64) -> i64 {
             let mut i = 0;
-            while i < n { let v: Vec<i64> = vec_new(); let _s = ch.send(vec_push(v, base + i)); i = i + 1; }
+            while i < n { let mut v: Vec<i64> = Vec::new(); v.push(base + i); let _s = ch.send(v); i = i + 1; }
             0
         }
         fn main() -> i64 {
@@ -87,7 +87,7 @@ fn channel_multi_producer_fan_in() {
             let t1 = Thread::spawn(|| produce(ch, 0, 100));
             let t2 = Thread::spawn(|| produce(ch, 1000, 100));
             let mut total = 0; let mut got = 0;
-            while got < 200 { let item = ch.recv_value(); total = total + vec_get_unchecked(item, 0); got = got + 1; }
+            while got < 200 { let item = ch.recv_value(); total = total + item[0]; got = got + 1; }
             let _a = t1.join(); let _b = t2.join();
             total
         }
@@ -242,11 +242,11 @@ fn atom_of_vec_single_threaded() {
     // functionally. Exercises pointer-CAS on a heap (Ref) value.
     let src = r#"
         fn main() -> i64 {
-            let a: Atom<Vec<i64>> = Atom::new(vec_new());
-            let _v = a.swap(|old| vec_push(old, 10));
-            let _w = a.swap(|old| vec_push(old, 20));
+            let a: Atom<Vec<i64>> = Atom::new(Vec::new());
+            let _v = a.swap(|old| { let mut v = old.clone(); v.push(10); v });
+            let _w = a.swap(|old| { let mut v = old.clone(); v.push(20); v });
             let cur = a.deref();
-            vec_get_unchecked(cur, 0) + vec_get_unchecked(cur, 1)
+            cur[0] + cur[1]
         }
     "#;
     assert_eq!(run(src), 30);
@@ -259,16 +259,16 @@ fn atom_of_vec_concurrent_swap_under_stress() {
     let src = r#"
         fn pushn(a: Atom<Vec<i64>>, n: i64) -> i64 {
             let mut i = 0;
-            while i < n { let _v = a.swap(|old| vec_push(old, 1)); i = i + 1; }
+            while i < n { let _v = a.swap(|old| { let mut v = old.clone(); v.push(1); v }); i = i + 1; }
             0
         }
         fn main() -> i64 {
-            let a: Atom<Vec<i64>> = Atom::new(vec_new());
+            let a: Atom<Vec<i64>> = Atom::new(Vec::new());
             let t1 = Thread::spawn(|| pushn(a, 300));
             let t2 = Thread::spawn(|| pushn(a, 300));
             let _l = pushn(a, 300);
             let _x = t1.join(); let _y = t2.join();
-            vec_len(a.deref())
+            a.deref().len()
         }
     "#;
     assert_eq!(run_stress(src), 900);

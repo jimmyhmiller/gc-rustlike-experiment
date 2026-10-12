@@ -13,7 +13,7 @@ fn main() -> i64 {
     let t = build(18, 1);   // 2^18 = 262144 leaves, ~524287 nodes (~a deep branching heap)
     // churn garbage so a collection runs while the tree is live -> it must survive
     let mut j = 0;
-    while j < 1000000 { let mut v = vec_new(); v = vec_push(v, j); j = j + 1; }
+    while j < 1000000 { let mut v = Vec::new(); v.push(j); j = j + 1; }
     let leaves = count_leaves(t);
     let s = sum_leaves(t);
     // leaves must be exactly 262144; s is deterministic; encode both into the exit

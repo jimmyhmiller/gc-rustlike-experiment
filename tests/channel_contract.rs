@@ -62,8 +62,8 @@ fn malformed_channel_intrinsics_report_frontend_errors() {
         "chan_close(42); 0",
         "chan_sender_clone(42); 0",
         "chan_waiting_receivers(42)",
-        "let a: Array<i64> = array_new(0); chan_new(1, a); 0",
-        "let a: Array<i64> = array_new(0); let c = atomic_i64_new(0); chan_recv(a, c)",
+        "let a: Array<i64> = Array::new(0); chan_new(1, a); 0",
+        "let a: Array<i64> = Array::new(0); let c = atomic_i64_new(0); chan_recv(a, c)",
         "let c: Channel<String> = Channel::new(1); let wrong = ChannelMessage { value: 42 }; chan_send(c.buf, c.ctrl, wrong)",
     ] {
         let source = format!("fn main() -> i64 {{ {body} }}");

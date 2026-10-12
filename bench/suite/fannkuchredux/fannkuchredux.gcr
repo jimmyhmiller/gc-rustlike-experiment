@@ -11,12 +11,12 @@
 // N is hardcoded to match the CLI arg the harness passes to the other langs.
 
 fn fannkuch(n: i64) -> i64 {
-    let mut perm1: Array<i64> = array_new(n);
-    let mut perm: Array<i64> = array_new(n);
-    let mut count: Array<i64> = array_new(n);
+    let mut perm1: Array<i64> = Array::new(n);
+    let mut perm: Array<i64> = Array::new(n);
+    let mut count: Array<i64> = Array::new(n);
     let mut i = 0;
     while i < n {
-        let _a = array_set(perm1, i, i);
+        perm1[i] = i;
         i = i + 1;
     }
     let mut max_flips = 0;
@@ -26,31 +26,31 @@ fn fannkuch(n: i64) -> i64 {
     let mut running = 1;
     while running == 1 {
         while r != 1 {
-            let _c = array_set(count, r - 1, r);
+            count[r - 1] = r;
             r = r - 1;
         }
         // copy perm1 -> perm
         let mut k0 = 0;
         while k0 < n {
-            let _p = array_set(perm, k0, array_get_unchecked(perm1, k0));
+            perm[k0] = perm1[k0];
             k0 = k0 + 1;
         }
         // count flips
         let mut flips = 0;
-        let mut k = array_get_unchecked(perm, 0);
+        let mut k = perm[0];
         while k != 0 {
             let mut a = 0;
             let mut b = k;
             while a < b {
-                let ta = array_get_unchecked(perm, a);
-                let tb = array_get_unchecked(perm, b);
-                let _x = array_set(perm, a, tb);
-                let _y = array_set(perm, b, ta);
+                let ta = perm[a];
+                let tb = perm[b];
+                perm[a] = tb;
+                perm[b] = ta;
                 a = a + 1;
                 b = b - 1;
             }
             flips = flips + 1;
-            k = array_get_unchecked(perm, 0);
+            k = perm[0];
         }
         if flips > max_flips {
             max_flips = flips;
@@ -67,15 +67,15 @@ fn fannkuch(n: i64) -> i64 {
                 running = 0;
                 done = 1;
             } else {
-                let perm0 = array_get_unchecked(perm1, 0);
+                let perm0 = perm1[0];
                 let mut m = 0;
                 while m < r {
-                    let _s = array_set(perm1, m, array_get_unchecked(perm1, m + 1));
+                    perm1[m] = perm1[m + 1];
                     m = m + 1;
                 }
-                let _e = array_set(perm1, r, perm0);
-                let cr = array_get_unchecked(count, r) - 1;
-                let _f = array_set(count, r, cr);
+                perm1[r] = perm0;
+                let cr = count[r] - 1;
+                count[r] = cr;
                 if cr > 0 {
                     done = 1;
                 } else {

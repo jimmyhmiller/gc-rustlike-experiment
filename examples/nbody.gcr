@@ -48,12 +48,12 @@ fn main() -> i64 {
     let mut vx = 0.0;
     while i < n {
         let dv = pair_dv(px, py, pz, 1.0, 0.0, 0.0, 0.0, 1000.0, 0.01);
-        vx = vx + dv;
-        px = px + vx * 0.01;
-        py = py + 0.001;
-        pz = pz - 0.0005;
+        vx += dv;
+        px += vx * 0.01;
+        py += 0.001;
+        pz -= 0.0005;
         acc = acc + energy(px, py, pz, 1.0);
-        i = i + 1;
+        i += 1;
     }
     (acc * 1000.0) as i64
 }

@@ -3,8 +3,8 @@ struct Record { n: i64, text: String }
 fn pipeline(ch: Channel<i64>) -> i64 {
     let mut n = 0;
     while n < 100 {
-        match ch.send(n) { Result::Ok(_) => (), Result::Err(_) => return 1 };
-        n = n + 1;
+        match ch.send(n) { Ok(_) => (), Err(_) => return 1 };
+        n += 1;
     }
     ch.close();
     0
@@ -14,8 +14,8 @@ fn main() -> i64 {
     ch.send(10); ch.send(20);
     ch.close(); ch.close();
     if ch.recv_value() != 10 || ch.recv_value() != 20 { return 1; }
-    match ch.recv() { Option::Some(_) => return 2, Option::None => () };
-    match ch.send(30) { Result::Ok(_) => return 3, Result::Err(n) => if n != 30 { return 4; } };
+    match ch.recv() { Some(_) => return 2, None => () };
+    match ch.send(30) { Ok(_) => return 3, Err(n) => if n != 30 { return 4; } };
 
     let full: Channel<i64> = Channel::new(1);
     full.send(100);
@@ -23,38 +23,38 @@ fn main() -> i64 {
     let second = Thread::spawn(|| full.send(102));
     while full.waiting_senders() != 2 { thread_yield(); }
     full.close(); full.close();
-    match first.join() { Result::Ok(_) => return 5, Result::Err(n) => if n != 101 { return 6; } };
-    match second.join() { Result::Ok(_) => return 7, Result::Err(n) => if n != 102 { return 8; } };
+    match first.join() { Ok(_) => return 5, Err(n) => if n != 101 { return 6; } };
+    match second.join() { Ok(_) => return 7, Err(n) => if n != 102 { return 8; } };
     if full.recv_value() != 100 { return 9; }
-    match full.recv() { Option::Some(_) => return 10, Option::None => () };
+    match full.recv() { Some(_) => return 10, None => () };
 
     let empty: Channel<String> = Channel::new(1);
     let a = Thread::spawn(|| empty.recv());
     let b = Thread::spawn(|| empty.recv());
     while empty.waiting_receivers() != 2 { thread_yield(); }
     empty.close();
-    match a.join() { Option::Some(_) => return 11, Option::None => () };
-    match b.join() { Option::Some(_) => return 12, Option::None => () };
+    match a.join() { Some(_) => return 11, None => () };
+    match b.join() { Some(_) => return 12, None => () };
 
     let values: Channel<Message> = Channel::new(3);
-    values.send(Message::Pair(42, str_concat("live", "λ")));
+    values.send(Message::Pair(42, "live" + "λ"));
     values.send(Message::Empty);
     let mut n = 0;
-    while n < 80 { let pressure = str_concat("garbage", to_string(n)); n = n + 1; }
-    match values.recv_value() { Message::Pair(n, s) => if n != 42 || !str_eq(s, "liveλ") { return 13; }, Message::Empty => return 14 };
+    while n < 80 { let pressure = "garbage" + n.to_string(); n += 1; }
+    match values.recv_value() { Message::Pair(n, s) => if n != 42 || !(s == "liveλ") { return 13; }, Message::Empty => return 14 };
     match values.recv_value() { Message::Empty => (), Message::Pair(_, _) => return 15 };
     values.close();
 
     let refs: Channel<Record> = Channel::new(1);
     refs.close();
     let mut original = Record { n: 7, text: "retained" };
-    match refs.send(original) { Result::Ok(_) => return 16, Result::Err(unsent) => { let mut rejected = unsent; rejected.n = 99; } };
+    match refs.send(original) { Ok(_) => return 16, Err(unsent) => { let mut rejected = unsent; rejected.n = 99; } };
     if original.n != 99 { return 17; }
 
     // Witness mutation cannot replace the canonical native queue storage.
     let mut stable: Channel<i64> = Channel::new(1);
     stable.send(77);
-    stable.buf = array_new(0);
+    stable.buf = Array::new(0);
     if stable.recv_value() != 77 { return 18; }
     stable.close();
 
@@ -68,12 +68,12 @@ fn main() -> i64 {
     let mut complete = false;
     while !complete {
         match pipe.recv() {
-            Option::Some(n) => {
+            Some(n) => {
                 if n != expected { return 21; }
-                let pressure = str_concat("pipeline", to_string(n));
-                expected = expected + 1;
+                let pressure = "pipeline" + n.to_string();
+                expected += 1;
             },
-            Option::None => complete = true
+            None => complete = true
         }
     }
     if expected != 100 || producer.join() != 0 { return 22; }
@@ -86,17 +86,17 @@ fn main() -> i64 {
         closer.join();
         racing.close();
         match sender.join() {
-            Result::Ok(_) => match racing.recv() {
-                Option::Some(n) => if n != round { return 23; },
-                Option::None => return 24
+            Ok(_) => match racing.recv() {
+                Some(n) => if n != round { return 23; },
+                None => return 24
             },
-            Result::Err(n) => {
+            Err(n) => {
                 if n != round { return 25; }
-                match racing.recv() { Option::Some(_) => return 26, Option::None => () };
+                match racing.recv() { Some(_) => return 26, None => () };
             }
         }
-        match racing.recv() { Option::Some(_) => return 27, Option::None => () };
-        round = round + 1;
+        match racing.recv() { Some(_) => return 27, None => () };
+        round += 1;
     }
     0
 }

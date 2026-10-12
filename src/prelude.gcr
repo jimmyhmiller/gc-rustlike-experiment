@@ -1,59 +1,103 @@
 // The gc-rust prelude — auto-imported into every program. Written in gc-rust
-// itself. Any item a user program re-declares (by name) shadows the prelude
-// version, so existing programs that declare their own Option/Result keep
-// working.
+// itself. A user item with the same name as a prelude item shadows it, along
+// with the prelude's impls for that type or trait.
+//
+// The API follows Rust's standard library: collections and strings are used
+// through methods (`Vec::new()`, `v.push(x)`, `v[i]`, `s.len()`), and
+// operators on non-scalar types dispatch to the traits below (`a + b` →
+// `Add::add`, `a == b` → `Eq::eq`, `a < b` → `Ord::cmp`). There are no
+// references: a struct value is a GC reference, and `mut self` methods mutate
+// the object in place, so every alias observes the change.
 
 // ---- Core sum types -------------------------------------------------------
 
 // A value (unboxed) enum: a flat tag + payload, no heap allocation. This keeps
-// `array_get`/`vec_get` returning `Option<T>` free of per-access allocation —
-// when the result is matched immediately, LLVM collapses the Option entirely.
+// `get` returning `Option<T>` free of per-access allocation — when the result
+// is matched immediately, LLVM collapses the Option entirely.
 #[value]
 enum Option<T> { None, Some(T) }
 
 enum Result<T, E> { Ok(T), Err(E) }
 
-// ---- Core comparison traits ------------------------------------------------
-// `Eq` and `Ord` let generic collection code compare elements. Implemented for
-// the built-in scalar/string types; users can implement them for their own
-// types to use the generic `vec_contains`/`vec_sort`/etc.
+// The result of `Ord::cmp`.
+#[value]
+enum Ordering { Less, Equal, Greater }
+
+// ---- Operator and comparison traits ----------------------------------------
+// Scalars use the built-in operators. For any other type, an operator calls
+// the method of that type's impl of the matching trait.
 
 trait Eq { fn eq(self, other: Self) -> bool; }
+trait Ord { fn cmp(self, other: Self) -> Ordering; }
+trait Add { fn add(self, other: Self) -> Self; }
+trait Sub { fn sub(self, other: Self) -> Self; }
+trait Mul { fn mul(self, other: Self) -> Self; }
+trait Div { fn div(self, other: Self) -> Self; }
+trait Rem { fn rem(self, other: Self) -> Self; }
 
-// `cmp` returns -1 (self < other), 0 (equal), or 1 (self > other).
-trait Ord { fn cmp(self, other: Self) -> i64; }
+// `x[i]` on a non-array type calls `Index::index`; `x[i] = v` calls
+// `IndexSet::index_set`. (Without references there is no `IndexMut`, so
+// assignment through an index is its own trait.)
+trait Index<T> { fn index(self, i: i64) -> T; }
+trait IndexSet<T> { fn index_set(mut self, i: i64, value: T); }
 
-impl Eq for i64 { fn eq(self, other: i64) -> bool { self == other } }
-impl Ord for i64 {
-    fn cmp(self, other: i64) -> i64 {
-        if self < other { 0 - 1 } else { if self > other { 1 } else { 0 } }
-    }
-}
-
-impl Eq for String { fn eq(self, other: String) -> bool { str_eq(self, other) } }
-// Lexicographic UTF-8 byte ordering; no substring allocation at each comparison.
-fn str_compare(left: String, right: String) -> i64 {
-    let mut i = 0;
-    let count = min_i64(str_len(left), str_len(right));
-    while i < count {
-        let a = str_get(left, i);
-        let b = str_get(right, i);
-        if a < b { return 0 - 1; }
-        if a > b { return 1; }
-        i = i + 1;
-    }
-    if str_len(left) < str_len(right) { 0 - 1 }
-    else if str_len(left) > str_len(right) { 1 }
-    else { 0 }
-}
-impl Ord for String { fn cmp(self, other: String) -> i64 { str_compare(self, other) } }
-
-impl Eq for bool { fn eq(self, other: bool) -> bool { self == other } }
-
-// `Hash` lets a type be used as a `HashMap<K, V>` key. Implement it (plus `Eq`)
-// for your own key types. The hash is folded into a power-of-two bucket index by
-// the map, so any i64 (including negative) is fine.
+// `Hash` lets a type be used as a `HashMap<K, V>` key; implement it together
+// with `Eq`. The map folds the hash into a power-of-two bucket index, so any
+// i64 (including negative) is fine.
 trait Hash { fn hash(self) -> i64; }
+
+trait ToString { fn to_string(self) -> String; }
+
+// `clone` copies a collection's storage, so the copy and the original can be
+// mutated independently. Elements are not cloned.
+trait Clone { fn clone(self) -> Self; }
+
+impl Ordering {
+    fn is_eq(self) -> bool { match self { Ordering::Equal => true, _ => false } }
+    fn is_ne(self) -> bool { match self { Ordering::Equal => false, _ => true } }
+    fn is_lt(self) -> bool { match self { Ordering::Less => true, _ => false } }
+    fn is_gt(self) -> bool { match self { Ordering::Greater => true, _ => false } }
+    fn is_le(self) -> bool { match self { Ordering::Greater => false, _ => true } }
+    fn is_ge(self) -> bool { match self { Ordering::Less => false, _ => true } }
+    fn reverse(self) -> Ordering {
+        match self { Ordering::Less => Ordering::Greater, Ordering::Equal => Ordering::Equal, Ordering::Greater => Ordering::Less }
+    }
+}
+impl Eq for Ordering {
+    fn eq(self, other: Ordering) -> bool {
+        match self {
+            Ordering::Less => other.is_lt(),
+            Ordering::Equal => other.is_eq(),
+            Ordering::Greater => other.is_gt(),
+        }
+    }
+}
+
+// ---- Scalar trait impls ------------------------------------------------------
+
+impl Eq for i8 { fn eq(self, other: i8) -> bool { self == other } }
+impl Eq for i16 { fn eq(self, other: i16) -> bool { self == other } }
+impl Eq for i32 { fn eq(self, other: i32) -> bool { self == other } }
+impl Eq for i64 { fn eq(self, other: i64) -> bool { self == other } }
+impl Eq for u8 { fn eq(self, other: u8) -> bool { self == other } }
+impl Eq for u16 { fn eq(self, other: u16) -> bool { self == other } }
+impl Eq for u32 { fn eq(self, other: u32) -> bool { self == other } }
+impl Eq for u64 { fn eq(self, other: u64) -> bool { self == other } }
+impl Eq for f32 { fn eq(self, other: f32) -> bool { self == other } }
+impl Eq for f64 { fn eq(self, other: f64) -> bool { self == other } }
+impl Eq for bool { fn eq(self, other: bool) -> bool { self == other } }
+impl Eq for char { fn eq(self, other: char) -> bool { self == other } }
+
+impl Ord for i8 { fn cmp(self, other: i8) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i16 { fn cmp(self, other: i16) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i32 { fn cmp(self, other: i32) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i64 { fn cmp(self, other: i64) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u8 { fn cmp(self, other: u8) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u16 { fn cmp(self, other: u16) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u32 { fn cmp(self, other: u32) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u64 { fn cmp(self, other: u64) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for bool { fn cmp(self, other: bool) -> Ordering { if self == other { Ordering::Equal } else if self { Ordering::Greater } else { Ordering::Less } } }
+impl Ord for char { fn cmp(self, other: char) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
 
 // SplitMix64-style finalizer: scrambles sequential integer keys so they don't
 // cluster in the open-addressed table. Arithmetic wraps (gc-rust ints wrap by
@@ -67,1172 +111,901 @@ impl Hash for i64 {
         z
     }
 }
-
-impl Hash for String { fn hash(self) -> i64 { str_hash(self) } }
-
+impl Hash for i32 { fn hash(self) -> i64 { (self as i64).hash() } }
+impl Hash for u8 { fn hash(self) -> i64 { (self as i64).hash() } }
+impl Hash for u32 { fn hash(self) -> i64 { (self as i64).hash() } }
+impl Hash for u64 { fn hash(self) -> i64 { (self as i64).hash() } }
 impl Hash for bool { fn hash(self) -> i64 { if self { 1 } else { 0 } } }
+impl Hash for char { fn hash(self) -> i64 { (self as i64).hash() } }
 
-// `Display` renders a value to a `String`. Implement it for your own types to
-// use the generic `str_of` / `print_line`. Built in for the scalar/string types;
-// `bool` renders as `true`/`false` (unlike `to_string`, which would give 1/0).
-trait Display { fn to_str(self) -> String; }
+impl ToString for i8 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for i16 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for i32 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for i64 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for u8 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for u16 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for u32 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for u64 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for f32 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for f64 { fn to_string(self) -> String { to_string(self) } }
+impl ToString for bool { fn to_string(self) -> String { if self { "true" } else { "false" } } }
+impl ToString for char { fn to_string(self) -> String { char_to_str(self as i64) } }
 
-impl Display for String { fn to_str(self) -> String { self } }
-impl Display for i64 { fn to_str(self) -> String { to_string(self) } }
-impl Display for f64 { fn to_str(self) -> String { to_string(self) } }
-impl Display for bool { fn to_str(self) -> String { if self { "true" } else { "false" } } }
+// ---- Integer and float methods -----------------------------------------------
 
-// Render any `Display` value to a `String`.
-fn str_of<T: Display>(x: T) -> String { x.to_str() }
+impl i64 {
+    // The largest and smallest i64 values.
+    fn max_value() -> i64 { 9223372036854775807 }
+    fn min_value() -> i64 { 0 - 9223372036854775807 - 1 }
 
-// Render a `Display` value and print it followed by a newline.
-fn print_line<T: Display>(x: T) -> i64 { println(x.to_str()) }
-
-// Render a `Display` value and print it with NO trailing newline.
-fn print_val<T: Display>(x: T) -> i64 { print(x.to_str()) }
-
-// Option combinators.
-fn opt_unwrap_or<T>(o: Option<T>, default: T) -> T {
-    match o {
-        Option::Some(x) => x,
-        Option::None => default,
+    fn min(self, other: i64) -> i64 { if self < other { self } else { other } }
+    fn max(self, other: i64) -> i64 { if self > other { self } else { other } }
+    fn clamp(self, lo: i64, hi: i64) -> i64 {
+        if lo > hi { panic("i64::clamp: lo is greater than hi"); }
+        self.max(lo).min(hi)
     }
-}
+    // Wraps for i64::MIN, like Rust's release-mode `abs`.
+    fn abs(self) -> i64 { if self < 0 { 0 - self } else { self } }
+    fn signum(self) -> i64 { if self < 0 { 0 - 1 } else if self > 0 { 1 } else { 0 } }
 
-fn opt_is_some<T>(o: Option<T>) -> bool {
-    match o {
-        Option::Some(_x) => true,
-        Option::None => false,
+    // `self` raised to `exp`; plain `*`, so the result wraps on overflow.
+    fn pow(self, exp: i64) -> i64 {
+        if exp < 0 { panic("i64::pow: negative exponent"); }
+        let mut result = 1;
+        let mut i = 0;
+        while i < exp {
+            result = result * self;
+            i += 1;
+        }
+        result
     }
-}
 
-// Result combinators.
-fn result_unwrap_or<T, E>(r: Result<T, E>, default: T) -> T {
-    match r {
-        Result::Ok(x) => x,
-        Result::Err(_e) => default,
+    // Overflow-checked arithmetic. Plain `+`/`-`/`*` wrap on overflow (see
+    // docs/overflow.md); these return None when the wrapped result differs from
+    // the true mathematical result.
+    fn checked_add(self, other: i64) -> Option<i64> {
+        // Overflows iff both operands share a sign and the sum has the other one.
+        let s = self + other;
+        if (self < 0) == (other < 0) && (s < 0) != (self < 0) { Option::None } else { Option::Some(s) }
     }
-}
-
-fn result_is_ok<T, E>(r: Result<T, E>) -> bool {
-    match r {
-        Result::Ok(_x) => true,
-        Result::Err(_e) => false,
+    fn checked_sub(self, other: i64) -> Option<i64> {
+        // Overflows iff the operands differ in sign and the result's sign
+        // differs from `self`'s.
+        let d = self - other;
+        if (self < 0) != (other < 0) && (d < 0) != (self < 0) { Option::None } else { Option::Some(d) }
     }
-}
-
-// ---- Numeric helpers ------------------------------------------------------
-
-fn min_i64(a: i64, b: i64) -> i64 { if a < b { a } else { b } }
-fn max_i64(a: i64, b: i64) -> i64 { if a > b { a } else { b } }
-fn abs_i64(a: i64) -> i64 { if a < 0 { 0 - a } else { a } }
-
-fn min_f64(a: f64, b: f64) -> f64 { if a < b { a } else { b } }
-fn max_f64(a: f64, b: f64) -> f64 { if a > b { a } else { b } }
-
-fn pow_i64(base: i64, exp: i64) -> i64 {
-    let mut result = 1;
-    let mut i = 0;
-    while i < exp {
-        result = result * base;
-        i = i + 1;
-    }
-    result
-}
-
-fn gcd_i64(a: i64, b: i64) -> i64 {
-    let mut x = abs_i64(a);
-    let mut y = abs_i64(b);
-    while y != 0 {
-        let t = y;
-        y = x % y;
-        x = t;
-    }
-    x
-}
-
-// Overflow-checked arithmetic (opt-in). Plain `+`/`*` wrap on overflow (see
-// docs/overflow.md); these return `Option::None` when the wrapping result
-// disagrees with the true mathematical result, so callers who care can detect it
-// without taxing every operation.
-
-// `a + b` overflows iff a and b share a sign but the sum has the opposite sign.
-fn checked_add_i64(a: i64, b: i64) -> Option<i64> {
-    let s = a + b;                          // wrapping
-    if (a < 0) == (b < 0) && (s < 0) != (a < 0) {
-        Option::None
-    } else {
-        Option::Some(s)
-    }
-}
-
-// `a - b` overflows iff a and b differ in sign and the result's sign differs
-// from a's.
-fn checked_sub_i64(a: i64, b: i64) -> Option<i64> {
-    let d = a - b;                          // wrapping
-    if (a < 0) != (b < 0) && (d < 0) != (a < 0) {
-        Option::None
-    } else {
-        Option::Some(d)
-    }
-}
-
-// `a * b` overflows iff dividing the wrapping product back doesn't recover `a`.
-fn checked_mul_i64(a: i64, b: i64) -> Option<i64> {
-    let minimum = 0 - 9223372036854775807 - 1;
-    if a == 0 || b == 0 {
-        Option::Some(0)
-    } else if (a == minimum && b == 0 - 1) || (b == minimum && a == 0 - 1) {
-        Option::None
-    } else {
-        let p = a * b;                      // wrapping
-        if p / b == a {
-            Option::Some(p)
-        } else {
+    fn checked_mul(self, other: i64) -> Option<i64> {
+        if self == 0 || other == 0 {
+            Option::Some(0)
+        } else if (self == i64::min_value() && other == 0 - 1) || (other == i64::min_value() && self == 0 - 1) {
             Option::None
+        } else {
+            // Overflows iff dividing the wrapped product back doesn't recover `self`.
+            let p = self * other;
+            if p / other == self { Option::Some(p) } else { Option::None }
+        }
+    }
+
+    // Explicit wrapping forms (identical to `+`/`-`/`*`).
+    fn wrapping_add(self, other: i64) -> i64 { self + other }
+    fn wrapping_sub(self, other: i64) -> i64 { self - other }
+    fn wrapping_mul(self, other: i64) -> i64 { self * other }
+
+    // Byte classes, for the bytes returned by `String::byte_at`.
+    fn is_ascii_whitespace(self) -> bool { self == 32 || self == 9 || self == 10 || self == 12 || self == 13 }
+    fn is_ascii_digit(self) -> bool { self >= 48 && self <= 57 }
+}
+
+impl f64 {
+    fn min(self, other: f64) -> f64 { if self < other { self } else { other } }
+    fn max(self, other: f64) -> f64 { if self > other { self } else { other } }
+    fn abs(self) -> f64 { if self < 0.0 { 0.0 - self } else { self } }
+}
+
+// ---- Option<T> and Result<T, E> ----------------------------------------------
+
+impl<T> Option<T> {
+    fn is_some(self) -> bool { match self { Option::Some(_x) => true, Option::None => false } }
+    fn is_none(self) -> bool { match self { Option::Some(_x) => false, Option::None => true } }
+    fn unwrap(self) -> T {
+        match self { Option::Some(x) => x, Option::None => panic("called `Option::unwrap()` on a `None` value") }
+    }
+    fn expect(self, message: String) -> T {
+        match self { Option::Some(x) => x, Option::None => panic(message) }
+    }
+    fn unwrap_or(self, default: T) -> T {
+        match self { Option::Some(x) => x, Option::None => default }
+    }
+    fn unwrap_or_else(self, f: fn() -> T) -> T {
+        match self { Option::Some(x) => x, Option::None => f() }
+    }
+    fn map<U>(self, f: fn(T) -> U) -> Option<U> {
+        match self { Option::Some(x) => Option::Some(f(x)), Option::None => Option::None }
+    }
+    fn and_then<U>(self, f: fn(T) -> Option<U>) -> Option<U> {
+        match self { Option::Some(x) => f(x), Option::None => Option::None }
+    }
+    fn ok_or<E>(self, err: E) -> Result<T, E> {
+        match self { Option::Some(x) => Result::Ok(x), Option::None => Result::Err(err) }
+    }
+}
+
+impl<T: Eq> Eq for Option<T> {
+    fn eq(self, other: Option<T>) -> bool {
+        match self {
+            Option::Some(a) => match other { Option::Some(b) => a == b, Option::None => false },
+            Option::None => other.is_none(),
         }
     }
 }
 
-// Explicit wrapping forms (identical to `+`/`-`/`*`, provided for symmetry).
-fn wrapping_add_i64(a: i64, b: i64) -> i64 { a + b }
-fn wrapping_sub_i64(a: i64, b: i64) -> i64 { a - b }
-fn wrapping_mul_i64(a: i64, b: i64) -> i64 { a * b }
+impl<T, E> Result<T, E> {
+    fn is_ok(self) -> bool { match self { Result::Ok(_x) => true, Result::Err(_e) => false } }
+    fn is_err(self) -> bool { match self { Result::Ok(_x) => false, Result::Err(_e) => true } }
+    fn unwrap(self) -> T {
+        match self { Result::Ok(x) => x, Result::Err(_e) => panic("called `Result::unwrap()` on an `Err` value") }
+    }
+    fn expect(self, message: String) -> T {
+        match self { Result::Ok(x) => x, Result::Err(_e) => panic(message) }
+    }
+    fn unwrap_err(self) -> E {
+        match self { Result::Ok(_x) => panic("called `Result::unwrap_err()` on an `Ok` value"), Result::Err(e) => e }
+    }
+    fn unwrap_or(self, default: T) -> T {
+        match self { Result::Ok(x) => x, Result::Err(_e) => default }
+    }
+    fn ok(self) -> Option<T> {
+        match self { Result::Ok(x) => Option::Some(x), Result::Err(_e) => Option::None }
+    }
+    fn err(self) -> Option<E> {
+        match self { Result::Ok(_x) => Option::None, Result::Err(e) => Option::Some(e) }
+    }
+    fn map<U>(self, f: fn(T) -> U) -> Result<U, E> {
+        match self { Result::Ok(x) => Result::Ok(f(x)), Result::Err(e) => Result::Err(e) }
+    }
+    fn map_err<F>(self, f: fn(E) -> F) -> Result<T, F> {
+        match self { Result::Ok(x) => Result::Ok(x), Result::Err(e) => Result::Err(f(e)) }
+    }
+}
 
-// ---- Vec<T> — a growable, GC-managed vector --------------------------------
-// A reference struct over an `Array<T>` backing store. `push` reallocates and
-// copies when full. Functions take/return the Vec by value (it's a small
-// 3-word reference object); the backing array is shared/replaced as needed.
+// ---- Array<T> -------------------------------------------------------------------
+// The built-in fixed-length array; its operations are compiler intrinsics.
+// `Array::new(n)` allocates (the element type comes from the annotation),
+// `a.len()`, `a.is_empty()`, `a.get(i)` (an Option), `a[i]` (aborting out of
+// bounds), and `a[i] = v`. Scalar slots start zeroed; reference and
+// inline-value slots must be written before they are read.
+
+// ---- Vec<T> — a growable, GC-managed vector --------------------------------------
+// A reference struct over an `Array<T>` backing store. `push` and the other
+// `mut self` methods update the Vec in place: every alias of a Vec sees its
+// pushes, like a Java `ArrayList`. Use `clone` for an independent copy.
 //
-// Usage needs a type annotation on construction so `T` is known:
-//     let mut v: Vec<i64> = vec_new();
-//     v = vec_push(v, 10);
-//     vec_get(v, 0)
-
 // Unsynchronized collection: shared mutation (including backing-array aliases)
 // requires external synchronization. Concurrent collections use separate APIs.
 struct Vec<T> { data: Array<T>, len: i64, cap: i64 }
 
-fn vec_new<T>() -> Vec<T> {
-    Vec { data: array_new(4), len: 0, cap: 4 }
-}
+impl<T> Vec<T> {
+    fn new() -> Vec<T> { Vec { data: Array::new(4), len: 0, cap: 4 } }
 
-fn vec_with_capacity<T>(cap: i64) -> Vec<T> {
-    let c = max_i64(cap, 1);
-    Vec { data: array_new(c), len: 0, cap: c }
-}
+    fn with_capacity(cap: i64) -> Vec<T> {
+        if cap < 0 { panic("Vec::with_capacity: negative capacity"); }
+        let c = cap.max(1);
+        Vec { data: Array::new(c), len: 0, cap: c }
+    }
 
-fn vec_len<T>(v: Vec<T>) -> i64 { v.len }
+    fn len(self) -> i64 { self.len }
+    fn is_empty(self) -> bool { self.len == 0 }
 
-// Bounds-checked indexing: Some(elem) when 0 <= i < len, None otherwise.
-fn vec_get<T>(v: Vec<T>, i: i64) -> Option<T> {
-    if i < 0 || i >= v.len { Option::None } else { Option::Some(array_get_unchecked(v.data, i)) }
-}
+    // Bounds-checked access: Some(element) when 0 <= i < len, otherwise None.
+    fn get(self, i: i64) -> Option<T> {
+        if i < 0 || i >= self.len { Option::None } else { Option::Some(self.data[i]) }
+    }
+    fn first(self) -> Option<T> { self.get(0) }
+    fn last(self) -> Option<T> { self.get(self.len - 1) }
 
-// Legacy direct-return indexing. The backing array still checks its own bounds:
-// racing metadata changes produce a defined failure instead of a raw bad read.
-fn vec_get_unchecked<T>(v: Vec<T>, i: i64) -> T { array_get_unchecked(v.data, i) }
+    fn push(mut self, x: T) {
+        if self.len == self.cap {
+            let new_cap = self.cap * 2;
+            let mut grown: Array<T> = Array::new(new_cap);
+            let mut i = 0;
+            while i < self.len {
+                grown[i] = self.data[i];
+                i += 1;
+            }
+            self.data = grown;
+            self.cap = new_cap;
+        }
+        self.data[self.len] = x;
+        self.len += 1;
+    }
 
-// `vec_set`/`vec_push` mutate the backing array, so they take `mut v`: under
-// gc-rust's immutable-by-default rule, mutating `v.data` requires `v` to be
-// mutable (see docs/mutability.md). Callers therefore need `let mut v`.
-fn vec_set<T>(mut v: Vec<T>, i: i64, x: T) -> Vec<T> {
-    let _u = array_set(v.data, i, x);
-    v
-}
+    // Remove and return the last element, or None if the Vec is empty.
+    fn pop(mut self) -> Option<T> {
+        if self.len == 0 {
+            Option::None
+        } else {
+            self.len -= 1;
+            Option::Some(self.data[self.len])
+        }
+    }
 
-fn vec_push<T>(mut v: Vec<T>, x: T) -> Vec<T> {
-    if v.len < v.cap {
-        let _u = array_set(v.data, v.len, x);
-        Vec { data: v.data, len: v.len + 1, cap: v.cap }
-    } else {
-        let new_cap = v.cap * 2;
-        let mut nd: Array<T> = array_new(new_cap);
+    // Shorten to `n` elements; no effect when `n >= len`.
+    fn truncate(mut self, n: i64) {
+        if n < 0 { panic("Vec::truncate: negative length"); }
+        if n < self.len { self.len = n; }
+    }
+    fn clear(mut self) { self.len = 0; }
+
+    fn swap(mut self, i: i64, j: i64) {
+        let tmp = self[i];
+        self[i] = self[j];
+        self[j] = tmp;
+    }
+
+    // Append every element of `other`.
+    fn extend(mut self, other: Vec<T>) {
         let mut i = 0;
-        while i < v.len {
-            let _u = array_set(nd, i, array_get_unchecked(v.data, i));
-            i = i + 1;
-        }
-        let _u2 = array_set(nd, v.len, x);
-        Vec { data: nd, len: v.len + 1, cap: new_cap }
-    }
-}
-
-// ---- Vec completion --------------------------------------------------------
-// Combinators that don't need element equality/ordering are fully generic.
-// Element-comparing ops (contains/index_of/sort) are provided as concrete i64
-// versions here; trait-bounded generic versions come with the Ord/Eq traits.
-
-fn vec_is_empty<T>(v: Vec<T>) -> bool { v.len == 0 }
-
-// Drop the last element (no-op if empty), returning the shrunk Vec. Pair with
-// `vec_last` to read the value first. (We keep value and container separate
-// rather than returning a tuple of generics, which the inference engine can't
-// yet resolve in the empty branch.)
-fn vec_pop<T>(mut v: Vec<T>) -> Vec<T> {
-    if v.len == 0 {
-        v
-    } else {
-        Vec { data: v.data, len: v.len - 1, cap: v.cap }
-    }
-}
-
-// Truncate to at most `n` elements.
-fn vec_truncate<T>(mut v: Vec<T>, n: i64) -> Vec<T> {
-    if n >= v.len {
-        v
-    } else {
-        Vec { data: v.data, len: max_i64(n, 0), cap: v.cap }
-    }
-}
-
-// The last element, or None if empty.
-fn vec_last<T>(v: Vec<T>) -> Option<T> {
-    if v.len == 0 { Option::None } else { Option::Some(array_get_unchecked(v.data, v.len - 1)) }
-}
-
-// The first element, or None for an empty Vec.
-fn vec_first<T>(v: Vec<T>) -> Option<T> {
-    if v.len == 0 { Option::None } else { Option::Some(array_get_unchecked(v.data, 0)) }
-}
-
-// Bounds-checked indexing: Some(elem) in range, None otherwise.
-fn vec_get_opt<T>(v: Vec<T>, i: i64) -> Option<T> {
-    if i < 0 || i >= v.len { Option::None } else { Option::Some(array_get_unchecked(v.data, i)) }
-}
-
-// A fresh Vec with every element of `a` followed by every element of `b`.
-fn vec_concat<T>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
-    let mut out: Vec<T> = vec_with_capacity(a.len + b.len);
-    let mut i = 0;
-    while i < a.len { out = vec_push(out, array_get_unchecked(a.data, i)); i = i + 1; }
-    let mut j = 0;
-    while j < b.len { out = vec_push(out, array_get_unchecked(b.data, j)); j = j + 1; }
-    out
-}
-
-// Append `b`'s elements onto `a` in place; returns the grown `a`.
-fn vec_extend<T>(mut a: Vec<T>, b: Vec<T>) -> Vec<T> {
-    let mut j = 0;
-    while j < b.len { a = vec_push(a, array_get_unchecked(b.data, j)); j = j + 1; }
-    a
-}
-
-// A fresh Vec copying elements [lo, hi). Indices are clamped to [0, len], so
-// out-of-range bounds yield a shorter slice rather than reading past the end.
-fn vec_slice<T>(v: Vec<T>, lo: i64, hi: i64) -> Vec<T> {
-    let mut a = lo; if a < 0 { a = 0; }
-    let mut b = hi; if b > v.len { b = v.len; }
-    let mut out: Vec<T> = vec_new();
-    while a < b { out = vec_push(out, array_get_unchecked(v.data, a)); a = a + 1; }
-    out
-}
-
-// The first `n` elements (clamped); `vec_drop` is everything after them.
-fn vec_take<T>(v: Vec<T>, n: i64) -> Vec<T> { vec_slice(v, 0, n) }
-fn vec_drop<T>(v: Vec<T>, n: i64) -> Vec<T> { vec_slice(v, n, v.len) }
-
-// Swap two elements in place; returns the Vec.
-fn vec_swap<T>(mut v: Vec<T>, i: i64, j: i64) -> Vec<T> {
-    let tmp = array_get_unchecked(v.data, i);
-    let _u1 = array_set(v.data, i, array_get_unchecked(v.data, j));
-    let _u2 = array_set(v.data, j, tmp);
-    v
-}
-
-// The first element satisfying `pred`, or None.
-fn vec_find<T>(v: Vec<T>, pred: fn(T) -> bool) -> Option<T> {
-    let mut i = 0;
-    let mut result: Option<T> = Option::None;
-    while i < v.len {
-        if opt_is_some(result) == false {
-            let x = array_get_unchecked(v.data, i);
-            if pred(x) { result = Option::Some(x); }
-        }
-        i = i + 1;
-    }
-    result
-}
-
-// The index of the first element satisfying `pred`, or -1.
-fn vec_position<T>(v: Vec<T>, pred: fn(T) -> bool) -> i64 {
-    let mut i = 0;
-    let mut found = 0 - 1;
-    while i < v.len {
-        if found < 0 { if pred(array_get_unchecked(v.data, i)) { found = i; } }
-        i = i + 1;
-    }
-    found
-}
-
-// A shallow copy (own backing array), so the original is untouched by later
-// in-place ops on the copy.
-fn vec_copy<T>(v: Vec<T>) -> Vec<T> {
-    let mut nd: Array<T> = array_new(max_i64(v.cap, 1));
-    let mut i = 0;
-    while i < v.len {
-        let _u = array_set(nd, i, array_get_unchecked(v.data, i));
-        i = i + 1;
-    }
-    Vec { data: nd, len: v.len, cap: max_i64(v.cap, 1) }
-}
-
-// Reverse the elements, returning a fresh Vec.
-fn vec_reverse<T>(v: Vec<T>) -> Vec<T> {
-    let mut out: Vec<T> = vec_with_capacity(max_i64(v.len, 1));
-    let mut i = v.len;
-    while i > 0 {
-        out = vec_push(out, array_get_unchecked(v.data, i - 1));
-        i = i - 1;
-    }
-    out
-}
-
-// ---- Vec<i64> concrete element-comparing ops -------------------------------
-
-fn vec_index_of_i64(v: Vec<i64>, x: i64) -> i64 {
-    let mut i = 0;
-    let mut found = 0 - 1;
-    while i < v.len {
-        if found < 0 {
-            if array_get_unchecked(v.data, i) == x {
-                found = i;
-            }
-        }
-        i = i + 1;
-    }
-    found
-}
-
-fn vec_contains_i64(v: Vec<i64>, x: i64) -> bool {
-    vec_index_of_i64(v, x) >= 0
-}
-
-fn vec_sum_i64(v: Vec<i64>) -> i64 {
-    let mut i = 0;
-    let mut acc = 0;
-    while i < v.len {
-        acc = acc + array_get_unchecked(v.data, i);
-        i = i + 1;
-    }
-    acc
-}
-
-// In-place insertion sort of a Vec<i64> (ascending). Stable, returns the sorted
-// Vec. Fine for the small/medium vectors a v1 stdlib targets.
-fn vec_sort_i64(mut v: Vec<i64>) -> Vec<i64> {
-    let mut i = 1;
-    while i < v.len {
-        let key = array_get_unchecked(v.data, i);
-        let mut j = i - 1;
-        // Shift larger elements right. `j` can go to -1, so guard before reading.
-        let mut placed = false;
-        while j >= 0 && placed == false {
-            let cur = array_get_unchecked(v.data, j);
-            if cur > key {
-                let _u = array_set(v.data, j + 1, cur);
-                j = j - 1;
-            } else {
-                placed = true;
-            }
-        }
-        let _u2 = array_set(v.data, j + 1, key);
-        i = i + 1;
-    }
-    v
-}
-
-// ---- String helpers --------------------------------------------------------
-// `String` is a built-in varlen heap type. The primitives `print_str`,
-// `str_len`, `str_eq`, and `str_concat` are runtime intrinsics; these wrappers
-// give friendlier names and a few conveniences, all in gc-rust itself.
-
-fn println(s: String) -> i64 { print_str(s) }
-
-fn string_len(s: String) -> i64 { str_len(s) }
-
-fn string_eq(a: String, b: String) -> bool { str_eq(a, b) }
-
-fn string_concat(a: String, b: String) -> String { str_concat(a, b) }
-
-fn str_is_empty(s: String) -> bool { str_len(s) == 0 }
-
-// Concatenate three strings: `str_concat3(a, b, c)`.
-fn str_concat3(a: String, b: String, c: String) -> String {
-    str_concat(str_concat(a, b), c)
-}
-
-// `s` repeated `n` times (empty for n <= 0).
-fn str_repeat(s: String, n: i64) -> String {
-    let mut out = "";
-    let mut i = 0;
-    while i < n { out = str_concat(out, s); i = i + 1; }
-    out
-}
-
-// Left-pad `s` with copies of `pad` until it is at least `width` bytes wide.
-// Pads in whole `pad` units (use a 1-byte `pad` for exact width).
-fn str_pad_left(s: String, width: i64, pad: String) -> String {
-    let mut out = s;
-    while str_len(out) < width { out = str_concat(pad, out); }
-    out
-}
-
-// Right-pad `s` with copies of `pad` until it is at least `width` bytes wide.
-fn str_pad_right(s: String, width: i64, pad: String) -> String {
-    let mut out = s;
-    while str_len(out) < width { out = str_concat(out, pad); }
-    out
-}
-
-// Reverse a string byte-wise (ASCII-correct; splits multi-byte UTF-8).
-fn str_reverse(s: String) -> String {
-    let n = str_len(s);
-    let mut out = "";
-    let mut i = n;
-    while i > 0 { out = str_concat(out, str_substring(s, i - 1, i)); i = i - 1; }
-    out
-}
-
-// Byte index of the first occurrence of `needle` in `s`, or -1. An empty needle
-// matches at 0 (mirrors most stdlibs).
-fn str_index_of(s: String, needle: String) -> i64 {
-    let hl = str_len(s); let nl = str_len(needle);
-    if nl == 0 { return 0; }
-    let mut i = 0;
-    let mut found = 0 - 1;
-    while i + nl <= hl && found < 0 {
-        if str_eq(str_substring(s, i, i + nl), needle) { found = i; }
-        i = i + 1;
-    }
-    found
-}
-
-// Split `s` on every (non-overlapping) occurrence of the string `sep`. An empty
-// `sep` yields the whole string as one part. Always returns at least one part.
-fn str_split(s: String, sep: String) -> Vec<String> {
-    let mut parts: Vec<String> = vec_new();
-    let sl = str_len(sep);
-    if sl == 0 { parts = vec_push(parts, s); return parts; }
-    let n = str_len(s);
-    let mut start = 0;
-    let mut i = 0;
-    while i + sl <= n {
-        if str_eq(str_substring(s, i, i + sl), sep) {
-            parts = vec_push(parts, str_substring(s, start, i));
-            i = i + sl;
-            start = i;
-        } else {
-            i = i + 1;
+        let n = other.len;
+        while i < n {
+            self.push(other.data[i]);
+            i += 1;
         }
     }
-    parts = vec_push(parts, str_substring(s, start, n));
-    parts
-}
 
-// ---- Unicode / code-point API ---------------------------------------------
-// `String`s are stored as UTF-8 bytes; `str_len`/`str_get`/`str_substring` work
-// in BYTES. These functions work in Unicode CODE POINTS instead: `str_chars`
-// decodes the UTF-8, and `char_to_str` (a runtime intrinsic) encodes one code
-// point back to a 1–4 byte string. Together they give character-aware length,
-// indexing, slicing, and (ASCII) case folding without splitting a code point.
-//
-// Decoding assumes well-formed UTF-8 (true for any string built from literals,
-// `str_concat`, `read_file` of UTF-8, etc.). A truncated/invalid sequence yields
-// a garbage code point rather than crashing.
+    // A new Vec holding a copy of elements [lo, hi).
+    fn slice(self, lo: i64, hi: i64) -> Vec<T> {
+        if lo < 0 || hi < lo || hi > self.len {
+            panic("Vec::slice: range " + lo.to_string() + ".." + hi.to_string() + " out of bounds for length " + self.len.to_string());
+        }
+        let mut out: Vec<T> = Vec::with_capacity(hi - lo);
+        let mut i = lo;
+        while i < hi {
+            out.push(self.data[i]);
+            i += 1;
+        }
+        out
+    }
 
-// Decode `s` into its Unicode code points.
-fn str_chars(s: String) -> Vec<i64> {
-    let n = str_len(s);
-    let mut out: Vec<i64> = vec_new();
-    let mut i = 0;
-    while i < n {
-        let b0 = str_get(s, i);
-        if b0 < 128 {
-            out = vec_push(out, b0);
-            i = i + 1;
-        } else {
-            if b0 < 224 {
-                let b1 = str_get(s, i + 1);
-                out = vec_push(out, ((b0 & 31) << 6) | (b1 & 63));
-                i = i + 2;
-            } else {
-                if b0 < 240 {
-                    let b1 = str_get(s, i + 1);
-                    let b2 = str_get(s, i + 2);
-                    out = vec_push(out, ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63));
-                    i = i + 3;
-                } else {
-                    let b1 = str_get(s, i + 1);
-                    let b2 = str_get(s, i + 2);
-                    let b3 = str_get(s, i + 3);
-                    out = vec_push(out, ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63));
-                    i = i + 4;
+    // Reverse the elements in place.
+    fn reverse(mut self) {
+        let mut i = 0;
+        let mut j = self.len - 1;
+        while i < j {
+            let tmp = self.data[i];
+            self.data[i] = self.data[j];
+            self.data[j] = tmp;
+            i += 1;
+            j -= 1;
+        }
+    }
+
+    // ---- Eager iterator-style combinators. Each returns a new Vec or a
+    // reduced value; the receiver is unchanged.
+
+    fn map<U>(self, f: fn(T) -> U) -> Vec<U> {
+        let mut out: Vec<U> = Vec::with_capacity(self.len);
+        let mut i = 0;
+        while i < self.len {
+            out.push(f(self.data[i]));
+            i += 1;
+        }
+        out
+    }
+
+    fn filter(self, pred: fn(T) -> bool) -> Vec<T> {
+        let mut out: Vec<T> = Vec::new();
+        let mut i = 0;
+        while i < self.len {
+            let x = self.data[i];
+            if pred(x) { out.push(x); }
+            i += 1;
+        }
+        out
+    }
+
+    fn fold<A>(self, init: A, f: fn(A, T) -> A) -> A {
+        let mut acc = init;
+        let mut i = 0;
+        while i < self.len {
+            acc = f(acc, self.data[i]);
+            i += 1;
+        }
+        acc
+    }
+
+    fn for_each(self, f: fn(T)) {
+        let mut i = 0;
+        while i < self.len {
+            f(self.data[i]);
+            i += 1;
+        }
+    }
+
+    fn any(self, pred: fn(T) -> bool) -> bool {
+        let mut i = 0;
+        while i < self.len {
+            if pred(self.data[i]) { return true; }
+            i += 1;
+        }
+        false
+    }
+
+    fn all(self, pred: fn(T) -> bool) -> bool {
+        let mut i = 0;
+        while i < self.len {
+            if !pred(self.data[i]) { return false; }
+            i += 1;
+        }
+        true
+    }
+
+    // The first element satisfying `pred`.
+    fn find(self, pred: fn(T) -> bool) -> Option<T> {
+        let mut i = 0;
+        while i < self.len {
+            let x = self.data[i];
+            if pred(x) { return Option::Some(x); }
+            i += 1;
+        }
+        Option::None
+    }
+
+    // Stable in-place merge sort by `compare`.
+    fn sort_by(mut self, compare: fn(T, T) -> Ordering) {
+        if self.len < 2 { return; }
+        let mut scratch: Array<T> = Array::new(self.len);
+        let mut width = 1;
+        while width < self.len {
+            let mut lo = 0;
+            while lo < self.len {
+                let mid = (lo + width).min(self.len);
+                let hi = (lo + width * 2).min(self.len);
+                let mut a = lo;
+                let mut b = mid;
+                let mut k = lo;
+                while k < hi {
+                    // Take from the left run unless the right element is
+                    // strictly smaller, which keeps equal elements in order.
+                    if a < mid && (b >= hi || !compare(self.data[b], self.data[a]).is_lt()) {
+                        scratch[k] = self.data[a];
+                        a += 1;
+                    } else {
+                        scratch[k] = self.data[b];
+                        b += 1;
+                    }
+                    k += 1;
                 }
+                lo = hi;
             }
+            let mut i = 0;
+            while i < self.len {
+                self.data[i] = scratch[i];
+                i += 1;
+            }
+            width = width * 2;
         }
     }
-    out
-}
 
-// The number of Unicode code points in `s` (vs `str_len`, which counts bytes).
-// Counts every byte that is not a UTF-8 continuation byte (0x80..0xBF).
-fn str_len_chars(s: String) -> i64 {
-    let n = str_len(s);
-    let mut count = 0;
-    let mut i = 0;
-    while i < n {
-        let b = str_get(s, i);
-        if b < 128 || b >= 192 { count = count + 1; }
-        i = i + 1;
-    }
-    count
-}
-
-// Build a `String` from a Vec of Unicode code points (inverse of `str_chars`).
-fn str_from_chars(cps: Vec<i64>) -> String {
-    let mut out = "";
-    let mut i = 0;
-    while i < vec_len(cps) { out = str_concat(out, char_to_str(array_get_unchecked(cps.data, i))); i = i + 1; }
-    out
-}
-
-// The code point at character index `i` (NOT byte index), or -1 if out of range.
-fn char_at(s: String, i: i64) -> i64 { opt_unwrap_or(vec_get_opt(str_chars(s), i), 0 - 1) }
-
-// Character-boundary-safe substring by CODE-POINT index `[lo, hi)`. Indices are
-// clamped, and it never splits a multibyte character (unlike `str_substring`).
-fn str_sub_chars(s: String, lo: i64, hi: i64) -> String {
-    str_from_chars(vec_slice(str_chars(s), lo, hi))
-}
-
-// ASCII-only upper/lower case (A–Z ↔ a–z); all other code points pass through
-// unchanged. (Full Unicode case folding is locale- and context-dependent and is
-// deliberately out of scope.)
-fn str_to_upper(s: String) -> String {
-    let cps = str_chars(s);
-    let mut out: Vec<i64> = vec_new();
-    let mut i = 0;
-    while i < vec_len(cps) {
-        let c = array_get_unchecked(cps.data, i);
-        out = vec_push(out, if c >= 97 && c <= 122 { c - 32 } else { c });
-        i = i + 1;
-    }
-    str_from_chars(out)
-}
-fn str_to_lower(s: String) -> String {
-    let cps = str_chars(s);
-    let mut out: Vec<i64> = vec_new();
-    let mut i = 0;
-    while i < vec_len(cps) {
-        let c = array_get_unchecked(cps.data, i);
-        out = vec_push(out, if c >= 65 && c <= 90 { c + 32 } else { c });
-        i = i + 1;
-    }
-    str_from_chars(out)
-}
-
-// ---- String algorithms (written in gc-rust over the primitives) -----------
-// Built on `str_len`, `str_get` (byte at index, -1 if out of range),
-// `str_substring`, and `to_string`.
-
-// Is byte `c` ASCII whitespace (space, tab, newline, carriage return)?
-fn is_space_byte(c: i64) -> bool {
-    c == 32 || c == 9 || c == 10 || c == 13
-}
-
-// Index of the first occurrence of single-byte `needle` (its first byte) at or
-// after `from`, or -1 if absent.
-fn str_index_of_byte(s: String, byte: i64, from: i64) -> i64 {
-    let n = str_len(s);
-    let mut i = max_i64(from, 0);
-    let mut found = 0 - 1;
-    while i < n {
-        if found < 0 {
-            if str_get(s, i) == byte {
-                found = i;
-            }
-        }
-        i = i + 1;
-    }
-    found
-}
-
-// Does `s` start with `prefix`?
-fn str_starts_with(s: String, prefix: String) -> bool {
-    let pn = str_len(prefix);
-    if pn > str_len(s) {
-        false
-    } else {
+    // The index of the first element satisfying `pred`.
+    fn position(self, pred: fn(T) -> bool) -> Option<i64> {
         let mut i = 0;
-        let mut ok = true;
-        while i < pn {
-            if str_get(s, i) != str_get(prefix, i) {
-                ok = false;
-            }
-            i = i + 1;
+        while i < self.len {
+            if pred(self.data[i]) { return Option::Some(i); }
+            i += 1;
         }
-        ok
+        Option::None
     }
 }
 
-// Does `s` end with `suffix`?
-fn str_ends_with(s: String, suffix: String) -> bool {
-    let sn = str_len(s);
-    let qn = str_len(suffix);
-    if qn > sn {
-        false
-    } else {
+impl<T> Index<T> for Vec<T> {
+    fn index(self, i: i64) -> T {
+        if i < 0 || i >= self.len {
+            panic("index out of bounds: the len is " + self.len.to_string() + " but the index is " + i.to_string());
+        }
+        self.data[i]
+    }
+}
+
+impl<T> IndexSet<T> for Vec<T> {
+    fn index_set(mut self, i: i64, value: T) {
+        if i < 0 || i >= self.len {
+            panic("index out of bounds: the len is " + self.len.to_string() + " but the index is " + i.to_string());
+        }
+        self.data[i] = value;
+    }
+}
+
+impl<T> Clone for Vec<T> {
+    fn clone(self) -> Vec<T> {
+        let cap = self.cap.max(1);
+        let mut data: Array<T> = Array::new(cap);
         let mut i = 0;
-        let mut ok = true;
-        while i < qn {
-            if str_get(s, sn - qn + i) != str_get(suffix, i) {
-                ok = false;
-            }
-            i = i + 1;
+        while i < self.len {
+            data[i] = self.data[i];
+            i += 1;
         }
-        ok
+        Vec { data: data, len: self.len, cap: cap }
     }
 }
 
-// Strip leading and trailing ASCII whitespace, returning a fresh substring.
-fn str_trim(s: String) -> String {
-    let n = str_len(s);
-    let mut lo = 0;
-    while lo < n && is_space_byte(str_get(s, lo)) {
-        lo = lo + 1;
-    }
-    let mut hi = n;
-    while hi > lo && is_space_byte(str_get(s, hi - 1)) {
-        hi = hi - 1;
-    }
-    str_substring(s, lo, hi)
-}
-
-// Does `s` contain the single byte `byte`?
-fn str_contains_byte(s: String, byte: i64) -> bool {
-    str_index_of_byte(s, byte, 0) >= 0
-}
-
-// Split `s` on every occurrence of the single byte `sep`, returning the pieces
-// (the separator is removed; adjacent separators yield empty pieces). A string
-// with no separators yields a one-element Vec holding the whole string.
-fn str_split_byte(s: String, sep: i64) -> Vec<String> {
-    let mut out: Vec<String> = vec_new();
-    let n = str_len(s);
-    let mut start = 0;
-    let mut i = 0;
-    while i < n {
-        if str_get(s, i) == sep {
-            out = vec_push(out, str_substring(s, start, i));
-            start = i + 1;
+impl<T: Eq> Eq for Vec<T> {
+    fn eq(self, other: Vec<T>) -> bool {
+        if self.len != other.len { return false; }
+        let mut i = 0;
+        while i < self.len {
+            if !(self.data[i] == other.data[i]) { return false; }
+            i += 1;
         }
-        i = i + 1;
+        true
     }
-    // The final piece (from the last separator to the end).
-    out = vec_push(out, str_substring(s, start, n));
-    out
 }
 
-// Parse a base-10 signed integer with an optional leading minus.
-// Empty, malformed, and out-of-range strings return None. Accumulate negatively
-// so the asymmetric i64 minimum remains representable without overflowing.
-fn parse_int(s: String) -> Option<i64> {
-    let n = str_len(s);
-    if n == 0 { return Option::None; }
-    let neg = str_get(s, 0) == 45;
-    let mut i = if neg { 1 } else { 0 };
-    if i == n { return Option::None; }
-    let limit = if neg { 0 - 9223372036854775807 - 1 } else { 0 - 9223372036854775807 };
-    let mut acc = 0;
-    while i < n {
-        let c = str_get(s, i);
-        if c < 48 || c > 57 { return Option::None; }
-        let digit = c - 48;
-        if acc < limit / 10 { return Option::None; }
-        acc = acc * 10;
-        if acc < limit + digit { return Option::None; }
-        acc = acc - digit;
-        i = i + 1;
-    }
-    Option::Some(if neg { acc } else { 0 - acc })
-}
-
-// Parse a float (runtime-backed; returns 0.0 on a malformed string). For a
-// checked variant, gate on a separate validity check.
-fn parse_float(s: String) -> f64 {
-    str_to_float(s)
-}
-
-// Replace every occurrence of the single byte `from` with the string `to`,
-// returning a fresh string. (Splitting on the byte and re-joining with `to`.)
-fn str_replace_byte(s: String, from: i64, to: String) -> String {
-    let n = str_len(s);
-    let mut out = "";
-    let mut start = 0;
-    let mut i = 0;
-    while i < n {
-        if str_get(s, i) == from {
-            out = str_concat(out, str_substring(s, start, i));
-            out = str_concat(out, to);
-            start = i + 1;
+impl<T: Eq> Vec<T> {
+    fn contains(self, x: T) -> bool {
+        let mut i = 0;
+        while i < self.len {
+            if self.data[i] == x { return true; }
+            i += 1;
         }
-        i = i + 1;
-    }
-    str_concat(out, str_substring(s, start, n))
-}
-
-// Join the strings in `parts` with `sep` between them.
-fn str_join(parts: Vec<String>, sep: String) -> String {
-    str_join_array(parts.data, parts.len, sep)
-}
-
-// ---- MapStr<V> — a String-keyed hash map ----------------------------------
-// Open addressing with linear probing over three parallel backing arrays:
-// `keys` (the String keys), `vals` (the values), and `used` (0 = empty slot,
-// 1 = occupied). Grows (rehashes into a 2x table) past a 0.7 load factor. No
-// deletion in v1. Keys are hashed with the `str_hash` runtime primitive.
-//
-//   let mut m: MapStr<i64> = mapstr_new();
-//   m = mapstr_insert(m, "a", 1);
-//   opt_unwrap_or(mapstr_get(m, "a"), 0)   // 1
-
-// Unsynchronized map: callers synchronize shared mutation and backing aliases.
-struct MapStr<V> { keys: Array<String>, vals: Array<V>, used: Array<i64>, len: i64, cap: i64 }
-
-fn mapstr_new<V>() -> MapStr<V> {
-    let cap = 8;
-    MapStr { keys: array_new(cap), vals: array_new(cap), used: array_new(cap), len: 0, cap: cap }
-}
-
-fn mapstr_len<V>(m: MapStr<V>) -> i64 { m.len }
-
-// Find the slot index for `key`: either where it already lives, or the first
-// empty slot on its probe sequence. Returns the index; caller checks `used`.
-fn mapstr_slot<V>(m: MapStr<V>, key: String) -> i64 {
-    let mask = m.cap - 1;
-    let mut i = str_hash(key) & mask;
-    let mut result = 0 - 1;
-    let mut steps = 0;
-    while steps < m.cap && result < 0 {
-        if array_get_unchecked(m.used, i) == 0 {
-            result = i;
-        } else {
-            if str_eq(array_get_unchecked(m.keys, i), key) {
-                result = i;
-            } else {
-                i = (i + 1) & mask;
-            }
-        }
-        steps = steps + 1;
-    }
-    result
-}
-
-// Insert into a map known to have a free slot (used internally by insert/grow).
-fn mapstr_put_raw<V>(mut m: MapStr<V>, key: String, val: V) -> MapStr<V> {
-    let slot = mapstr_slot(m, key);
-    let was_used = array_get_unchecked(m.used, slot);
-    let _u1 = array_set(m.keys, slot, key);
-    let _u2 = array_set(m.vals, slot, val);
-    let _u3 = array_set(m.used, slot, 1);
-    if was_used == 0 {
-        MapStr { keys: m.keys, vals: m.vals, used: m.used, len: m.len + 1, cap: m.cap }
-    } else {
-        m
+        false
     }
 }
 
-// Double the table and re-insert every occupied entry.
-fn mapstr_grow<V>(m: MapStr<V>) -> MapStr<V> {
-    let new_cap = m.cap * 2;
-    let mut bigger: MapStr<V> = MapStr {
-        keys: array_new(new_cap), vals: array_new(new_cap), used: array_new(new_cap),
-        len: 0, cap: new_cap,
-    };
-    let mut i = 0;
-    while i < m.cap {
-        if array_get_unchecked(m.used, i) == 1 {
-            bigger = mapstr_put_raw(bigger, array_get_unchecked(m.keys, i), array_get_unchecked(m.vals, i));
-        }
-        i = i + 1;
-    }
-    bigger
-}
+impl<T: Ord> Vec<T> {
+    // Stable in-place sort, ascending by `Ord`.
+    fn sort(mut self) { self.sort_by(|a: T, b: T| a.cmp(b)); }
 
-fn mapstr_insert<V>(mut m: MapStr<V>, key: String, val: V) -> MapStr<V> {
-    // Grow first if we're past the 0.7 load factor (len*10 >= cap*7).
-    if (m.len + 1) * 10 >= m.cap * 7 {
-        m = mapstr_grow(m);
-    }
-    mapstr_put_raw(m, key, val)
-}
-
-fn mapstr_contains<V>(m: MapStr<V>, key: String) -> bool {
-    let slot = mapstr_slot(m, key);
-    if slot < 0 { false } else { array_get_unchecked(m.used, slot) == 1 }
-}
-
-fn mapstr_get<V>(m: MapStr<V>, key: String) -> Option<V> {
-    let slot = mapstr_slot(m, key);
-    if slot < 0 {
-        Option::None
-    } else {
-        if array_get_unchecked(m.used, slot) == 1 {
-            Option::Some(array_get_unchecked(m.vals, slot))
-        } else {
-            Option::None
-        }
-    }
-}
-
-// An independent copy of a map (separate backing arrays). Use when a scope adds
-// bindings to a borrowed map and the original must stay unmutated — MapStr shares
-// its arrays across inserts, so aliasing + mutating both sides corrupts it.
-fn mapstr_copy<V>(m: MapStr<V>) -> MapStr<V> {
-    let mut c: MapStr<V> = mapstr_new();
-    let mut i = 0;
-    while i < m.cap {
-        if array_get_unchecked(m.used, i) == 1 { c = mapstr_insert(c, array_get_unchecked(m.keys, i), array_get_unchecked(m.vals, i)); }
-        i = i + 1;
-    }
-    c
-}
-
-// Enumerate a map's occupied keys / values (same order). Used by the self-hosted
-// compiler to capture all in-scope locals when lowering a closure.
-// Substring search: 1 if `n` occurs in `h`, else 0 (i64 to match call sites).
-fn str_contains(h: String, n: String) -> i64 {
-    let hl = str_len(h); let nl = str_len(n);
-    if nl == 0 { return 1; }
-    let mut i = 0;
-    while i + nl <= hl {
-        if str_eq(str_substring(h, i, i + nl), n) { return 1; }
-        i = i + 1;
-    }
-    0
-}
-
-// Legacy argument conveniences. Use process_args() when encoding errors matter.
-fn arg_count() -> i64 {
-    match process_args() { Result::Ok(args) => array_len(args), Result::Err(e) => 0 }
-}
-fn arg_str(i: i64) -> String {
-    match process_args() {
-        Result::Ok(args) => match array_get(args, i) { Option::Some(s) => s, Option::None => "" },
-        Result::Err(e) => ""
-    }
-}
-
-fn mapstr_keys<V>(m: MapStr<V>) -> Vec<String> {
-    let mut ks: Vec<String> = vec_new();
-    let mut i = 0;
-    while i < m.cap { if array_get_unchecked(m.used, i) == 1 { ks = vec_push(ks, array_get_unchecked(m.keys, i)); } i = i + 1; }
-    ks
-}
-fn mapstr_vals<V>(m: MapStr<V>) -> Vec<V> {
-    let mut vs: Vec<V> = vec_new();
-    let mut i = 0;
-    while i < m.cap { if array_get_unchecked(m.used, i) == 1 { vs = vec_push(vs, array_get_unchecked(m.vals, i)); } i = i + 1; }
-    vs
-}
-
-// ---- HashMap<K, V>: a generic-keyed hash map ------------------------------
-// Open-addressing (linear probe) over three parallel arrays — the same shape as
-// `MapStr<V>`, but the key is any `K: Eq + Hash` instead of `String`. Like the
-// rest of the prelude it shares backing arrays across inserts, so use
-// `hashmap_copy` before letting two scopes mutate the same map. Grows past a 0.7
-// load factor. No deletion in v1 (matching `MapStr`).
-
-struct HashMap<K, V> { keys: Array<K>, vals: Array<V>, used: Array<i64>, len: i64, cap: i64 }
-
-fn hashmap_new<K, V>() -> HashMap<K, V> {
-    let cap = 8;
-    HashMap { keys: array_new(cap), vals: array_new(cap), used: array_new(cap), len: 0, cap: cap }
-}
-
-fn hashmap_len<K, V>(m: HashMap<K, V>) -> i64 { m.len }
-
-fn hashmap_is_empty<K, V>(m: HashMap<K, V>) -> bool { m.len == 0 }
-
-// The slot where `key` lives, or the first empty slot on its probe sequence.
-// Returns -1 only if the table is somehow full (callers grow before that).
-fn hashmap_slot<K: Eq + Hash, V>(m: HashMap<K, V>, key: K) -> i64 {
-    let mask = m.cap - 1;
-    let mut i = key.hash() & mask;
-    let mut result = 0 - 1;
-    let mut steps = 0;
-    while steps < m.cap && result < 0 {
-        if array_get_unchecked(m.used, i) == 0 {
-            result = i;
-        } else {
-            if array_get_unchecked(m.keys, i).eq(key) {
-                result = i;
-            } else {
-                i = (i + 1) & mask;
-            }
-        }
-        steps = steps + 1;
-    }
-    result
-}
-
-// Insert into a map known to have a free slot (used by insert/grow).
-fn hashmap_put_raw<K: Eq + Hash, V>(mut m: HashMap<K, V>, key: K, val: V) -> HashMap<K, V> {
-    let slot = hashmap_slot(m, key);
-    let was_used = array_get_unchecked(m.used, slot);
-    let _u1 = array_set(m.keys, slot, key);
-    let _u2 = array_set(m.vals, slot, val);
-    let _u3 = array_set(m.used, slot, 1);
-    if was_used == 0 {
-        HashMap { keys: m.keys, vals: m.vals, used: m.used, len: m.len + 1, cap: m.cap }
-    } else {
-        m
-    }
-}
-
-// Double the table and re-insert every occupied entry.
-fn hashmap_grow<K: Eq + Hash, V>(m: HashMap<K, V>) -> HashMap<K, V> {
-    let new_cap = m.cap * 2;
-    let mut bigger: HashMap<K, V> = HashMap {
-        keys: array_new(new_cap), vals: array_new(new_cap), used: array_new(new_cap),
-        len: 0, cap: new_cap,
-    };
-    let mut i = 0;
-    while i < m.cap {
-        if array_get_unchecked(m.used, i) == 1 {
-            bigger = hashmap_put_raw(bigger, array_get_unchecked(m.keys, i), array_get_unchecked(m.vals, i));
-        }
-        i = i + 1;
-    }
-    bigger
-}
-
-fn hashmap_insert<K: Eq + Hash, V>(mut m: HashMap<K, V>, key: K, val: V) -> HashMap<K, V> {
-    if (m.len + 1) * 10 >= m.cap * 7 {
-        m = hashmap_grow(m);
-    }
-    hashmap_put_raw(m, key, val)
-}
-
-fn hashmap_contains<K: Eq + Hash, V>(m: HashMap<K, V>, key: K) -> bool {
-    let slot = hashmap_slot(m, key);
-    if slot < 0 { false } else { array_get_unchecked(m.used, slot) == 1 }
-}
-
-fn hashmap_get<K: Eq + Hash, V>(m: HashMap<K, V>, key: K) -> Option<V> {
-    let slot = hashmap_slot(m, key);
-    if slot < 0 {
-        Option::None
-    } else {
-        if array_get_unchecked(m.used, slot) == 1 {
-            Option::Some(array_get_unchecked(m.vals, slot))
-        } else {
-            Option::None
-        }
-    }
-}
-
-// `get` with a fallback for the missing case.
-fn hashmap_get_or<K: Eq + Hash, V>(m: HashMap<K, V>, key: K, default: V) -> V {
-    opt_unwrap_or(hashmap_get(m, key), default)
-}
-
-// An independent copy (separate backing arrays); see the `MapStr` note.
-fn hashmap_copy<K: Eq + Hash, V>(m: HashMap<K, V>) -> HashMap<K, V> {
-    let mut c: HashMap<K, V> = hashmap_new();
-    let mut i = 0;
-    while i < m.cap {
-        if array_get_unchecked(m.used, i) == 1 { c = hashmap_insert(c, array_get_unchecked(m.keys, i), array_get_unchecked(m.vals, i)); }
-        i = i + 1;
-    }
-    c
-}
-
-fn hashmap_keys<K, V>(m: HashMap<K, V>) -> Vec<K> {
-    let mut ks: Vec<K> = vec_new();
-    let mut i = 0;
-    while i < m.cap { if array_get_unchecked(m.used, i) == 1 { ks = vec_push(ks, array_get_unchecked(m.keys, i)); } i = i + 1; }
-    ks
-}
-fn hashmap_vals<K, V>(m: HashMap<K, V>) -> Vec<V> {
-    let mut vs: Vec<V> = vec_new();
-    let mut i = 0;
-    while i < m.cap { if array_get_unchecked(m.used, i) == 1 { vs = vec_push(vs, array_get_unchecked(m.vals, i)); } i = i + 1; }
-    vs
-}
-
-// ---- Functional iterator combinators over Vec -----------------------------
-// gc-rust has value semantics (no references), so iteration is expressed as
-// eager combinators over Vec<T> taking closures, rather than a stateful
-// `Iterator` with `next()`. Each returns a fresh Vec or a reduced value.
-
-// Apply `f` to every element, collecting the results into a new Vec<U>.
-fn vec_map<T, U>(v: Vec<T>, f: fn(T) -> U) -> Vec<U> {
-    let mut out: Vec<U> = vec_with_capacity(max_i64(vec_len(v), 1));
-    let mut i = 0;
-    while i < vec_len(v) {
-        out = vec_push(out, f(array_get_unchecked(v.data, i)));
-        i = i + 1;
-    }
-    out
-}
-
-// Keep only elements for which `pred` returns true.
-fn vec_filter<T>(v: Vec<T>, pred: fn(T) -> bool) -> Vec<T> {
-    let mut out: Vec<T> = vec_new();
-    let mut i = 0;
-    while i < vec_len(v) {
-        let x = array_get_unchecked(v.data, i);
-        if pred(x) {
-            out = vec_push(out, x);
-        }
-        i = i + 1;
-    }
-    out
-}
-
-// Left fold: `acc = f(acc, elem)` for each element, starting from `init`.
-fn vec_fold<T, A>(v: Vec<T>, init: A, f: fn(A, T) -> A) -> A {
-    let mut acc = init;
-    let mut i = 0;
-    while i < vec_len(v) {
-        acc = f(acc, array_get_unchecked(v.data, i));
-        i = i + 1;
-    }
-    acc
-}
-
-// Does any element satisfy `pred`?
-fn vec_any<T>(v: Vec<T>, pred: fn(T) -> bool) -> bool {
-    let mut i = 0;
-    let mut found = false;
-    while i < vec_len(v) {
-        if pred(array_get_unchecked(v.data, i)) {
-            found = true;
-        }
-        i = i + 1;
-    }
-    found
-}
-
-// Do all elements satisfy `pred`?
-fn vec_all<T>(v: Vec<T>, pred: fn(T) -> bool) -> bool {
-    let mut i = 0;
-    let mut ok = true;
-    while i < vec_len(v) {
-        if pred(array_get_unchecked(v.data, i)) == false {
-            ok = false;
-        }
-        i = i + 1;
-    }
-    ok
-}
-
-// Count elements satisfying `pred`.
-fn vec_count<T>(v: Vec<T>, pred: fn(T) -> bool) -> i64 {
-    let mut i = 0;
-    let mut n = 0;
-    while i < vec_len(v) {
-        if pred(array_get_unchecked(v.data, i)) {
-            n = n + 1;
-        }
-        i = i + 1;
-    }
-    n
-}
-
-// Apply `f` to each element for its side effect (returns 0).
-fn vec_for_each<T>(v: Vec<T>, f: fn(T) -> i64) -> i64 {
-    let mut i = 0;
-    while i < vec_len(v) {
-        let _u = f(array_get_unchecked(v.data, i));
-        i = i + 1;
-    }
-    0
-}
-
-// Build a Vec<i64> of `[start, start+1, ..., end-1]`.
-fn vec_range(start: i64, end: i64) -> Vec<i64> {
-    let mut out: Vec<i64> = vec_with_capacity(max_i64(end - start, 1));
-    let mut i = start;
-    while i < end {
-        out = vec_push(out, i);
-        i = i + 1;
-    }
-    out
-}
-
-// ---- Generic trait-bounded collection ops ---------------------------------
-// These work for any element type implementing `Eq` / `Ord` (the prelude
-// implements both for i64 and Eq for String; users can add their own).
-
-// Does `v` contain an element equal (by `Eq`) to `x`?
-fn vec_contains<T: Eq>(v: Vec<T>, x: T) -> bool {
-    let mut i = 0;
-    let mut found = false;
-    while i < vec_len(v) {
-        if array_get_unchecked(v.data, i).eq(x) {
-            found = true;
-        }
-        i = i + 1;
-    }
-    found
-}
-
-// Index of the first element equal to `x`, or -1.
-fn vec_index_of<T: Eq>(v: Vec<T>, x: T) -> i64 {
-    let mut i = 0;
-    let mut found = 0 - 1;
-    while i < vec_len(v) {
-        if found < 0 {
-            if array_get_unchecked(v.data, i).eq(x) {
-                found = i;
-            }
-        }
-        i = i + 1;
-    }
-    found
-}
-
-// In-place insertion sort using the `Ord` trait (ascending). Returns the sorted
-// Vec. Works for any `T: Ord`.
-fn vec_sort<T: Ord>(mut v: Vec<T>) -> Vec<T> {
-    let mut i = 1;
-    while i < v.len {
-        let key = array_get_unchecked(v.data, i);
-        let mut j = i - 1;
-        let mut placed = false;
-        while j >= 0 && placed == false {
-            let cur = array_get_unchecked(v.data, j);
-            if cur.cmp(key) > 0 {
-                let _u = array_set(v.data, j + 1, cur);
-                j = j - 1;
-            } else {
-                placed = true;
-            }
-        }
-        let _u2 = array_set(v.data, j + 1, key);
-        i = i + 1;
-    }
-    v
-}
-
-// The maximum element by `Ord`, or None if empty.
-fn vec_max<T: Ord>(v: Vec<T>) -> Option<T> {
-    if vec_len(v) == 0 {
-        Option::None
-    } else {
-        let mut best = array_get_unchecked(v.data, 0);
+    fn max(self) -> Option<T> {
+        if self.len == 0 { return Option::None; }
+        let mut best = self.data[0];
         let mut i = 1;
-        while i < vec_len(v) {
-            let x = array_get_unchecked(v.data, i);
-            if x.cmp(best) > 0 {
-                best = x;
-            }
-            i = i + 1;
+        while i < self.len {
+            let x = self.data[i];
+            if x > best { best = x; }
+            i += 1;
         }
         Option::Some(best)
+    }
+
+    fn min(self) -> Option<T> {
+        if self.len == 0 { return Option::None; }
+        let mut best = self.data[0];
+        let mut i = 1;
+        while i < self.len {
+            let x = self.data[i];
+            if x < best { best = x; }
+            i += 1;
+        }
+        Option::Some(best)
+    }
+}
+
+impl Vec<i64> {
+    fn sum(self) -> i64 {
+        let mut acc = 0;
+        let mut i = 0;
+        while i < self.len {
+            acc += self.data[i];
+            i += 1;
+        }
+        acc
+    }
+}
+
+impl Vec<String> {
+    // The elements concatenated with `sep` between them.
+    fn join(self, sep: String) -> String { str_join_array(self.data, self.len, sep) }
+}
+
+// ---- String ------------------------------------------------------------------------
+// `String` is a built-in immutable UTF-8 byte string. `len`, `byte_at`, and
+// `substring` work in bytes; `chars` decodes Unicode code points.
+
+impl Eq for String { fn eq(self, other: String) -> bool { str_eq(self, other) } }
+
+// Lexicographic UTF-8 byte order.
+impl Ord for String {
+    fn cmp(self, other: String) -> Ordering {
+        let n = str_len(self);
+        let m = str_len(other);
+        let count = n.min(m);
+        let mut i = 0;
+        while i < count {
+            let a = str_get(self, i);
+            let b = str_get(other, i);
+            if a < b { return Ordering::Less; }
+            if a > b { return Ordering::Greater; }
+            i += 1;
+        }
+        n.cmp(m)
+    }
+}
+
+impl Hash for String { fn hash(self) -> i64 { str_hash(self) } }
+impl ToString for String { fn to_string(self) -> String { self } }
+impl Add for String { fn add(self, other: String) -> String { str_concat(self, other) } }
+
+impl String {
+    fn len(self) -> i64 { str_len(self) }
+    fn is_empty(self) -> bool { str_len(self) == 0 }
+
+    // The byte at index `i`; aborts when `i` is out of bounds.
+    fn byte_at(self, i: i64) -> i64 {
+        // The intrinsic yields -1 exactly when `i` is out of range (a byte is
+        // 0..=255), so one runtime call both reads and bounds-checks.
+        let b = str_get(self, i);
+        if b < 0 {
+            panic("byte index " + i.to_string() + " is out of bounds of a string of length " + str_len(self).to_string());
+        }
+        b
+    }
+
+    // A new string holding bytes [lo, hi); aborts on an out-of-bounds range.
+    fn substring(self, lo: i64, hi: i64) -> String {
+        if lo < 0 || hi < lo || hi > str_len(self) {
+            panic("byte range " + lo.to_string() + ".." + hi.to_string() + " is out of bounds of a string of length " + str_len(self).to_string());
+        }
+        str_substring(self, lo, hi)
+    }
+
+    // Does `needle` occur at byte offset `at`?
+    fn starts_with_at(self, needle: String, at: i64) -> bool {
+        let n = str_len(needle);
+        if at < 0 || at + n > str_len(self) { return false; }
+        let mut j = 0;
+        while j < n {
+            if str_get(self, at + j) != str_get(needle, j) { return false; }
+            j += 1;
+        }
+        true
+    }
+    fn starts_with(self, prefix: String) -> bool { self.starts_with_at(prefix, 0) }
+    fn ends_with(self, suffix: String) -> bool { self.starts_with_at(suffix, str_len(self) - str_len(suffix)) }
+
+    // The byte offset of the first occurrence of `needle` that starts within
+    // [from, end) and ends by `end`. Bounds are clamped to the string; an
+    // empty needle matches at the clamped `from` unless the range is reversed.
+    fn find_between(self, needle: String, from: i64, end: i64) -> Option<i64> {
+        // Hot path (line scanning in the apps): one inline byte loop, no
+        // per-candidate calls or allocations.
+        let n = str_len(needle);
+        let len = str_len(self);
+        let stop = if end < 0 { 0 } else if end > len { len } else { end };
+        let mut i = if from < 0 { 0 } else { from };
+        if i > stop { return Option::None; }
+        if n == 1 {
+            // A one-byte needle (`"\n"`, `","`) needs one read per position.
+            let b = str_get(needle, 0);
+            while i < stop {
+                if str_get(self, i) == b { return Option::Some(i); }
+                i += 1;
+            }
+            return Option::None;
+        }
+        while n <= stop - i {
+            let mut j = 0;
+            while j < n && str_get(self, i + j) == str_get(needle, j) { j += 1; }
+            if j == n { return Option::Some(i); }
+            i += 1;
+        }
+        Option::None
+    }
+    fn find_from(self, needle: String, from: i64) -> Option<i64> { self.find_between(needle, from, str_len(self)) }
+    fn find(self, needle: String) -> Option<i64> { self.find_between(needle, 0, str_len(self)) }
+    fn contains(self, needle: String) -> bool { self.find(needle).is_some() }
+
+    // Strip leading and trailing ASCII whitespace.
+    fn trim(self) -> String {
+        let n = str_len(self);
+        let mut lo = 0;
+        while lo < n && str_get(self, lo).is_ascii_whitespace() { lo += 1; }
+        let mut hi = n;
+        while hi > lo && str_get(self, hi - 1).is_ascii_whitespace() { hi -= 1; }
+        str_substring(self, lo, hi)
+    }
+
+    // Split on every non-overlapping occurrence of `sep`. Adjacent separators
+    // give empty pieces; the result always has at least one piece. An empty
+    // `sep` aborts.
+    fn split(self, sep: String) -> Vec<String> {
+        let sl = str_len(sep);
+        if sl == 0 { panic("String::split: empty separator"); }
+        let mut parts: Vec<String> = Vec::new();
+        let n = str_len(self);
+        let mut start = 0;
+        let mut i = 0;
+        while i + sl <= n {
+            let mut j = 0;
+            while j < sl && str_get(self, i + j) == str_get(sep, j) { j += 1; }
+            if j == sl {
+                parts.push(str_substring(self, start, i));
+                i += sl;
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        parts.push(str_substring(self, start, n));
+        parts
+    }
+
+    // Replace every non-overlapping occurrence of `from` with `to`. An empty
+    // `from` aborts.
+    fn replace(self, from: String, to: String) -> String {
+        let fl = str_len(from);
+        if fl == 0 { panic("String::replace: empty pattern"); }
+        let mut parts: Vec<String> = Vec::new();
+        let n = str_len(self);
+        let mut start = 0;
+        let mut i = 0;
+        while i + fl <= n {
+            let mut j = 0;
+            while j < fl && str_get(self, i + j) == str_get(from, j) { j += 1; }
+            if j == fl {
+                parts.push(str_substring(self, start, i));
+                parts.push(to);
+                i += fl;
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        parts.push(str_substring(self, start, n));
+        parts.join("")
+    }
+
+    fn repeat(self, n: i64) -> String {
+        if n < 0 { panic("String::repeat: negative count"); }
+        let mut parts: Vec<String> = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n { parts.push(self); i += 1; }
+        parts.join("")
+    }
+
+    // Left-pad with copies of `pad` until the string is at least `width`
+    // bytes long (whole copies, so use a one-byte `pad` for an exact width).
+    fn pad_left(self, width: i64, pad: String) -> String {
+        if str_len(pad) == 0 { panic("String::pad_left: empty pad"); }
+        let mut out = self;
+        while str_len(out) < width { out = pad + out; }
+        out
+    }
+    fn pad_right(self, width: i64, pad: String) -> String {
+        if str_len(pad) == 0 { panic("String::pad_right: empty pad"); }
+        let mut out = self;
+        while str_len(out) < width { out += pad; }
+        out
+    }
+
+    // ASCII-only case mapping; other characters are unchanged.
+    fn to_uppercase(self) -> String {
+        let mut cs = self.chars();
+        let mut i = 0;
+        while i < cs.len() {
+            let c = cs[i];
+            if c >= 'a' && c <= 'z' { cs[i] = ((c as i64) - 32) as char; }
+            i += 1;
+        }
+        String::from_chars(cs)
+    }
+    fn to_lowercase(self) -> String {
+        let mut cs = self.chars();
+        let mut i = 0;
+        while i < cs.len() {
+            let c = cs[i];
+            if c >= 'A' && c <= 'Z' { cs[i] = ((c as i64) + 32) as char; }
+            i += 1;
+        }
+        String::from_chars(cs)
+    }
+
+    // Decode the UTF-8 bytes into Unicode code points. Assumes well-formed
+    // UTF-8 (true of literals, concatenations, and checked file reads).
+    fn chars(self) -> Vec<char> {
+        let n = str_len(self);
+        let mut out: Vec<char> = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let b0 = str_get(self, i);
+            if b0 < 128 {
+                out.push(b0 as char);
+                i += 1;
+            } else if b0 < 224 {
+                let b1 = str_get(self, i + 1);
+                out.push((((b0 & 31) << 6) | (b1 & 63)) as char);
+                i += 2;
+            } else if b0 < 240 {
+                let b1 = str_get(self, i + 1);
+                let b2 = str_get(self, i + 2);
+                out.push((((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63)) as char);
+                i += 3;
+            } else {
+                let b1 = str_get(self, i + 1);
+                let b2 = str_get(self, i + 2);
+                let b3 = str_get(self, i + 3);
+                out.push((((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63)) as char);
+                i += 4;
+            }
+        }
+        out
+    }
+
+    // Encode code points as a UTF-8 string (the inverse of `chars`).
+    fn from_chars(cs: Vec<char>) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(cs.len());
+        let mut i = 0;
+        while i < cs.len() {
+            parts.push(char_to_str(cs[i] as i64));
+            i += 1;
+        }
+        parts.join("")
+    }
+
+    // Parse a base-10 i64 with an optional leading `-` or `+`. Empty,
+    // malformed, and out-of-range strings give None. Accumulates negatively so
+    // the asymmetric i64 minimum stays representable.
+    fn parse_i64(self) -> Option<i64> {
+        let n = str_len(self);
+        if n == 0 { return Option::None; }
+        let first = str_get(self, 0);
+        let neg = first == 45;
+        let mut i = if neg || first == 43 { 1 } else { 0 };
+        if i == n { return Option::None; }
+        let limit = if neg { i64::min_value() } else { 0 - i64::max_value() };
+        let mut acc = 0;
+        while i < n {
+            let c = str_get(self, i);
+            if c < 48 || c > 57 { return Option::None; }
+            let digit = c - 48;
+            if acc < limit / 10 { return Option::None; }
+            acc = acc * 10;
+            if acc < limit + digit { return Option::None; }
+            acc -= digit;
+            i += 1;
+        }
+        Option::Some(if neg { acc } else { 0 - acc })
+    }
+
+    // Parse a decimal float: optional sign, digits with an optional `.`
+    // fraction (at least one digit overall), and an optional exponent; or
+    // `inf`, `infinity`, `nan` in any case. Anything else gives None.
+    fn parse_f64(self) -> Option<f64> {
+        let n = str_len(self);
+        let mut i = 0;
+        if n > 0 && (str_get(self, 0) == 43 || str_get(self, 0) == 45) { i = 1; }
+        let word = str_substring(self, i, n).to_lowercase();
+        if word == "inf" || word == "infinity" || word == "nan" { return Option::Some(str_to_float(self)); }
+        let mut digits = 0;
+        while i < n && str_get(self, i).is_ascii_digit() { i += 1; digits += 1; }
+        if i < n && str_get(self, i) == 46 {
+            i += 1;
+            while i < n && str_get(self, i).is_ascii_digit() { i += 1; digits += 1; }
+        }
+        if digits == 0 { return Option::None; }
+        if i < n && (str_get(self, i) == 101 || str_get(self, i) == 69) {
+            i += 1;
+            if i < n && (str_get(self, i) == 43 || str_get(self, i) == 45) { i += 1; }
+            let mut exp_digits = 0;
+            while i < n && str_get(self, i).is_ascii_digit() { i += 1; exp_digits += 1; }
+            if exp_digits == 0 { return Option::None; }
+        }
+        if i != n { return Option::None; }
+        Option::Some(str_to_float(self))
+    }
+}
+
+// Print `s` followed by a newline.
+fn println(s: String) -> i64 { print_str(s) }
+
+// ---- HashMap<K, V> -------------------------------------------------------------
+// Open addressing with linear probing over parallel `keys`/`vals`/`used`
+// arrays. Grows (rehashes into a 2x table) past a 0.7 load factor, so a probe
+// always finds an empty slot. No removal yet. Keys need `Eq + Hash`.
+//
+// Unsynchronized map: callers synchronize shared mutation and backing aliases.
+struct HashMap<K, V> { keys: Array<K>, vals: Array<V>, used: Array<bool>, len: i64, cap: i64 }
+
+impl<K: Eq + Hash, V> HashMap<K, V> {
+    fn new() -> HashMap<K, V> {
+        let cap = 8;
+        HashMap { keys: Array::new(cap), vals: Array::new(cap), used: Array::new(cap), len: 0, cap: cap }
+    }
+
+    fn len(self) -> i64 { self.len }
+    fn is_empty(self) -> bool { self.len == 0 }
+
+    // The slot holding `key`, or the empty slot where it would go.
+    fn probe(self, key: K) -> i64 {
+        let mask = self.cap - 1;
+        let mut i = key.hash() & mask;
+        loop {
+            if !self.used[i] || self.keys[i] == key { return i; }
+            i = (i + 1) & mask;
+        }
+    }
+
+    // Insert or replace; returns the previous value for `key`, if any.
+    fn insert(mut self, key: K, val: V) -> Option<V> {
+        if (self.len + 1) * 10 >= self.cap * 7 { self.grow(); }
+        let slot = self.probe(key);
+        if self.used[slot] {
+            let old = self.vals[slot];
+            self.vals[slot] = val;
+            Option::Some(old)
+        } else {
+            self.keys[slot] = key;
+            self.vals[slot] = val;
+            self.used[slot] = true;
+            self.len += 1;
+            Option::None
+        }
+    }
+
+    // Double the table and re-insert every entry.
+    fn grow(mut self) {
+        let old_keys = self.keys;
+        let old_vals = self.vals;
+        let old_used = self.used;
+        let old_cap = self.cap;
+        self.cap = old_cap * 2;
+        self.keys = Array::new(self.cap);
+        self.vals = Array::new(self.cap);
+        self.used = Array::new(self.cap);
+        let mut i = 0;
+        while i < old_cap {
+            if old_used[i] {
+                let slot = self.probe(old_keys[i]);
+                self.keys[slot] = old_keys[i];
+                self.vals[slot] = old_vals[i];
+                self.used[slot] = true;
+            }
+            i += 1;
+        }
+    }
+
+    fn get(self, key: K) -> Option<V> {
+        let slot = self.probe(key);
+        if self.used[slot] { Option::Some(self.vals[slot]) } else { Option::None }
+    }
+
+    fn contains_key(self, key: K) -> bool { self.used[self.probe(key)] }
+
+    // Keys and values in table order (the same order for both).
+    fn keys(self) -> Vec<K> {
+        let mut out: Vec<K> = Vec::with_capacity(self.len);
+        let mut i = 0;
+        while i < self.cap {
+            if self.used[i] { out.push(self.keys[i]); }
+            i += 1;
+        }
+        out
+    }
+    fn values(self) -> Vec<V> {
+        let mut out: Vec<V> = Vec::with_capacity(self.len);
+        let mut i = 0;
+        while i < self.cap {
+            if self.used[i] { out.push(self.vals[i]); }
+            i += 1;
+        }
+        out
+    }
+}
+
+impl<K, V> Clone for HashMap<K, V> {
+    fn clone(self) -> HashMap<K, V> {
+        let mut keys: Array<K> = Array::new(self.cap);
+        let mut vals: Array<V> = Array::new(self.cap);
+        let mut used: Array<bool> = Array::new(self.cap);
+        let mut i = 0;
+        while i < self.cap {
+            if self.used[i] {
+                keys[i] = self.keys[i];
+                vals[i] = self.vals[i];
+                used[i] = true;
+            }
+            i += 1;
+        }
+        HashMap { keys: keys, vals: vals, used: used, len: self.len, cap: self.cap }
     }
 }
 
@@ -1361,7 +1134,7 @@ struct Channel<T> { buf: Array<ChannelMessage<T>>, ctrl: RawPtr }
 
 impl<T> Channel<T> {
     fn new(cap: i64) -> Channel<T> {
-        let b: Array<ChannelMessage<T>> = array_new(0);
+        let b: Array<ChannelMessage<T>> = Array::new(0);
         Channel { buf: b, ctrl: chan_new(cap, b) }
     }
     fn send(self, v: T) -> Result<(), T> {

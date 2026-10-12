@@ -3,13 +3,14 @@ use index::Document;
 // One result per matching line; column is the first match's 1-based byte column.
 // A query is a nonempty, case-sensitive literal contained within one line.
 fn document_offsets(doc: Document, needle: String) -> Vec<i64> {
-    let mut offsets: Vec<i64> = vec_new();
+    let mut offsets: Vec<i64> = Vec::new();
     let mut start = 0;
-    while start < str_len(doc.text) {
-        let newline = str_find_from(doc.text, "\n", start);
-        let end = if newline < 0 { str_len(doc.text) } else { newline };
-        let position = str_find_range(doc.text, needle, start, end);
-        if position >= start && position < end { offsets = vec_push(offsets, position); }
+    while start < doc.text.len() {
+        let end = doc.text.find_from("\n", start).unwrap_or(doc.text.len());
+        match doc.text.find_between(needle, start, end) {
+            Some(position) => { if position < end { offsets.push(position); } }
+            None => {}
+        }
         start = end + 1;
     }
     offsets
@@ -21,46 +22,45 @@ fn document_lines(doc: Document, offsets: Vec<i64>) -> Result<i64, String> {
 
         let mut start = 0;
         let mut line = 1;
-        while start < str_len(doc.text) {
-            let newline = str_find_from(doc.text, "\n", start);
-            let end = if newline < 0 { str_len(doc.text) } else { newline };
-            let text = str_substring(doc.text, start, end);
-            if hit < vec_len(offsets) && vec_at(offsets, hit) < end {
-                let column = vec_at(offsets, hit) - start;
-                hit = hit + 1;
-                let mut parts: Vec<String> = vec_new();
-                parts = vec_push(parts, "{\"path\":");
-                parts = vec_push(parts, json_quote(doc.path));
-                parts = vec_push(parts, ",\"line\":");
-                parts = vec_push(parts, to_string(line));
-                parts = vec_push(parts, ",\"byte_column\":");
-                parts = vec_push(parts, to_string(column + 1));
-                parts = vec_push(parts, ",\"text\":");
-                parts = vec_push(parts, json_quote(text));
-                parts = vec_push(parts, "}");
-                match stdout_line(str_join(parts, "")) { Result::Ok(_) => {}, Result::Err(e) => { return Result::Err(io_error_message(e)); } };
-                hits = hits + 1;
+        while start < doc.text.len() {
+            let end = doc.text.find_from("\n", start).unwrap_or(doc.text.len());
+            let text = doc.text.substring(start, end);
+            if hit < offsets.len() && offsets[hit] < end {
+                let column = offsets[hit] - start;
+                hit += 1;
+                let mut parts: Vec<String> = Vec::new();
+                parts.push("{\"path\":");
+                parts.push(json_quote(doc.path));
+                parts.push(",\"line\":");
+                parts.push(line.to_string());
+                parts.push(",\"byte_column\":");
+                parts.push((column + 1).to_string());
+                parts.push(",\"text\":");
+                parts.push(json_quote(text));
+                parts.push("}");
+                match stdout_line(parts.join("")) { Ok(_) => {}, Err(e) => { return Err(e.to_string()); } };
+                hits += 1;
             }
             start = end + 1;
-            line = line + 1;
+            line += 1;
         }
-    Result::Ok(hits)
+    Ok(hits)
 }
 
 
 pub fn query(docs: Vec<Document>, needle: String) -> Result<i64, String> {
     let mut hits = 0;
     let mut start = 0;
-    while start < vec_len(docs) {
-        let end = if start + 4 < vec_len(docs) { start + 4 } else { vec_len(docs) };
-        let batch = vec_slice(docs, start, end);
-        let matches = match vec_parallel_map(batch, 4, |item: Document| document_offsets(item, needle)) { Result::Ok(v) => v, Result::Err(e) => { return Result::Err(e); } };
+    while start < docs.len() {
+        let end = if start + 4 < docs.len() { start + 4 } else { docs.len() };
+        let batch = docs.slice(start, end);
+        let matches = match batch.parallel_map(4, |item: Document| document_offsets(item, needle)) { Ok(v) => v, Err(e) => { return Err(e); } };
         let mut i = 0;
-        while i < vec_len(batch) {
-            match document_lines(vec_at(batch, i), vec_at(matches, i)) { Result::Ok(n) => hits = hits + n, Result::Err(e) => { return Result::Err(e); } };
-            i = i + 1;
+        while i < batch.len() {
+            match document_lines(batch[i], matches[i]) { Ok(n) => hits = hits + n, Err(e) => { return Err(e); } };
+            i += 1;
         }
         start = end;
     }
-    Result::Ok(hits)
+    Ok(hits)
 }

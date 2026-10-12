@@ -55,10 +55,10 @@ fn main() -> i64 {
     let add_bonus = |n: i64| n + bonus;
 
     // array (mutable: we write into its elements)
-    let mut a: Array<i64> = array_new(3);
-    array_set(a, 0, 10);
-    array_set(a, 1, 20);
-    array_set(a, 2, 12);
+    let mut a: Array<i64> = Array::new(3);
+    a[0] = 10;
+    a[1] = 20;
+    a[2] = 12;
 
     let total =
         p.manhattan()                      // 7
@@ -67,6 +67,6 @@ fn main() -> i64 {
         + unwrap_or(compute(20, 2), 0)     // 9
         + unwrap_or(compute(1, 0), 100)    // 100 (Err -> default)
         + add_bonus(0)                     // 5
-        + array_get_unchecked(a, 0) + array_get_unchecked(a, 1) + array_get_unchecked(a, 2); // 42
+        + a[0] + a[1] + a[2]; // 42
     total   // 7+42+1+9+100+5+42 = 206
 }

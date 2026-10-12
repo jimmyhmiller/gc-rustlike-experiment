@@ -10,38 +10,38 @@ struct Payload { n: i64, text: String }
 // Transitional bridge: all conflicting payload accesses are synchronized.
 impl Sync for Payload {}
 fn main() -> i64 {
-    let initial = Payload { n: 11, text: str_concat("start", "λ") };
+    let initial = Payload { n: 11, text: ("start" + "λ") };
     let child = Thread::spawn(|| {
-        if initial.n != 11 || !str_eq(initial.text, "startλ") { 81 } else {
+        if initial.n != 11 || !(initial.text == "startλ") { 81 } else {
             let mut p = initial;
             p.n = 12;
-            p.text = str_concat("join", "λ");
+            p.text = "join" + "λ";
             0
         }
     });
     if child.join() != 0 { return 81; }
-    if initial.n != 12 || !str_eq(initial.text, "joinλ") { return 82; }
+    if initial.n != 12 || !(initial.text == "joinλ") { return 82; }
     let queue: Channel<Payload> = Channel::new(1);
     let producer = Thread::spawn(|| {
-        let p = Payload { n: 13, text: str_concat("channel", "λ") };
+        let p = Payload { n: 13, text: ("channel" + "λ") };
         queue.send(p);
         0
     });
     let received = queue.recv_value();
-    if received.n != 13 || !str_eq(received.text, "channelλ") { return 83; }
+    if received.n != 13 || !(received.text == "channelλ") { return 83; }
     producer.join();
     let published = Payload { n: 0, text: "" };
     let ready = AtomicI64::new(0);
     let writer = Thread::spawn(|| {
         let mut p = published;
         p.n = 14;
-        p.text = str_concat("atomic", "λ");
+        p.text = "atomic" + "λ";
         ready.store(1);
         0
     });
     while ready.load() == 0 { Thread::sleep(1); }
     // Sleep avoids busy spinning; ready.load(), not sleep, publishes the data.
-    if published.n != 14 || !str_eq(published.text, "atomicλ") { return 84; }
+    if published.n != 14 || !(published.text == "atomicλ") { return 84; }
     writer.join();
     0
 }

@@ -1020,7 +1020,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                             span: e.span,
                         },
                     };
-                    return self.array_set_op(base, index, &val_expr, e.span);
+                    return self.index_set(base, index, &val_expr, e.span);
                 }
                 // `s.field = v` → store into the heap object's field slot.
                 if let ExprKind::Field { base, field } = &*target.kind {
@@ -1042,6 +1042,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                         format!("cannot reassign immutable binding `{}` (declare it `let mut {}`)", p.last(), p.last()),
                         e.span,
                     );
+                }
+                if let Some(binop) = op {
+                    let repr = self.repr_of(&ty, e.span)?;
+                    if !matches!(repr, Repr::Scalar(_)) {
+                        // `x += v` on a non-scalar uses the operator trait.
+                        let load = CoreExpr::new(CoreExprKind::Local(id), repr);
+                        let (call, ct) = self.overloaded_binary(*binop, load, ty.clone(), target, value, e.span)?;
+                        check_assignable(&ct, &ty, e.span)?;
+                        return Ok((CoreExpr::new(CoreExprKind::Assign { local: id, value: Box::new(call) }, Repr::Unit), Ty::unit()));
+                    }
                 }
                 let (cv, vt) = self.expr(value, Some(&ty))?;
                 check_assignable(&vt, &ty, e.span)?;
@@ -1072,7 +1082,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::Field { base, field } => self.field_access(base, field, e.span),
 
-            ExprKind::Index { base, index } => self.array_get_checked_op(base, index, e.span),
+            ExprKind::Index { base, index } => self.index_get(base, index, e.span),
 
             ExprKind::Tuple(elems) => {
                 let mut cfields = Vec::with_capacity(elems.len());
@@ -1343,9 +1353,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             Some(binop) => {
                 let frepr = self.repr_of(&fty, span)?;
                 let cur = CoreExpr::new(CoreExprKind::Field { base: Box::new(cbase.clone()), loc }, frepr.clone());
-                let (cv, vt) = self.expr(value, Some(&fty))?;
-                check_assignable(&vt, &fty, value.span)?;
-                CoreExpr::new(CoreExprKind::Bin(*binop, Box::new(cur), Box::new(cv)), frepr)
+                if !matches!(frepr, Repr::Scalar(_)) {
+                    // `s.f += v` on a non-scalar field uses the operator trait.
+                    let (call, ct) = self.overloaded_binary(*binop, cur, fty.clone(), base, value, span)?;
+                    check_assignable(&ct, &fty, span)?;
+                    call
+                } else {
+                    let (cv, vt) = self.expr(value, Some(&fty))?;
+                    check_assignable(&vt, &fty, value.span)?;
+                    CoreExpr::new(CoreExprKind::Bin(*binop, Box::new(cur), Box::new(cv)), frepr)
+                }
             }
         };
         Ok((CoreExpr::new(CoreExprKind::SetField { base: Box::new(cbase), loc, value: Box::new(new_val) }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
@@ -1742,7 +1759,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn array_new(&mut self, len: &Expr, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
         let elem_ty = match expected {
             Some(Ty::Named { name, args }) if name.rsplit("::").next() == Some("Array") && !args.is_empty() => args[0].clone(),
-            _ => return err("array_new requires an expected `Array<T>` type (annotate the let binding)", span),
+            _ => return err("`Array::new` requires an expected `Array<T>` type (annotate the let binding)", span),
         };
         let elem = self.repr_of(&elem_ty, span)?;
         let lid = self.reg.array_for(&elem).map_err(|e| LowerError { msg: e.0, span })?;
@@ -1775,9 +1792,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// The `a[i]` index operator: bounds-checked, yields `T` directly, aborts on
     /// out-of-bounds (Rust-like). The `array_get` function returns `Option<T>`.
-    fn array_get_checked_op(&mut self, arr: &Expr, idx: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
-        let (ca, aty) = self.expr(arr, None)?;
-        let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "indexing a non-array".into(), span })?;
+    /// `base[idx]`: a bounds-checked element read for an `Array`, otherwise a
+    /// call to the base type's `Index::index`.
+    fn index_get(&mut self, base: &Expr, idx: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let (ca, aty) = self.expr(base, None)?;
+        let Some(elem_ty) = array_elem_ty(&aty) else {
+            return self.trait_method_call(ca, aty, Some(base), "Index", "index", "indexing", std::slice::from_ref(idx), span);
+        };
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
         check_assignable(&it, &Ty::i64(), idx.span)?;
@@ -1795,11 +1816,28 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok((CoreExpr::new(CoreExprKind::ArrayGetUnchecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
     }
 
+    /// `base[idx] = val`: an element store for an `Array`, otherwise a call to
+    /// the base type's `IndexSet::index_set`.
+    fn index_set(&mut self, base: &Expr, idx: &Expr, val: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        self.check_mutable_root(base, "element of", span)?;
+        let (ca, aty) = self.expr(base, None)?;
+        if array_elem_ty(&aty).is_none() {
+            let args = [idx.clone(), val.clone()];
+            let (call, _) = self.trait_method_call(ca, aty, Some(base), "IndexSet", "index_set", "indexed assignment", &args, span)?;
+            return Ok((call, Ty::unit()));
+        }
+        self.array_store(ca, aty, idx, val, span)
+    }
+
     fn array_set_op(&mut self, arr: &Expr, idx: &Expr, val: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         // Mutating an array element (whether via `a[i] = v` or `array_set(a, ..)`)
         // requires the array's access-path root to be a `mut` binding.
         self.check_mutable_root(arr, "element of", span)?;
         let (ca, aty) = self.expr(arr, None)?;
+        self.array_store(ca, aty, idx, val, span)
+    }
+
+    fn array_store(&mut self, ca: CoreExpr, aty: Ty, idx: &Expr, val: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_set on a non-array".into(), span })?;
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
@@ -2305,24 +2343,104 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// with `recv` passed as the leading `self` argument.
     fn method_call(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
         let (crecv, recv_ty) = self.expr(recv, None)?;
-        let base = match &recv_ty {
+        if let Some(elem_ty) = array_elem_ty(&recv_ty) {
+            return self.array_method(crecv, elem_ty, method, args, span);
+        }
+        let entry = self.lookup_method(&recv_ty, method)
+            .ok_or_else(|| LowerError { msg: format!("no method `{}` on `{}`", method, ty_display(&recv_ty)), span })?;
+        self.method_call_lowered(crecv, recv_ty, Some(recv), entry, args, span)
+    }
+
+    /// `Array<T>` is built in: its methods lower directly to the array
+    /// intrinsics, so the array analyses see `a.len()` exactly as they see
+    /// `a[i]`.
+    fn array_method(&mut self, ca: CoreExpr, elem_ty: Ty, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        let arity = |n: usize| -> LResult<()> {
+            if args.len() == n { Ok(()) } else { err(format!("`Array::{}` expects {} args, got {}", method, n, args.len()), span) }
+        };
+        match method {
+            "len" => {
+                arity(0)?;
+                Ok((CoreExpr::new(CoreExprKind::ArrayLen(Box::new(ca)), Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
+            }
+            "is_empty" => {
+                arity(0)?;
+                let len = CoreExpr::new(CoreExprKind::ArrayLen(Box::new(ca)), Repr::Scalar(ScalarRepr::I64));
+                let zero = CoreExpr::new(CoreExprKind::ConstInt(0, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+                Ok((CoreExpr::new(CoreExprKind::Bin(BinOp::Eq, Box::new(len), Box::new(zero)), Repr::Scalar(ScalarRepr::Bool)), Ty::bool()))
+            }
+            "get" => {
+                arity(1)?;
+                let elem = self.repr_of(&elem_ty, span)?;
+                let (ci, it) = self.expr(&args[0], Some(&Ty::i64()))?;
+                check_assignable(&it, &Ty::i64(), args[0].span)?;
+                let opt_ty = Ty::Named { name: "Option".to_string(), args: vec![elem_ty] };
+                let opt_repr = self.repr_of(&opt_ty, span)?;
+                Ok((CoreExpr::new(CoreExprKind::ArrayGet { array: Box::new(ca), index: Box::new(ci), elem }, opt_repr), opt_ty))
+            }
+            _ => err(format!("no method `{}` on `Array<{}>`", method, ty_display(&elem_ty)), span),
+        }
+    }
+
+    /// The impl method `method` for a receiver of type `recv_ty`, if any.
+    fn lookup_method(&self, recv_ty: &Ty, method: &str) -> Option<crate::types::MethodEntry> {
+        let base = match recv_ty {
             Ty::Named { name, .. } => name.rsplit("::").next().unwrap().to_string(),
             Ty::Prim(p) => format!("{:?}", p).to_lowercase(),
-            _ => return err("method call on an unsupported receiver type", span),
+            _ => return None,
         };
-        // Look up the method (try the exact base, then the canonical struct/enum
-        // name's last segment).
-        let entry = self.ctx.methods.get(&(base.clone(), method.to_string())).cloned()
-            .or_else(|| {
-                // primitives: i64 etc are keyed by their literal name in impls.
-                self.ctx.methods.get(&(prim_impl_key(&recv_ty), method.to_string())).cloned()
-            })
-            .ok_or_else(|| LowerError { msg: format!("no method `{}` on `{}`", method, base), span })?;
+        // Try the exact base, then the primitive's impl key (`impl i64`,
+        // `impl String`).
+        self.ctx.methods.get(&(base, method.to_string())).cloned()
+            .or_else(|| self.ctx.methods.get(&(prim_impl_key(recv_ty), method.to_string())).cloned())
+    }
 
+    /// Call the method `method` of `impl trait_name for <recv_ty>` on an
+    /// already-lowered receiver. Operators and indexing desugar through this,
+    /// so the method must come from that trait's impl, not an inherent impl.
+    fn trait_method_call(
+        &mut self,
+        crecv: CoreExpr,
+        recv_ty: Ty,
+        recv: Option<&Expr>,
+        trait_name: &str,
+        method: &str,
+        what: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
+        let entry = self.lookup_method(&recv_ty, method)
+            .filter(|e| e.trait_name.as_deref() == Some(trait_name))
+            .ok_or_else(|| LowerError {
+                msg: format!("{} is not defined for `{}` (it needs `impl {} for {}`)",
+                    what, ty_display(&recv_ty), trait_name, ty_display(&recv_ty)),
+                span,
+            })?;
+        self.method_call_lowered(crecv, recv_ty, recv, entry, args, span)
+    }
+
+    /// Lower a call to the impl method `entry` with an already-lowered
+    /// receiver. `recv` is the receiver's source expression, used to check
+    /// that a `mut self` receiver is rooted in a `mut` binding; `None` means
+    /// the receiver is a temporary.
+    fn method_call_lowered(
+        &mut self,
+        crecv: CoreExpr,
+        recv_ty: Ty,
+        recv: Option<&Expr>,
+        entry: crate::types::MethodEntry,
+        args: &[Expr],
+        span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
+        let method = entry.method.name.clone();
+        let method = method.as_str();
         // Transitive immutability: calling a `mut self` method requires the
         // receiver to be rooted in a `mut` binding (see docs/mutability.md).
         if entry.method.self_is_mut {
-            self.check_mutable_root(recv, "the receiver of a `mut self` method through", span)?;
+            match recv {
+                Some(recv) => self.check_mutable_root(recv, "the receiver of a `mut self` method through", span)?,
+                None => return err(format!("cannot call `mut self` method `{}` on a temporary value", method), span),
+            }
         }
 
         // Infer the impl's generic params + Self by unifying the impl's written
@@ -2581,6 +2699,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn binary(&mut self, op: BinOp, l: &Expr, r: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         use BinOp::*;
         let (cl, lt) = self.expr(l, None)?;
+        if !matches!(cl.repr, Repr::Scalar(_)) && !matches!(op, And | Or) {
+            return self.overloaded_binary(op, cl, lt, l, r, span);
+        }
         // Right side expects the left's type for arithmetic/compare.
         let (cr, rt) = self.expr(r, Some(&lt))?;
         match op {
@@ -2613,6 +2734,44 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     Ty::bool(),
                 ))
             }
+        }
+    }
+
+    /// A binary operator on a non-scalar operand desugars to its trait method:
+    /// `a + b` → `Add::add`, `a == b` → `Eq::eq` (`!=` negates it), and
+    /// `a < b` → `Ord::cmp(a, b).is_lt()` (likewise `is_le`/`is_gt`/`is_ge`).
+    fn overloaded_binary(&mut self, op: BinOp, cl: CoreExpr, lt: Ty, l: &Expr, r: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        use BinOp::*;
+        let (trait_name, method, sym) = match op {
+            Add => ("Add", "add", "+"),
+            Sub => ("Sub", "sub", "-"),
+            Mul => ("Mul", "mul", "*"),
+            Div => ("Div", "div", "/"),
+            Rem => ("Rem", "rem", "%"),
+            Eq => ("Eq", "eq", "=="),
+            Ne => ("Eq", "eq", "!="),
+            Lt => ("Ord", "cmp", "<"),
+            Le => ("Ord", "cmp", "<="),
+            Gt => ("Ord", "cmp", ">"),
+            Ge => ("Ord", "cmp", ">="),
+            BitAnd | BitOr | BitXor | Shl | Shr => {
+                return err(format!("bitwise operator on non-scalar type `{}`", ty_display(&lt)), span);
+            }
+            And | Or => unreachable!("logical operators are not overloadable"),
+        };
+        let what = format!("`{}`", sym);
+        let (call, ret) = self.trait_method_call(cl, lt, Some(l), trait_name, method, &what, std::slice::from_ref(r), span)?;
+        match op {
+            Ne => Ok((CoreExpr::new(CoreExprKind::Un(UnOp::Not, Box::new(call)), Repr::Scalar(ScalarRepr::Bool)), Ty::bool())),
+            Lt | Le | Gt | Ge => {
+                let test = match op { Lt => "is_lt", Le => "is_le", Gt => "is_gt", _ => "is_ge" };
+                let entry = self.lookup_method(&ret, test).ok_or_else(|| LowerError {
+                    msg: format!("`Ord::cmp` must return `Ordering` (found `{}`)", ty_display(&ret)),
+                    span,
+                })?;
+                self.method_call_lowered(call, ret, None, entry, &[], span)
+            }
+            _ => Ok((call, ret)),
         }
     }
 
@@ -2775,6 +2934,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Associated (self-less) function call: `Type::func(args)`. The path's
         // second-to-last segment names the type; look up an impl item of that
         // name with NO `self`. (Methods with `self` go through `method_call`.)
+        if path.segments.len() == 2 && path.segments[0] == "Array" && name == "new"
+            && !self.ctx.structs.contains_key("Array")
+        {
+            if args.len() != 1 { return err("`Array::new` takes a length", span); }
+            return self.array_new(&args[0], expected, span);
+        }
         if path.segments.len() >= 2 {
             let base = path.segments[path.segments.len() - 2].clone();
             if let Some(entry) = self.ctx.methods.get(&(base.clone(), name.to_string())).cloned() {
@@ -3195,7 +3360,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let gparams: Vec<String> = f.generics.params.iter().map(|p| p.name.clone()).collect();
         let mut targ: HashMap<String, Ty> = HashMap::new();
         // Seed inference from the EXPECTED return type, if any. This lets
-        // `let v: Vec<i64> = vec_new()` infer `T=i64` from the annotation when no
+        // `let v: Vec<i64> = Vec::new()` infer `T=i64` from the annotation when no
         // argument constrains it (the only way to type a no-arg generic ctor).
         if !gparams.is_empty() {
             if let Some(exp) = expected {

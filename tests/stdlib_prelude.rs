@@ -23,14 +23,14 @@ fn run(src: &str) -> i64 {
 fn hashmap_string_keys_insert_get_overwrite() {
     let r = run(r#"
         fn main() -> i64 {
-            let mut m: HashMap<String, i64> = hashmap_new();
-            m = hashmap_insert(m, "alpha", 10);
-            m = hashmap_insert(m, "beta", 20);
-            m = hashmap_insert(m, "alpha", 11);            // overwrite, not a new entry
-            let a = hashmap_get_or(m, "alpha", 0 - 1);     // 11
-            let b = hashmap_get_or(m, "beta", 0 - 1);      // 20
-            let miss = hashmap_get_or(m, "gamma", 999);    // 999
-            let len = hashmap_len(m);                      // 2 (overwrite didn't grow it)
+            let mut m: HashMap<String, i64> = HashMap::new();
+            m.insert("alpha", 10);
+            m.insert("beta", 20);
+            m.insert("alpha", 11);            // overwrite, not a new entry
+            let a = m.get("alpha").unwrap_or(0 - 1);     // 11
+            let b = m.get("beta").unwrap_or(0 - 1);      // 20
+            let miss = m.get("gamma").unwrap_or(999);    // 999
+            let len = m.len();                      // 2 (overwrite didn't grow it)
             a + b + miss + len                             // 11 + 20 + 999 + 2 = 1032
         }
     "#);
@@ -43,13 +43,13 @@ fn hashmap_int_keys_force_grow() {
     // must spread sequential keys so probing stays correct across rehashes.
     let r = run(r#"
         fn main() -> i64 {
-            let mut n: HashMap<i64, i64> = hashmap_new();
+            let mut n: HashMap<i64, i64> = HashMap::new();
             let mut i = 0;
-            while i < 50 { n = hashmap_insert(n, i, i * i); i = i + 1; }
-            let sq = hashmap_get_or(n, 7, 0 - 1);          // 49
-            let len = hashmap_len(n);                       // 50
-            let has = if hashmap_contains(n, 49) { 1 } else { 0 };   // 1
-            let nope = if hashmap_contains(n, 50) { 1 } else { 0 };  // 0
+            while i < 50 { n.insert(i, i * i); i = i + 1; }
+            let sq = n.get(7).unwrap_or(0 - 1);          // 49
+            let len = n.len();                       // 50
+            let has = if n.contains_key(49) { 1 } else { 0 };   // 1
+            let nope = if n.contains_key(50) { 1 } else { 0 };  // 0
             sq + len + has + nope                           // 49 + 50 + 1 + 0 = 100
         }
     "#);
@@ -60,13 +60,13 @@ fn hashmap_int_keys_force_grow() {
 fn hashmap_keys_vals_roundtrip() {
     let r = run(r#"
         fn main() -> i64 {
-            let mut m: HashMap<i64, i64> = hashmap_new();
-            m = hashmap_insert(m, 1, 100);
-            m = hashmap_insert(m, 2, 200);
-            m = hashmap_insert(m, 3, 300);
-            let ks = hashmap_keys(m);   // {1,2,3} in some order
-            let vs = hashmap_vals(m);   // {100,200,300}
-            vec_sum_i64(ks) + vec_sum_i64(vs)   // 6 + 600 = 606
+            let mut m: HashMap<i64, i64> = HashMap::new();
+            m.insert(1, 100);
+            m.insert(2, 200);
+            m.insert(3, 300);
+            let ks = m.keys();   // {1,2,3} in some order
+            let vs = m.values();   // {100,200,300}
+            ks.sum() + vs.sum()   // 6 + 600 = 606
         }
     "#);
     assert_eq!(r, 606);
@@ -77,10 +77,10 @@ fn display_and_str_of() {
     // `bool` renders as true/false (length 4/5); ints/floats via to_string.
     let r = run(r#"
         fn main() -> i64 {
-            let t = str_of(true);       // "true"  len 4
-            let f = str_of(false);      // "false" len 5
-            let n = str_of(42);         // "42"    len 2
-            str_len(t) + str_len(f) + str_len(n)   // 4 + 5 + 2 = 11
+            let t = true.to_string();       // "true"  len 4
+            let f = false.to_string();      // "false" len 5
+            let n = 42.to_string();         // "42"    len 2
+            t.len() + f.len() + n.len()   // 4 + 5 + 2 = 11
         }
     "#);
     assert_eq!(r, 11);
@@ -90,12 +90,14 @@ fn display_and_str_of() {
 fn string_formatting_helpers() {
     let r = run(r#"
         fn main() -> i64 {
-            let rep = str_repeat("ab", 3);            // "ababab" len 6
-            let pl = str_pad_left("42", 5, "0");      // "00042" len 5
-            let pr = str_pad_right("x", 4, ".");      // "x..." len 4
-            let rev = str_reverse("abcdef");          // "fedcba"
-            let rev_ok = if str_eq(rev, "fedcba") { 1 } else { 0 };
-            str_len(rep) + str_len(pl) + str_len(pr) + rev_ok   // 6 + 5 + 4 + 1 = 16
+            let rep = "ab".repeat(3);            // "ababab" len 6
+            let pl = "42".pad_left(5, "0");      // "00042" len 5
+            let pr = "x".pad_right(4, ".");      // "x..." len 4
+            let mut cs = "abcdef".chars();
+            cs.reverse();
+            let rev = String::from_chars(cs);         // "fedcba"
+            let rev_ok = if rev == "fedcba" { 1 } else { 0 };
+            rep.len() + pl.len() + pr.len() + rev_ok   // 6 + 5 + 4 + 1 = 16
         }
     "#);
     assert_eq!(r, 16);
@@ -105,22 +107,25 @@ fn string_formatting_helpers() {
 fn vec_api_roundout() {
     let r = run(r#"
         fn main() -> i64 {
-            let mut a: Vec<i64> = vec_new();
-            a = vec_push(a, 10); a = vec_push(a, 20); a = vec_push(a, 30); a = vec_push(a, 40);
-            let mut b: Vec<i64> = vec_new();
-            b = vec_push(b, 50); b = vec_push(b, 60);
+            let mut a: Vec<i64> = Vec::new();
+            a.push(10); a.push(20); a.push(30); a.push(40);
+            let mut b: Vec<i64> = Vec::new();
+            b.push(50); b.push(60);
 
-            let f = opt_unwrap_or(vec_first(a), 0 - 1);        // 10
-            let oob = opt_unwrap_or(vec_get_opt(a, 9), 0 - 1); // -1
-            let c = vec_concat(a, b);                          // len 6
-            let sl = vec_sum_i64(vec_slice(c, 1, 4));          // 20+30+40 = 90
-            let tk = vec_sum_i64(vec_take(c, 2));              // 10+20 = 30
-            let dr = vec_sum_i64(vec_drop(c, 4));              // 50+60 = 110
-            let sw = opt_unwrap_or(vec_first(vec_swap(vec_copy(a), 0, 3)), 0); // 40
-            let pos = vec_position(a, |x: i64| x - (x / 2) * 2 == 0);          // 0
-            let found = opt_unwrap_or(vec_find(a, |x: i64| x > 25), 0 - 1);    // 30
+            let f = a.first().unwrap_or(0 - 1);        // 10
+            let oob = a.get(9).unwrap_or(0 - 1); // -1
+            let mut c = a.clone();
+            c.extend(b);                                       // len 6
+            let sl = c.slice(1, 4).sum();          // 20+30+40 = 90
+            let tk = c.slice(0, 2).sum();              // 10+20 = 30
+            let dr = c.slice(4, c.len()).sum();              // 50+60 = 110
+            let mut swapped = a.clone();
+            swapped.swap(0, 3);
+            let sw = swapped.first().unwrap_or(0); // 40
+            let pos = a.position(|x: i64| x - (x / 2) * 2 == 0).unwrap();          // 0
+            let found = a.find(|x: i64| x > 25).unwrap_or(0 - 1);    // 30
 
-            f + oob + vec_len(c) + sl + tk + dr + sw + pos + found
+            f + oob + c.len() + sl + tk + dr + sw + pos + found
             // 10 + (-1) + 6 + 90 + 30 + 110 + 40 + 0 + 30 = 315
         }
     "#);
@@ -135,13 +140,13 @@ fn unicode_codepoint_api() {
     let r = run(r#"
         fn main() -> i64 {
             let s = "café";
-            let bytes = str_len(s);                                            // 5
-            let chars = str_len_chars(s);                                      // 4
-            let rt = if str_eq(str_from_chars(str_chars(s)), s) { 1 } else { 0 };  // 1
-            let cp = char_at(s, 3);                                            // 233
-            let byte = str_get(s, 3);                                          // 195
-            let sub_ok = if str_eq(str_sub_chars(s, 0, 4), s) { 1 } else { 0 };    // 1 (é intact)
-            let emoji_bytes = str_len(char_to_str(128512));                   // 4 (😀)
+            let bytes = s.len();                                            // 5
+            let chars = s.chars().len();                                      // 4
+            let rt = if String::from_chars(s.chars()) == s { 1 } else { 0 };  // 1
+            let cp = s.chars()[3] as i64;                                     // 233
+            let byte = s.byte_at(3);                                          // 195
+            let sub_ok = if String::from_chars(s.chars().slice(0, 4)) == s { 1 } else { 0 };    // 1 (é intact)
+            let emoji_bytes = (128512 as char).to_string().len();          // 4 (😀)
             bytes + chars + rt + cp + byte + sub_ok + emoji_bytes
             // 5 + 4 + 1 + 233 + 195 + 1 + 4 = 443
         }
@@ -154,9 +159,9 @@ fn unicode_case_folding_and_invalid_scalar() {
     let r = run(r#"
         fn main() -> i64 {
             // ASCII folds; é (non-ASCII) passes through unchanged either way.
-            let up_ok = if str_eq(str_to_upper("Café!"), "CAFé!") { 1 } else { 0 };
-            let lo_ok = if str_eq(str_to_lower("HeLLo"), "hello") { 1 } else { 0 };
-            let inv = str_len(char_to_str(0 - 5));   // invalid scalar -> U+FFFD = 3 bytes
+            let up_ok = if ("Café!".to_uppercase()) == "CAFé!" { 1 } else { 0 };
+            let lo_ok = if ("HeLLo".to_lowercase()) == "hello" { 1 } else { 0 };
+            let inv = char_to_str(0 - 5).len();   // invalid scalar -> U+FFFD = 3 bytes
             up_ok + lo_ok + inv                      // 1 + 1 + 3 = 5
         }
     "#);
@@ -167,11 +172,11 @@ fn unicode_case_folding_and_invalid_scalar() {
 fn string_split_and_index_of() {
     let r = run(r#"
         fn main() -> i64 {
-            let idx = str_index_of("hello world", "world");   // 6
-            let miss = str_index_of("abc", "z");              // -1
-            let parts = str_split("a,bb,ccc", ",");           // 3 parts
-            let joined = str_join(parts, "|");                // "a|bb|ccc" len 8
-            idx + miss + vec_len(parts) + str_len(joined)     // 6 + (-1) + 3 + 8 = 16
+            let idx = "hello world".find("world").unwrap();   // 6
+            let miss = if "abc".find("z").is_none() { 0 - 1 } else { 0 };  // -1
+            let parts = "a,bb,ccc".split(",");           // 3 parts
+            let joined = parts.join("|");                // "a|bb|ccc" len 8
+            idx + miss + parts.len() + joined.len()     // 6 + (-1) + 3 + 8 = 16
         }
     "#);
     assert_eq!(r, 16);
