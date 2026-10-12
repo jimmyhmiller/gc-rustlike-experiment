@@ -3030,7 +3030,17 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// Resolve and lower `recv.method(args)` to a concrete monomorphic call,
     /// with `recv` passed as the leading `self` argument.
     fn method_call(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
-        let (crecv, recv_ty) = self.expr(recv, None)?;
+        self.infer.unresolved = None;
+        let (crecv, recv_ty) = match self.expr(recv, None) {
+            Ok(v) => v,
+            Err(error) => {
+                // A receiver whose type parameters are open (`None.unwrap_or(7)`):
+                // take them from the arguments, then lower it with that type.
+                let Some(partial) = self.infer.unresolved.take().filter(|_| error.span == recv.span) else { return Err(error) };
+                let Some(expected) = self.receiver_type_from_args(&partial, method, args)? else { return Err(error) };
+                self.expr(recv, Some(&expected))?
+            }
+        };
         if let Some(elem_ty) = array_elem_ty(&recv_ty) {
             return self.array_method(crecv, elem_ty, method, args, span);
         }
@@ -3068,6 +3078,37 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             _ => err(format!("no method `{}` on `Array<{}>`", method, ty_display(&elem_ty)), span),
         }
+    }
+
+    /// Complete a receiver type whose type parameters are open by typing the
+    /// method's arguments. The arguments are lowered only to learn their
+    /// types; that lowering is rolled back (the call lowers them again).
+    fn receiver_type_from_args(&mut self, partial: &Ty, method: &str, args: &[Expr]) -> LResult<Option<Ty>> {
+        let Some(entry) = self.lookup_method(partial, method) else { return Ok(None) };
+        if entry.method.params.len() != args.len() {
+            return Ok(None);
+        }
+        let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).map_err(conv)?;
+        let mut scope_params = entry.impl_generics.clone();
+        scope_params.extend(entry.method.generics.params.iter().map(|p| p.name.clone()));
+        scope_params.push("Self".to_string());
+        let mut subst = HashMap::new();
+        for (a, p) in args.iter().zip(&entry.method.params) {
+            let declared = lower_type(&p.ty, &scope_params, self.ctx).map_err(conv)?;
+            if !has_var(&declared) {
+                continue;
+            }
+            let snap = (self.mono.snapshot(), self.reg.snapshot(), *self.count);
+            let lowered = self.expr(a, None);
+            self.mono.restore(snap.0);
+            self.reg.restore(snap.1);
+            *self.count = snap.2;
+            if let Ok((_, actual)) = lowered {
+                unify_infer(&declared, &actual, &mut subst);
+            }
+        }
+        let receiver = apply_subst(&impl_self, &subst);
+        Ok(if has_var(&receiver) { None } else { Some(receiver) })
     }
 
     /// The impl method `method` for a receiver of type `recv_ty`, if any.

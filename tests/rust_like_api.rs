@@ -573,3 +573,8 @@ fn array_literals() {
         assert!(msg.contains(want), "{src}: {msg}");
     }
 }
+
+#[test]
+fn methods_on_none_take_the_type_from_their_arguments() {
+    assert_eq!(run("fn main() -> i64 { None.unwrap_or(7) + Option::None.unwrap_or(30) + Some(5).unwrap_or(0) }"), 42);
+}

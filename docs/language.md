@@ -86,8 +86,11 @@ Array literals `[a, b, c]` and `[x; n]` build a fixed-length `[T; N]`
 Both share the runtime array object: indexing, `len()`, `get`, and `for` work
 on either. In `[x; n]`, every slot holds the same value.
 
-Known gaps: a method called directly on `None` cannot infer `T` from its
-arguments, and there are no user-defined macros.
+A method called on a value whose type parameters are still open, such as
+`None.unwrap_or(7)`, takes them from its arguments.
+
+There are no user-defined macros, no trait objects (`dyn Trait`), and no lazy
+iterators: `map`, `filter`, and the other combinators on `Vec` are eager.
 
 ## Patterns
 
