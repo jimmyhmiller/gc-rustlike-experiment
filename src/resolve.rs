@@ -145,6 +145,7 @@ pub fn resolve_module(module: Module) -> Result<Resolved, ResolveError> {
     globals.apply_uses();
     validate_types(&globals)?;
     validate_methods(&globals)?;
+    validate_trait_impls(&globals)?;
     validate_visibility(&module.items, &mut Vec::new(), &globals)?;
     Ok(Resolved { module, globals })
 }
@@ -166,6 +167,149 @@ fn validate_methods(g: &GlobalTable) -> Result<(), ResolveError> {
         }
     }
     Ok(())
+}
+
+/// Check each `impl Trait for T` against the trait's declaration: the trait
+/// must exist and take the given type arguments, every required method must
+/// be implemented, no method may be outside the trait, and each method's
+/// receiver, parameters, and return type must match the declaration with
+/// `Self` and the trait's type parameters substituted.
+fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
+    for imp in &g.impls {
+        let Some(tr) = &imp.trait_ref else { continue };
+        let tname = tr.path.last();
+        let def = g.traits.iter().find(|(k, _)| k.rsplit("::").next() == Some(tname)).map(|(_, d)| d)
+            .ok_or_else(|| ResolveError { msg: format!("unknown trait `{}`", tname), span: tr.span })?;
+        if tr.args.len() != def.generics.params.len() {
+            return Err(ResolveError {
+                msg: format!("trait `{}` takes {} type argument(s), the impl gives {}", tname, def.generics.params.len(), tr.args.len()),
+                span: tr.span,
+            });
+        }
+        let mut subst: HashMap<String, Type> = def.generics.params.iter().map(|p| p.name.clone()).zip(tr.args.iter().cloned()).collect();
+        subst.insert("Self".to_string(), imp.self_ty.clone());
+        let self_name = crate::types::type_base_name(&imp.self_ty);
+        for item in &def.items {
+            let (sig, provided) = match item {
+                TraitItem::Required(sig) => (sig.clone(), false),
+                TraitItem::Provided(f) => (FnSig {
+                    name: f.name.clone(),
+                    generics: f.generics.clone(),
+                    params: f.params.clone(),
+                    has_self: f.has_self,
+                    self_is_mut: f.self_is_mut,
+                    ret: f.ret.clone(),
+                    span: f.span,
+                }, true),
+                TraitItem::AssocType(name) => {
+                    return Err(ResolveError { msg: format!("associated type `{}` in trait `{}` is not supported", name, tname), span: def.span });
+                }
+            };
+            match imp.items.iter().find(|m| m.name == sig.name) {
+                Some(m) => check_impl_signature(&sig, m, &subst, tname)?,
+                None if provided => {}
+                None => {
+                    return Err(ResolveError {
+                        msg: format!("`impl {} for {}` is missing method `{}`", tname, self_name, sig.name),
+                        span: imp.span,
+                    });
+                }
+            }
+        }
+        for m in &imp.items {
+            let declared = def.items.iter().any(|item| match item {
+                TraitItem::Required(sig) => sig.name == m.name,
+                TraitItem::Provided(f) => f.name == m.name,
+                TraitItem::AssocType(_) => false,
+            });
+            if !declared {
+                return Err(ResolveError { msg: format!("method `{}` is not a member of trait `{}`", m.name, tname), span: m.span });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An impl method must have the trait method's receiver, parameter types, and
+/// return type, after `subst` (Self and the trait's type parameters).
+fn check_impl_signature(sig: &FnSig, m: &FnDef, subst: &HashMap<String, Type>, tname: &str) -> Result<(), ResolveError> {
+    let fail = |what: String| Err(ResolveError {
+        msg: format!("method `{}` does not match trait `{}`: {}", m.name, tname, what),
+        span: m.span,
+    });
+    if sig.has_self != m.has_self {
+        return fail(if sig.has_self { "the trait method takes `self`".into() } else { "the trait method takes no `self`".into() });
+    }
+    if sig.self_is_mut != m.self_is_mut {
+        return fail(if sig.self_is_mut { "the trait method takes `mut self`".into() } else { "the trait method takes `self`, not `mut self`".into() });
+    }
+    if sig.params.len() != m.params.len() {
+        return fail(format!("the trait method takes {} parameter(s), this one takes {}", sig.params.len(), m.params.len()));
+    }
+    if sig.generics.params.len() != m.generics.params.len() {
+        return fail(format!("the trait method has {} type parameter(s), this one has {}", sig.generics.params.len(), m.generics.params.len()));
+    }
+    // The method's own type parameters correspond by position.
+    let mut subst = subst.clone();
+    for (tp, mp) in sig.generics.params.iter().zip(&m.generics.params) {
+        subst.insert(tp.name.clone(), Type { kind: TypeKind::Path(Path::single(mp.name.clone(), mp.span), vec![]), span: mp.span });
+    }
+    let self_ty = subst.get("Self").cloned().expect("Self is substituted");
+    for (i, (tp, mp)) in sig.params.iter().zip(&m.params).enumerate() {
+        if !same_type(&tp.ty, &subst, &mp.ty, &self_ty) {
+            return fail(format!("parameter {} should be `{}`, found `{}`", i + 1, type_text(&tp.ty, &subst), type_text(&mp.ty, &HashMap::new())));
+        }
+    }
+    let unit = Type { kind: TypeKind::Tuple(vec![]), span: m.span };
+    let tret = sig.ret.clone().unwrap_or_else(|| unit.clone());
+    let mret = m.ret.clone().unwrap_or(unit);
+    if !same_type(&tret, &subst, &mret, &self_ty) {
+        return fail(format!("it should return `{}`, found `{}`", type_text(&tret, &subst), type_text(&mret, &HashMap::new())));
+    }
+    Ok(())
+}
+
+/// Is the trait-side type `t` (under `subst`) the impl-side type `u` (whose
+/// `Self` is `self_ty`)? Named types compare by their last path segment.
+fn same_type(t: &Type, subst: &HashMap<String, Type>, u: &Type, self_ty: &Type) -> bool {
+    let empty = HashMap::new();
+    match (&t.kind, &u.kind) {
+        (TypeKind::SelfType, _) => match subst.get("Self") {
+            Some(s) => same_type(s, &empty, u, self_ty),
+            None => false,
+        },
+        (_, TypeKind::SelfType) => same_type(t, subst, self_ty, self_ty),
+        (TypeKind::Path(p, args), _) if args.is_empty() && p.is_single() && subst.contains_key(p.last()) => {
+            same_type(&subst[p.last()], &empty, u, self_ty)
+        }
+        (TypeKind::Path(p, pa), TypeKind::Path(q, qa)) => {
+            p.last() == q.last() && pa.len() == qa.len() && pa.iter().zip(qa).all(|(a, b)| same_type(a, subst, b, self_ty))
+        }
+        (TypeKind::Tuple(a), TypeKind::Tuple(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_type(x, subst, y, self_ty)),
+        (TypeKind::Array(a, _), TypeKind::Array(b, _)) => same_type(a, subst, b, self_ty),
+        (TypeKind::Fn(ap, ar), TypeKind::Fn(bp, br)) | (TypeKind::ExternFn(ap, ar), TypeKind::ExternFn(bp, br)) => {
+            let unit = Type { kind: TypeKind::Tuple(vec![]), span: t.span };
+            ap.len() == bp.len()
+                && ap.iter().zip(bp).all(|(x, y)| same_type(x, subst, y, self_ty))
+                && same_type(ar.as_deref().unwrap_or(&unit), subst, br.as_deref().unwrap_or(&unit), self_ty)
+        }
+        _ => false,
+    }
+}
+
+/// Render a surface type for a diagnostic, applying `subst`.
+fn type_text(t: &Type, subst: &HashMap<String, Type>) -> String {
+    let list = |ts: &[Type]| ts.iter().map(|x| type_text(x, subst)).collect::<Vec<_>>().join(", ");
+    match &t.kind {
+        TypeKind::SelfType => subst.get("Self").map(|s| type_text(s, &HashMap::new())).unwrap_or_else(|| "Self".into()),
+        TypeKind::Path(p, args) if args.is_empty() && p.is_single() && subst.contains_key(p.last()) => type_text(&subst[p.last()], &HashMap::new()),
+        TypeKind::Path(p, args) if args.is_empty() => p.last().to_string(),
+        TypeKind::Path(p, args) => format!("{}<{}>", p.last(), list(args)),
+        TypeKind::Tuple(ts) => format!("({})", list(ts)),
+        TypeKind::Array(e, _) => format!("[{}; _]", type_text(e, subst)),
+        TypeKind::Fn(ps, r) => format!("fn({}){}", list(ps), r.as_ref().map(|r| format!(" -> {}", type_text(r, subst))).unwrap_or_default()),
+        TypeKind::ExternFn(ps, r) => format!("extern fn({}){}", list(ps), r.as_ref().map(|r| format!(" -> {}", type_text(r, subst))).unwrap_or_default()),
+    }
 }
 
 /// Can code in module `from_mod` reference the symbol at fully-qualified path

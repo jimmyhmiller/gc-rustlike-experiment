@@ -41,6 +41,12 @@ array slots have no generic default value: initialize each slot with `a[i] = v`
 before reading it. An in-bounds read of an unwritten slot aborts with an
 uninitialized-element diagnostic, including `Array::get` and native string join.
 
+Each `impl Trait for T` is checked against the trait: every required method
+must be present, no method may be outside the trait, and each method's
+receiver (`self` or `mut self`), parameters, and return type must match the
+declaration with `Self` and the trait's type parameters substituted. A trait's
+default methods apply to every implementing type that does not override them.
+
 Two methods with the same name on the same type are an error, as is an
 attribute other than `#[value]`. A user item that shadows a prelude type or
 trait also drops the prelude's impls for it.

@@ -53,6 +53,10 @@ trait Hash { fn hash(self) -> i64; }
 
 trait ToString { fn to_string(self) -> String; }
 
+// Marker: values of the type may be shared between threads. Usually derived
+// from the type's fields; `impl Sync for T {}` asserts it.
+trait Sync {}
+
 // `clone` copies a collection's storage, so the copy and the original can be
 // mutated independently. Elements are not cloned.
 trait Clone { fn clone(self) -> Self; }

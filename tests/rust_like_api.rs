@@ -487,3 +487,41 @@ fn range_indexing_copies_part_of_a_string_or_vec() {
     let msg = compile_error("fn main() -> i64 { let a: Array<i64> = Array::new(3); a[0..1].len() }");
     assert!(msg.contains("range indexing is not supported on `Array`"), "{msg}");
 }
+
+#[test]
+fn trait_impls_are_checked_and_default_methods_apply() {
+    for (src, want) in [
+        ("struct P { x: i64 } impl Ord for P { fn cmp(self, o: P) -> i64 { 0 } }", "it should return `Ordering`, found `i64`"),
+        ("struct P { x: i64 } impl Eq for P { }", "`impl Eq for P` is missing method `eq`"),
+        ("struct P { x: i64 } impl Eq for P { fn eq(self, o: P) -> bool { true } fn extra(self) -> i64 { 1 } }", "method `extra` is not a member of trait `Eq`"),
+        ("struct P { x: i64 } impl Frobnicate for P { }", "unknown trait `Frobnicate`"),
+        ("struct P { x: i64 } impl Index for P { fn index(self, i: i64) -> i64 { 0 } }", "trait `Index` takes 1 type argument(s)"),
+        ("struct P { x: i64 } impl Eq for P { fn eq(mut self, o: P) -> bool { true } }", "takes `self`, not `mut self`"),
+        ("struct P { x: i64 } impl Eq for P { fn eq(self, o: i64) -> bool { true } }", "parameter 1 should be `P`, found `i64`"),
+    ] {
+        let msg = compile_error(&format!("{src} fn main() -> i64 {{ 0 }}"));
+        assert!(msg.contains(want), "{src}: {msg}");
+    }
+    let r = run(r#"
+        trait Shape {
+            fn area(self) -> i64;
+            fn describe(self) -> String { format!("area {}", self.area()) }
+            fn double(self) -> i64 { self.area() * 2 }
+        }
+        struct Square { side: i64 }
+        struct Circle { r: i64 }
+        impl Shape for Square { fn area(self) -> i64 { self.side * self.side } }
+        impl Shape for Circle {
+            fn area(self) -> i64 { 3 * self.r * self.r }
+            fn describe(self) -> String { "a circle" }
+        }
+        fn main() -> i64 {
+            let s = Square { side: 3 };
+            let c = Circle { r: 1 };
+            assert_eq!(s.describe(), "area 9");
+            assert_eq!(c.describe(), "a circle");
+            s.double() + c.double()
+        }
+    "#);
+    assert_eq!(r, 24);
+}

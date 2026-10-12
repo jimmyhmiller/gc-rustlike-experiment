@@ -126,6 +126,24 @@ impl TyCtx {
                 );
             }
         }
+        // A trait's default methods belong to every implementing type that
+        // does not define them, after all impl methods (so inherent and
+        // overriding methods take precedence).
+        for imp in &g.impls {
+            let Some(tr) = &imp.trait_ref else { continue };
+            let Some(def) = g.traits.iter().find(|(k, _)| k.rsplit("::").next() == Some(tr.path.last())).map(|(_, d)| d) else { continue };
+            let base = type_base_name(&imp.self_ty);
+            let impl_generics: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
+            for item in &def.items {
+                let crate::ast::TraitItem::Provided(f) = item else { continue };
+                methods.entry((base.clone(), f.name.clone())).or_insert_with(|| MethodEntry {
+                    self_ty: imp.self_ty.clone(),
+                    impl_generics: impl_generics.clone(),
+                    trait_name: Some(tr.path.last().to_string()),
+                    method: Rc::new(f.clone()),
+                });
+            }
+        }
         TyCtx {
             structs: g.structs.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             enums: g.enums.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
