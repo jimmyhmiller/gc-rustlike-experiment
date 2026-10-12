@@ -525,3 +525,22 @@ fn trait_impls_are_checked_and_default_methods_apply() {
     "#);
     assert_eq!(r, 24);
 }
+
+#[test]
+fn self_tail_call_beside_a_value_return_in_nested_if() {
+    // Tail-call elimination turns `find(..)` into a loop `continue`; the inner
+    // `if` still yields an inline `Option` from its other branch.
+    let r = run(r#"
+        struct Pt { x: i64 }
+        fn find(target: i64, i: i64) -> Option<Pt> {
+            if i >= 50 { None }
+            else { let p = Pt { x: i }; if p.x == target { Some(p) } else { find(target, i + 1) } }
+        }
+        fn main() -> i64 {
+            let hit = match find(42, 0) { Some(p) => p.x, None => 0 };
+            let miss = match find(99, 0) { Some(p) => p.x, None => 1 };
+            hit + miss
+        }
+    "#);
+    assert_eq!(r, 43);
+}

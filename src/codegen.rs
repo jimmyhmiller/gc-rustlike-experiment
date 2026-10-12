@@ -4394,10 +4394,19 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let cont_bb = self.ctx.append_basic_block(func, "ifcont");
         self.builder.build_conditional_branch(cv, then_bb, else_bb).unwrap();
 
+        // A branch of a value-typed `if` that ends open without a value
+        // diverged (return/continue/break) and left the builder in a dead
+        // block; it must not reach the merge, whose phi has no value for it.
+        let wants_value = self.llvm_ty(repr).is_some();
+
         self.builder.position_at_end(then_bb);
         let tv = self.gen_block(fcx, then_b)?;
         let then_end = self.builder.get_insert_block().unwrap();
-        let then_open = then_end.get_terminator().is_none();
+        let mut then_open = then_end.get_terminator().is_none();
+        if then_open && wants_value && tv.is_none() {
+            self.builder.build_unreachable().unwrap();
+            then_open = false;
+        }
         if then_open {
             self.builder.build_unconditional_branch(cont_bb).unwrap();
         }
@@ -4405,7 +4414,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(else_bb);
         let ev = self.gen_block(fcx, else_b)?;
         let else_end = self.builder.get_insert_block().unwrap();
-        let else_open = else_end.get_terminator().is_none();
+        let mut else_open = else_end.get_terminator().is_none();
+        if else_open && wants_value && ev.is_none() {
+            self.builder.build_unreachable().unwrap();
+            else_open = false;
+        }
         if else_open {
             self.builder.build_unconditional_branch(cont_bb).unwrap();
         }

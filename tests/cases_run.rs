@@ -9,7 +9,6 @@ use gcrust::resolve::resolve_module;
 
 /// (file, reason) for programs that do not compile yet.
 const KNOWN_FAILURES: &[(&str, &str)] = &[
-    ("rec_option_struct.gcr", "LLVM verify failure in tail-call lowering of an Option-returning recursion"),
     ("tuples_arrays.gcr", "fixed-size array literals `[a, b]` / `[x; n]` are not lowered"),
 ];
 
