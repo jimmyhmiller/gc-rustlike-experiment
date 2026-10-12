@@ -16,7 +16,7 @@ fn main() -> i64 {
     let squares = nums.map(|x: i64| x * x);       // [1,4,9,...,100]
     let big = squares.filter(|x: i64| x > 25);    // [36,49,64,81,100]
     let sum_big = big.fold(0, |a: i64, x: i64| a + x);  // 330
-    println("sum of squares > 25: " + sum_big.to_string());
+    println!("sum of squares > 25: {}", sum_big);
 
     // HashMap: word -> length.
     let mut lengths: HashMap<String, i64> = HashMap::new();
@@ -27,7 +27,7 @@ fn main() -> i64 {
         lengths.insert(w, w.len());
         i += 1;
     }
-    println("len(quick) = " + lengths.get("quick").unwrap_or(0).to_string());
+    println!("len(quick) = {}", lengths.get("quick").unwrap_or(0));
 
     // Generic Ord-based sort on a user struct.
     let mut board: Vec<Score> = Vec::new();
@@ -35,7 +35,7 @@ fn main() -> i64 {
     board.push(Score { name: "bob", points: 50 });
     board.push(Score { name: "carol", points: 40 });
     let top = board.max().unwrap_or(Score { name: "none", points: 0 });
-    println("top scorer: " + top.name + " with " + top.points.to_string());
+    println!("top scorer: {} with {}", top.name, top.points);
 
     board.sort();                                      // ascending by points
     // Checksum: sum_big + map length + lowest & highest points.

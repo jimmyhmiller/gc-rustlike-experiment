@@ -23,7 +23,7 @@ fn csv_decode_field(text: String, start: i64, record: i64) -> Result<CsvField, C
             i += 1;
             if i - start > 1048576 { return Err(CsvError::new(record, i, "field exceeds 1 MiB")); }
         }
-        return Ok(CsvField { text: text.substring(start, i), next: i });
+        return Ok(CsvField { text: text[start..i], next: i });
     }
     let mut pieces: Vec<String> = Vec::new();
     let mut i = start + 1;
@@ -33,7 +33,7 @@ fn csv_decode_field(text: String, start: i64, record: i64) -> Result<CsvField, C
         if text.byte_at(i) == 34 {
             bytes += i - segment;
             if bytes > 1048576 { return Err(CsvError::new(record, i, "field exceeds 1 MiB")); }
-            pieces.push(text.substring(segment, i));
+            pieces.push(text[segment..i]);
             if i + 1 < length && text.byte_at(i + 1) == 34 {
                 pieces.push("\"");
                 bytes += 1;
@@ -97,13 +97,13 @@ fn csv_escape(text: String) -> String {
     i = 0;
     while i < text.len() {
         if text.byte_at(i) == 34 {
-            pieces.push(text.substring(start, i));
+            pieces.push(text[start..i]);
             pieces.push("\"\"");
             start = i + 1;
         }
         i += 1;
     }
-    pieces.push(text.substring(start, i));
+    pieces.push(text[start..i]);
     pieces.push("\"");
     pieces.join("")
 }

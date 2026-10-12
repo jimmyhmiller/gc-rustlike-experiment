@@ -11,7 +11,7 @@ impl Ord for Running {
         }
     }
 }
-fn failure(message: String) -> i64 { stderr_line("gcr-buildplan: " + message); 1 }
+fn failure(message: String) -> i64 { stderr_line(format!("gcr-buildplan: {}", message)); 1 }
 fn load(text: String) -> Result<Vec<Task>, String> {
     let rows = csv_parse(text, 2001, 3).map_err(|e| e.to_string())?;
     if rows.is_empty() { return Err("missing task,duration,depends header"); }
@@ -23,12 +23,12 @@ fn load(text: String) -> Result<Vec<Task>, String> {
     let mut names = HashMap::new();
     for r in 1..rows.len() {
         let row = rows[r];
-        if row.len() != 3 { return Err("wrong field count at record " + (r + 1).to_string()); }
+        if row.len() != 3 { return Err(format!("wrong field count at record {}", r + 1)); }
         let name = row[0].trim();
         if name.is_empty() || name.contains(";") { return Err("task names must be nonempty and contain no semicolons"); }
-        if names.contains_key(name) { return Err("duplicate task: " + name); }
+        if names.contains_key(name) { return Err(format!("duplicate task: {}", name)); }
         let duration = row[1].trim().parse_i64().ok_or_else(|| "invalid duration for " + name)?;
-        if duration < 0 { return Err("negative duration for " + name); }
+        if duration < 0 { return Err(format!("negative duration for {}", name)); }
         names.insert(name, tasks.len());
         tasks.push(Task { name: name, duration: duration, depends: Vec::new(), children: Vec::new() });
     }
@@ -40,8 +40,8 @@ fn load(text: String) -> Result<Vec<Task>, String> {
         for dependency in text.split(";") {
             let name = dependency.trim();
             let index = names.get(name).ok_or_else(|| "unknown dependency: " + name)?;
-            if index == r { return Err("self dependency: " + task.name); }
-            if task.depends.contains(index) { return Err("duplicate dependency for " + task.name); }
+            if index == r { return Err(format!("self dependency: {}", task.name)); }
+            if task.depends.contains(index) { return Err(format!("duplicate dependency for {}", task.name)); }
             task.depends.push(index);
             let mut parent = tasks[index];
             parent.children.push(r);
@@ -87,7 +87,7 @@ fn schedule(tasks: Vec<Task>, worker_count: i64) -> Result<Schedule, String> {
             let mut blocked = Vec::new();
             for i in 0..count { if !complete[i] { blocked.push(tasks[i].name); } }
             blocked.sort();
-            return Err("dependency cycle or blocked tasks: " + blocked.join(", "));
+            return Err(format!("dependency cycle or blocked tasks: {}", blocked.join(", ")));
         }
         now = running.peek().expect("running queue invariant").finish;
         // Finish every job at this instant before dispatching lexically ready jobs.
@@ -111,22 +111,17 @@ fn schedule(tasks: Vec<Task>, worker_count: i64) -> Result<Schedule, String> {
     Ok(Schedule { tasks: tasks, starts: starts, finishes: finishes, workers: assignments, makespan: now, critical: critical })
 }
 fn render(plan: Schedule, workers: i64) -> String {
-    let mut parts = Vec::new();
-    parts.push("{\"workers\":" + workers.to_string() + ",\"makespan\":");
-    parts.push(plan.makespan.to_string() + ",\"critical_path\":" + plan.critical.to_string());
-    parts.push(",\"tasks\":[");
     let mut order = Vec::new();
     for i in 0..plan.tasks.len() { order.push(Ready { name: plan.tasks[i].name, index: i }); }
     order.sort();
-    for i in 0..order.len() {
-        if i > 0 { parts.push(","); }
-        let job = order[i];
-        parts.push("{\"task\":" + json_quote(job.name) + ",\"start\":");
-        parts.push(plan.starts[job.index].to_string() + ",\"finish\":" + plan.finishes[job.index].to_string());
-        parts.push(",\"worker\":" + plan.workers[job.index].to_string() + "}");
+    let mut tasks = Vec::new();
+    for job in order {
+        let i = job.index;
+        tasks.push(format!("{{\"task\":{},\"start\":{},\"finish\":{},\"worker\":{}}}",
+            json_quote(job.name), plan.starts[i], plan.finishes[i], plan.workers[i]));
     }
-    parts.push("]}");
-    parts.join("")
+    format!("{{\"workers\":{},\"makespan\":{},\"critical_path\":{},\"tasks\":[{}]}}",
+        workers, plan.makespan, plan.critical, tasks.join(","))
 }
 fn main() -> i64 {
     let args = match process_args() { Ok(a) => a, Err(e) => { return failure(e.to_string()); } };

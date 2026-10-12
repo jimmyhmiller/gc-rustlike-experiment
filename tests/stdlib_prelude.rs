@@ -116,9 +116,9 @@ fn vec_api_roundout() {
             let oob = a.get(9).unwrap_or(0 - 1); // -1
             let mut c = a.clone();
             c.extend(b);                                       // len 6
-            let sl = c.slice(1, 4).sum();          // 20+30+40 = 90
-            let tk = c.slice(0, 2).sum();              // 10+20 = 30
-            let dr = c.slice(4, c.len()).sum();              // 50+60 = 110
+            let sl = c[1..4].sum();          // 20+30+40 = 90
+            let tk = c[0..2].sum();              // 10+20 = 30
+            let dr = c[4..].sum();                     // 50+60 = 110
             let mut swapped = a.clone();
             swapped.swap(0, 3);
             let sw = swapped.first().unwrap_or(0); // 40
@@ -145,7 +145,7 @@ fn unicode_codepoint_api() {
             let rt = if String::from_chars(s.chars()) == s { 1 } else { 0 };  // 1
             let cp = s.chars()[3] as i64;                                     // 233
             let byte = s.byte_at(3);                                          // 195
-            let sub_ok = if String::from_chars(s.chars().slice(0, 4)) == s { 1 } else { 0 };    // 1 (é intact)
+            let sub_ok = if String::from_chars(s.chars()[0..4]) == s { 1 } else { 0 };    // 1 (é intact)
             let emoji_bytes = (128512 as char).to_string().len();          // 4 (😀)
             bytes + chars + rt + cp + byte + sub_ok + emoji_bytes
             // 5 + 4 + 1 + 233 + 195 + 1 + 4 = 443

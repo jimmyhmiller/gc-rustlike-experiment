@@ -2343,6 +2343,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// `base[idx]`: a bounds-checked element read for an `Array`, otherwise a
     /// call to the base type's `Index::index`.
     fn index_get(&mut self, base: &Expr, idx: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        if let ExprKind::Range { lo, hi, inclusive } = &*idx.kind {
+            return self.index_range(base, lo, hi, *inclusive, span);
+        }
         let (ca, aty) = self.expr(base, None)?;
         let Some(elem_ty) = array_elem_ty(&aty) else {
             return self.trait_method_call(ca, aty, Some(base), "Index", "index", "indexing", std::slice::from_ref(idx), span);
@@ -2362,6 +2365,36 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
         self.check_assignable(&it, &Ty::i64(), idx.span)?;
         Ok((CoreExpr::new(CoreExprKind::ArrayGetUnchecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
+    }
+
+    /// `base[lo..hi]` (either bound may be omitted; `lo..=hi` includes `hi`):
+    /// a call to the base type's `IndexRange::index_range(lo, hi)`, which
+    /// returns a copy of that part. The base is evaluated once.
+    fn index_range(&mut self, base: &Expr, lo: &Option<Expr>, hi: &Option<Expr>, inclusive: bool, span: Span) -> LResult<(CoreExpr, Ty)> {
+        if inclusive && hi.is_none() {
+            return err("an inclusive range needs an end (`lo..=hi`)", span);
+        }
+        let (cb, bty) = self.expr(base, None)?;
+        if array_elem_ty(&bty).is_some() {
+            return err("range indexing is not supported on `Array`; use a `Vec`", span);
+        }
+        let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+        let base_var = ex(ExprKind::Path(Path::single(RANGE_BASE.to_string(), span)));
+        let lo = lo.clone().unwrap_or_else(|| ex(ExprKind::Int(0, crate::lexer::NumSuffix::None)));
+        let hi = match hi {
+            Some(h) if inclusive => ex(ExprKind::Binary(BinOp::Add, h.clone(), ex(ExprKind::Int(1, crate::lexer::NumSuffix::None)))),
+            Some(h) => h.clone(),
+            None => ex(ExprKind::MethodCall { recv: base_var.clone(), method: "len".into(), args: vec![], span }),
+        };
+        self.push_scope();
+        let id = self.fresh_local(cb.repr.clone(), bty.clone());
+        self.bind_mut(RANGE_BASE, id, bty.clone(), false);
+        let recv = CoreExpr::new(CoreExprKind::Local(id), cb.repr.clone());
+        let call = self.trait_method_call(recv, bty, Some(&base_var), "IndexRange", "index_range", "range indexing", &[lo, hi], span);
+        self.pop_scope();
+        let (call, ty) = call?;
+        let repr = call.repr.clone();
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, cb)], tail: Some(call) })), repr), ty))
     }
 
     /// `base[idx] = val`: an element store for an `Array`, otherwise a call to
@@ -4120,6 +4153,8 @@ const FOR_INDEX: &str = "for#index";
 const FOR_END: &str = "for#end";
 const FOR_DONE: &str = "for#done";
 const FOR_ITEMS: &str = "for#items";
+/// The evaluated base of a range index `base[lo..hi]`.
+const RANGE_BASE: &str = "range#base";
 
 /// Desugar `for pat in iter { body }` to a `while` loop.
 ///

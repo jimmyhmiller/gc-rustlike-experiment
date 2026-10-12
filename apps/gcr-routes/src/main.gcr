@@ -11,7 +11,7 @@ impl Ord for Candidate {
         }
     }
 }
-fn failure(message: String) -> i64 { stderr_line("gcr-routes: " + message); 1 }
+fn failure(message: String) -> i64 { stderr_line(format!("gcr-routes: {}", message)); 1 }
 fn node(mut graph: Graph, name: String) -> Result<i64, String> {
     if let Some(index) = graph.names.get(name) { return Ok(index); }
     let index = graph.nodes.len();
@@ -28,7 +28,7 @@ fn load(text: String) -> Result<Graph, String> {
     let mut graph = Graph { nodes: Vec::new(), names: HashMap::new(), edges: 0 };
     for i in 1..rows.len() {
         let row = rows[i];
-        if row.len() != 3 { return Err("wrong field count at record " + (i + 1).to_string()); }
+        if row.len() != 3 { return Err(format!("wrong field count at record {}", i + 1)); }
         let from = row[0];
         let to = row[1];
         if from.is_empty() || to.is_empty() { return Err("node names must be nonempty"); }
@@ -102,19 +102,10 @@ fn route(graph: Graph, from: String, to: String) -> Result<Route, String> {
     Ok(Route { reachable: true, distance: distances[target], path: path })
 }
 fn render(result: Route, graph: Graph, from: String, to: String) -> String {
-    let mut parts = Vec::new();
-    parts.push("{\"from\":" + json_quote(from) + ",\"to\":");
-    parts.push(json_quote(to));
-    parts.push(if result.reachable { ",\"reachable\":true,\"distance\":" } else { ",\"reachable\":false,\"distance\":" });
-    parts.push(if result.reachable { result.distance.to_string() } else { "null" });
-    parts.push(",\"path\":[");
-    for i in 0..result.path.len() {
-        if i > 0 { parts.push(","); }
-        parts.push(json_quote(result.path[i]));
-    }
-    parts.push("],\"nodes\":" + graph.nodes.len().to_string() + ",\"edges\":");
-    parts.push(graph.edges.to_string() + "}");
-    parts.join("")
+    let distance = if result.reachable { result.distance.to_string() } else { "null" };
+    let path = result.path.map(|name: String| json_quote(name)).join(",");
+    format!("{{\"from\":{},\"to\":{},\"reachable\":{},\"distance\":{},\"path\":[{}],\"nodes\":{},\"edges\":{}}}",
+        json_quote(from), json_quote(to), result.reachable, distance, path, graph.nodes.len(), graph.edges)
 }
 fn main() -> i64 {
     let args = match process_args() { Ok(a) => a, Err(e) => { return failure(e.to_string()); } };

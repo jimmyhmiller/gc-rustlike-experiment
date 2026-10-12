@@ -35,7 +35,7 @@ fn worker_count(text: String) -> i64 {
     let n = text.parse_i64().unwrap_or(0);
     if text.byte_at(0).is_ascii_digit() && n >= 1 && n <= 64 { n } else { 0 }
 }
-fn fail(message: String) -> i64 { stderr_line("gcr-logstats: " + message); 1 }
+fn fail(message: String) -> i64 { stderr_line(format!("gcr-logstats: {}", message)); 1 }
 fn main() -> i64 {
     let args = match process_args() { Ok(a) => a, Err(e) => { return fail(e.to_string()); } };
     if args.len() < 3 || args.len() > 10002 {
@@ -61,12 +61,7 @@ fn main() -> i64 {
     }
     if let Some(e) = failure { return fail(e); }
     let s = total.deref();
-    let mut parts = Vec::new();
-    parts.push("{\"files\":"); parts.push(s.files.to_string());
-    parts.push(",\"bytes\":"); parts.push(s.bytes.to_string());
-    parts.push(",\"lines\":"); parts.push(s.lines.to_string());
-    parts.push(",\"error_lines\":"); parts.push(s.errors.to_string());
-    parts.push(",\"warning_lines\":"); parts.push(s.warnings.to_string());
-    parts.push("}");
-    match stdout_line(parts.join("")) { Ok(_) => 0, Err(e) => fail(e.to_string()) }
+    let json = format!("{{\"files\":{},\"bytes\":{},\"lines\":{},\"error_lines\":{},\"warning_lines\":{}}}",
+        s.files, s.bytes, s.lines, s.errors, s.warnings);
+    match stdout_line(json) { Ok(_) => 0, Err(e) => fail(e.to_string()) }
 }

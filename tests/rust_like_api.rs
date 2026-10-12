@@ -136,7 +136,7 @@ fn string_byte_access_aborts_out_of_range() {
     let (ok, stderr) = run_cli("str_oob", "fn main() -> i64 { \"abc\".byte_at(3) }\n");
     assert!(!ok);
     assert!(stderr.contains("byte index 3 is out of bounds of a string of length 3"), "{stderr}");
-    let (ok, stderr) = run_cli("substr_oob", "fn main() -> i64 { \"abc\".substring(1, 4).len() }\n");
+    let (ok, stderr) = run_cli("substr_oob", "fn main() -> i64 { \"abc\"[1..4].len() }\n");
     assert!(!ok);
     assert!(stderr.contains("byte range 1..4 is out of bounds"), "{stderr}");
 }
@@ -463,4 +463,27 @@ fn format_vec_and_assert_macros() {
     let (ok, stderr) = run_cli("assert_fail", "fn main() -> i64 { assert_eq!(1 + 1, 3, \"math is {}\", \"broken\"); 0 }\n");
     assert!(!ok);
     assert!(stderr.contains("math is broken"), "{stderr}");
+}
+
+#[test]
+fn range_indexing_copies_part_of_a_string_or_vec() {
+    let r = run(r#"
+        fn main() -> i64 {
+            let s = "hello world";
+            let v = vec![1, 2, 3, 4, 5];
+            let mut ok = 0;
+            if s[0..5] == "hello" && s[6..] == "world" && s[..5] == "hello" && s[..] == s && s[4..=4] == "o" { ok += 1; }
+            if v[1..3].sum() == 5 && v[3..].len() == 2 && v[..2] == vec![1, 2] && v[0..=4].len() == 5 && v[2..2].is_empty() { ok += 2; }
+            let mut copy = v[0..2];
+            copy.push(9);
+            if v.len() == 5 && copy.len() == 3 { ok += 4; }      // a copy, not a view
+            ok
+        }
+    "#);
+    assert_eq!(r, 7);
+    let (ok, stderr) = run_cli("vec_range_oob", "fn main() -> i64 { let v = vec![1, 2]; v[1..3].len() }\n");
+    assert!(!ok);
+    assert!(stderr.contains("range 1..3 is out of bounds for a Vec of length 2"), "{stderr}");
+    let msg = compile_error("fn main() -> i64 { let a: Array<i64> = Array::new(3); a[0..1].len() }");
+    assert!(msg.contains("range indexing is not supported on `Array`"), "{msg}");
 }

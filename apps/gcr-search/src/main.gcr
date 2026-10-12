@@ -1,7 +1,7 @@
 mod index;
 mod search;
 
-fn fail(message: String) -> i64 { stderr_line("gcr-search: " + message); 1 }
+fn fail(message: String) -> i64 { stderr_line(format!("gcr-search: {}", message)); 1 }
 fn usage() -> i64 {
     stderr_line("usage: gcr-search index <directory> [index-file]\n       gcr-search query <literal> [index-file]");
     2
@@ -18,7 +18,7 @@ fn main() -> i64 {
         let result = match index::scan(root, destination) { Ok(s) => s, Err(e) => { return fail(e); } };
         let encoded = index::encode(result.documents);
         match fs_write_text_atomic(destination, encoded) {
-            Ok(_) => { stderr_line("indexed " + result.documents.len().to_string() + " files; skipped " + result.skipped.to_string() + " files/links"); 0 }
+            Ok(_) => { stderr_line(format!("indexed {} files; skipped {} files/links", result.documents.len(), result.skipped)); 0 }
             Err(e) => fail(e.to_string()),
         }
     } else if command == "query" {

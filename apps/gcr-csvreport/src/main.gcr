@@ -2,7 +2,7 @@ struct Group { name: String, count: i64, sum: i64, minimum: i64, maximum: i64 }
 struct FileReport { rows: i64, bytes: i64, total: i64, groups: Vec<Group> }
 struct Completion { index: i64, report: Result<FileReport, String> }
 impl Ord for Group { fn cmp(self, other: Group) -> Ordering { self.name.cmp(other.name) } }
-fn failure(message: String) -> i64 { stderr_line("gcr-csvreport: " + message); 1 }
+fn failure(message: String) -> i64 { stderr_line(format!("gcr-csvreport: {}", message)); 1 }
 fn report(text: String, group_column: String, value_column: String) -> Result<FileReport, String> {
     let rows = csv_parse(text, 20001, 256).map_err(|e| e.to_string())?;
     if rows.is_empty() { return Err("missing CSV header"); }
@@ -18,7 +18,7 @@ fn report(text: String, group_column: String, value_column: String) -> Result<Fi
     let mut total = 0;
     for r in 1..rows.len() {
         let row = rows[r];
-        if row.len() != header.len() { return Err("wrong field count at record " + (r + 1).to_string()); }
+        if row.len() != header.len() { return Err(format!("wrong field count at record {}", r + 1)); }
         let key = row[group_index];
         let value = row[value_index].trim().parse_i64().ok_or_else(|| "invalid signed integer at record " + (r + 1).to_string())?;
         total = total.checked_add(value).ok_or("file total overflow")?;
@@ -76,20 +76,13 @@ fn merge(reports: Array<Result<FileReport, String>>, paths: Vec<String>) -> Resu
     Ok(FileReport { rows: rows, bytes: bytes, total: total, groups: sorted })
 }
 fn render(summary: FileReport, files: i64) -> String {
-    let mut parts = Vec::new();
-    parts.push("{\"files\":" + files.to_string() + ",\"rows\":");
-    parts.push(summary.rows.to_string() + ",\"bytes\":" + summary.bytes.to_string());
-    parts.push(",\"total\":" + summary.total.to_string() + ",\"groups\":[");
-    for i in 0..summary.groups.len() {
-        if i > 0 { parts.push(","); }
-        let g = summary.groups[i];
-        parts.push("{\"key\":" + json_quote(g.name) + ",\"count\":");
-        parts.push(g.count.to_string() + ",\"sum\":" + g.sum.to_string());
-        parts.push(",\"min\":" + g.minimum.to_string() + ",\"max\":");
-        parts.push(g.maximum.to_string() + "}");
+    let mut groups = Vec::new();
+    for g in summary.groups {
+        groups.push(format!("{{\"key\":{},\"count\":{},\"sum\":{},\"min\":{},\"max\":{}}}",
+            json_quote(g.name), g.count, g.sum, g.minimum, g.maximum));
     }
-    parts.push("]}");
-    parts.join("")
+    format!("{{\"files\":{},\"rows\":{},\"bytes\":{},\"total\":{},\"groups\":[{}]}}",
+        files, summary.rows, summary.bytes, summary.total, groups.join(","))
 }
 fn main() -> i64 {
     let args = match process_args() { Ok(a) => a, Err(e) => { return failure(e.to_string()); } };

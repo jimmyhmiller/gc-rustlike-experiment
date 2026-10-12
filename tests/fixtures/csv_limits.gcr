@@ -18,7 +18,7 @@ fn main() -> i64 {
     if csv_parse(quoted_long,1,1).is_ok() { return 9; }
     // Include record terminators in the exact encoded output boundary.
     let mut row: Vec<String> = Vec::new();
-    row.push(field.substring(0, 1048574));
+    row.push(field[0..1048574]);
     let mut output_rows: Vec<Vec<String>> = Vec::new();
     i = 0;
     while i < 16 { output_rows.push(row); i += 1; }

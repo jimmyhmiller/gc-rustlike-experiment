@@ -762,6 +762,14 @@ impl Parser {
 
     fn expr_bp_inner(&mut self, min_bp: u8) -> PResult<Expr> {
         let start = self.span();
+        // A range with no start: `..hi`, `..=hi`, or `..`.
+        if matches!(self.peek(), TokKind::DotDot | TokKind::DotDotEq) && min_bp <= 2 {
+            let inclusive = matches!(self.peek(), TokKind::DotDotEq);
+            self.bump();
+            let hi = if self.starts_expr() { Some(self.expr_bp(3)?) } else { None };
+            let span = start.to(self.prev_span());
+            return Ok(Expr { kind: Box::new(ExprKind::Range { lo: None, hi, inclusive }), span });
+        }
         let mut lhs = self.unary()?;
 
         loop {

@@ -17,7 +17,7 @@ pub fn scan(root: String, destination: String) -> Result<Scan, String> {
     while let Some(task) = pending.pop() {
         visited += 1;
         if visited > 100000 { return Err("scan exceeds 100000 path limit"); }
-        if task.depth > 128 { return Err("directory depth limit: " + task.path); }
+        if task.depth > 128 { return Err(format!("directory depth limit: {}", task.path)); }
         let kind = fs_kind(task.path).map_err(|e| e.to_string())?;
         if task.depth == 0 && kind != 2 { return Err("index root must be a directory"); }
         if kind == 2 {
@@ -96,7 +96,7 @@ fn number(text: String, mut cursor: Cursor) -> Result<i64, String> {
 fn framed(text: String, mut cursor: Cursor) -> Result<String, String> {
     let size = number(text, cursor)?;
     if size > text.len() - cursor.offset { return Err("truncated index record"); }
-    let out = text.substring(cursor.offset, cursor.offset + size);
+    let out = text[cursor.offset..cursor.offset + size];
     cursor.offset += size;
     Ok(out)
 }

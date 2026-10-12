@@ -42,6 +42,9 @@ trait Rem { fn rem(self, other: Self) -> Self; }
 // assignment through an index is its own trait.)
 trait Index<T> { fn index(self, i: i64) -> T; }
 trait IndexSet<T> { fn index_set(mut self, i: i64, value: T); }
+// `x[lo..hi]` (also `x[lo..]`, `x[..hi]`, `x[lo..=hi]`) calls
+// `IndexRange::index_range(lo, hi)`, which returns a copy of that part.
+trait IndexRange<T> { fn index_range(self, lo: i64, hi: i64) -> T; }
 
 // `Hash` lets a type be used as a `HashMap<K, V>` key; implement it together
 // with `Eq`. The map folds the hash into a power-of-two bucket index, so any
@@ -357,20 +360,6 @@ impl<T> Vec<T> {
         }
     }
 
-    // A new Vec holding a copy of elements [lo, hi).
-    fn slice(self, lo: i64, hi: i64) -> Vec<T> {
-        if lo < 0 || hi < lo || hi > self.len {
-            panic("Vec::slice: range " + lo.to_string() + ".." + hi.to_string() + " out of bounds for length " + self.len.to_string());
-        }
-        let mut out: Vec<T> = Vec::with_capacity(hi - lo);
-        let mut i = lo;
-        while i < hi {
-            out.push(self.data[i]);
-            i += 1;
-        }
-        out
-    }
-
     // Reverse the elements in place.
     fn reverse(mut self) {
         let mut i = 0;
@@ -505,16 +494,28 @@ impl<T> Vec<T> {
 impl<T> Index<T> for Vec<T> {
     fn index(self, i: i64) -> T {
         if i < 0 || i >= self.len {
-            panic("index out of bounds: the len is " + self.len.to_string() + " but the index is " + i.to_string());
+            panic!("index out of bounds: the len is {} but the index is {}", self.len, i);
         }
         self.data[i]
+    }
+}
+
+// `v[lo..hi]`: a new Vec holding a copy of elements [lo, hi).
+impl<T> IndexRange<Vec<T>> for Vec<T> {
+    fn index_range(self, lo: i64, hi: i64) -> Vec<T> {
+        if lo < 0 || hi < lo || hi > self.len {
+            panic!("range {}..{} is out of bounds for a Vec of length {}", lo, hi, self.len);
+        }
+        let mut out: Vec<T> = Vec::with_capacity(hi - lo);
+        for i in lo..hi { out.push(self.data[i]); }
+        out
     }
 }
 
 impl<T> IndexSet<T> for Vec<T> {
     fn index_set(mut self, i: i64, value: T) {
         if i < 0 || i >= self.len {
-            panic("index out of bounds: the len is " + self.len.to_string() + " but the index is " + i.to_string());
+            panic!("index out of bounds: the len is {} but the index is {}", self.len, i);
         }
         self.data[i] = value;
     }
@@ -630,6 +631,16 @@ impl Hash for String { fn hash(self) -> i64 { str_hash(self) } }
 impl ToString for String { fn to_string(self) -> String { self } }
 impl Add for String { fn add(self, other: String) -> String { str_concat(self, other) } }
 
+// `s[lo..hi]`: a new string holding bytes [lo, hi).
+impl IndexRange<String> for String {
+    fn index_range(self, lo: i64, hi: i64) -> String {
+        if lo < 0 || hi < lo || hi > str_len(self) {
+            panic!("byte range {}..{} is out of bounds of a string of length {}", lo, hi, str_len(self));
+        }
+        str_substring(self, lo, hi)
+    }
+}
+
 impl String {
     fn len(self) -> i64 { str_len(self) }
     fn is_empty(self) -> bool { str_len(self) == 0 }
@@ -640,17 +651,9 @@ impl String {
         // 0..=255), so one runtime call both reads and bounds-checks.
         let b = str_get(self, i);
         if b < 0 {
-            panic("byte index " + i.to_string() + " is out of bounds of a string of length " + str_len(self).to_string());
+            panic!("byte index {} is out of bounds of a string of length {}", i, str_len(self));
         }
         b
-    }
-
-    // A new string holding bytes [lo, hi); aborts on an out-of-bounds range.
-    fn substring(self, lo: i64, hi: i64) -> String {
-        if lo < 0 || hi < lo || hi > str_len(self) {
-            panic("byte range " + lo.to_string() + ".." + hi.to_string() + " is out of bounds of a string of length " + str_len(self).to_string());
-        }
-        str_substring(self, lo, hi)
     }
 
     // Does `needle` occur at byte offset `at`?

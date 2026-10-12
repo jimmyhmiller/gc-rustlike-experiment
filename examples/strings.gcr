@@ -27,8 +27,8 @@ fn main() -> i64 {
     println(acc);                        // "ababababab"
 
     // Formatting: numbers become strings with `to_string`, then concat.
-    println("answer = " + 42.to_string());   // "answer = 42"
-    println("pi ~ " + (3.14).to_string());     // "pi ~ 3.14"
+    println!("answer = {}", 42);   // "answer = 42"
+    println!("pi ~ {}", 3.14);     // "pi ~ 3.14"
 
     // Stdlib algorithms (written in gc-rust over the primitives): trim,
     // prefix/suffix tests, substring, byte search.
@@ -36,7 +36,7 @@ fn main() -> i64 {
     let clean = padded.trim();
     println(clean);                      // "trimmed"
     let pre = if clean.starts_with("trim") { 1 } else { 0 };
-    let mid = clean.substring(0, 4);
+    let mid = clean[0..4];
     println(mid);                        // "trim"
 
     // Return a checksum: greeting len + acc len + equality + prefix flag +

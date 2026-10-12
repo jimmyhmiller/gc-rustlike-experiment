@@ -56,17 +56,17 @@ fn json_quote(text: String) -> String {
     while i < text.len() {
         let b = text.byte_at(i);
         if b < 32 || b == 34 || b == 92 {
-            parts.push(text.substring(start, i));
+            parts.push(text[start..i]);
             if b == 34 { parts.push("\\\""); }
             else if b == 92 { parts.push("\\\\"); }
             else {
-                parts.push("\\u00" + hex.substring(b / 16, b / 16 + 1) + hex.substring(b % 16, b % 16 + 1));
+                parts.push("\\u00" + hex[b / 16..b / 16 + 1] + hex[b % 16..b % 16 + 1]);
             }
             start = i + 1;
         }
         i += 1;
     }
-    parts.push(text.substring(start, i));
+    parts.push(text[start..i]);
     parts.push("\"");
     parts.join("")
 }

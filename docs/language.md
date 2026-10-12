@@ -70,9 +70,14 @@ Built-in macros expand in the parser:
 - `assert!(cond)`, `assert_eq!(a, b)`, `assert_ne!(a, b)`, each with an
   optional trailing format message.
 
+`x[lo..hi]` on a `String` or `Vec` (also `x[lo..]`, `x[..hi]`, `x[..]`,
+`x[lo..=hi]`) returns a copy of that part through the `IndexRange` trait; with
+no references there are no borrowed slices. Indices are bytes for a `String`,
+and an out-of-range bound aborts.
+
 Known gaps: a method called directly on `None` cannot infer `T` from its
-arguments. There is no range indexing, no array literal syntax, and no
-user-defined macros.
+arguments. There is no array literal syntax and there are no user-defined
+macros.
 
 ## Patterns
 
