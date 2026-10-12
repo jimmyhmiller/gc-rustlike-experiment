@@ -2654,10 +2654,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// rejects buffers invalidated by nursery reset. Stress always takes the
     /// collecting runtime path. The prefix is published before any safepoint;
     /// construction stores below initialize fields before the object escapes.
-    fn gen_fixed_allocation(&mut self, fcx: &mut FnCtx<'ctx>, layout: LayoutId, site: u32, logical: LayoutId, tag: Option<u32>,
+    fn gen_fixed_allocation(&mut self, fcx: &mut FnCtx<'ctx>, layout: LayoutId, site: u32, init: FixedInit,
         fields: &[CoreExpr], vals: &[(Option<BasicValueEnum<'ctx>>, Repr)]) -> Result<PointerValue<'ctx>, CodegenError> {
         use crate::gc::{Full, ObjHeader, TypeInfo, inline_tlab_offsets as off};
-        let header_tag = tag.filter(|_| self.enum_tag_offset(logical) == Full::ENUM_TAG_OFFSET as u64);
+        let header_tag = match init {
+            FixedInit::Fields { logical, tag } => tag.filter(|_| self.enum_tag_offset(logical) == Full::ENUM_TAG_OFFSET as u64),
+            FixedInit::ClosureEnv { .. } => None,
+        };
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
@@ -2669,7 +2672,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         if size > 8192 || !matches!(lay.varlen, crate::core::VarLen::None) {
             let object = call_result(self.build_managed_call(fcx, alloc, &args, "obj").unwrap()).into_pointer_value();
             let restored = self.reload_allocation_values(fcx, fields, vals)?;
-            self.store_allocation_fields(object, logical, tag, &restored, tag.is_some_and(|tag| tag != 0));
+            self.init_fixed_object(object, layout, init, &restored, init.nonzero_tag());
             return Ok(object);
         }
         let window_addr = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::TLAB_WINDOW as u64);
@@ -2716,7 +2719,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         ]);
         self.builder.build_store(object, header).unwrap().set_alignment(8).unwrap();
         let mut initialized = Full::SIZE as u64;
-        for (start, stop) in self.constructor_ranges(logical, tag, vals) {
+        let ranges = match init {
+            FixedInit::Fields { logical, tag } => self.constructor_ranges(logical, tag, vals),
+            // A closure env is zeroed whole, then its code pointer and
+            // captures are stored.
+            FixedInit::ClosureEnv { .. } => Vec::new(),
+        };
+        for (start, stop) in ranges {
             if start > initialized {
                 self.builder.build_memset(self.obj_addr(object, initialized), 1,
                     self.ctx.i8_type().const_zero(), i64t.const_int(start - initialized, false)).unwrap();
@@ -2729,7 +2738,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
         // Complete constructor stores before publishing the initialized extent.
         // This path cannot collect; pre-allocation reference values remain valid.
-        self.store_allocation_fields(object, logical, tag, vals, header_tag.is_none());
+        self.init_fixed_object(object, layout, init, vals, header_tag.is_none());
         self.builder.build_store(cursor_addr, end).unwrap();
         let initialized_addr = self.obj_addr(window, off::INITIALIZED as u64);
         let initialized = self.builder.build_load(ptr, initialized_addr, "tlab.initialized").unwrap().into_pointer_value();
@@ -2753,7 +2762,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(slow);
         let allocated = call_result(self.build_managed_call(fcx, alloc, &args, "obj.slow").unwrap()).into_pointer_value();
         let restored = self.reload_allocation_values(fcx, fields, vals)?;
-        self.store_allocation_fields(allocated, logical, tag, &restored, tag.is_some_and(|tag| tag != 0));
+        self.init_fixed_object(allocated, layout, init, &restored, init.nonzero_tag());
         let slow_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).unwrap();
         self.builder.position_at_end(merge);
@@ -2778,6 +2787,57 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     /// Allocate a heap object and initialize its tag and payload, with pointer
     /// fields in leading slots and scalar/value fields in the raw region.
+    /// Store a new fixed object's contents. `store_tag`: whether a `Fields`
+    /// enum variant's tag still has to be written (the fast path writes it in
+    /// the header when the tag lives there).
+    fn init_fixed_object(&mut self, obj: PointerValue<'ctx>, layout: LayoutId, init: FixedInit,
+        vals: &[(Option<BasicValueEnum<'ctx>>, Repr)], store_tag: bool) {
+        match init {
+            FixedInit::Fields { logical, tag } => self.store_allocation_fields(obj, logical, tag, vals, store_tag),
+            FixedInit::ClosureEnv { code } => self.store_closure_env(obj, layout, code, vals),
+        }
+    }
+
+    /// Store a closure env: the code pointer at raw offset 0, pointer captures
+    /// in pointer slots, and scalar/value captures after the code pointer
+    /// (mirrors `lower_lifted`'s offsets).
+    fn store_closure_env(&mut self, obj: PointerValue<'ctx>, env: LayoutId, code: FuncId,
+        vals: &[(Option<BasicValueEnum<'ctx>>, Repr)]) {
+        let lay = &self.prog.layouts[env as usize];
+        let raw_base = Self::HEADER + lay.ptr_fields as u64 * 8;
+        let code_ptr = self.funcs[&code].as_global_value().as_pointer_value();
+        let addr = self.obj_addr(obj, raw_base);
+        self.builder.build_store(addr, code_ptr).unwrap();
+        let mut ptr_slot = 0u64;
+        let mut raw_off = 8u64;
+        for (v, repr) in vals {
+            match repr {
+                Repr::Ref(_) => {
+                    let a = self.obj_addr(obj, Self::HEADER + ptr_slot * 8);
+                    ptr_slot += 1;
+                    if let Some(v) = v { self.builder.build_store(a, *v).unwrap(); }
+                }
+                Repr::Scalar(s) => {
+                    let sz = (s.bits().max(8) / 8) as u64;
+                    raw_off = align_up64(raw_off, sz);
+                    let a = self.obj_addr(obj, raw_base + raw_off);
+                    raw_off += sz;
+                    if let Some(v) = v { self.builder.build_store(a, *v).unwrap(); }
+                }
+                // Inline value-aggregate capture: its bytes at an 8-aligned
+                // offset in the raw section.
+                Repr::Value(vid) => {
+                    let sz = self.prog.values[*vid as usize].size as u64;
+                    raw_off = align_up64(raw_off, 8);
+                    let a = self.obj_addr(obj, raw_base + raw_off);
+                    raw_off += sz;
+                    if let Some(v) = v { self.builder.build_store(a, *v).unwrap(); }
+                }
+                Repr::Unit => {}
+            }
+        }
+    }
+
     fn store_allocation_fields(&mut self, obj: PointerValue<'ctx>, layout: LayoutId,
         tag: Option<u32>, vals: &[(Option<BasicValueEnum<'ctx>>, Repr)], write_tag: bool) {
         let ptr = self.ctx.ptr_type(AddressSpace::default());
@@ -2913,7 +2973,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }) {
             self.physical_layouts.empty_variants.get(&layout).copied().unwrap_or(layout)
         } else { layout };
-        let obj = self.gen_fixed_allocation(fcx, physical, site, layout, tag, fields, &vals)?;
+        let obj = self.gen_fixed_allocation(fcx, physical, site, FixedInit::Fields { logical: layout, tag }, fields, &vals)?;
         Ok(Some(obj.into()))
     }
 
@@ -3414,75 +3474,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         captures: &[CoreExpr],
         span: crate::core::SpanId,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        let i32t = self.ctx.i32_type();
-        // Evaluate captures first. The env allocation below is a SAFEPOINT, so any
-        // GC-valued capture cached in a register before it goes stale on a
-        // collection (relocated slot, stale register) — exactly the `gen_alloc`
-        // hazard. ANF makes every GC capture an atomic local, so we reload them
-        // from their relocated slots after the alloc (a side-effect-free load).
+        // Evaluate captures first. The env allocation is a SAFEPOINT on its slow
+        // path, which reloads GC-valued captures from their relocated slots (ANF
+        // makes every GC capture an atomic local); the inline fast path cannot
+        // collect.
         let mut vals = Vec::with_capacity(captures.len());
         for c in captures {
             vals.push((self.gen_expr(fcx, c)?, c.repr.clone()));
         }
         let site = self.alloc_site_id(&self.current_fn_name(fcx), env as u16, span);
-        let alloc = self.module.get_function("ai_gc_alloc_fixed").unwrap();
-        let obj = call_result(
-            self.build_managed_call(fcx,
-                alloc,
-                &[
-                    fcx.thread.into(),
-                    i32t.const_int(env as u64, false).into(),
-                    i32t.const_int(site as u64, false).into(),
-                ],
-                "clo",
-            ).unwrap(),
-        ).into_pointer_value();
-        for (c, slot) in captures.iter().zip(vals.iter_mut()) {
-            if self.repr_relocates(&c.repr) {
-                slot.0 = self.gen_expr(fcx, c)?;
-            }
-        }
-
-        let lay = &self.prog.layouts[env as usize];
-        let ptr_fields = lay.ptr_fields as u64;
-        let raw_base = Self::HEADER + ptr_fields * 8;
-        // Store the code pointer at raw offset 0.
-        let code_fn = self.funcs[&code];
-        let code_ptr = code_fn.as_global_value().as_pointer_value();
-        let addr = self.obj_addr(obj, raw_base);
-        self.builder.build_store(addr, code_ptr).unwrap();
-
-        // Store captures: pointer captures in pointer slots, scalars after the
-        // code pointer (mirrors lower_lifted's offsets).
-        let mut ptr_slot = 0u64;
-        let mut raw_off = 8u64;
-        for (v, repr) in &vals {
-            match repr {
-                Repr::Ref(_) => {
-                    let off = Self::HEADER + ptr_slot * 8;
-                    ptr_slot += 1;
-                    let a = self.obj_addr(obj, off);
-                    if let Some(v) = v { self.builder.build_store(a, *v).unwrap(); }
-                }
-                Repr::Scalar(s) => {
-                    let sz = (s.bits().max(8) / 8) as u64;
-                    raw_off = align_up64(raw_off, sz);
-                    let a = self.obj_addr(obj, raw_base + raw_off);
-                    raw_off += sz;
-                    if let Some(v) = v { self.builder.build_store(a, *v).unwrap(); }
-                }
-                // Inline value-aggregate capture: store its bytes in the raw
-                // section at an 8-aligned offset (mirrors lower_lifted).
-                Repr::Value(vid) => {
-                    let sz = self.prog.values[*vid as usize].size as u64;
-                    raw_off = align_up64(raw_off, 8);
-                    let a = self.obj_addr(obj, raw_base + raw_off);
-                    raw_off += sz;
-                    if let Some(v) = v { self.builder.build_store(a, *v).unwrap(); }
-                }
-                Repr::Unit => {}
-            }
-        }
+        let obj = self.gen_fixed_allocation(fcx, env, site, FixedInit::ClosureEnv { code }, captures, &vals)?;
         Ok(Some(obj.into()))
     }
 
@@ -4441,6 +4442,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             _ => Ok(None),
         }
+    }
+}
+
+/// How a freshly allocated fixed-size object is initialized.
+#[derive(Clone, Copy)]
+enum FixedInit {
+    /// A struct or enum variant of `logical`, with its fields.
+    Fields { logical: LayoutId, tag: Option<u32> },
+    /// The environment of closure `code`: its code pointer and captures.
+    ClosureEnv { code: FuncId },
+}
+
+impl FixedInit {
+    /// A runtime-allocated object starts zeroed, so only a nonzero enum tag
+    /// has to be stored.
+    fn nonzero_tag(self) -> bool {
+        matches!(self, FixedInit::Fields { tag: Some(tag), .. } if tag != 0)
     }
 }
 
