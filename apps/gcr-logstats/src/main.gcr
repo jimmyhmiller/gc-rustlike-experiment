@@ -24,11 +24,7 @@ fn worker(paths: Vec<String>, next: AtomicI64, total: Atom<Summary>) -> Result<i
     loop {
         let index = next.fetch_add(1);
         if index >= paths.len() { return Ok(0); }
-        let path = paths[index];
-        let text = match fs_read_text(path, 1048576) {
-            Ok(s) => s,
-            Err(e) => { return Err(e.to_string()); }
-        };
+        let text = fs_read_text(paths[index], 1048576).map_err(|e| e.to_string())?;
         let delta = analyze(text);
         // The retry callback has no effects: each successful CAS commits one file.
         total.swap(|old: Summary| merge(old, delta));
@@ -36,15 +32,8 @@ fn worker(paths: Vec<String>, next: AtomicI64, total: Atom<Summary>) -> Result<i
 }
 fn worker_count(text: String) -> i64 {
     if text.is_empty() || text.len() > 2 { return 0; }
-    let mut n = 0;
-    let mut i = 0;
-    while i < text.len() {
-        let digit = text.byte_at(i) - 48;
-        if digit < 0 || digit > 9 { return 0; }
-        n = n * 10 + digit;
-        i += 1;
-    }
-    if n >= 1 && n <= 64 { n } else { 0 }
+    let n = text.parse_i64().unwrap_or(0);
+    if text.byte_at(0).is_ascii_digit() && n >= 1 && n <= 64 { n } else { 0 }
 }
 fn fail(message: String) -> i64 { stderr_line("gcr-logstats: " + message); 1 }
 fn main() -> i64 {
@@ -55,30 +44,24 @@ fn main() -> i64 {
     }
     let workers = worker_count(args[1]);
     if workers == 0 { return fail("worker count must be an integer from 1 to 64"); }
-    let mut paths: Vec<String> = Vec::new();
-    let mut i = 2;
-    while i < args.len() { paths.push(args[i]); i += 1; }
+    let mut paths = Vec::new();
+    for i in 2..args.len() { paths.push(args[i]); }
     let next = AtomicI64::new(0);
-    let total: Atom<Summary> = Atom::new(empty());
-    let mut threads: Vec<Thread<Result<i64, String>>> = Vec::new();
-    let count = if workers < paths.len() { workers } else { paths.len() };
-    i = 0;
-    while i < count {
+    let total = Atom::new(empty());
+    let mut threads = Vec::new();
+    for _ in 0..workers.min(paths.len()) {
         threads.push(Thread::spawn(|| worker(paths, next, total)));
-        i += 1;
     }
-    let mut failure: Option<String> = None;
-    i = 0;
-    while i < threads.len() {
-        match threads[i].join() {
-            Ok(_) => {},
-            Err(e) => { match failure { None => { failure = Some(e); }, Some(_) => {} }; }
-        };
-        i += 1;
+    // Join every worker; report the first failure.
+    let mut failure = None;
+    for thread in threads {
+        if let Err(e) = thread.join() {
+            if failure.is_none() { failure = Some(e); }
+        }
     }
-    match failure { Some(e) => { return fail(e); }, None => {} };
+    if let Some(e) = failure { return fail(e); }
     let s = total.deref();
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts = Vec::new();
     parts.push("{\"files\":"); parts.push(s.files.to_string());
     parts.push(",\"bytes\":"); parts.push(s.bytes.to_string());
     parts.push(",\"lines\":"); parts.push(s.lines.to_string());

@@ -3,13 +3,12 @@ use index::Document;
 // One result per matching line; column is the first match's 1-based byte column.
 // A query is a nonempty, case-sensitive literal contained within one line.
 fn document_offsets(doc: Document, needle: String) -> Vec<i64> {
-    let mut offsets: Vec<i64> = Vec::new();
+    let mut offsets = Vec::new();
     let mut start = 0;
     while start < doc.text.len() {
         let end = doc.text.find_from("\n", start).unwrap_or(doc.text.len());
-        match doc.text.find_between(needle, start, end) {
-            Some(position) => { if position < end { offsets.push(position); } }
-            None => {}
+        if let Some(position) = doc.text.find_between(needle, start, end) {
+            if position < end { offsets.push(position); }
         }
         start = end + 1;
     }
@@ -19,46 +18,41 @@ fn document_offsets(doc: Document, needle: String) -> Vec<i64> {
 fn document_lines(doc: Document, offsets: Vec<i64>) -> Result<i64, String> {
     let mut hits = 0;
     let mut hit = 0;
-
-        let mut start = 0;
-        let mut line = 1;
-        while start < doc.text.len() {
-            let end = doc.text.find_from("\n", start).unwrap_or(doc.text.len());
-            let text = doc.text.substring(start, end);
-            if hit < offsets.len() && offsets[hit] < end {
-                let column = offsets[hit] - start;
-                hit += 1;
-                let mut parts: Vec<String> = Vec::new();
-                parts.push("{\"path\":");
-                parts.push(json_quote(doc.path));
-                parts.push(",\"line\":");
-                parts.push(line.to_string());
-                parts.push(",\"byte_column\":");
-                parts.push((column + 1).to_string());
-                parts.push(",\"text\":");
-                parts.push(json_quote(text));
-                parts.push("}");
-                match stdout_line(parts.join("")) { Ok(_) => {}, Err(e) => { return Err(e.to_string()); } };
-                hits += 1;
-            }
-            start = end + 1;
-            line += 1;
+    let mut start = 0;
+    let mut line = 1;
+    while start < doc.text.len() {
+        let end = doc.text.find_from("\n", start).unwrap_or(doc.text.len());
+        if hit < offsets.len() && offsets[hit] < end {
+            let column = offsets[hit] - start;
+            hit += 1;
+            let mut parts = Vec::new();
+            parts.push("{\"path\":");
+            parts.push(json_quote(doc.path));
+            parts.push(",\"line\":");
+            parts.push(line.to_string());
+            parts.push(",\"byte_column\":");
+            parts.push((column + 1).to_string());
+            parts.push(",\"text\":");
+            parts.push(json_quote(doc.text.substring(start, end)));
+            parts.push("}");
+            stdout_line(parts.join("")).map_err(|e| e.to_string())?;
+            hits += 1;
         }
+        start = end + 1;
+        line += 1;
+    }
     Ok(hits)
 }
-
 
 pub fn query(docs: Vec<Document>, needle: String) -> Result<i64, String> {
     let mut hits = 0;
     let mut start = 0;
     while start < docs.len() {
-        let end = if start + 4 < docs.len() { start + 4 } else { docs.len() };
+        let end = (start + 4).min(docs.len());
         let batch = docs.slice(start, end);
-        let matches = match batch.parallel_map(4, |item: Document| document_offsets(item, needle)) { Ok(v) => v, Err(e) => { return Err(e); } };
-        let mut i = 0;
-        while i < batch.len() {
-            match document_lines(batch[i], matches[i]) { Ok(n) => hits = hits + n, Err(e) => { return Err(e); } };
-            i += 1;
+        let matches = batch.parallel_map(4, |item: Document| document_offsets(item, needle))?;
+        for i in 0..batch.len() {
+            hits += document_lines(batch[i], matches[i])?;
         }
         start = end;
     }

@@ -9,22 +9,24 @@ fn usage() -> i64 {
 fn main() -> i64 {
     let args = match process_args() { Ok(a) => a, Err(e) => { return fail(e.to_string()); } };
     if args.len() < 3 || args.len() > 4 { return usage(); }
-    let command = match args.get(1) { Some(s) => s, None => "" };
-    let value = match args.get(2) { Some(s) => s, None => "" };
-    let output = if args.len() == 4 { match args.get(3) { Some(s) => s, None => "" } } else { ".gcr-search.index" };
+    let command = args[1];
+    let value = args[2];
+    let output = if args.len() == 4 { args[3] } else { ".gcr-search.index" };
     let destination = match path_absolute(output) { Ok(p) => p, Err(e) => { return fail(e.to_string()); } };
     if command == "index" {
         let root = match path_absolute(value) { Ok(p) => p, Err(e) => { return fail(e.to_string()); } };
         let result = match index::scan(root, destination) { Ok(s) => s, Err(e) => { return fail(e); } };
         let encoded = index::encode(result.documents);
         match fs_write_text_atomic(destination, encoded) {
-            Ok(n) => { stderr_line("indexed " + result.documents.len().to_string() + " files; skipped " + result.skipped.to_string() + " files/links"); 0 },
-            Err(e) => fail(e.to_string())
+            Ok(_) => { stderr_line("indexed " + result.documents.len().to_string() + " files; skipped " + result.skipped.to_string() + " files/links"); 0 }
+            Err(e) => fail(e.to_string()),
         }
     } else if command == "query" {
         if value.is_empty() || value.contains("\n") || value.contains("\r") { return fail("query must be a nonempty single-line literal"); }
         let text = match fs_read_text(destination, 67108864) { Ok(s) => s, Err(e) => { return fail(e.to_string()); } };
         let docs = match index::decode(text) { Ok(d) => d, Err(e) => { return fail(e); } };
-        match search::query(docs, value) { Ok(n) => 0, Err(e) => fail(e) }
-    } else { usage() }
+        match search::query(docs, value) { Ok(_) => 0, Err(e) => fail(e) }
+    } else {
+        usage()
+    }
 }
