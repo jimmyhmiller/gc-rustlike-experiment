@@ -447,9 +447,10 @@ struct FnLowerer<'a, 'r, 'm> {
     infer: LetInference,
 }
 
-/// A source span as a map key.
-type SpanKey = (u32, u32, crate::lexer::SourceId);
-fn span_key(s: Span) -> SpanKey { (s.start, s.end, s.source) }
+/// Identifies a `let` for inference: its statement span plus the bound name
+/// (macro expansions give several `let`s the same span).
+type SpanKey = (u32, u32, crate::lexer::SourceId, String);
+fn span_key(s: Span, name: &str) -> SpanKey { (s.start, s.end, s.source, name.to_string()) }
 
 /// State for inferring the type of `let x = Vec::new();` from a later use.
 ///
@@ -802,7 +803,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             for (key, template) in &inf.templates {
                 let ty = fill_placeholders(template, &inf.solved);
                 if !has_placeholder(&ty, &inf.placeholders) {
-                    inf.solution = Some((*key, ty));
+                    inf.solution = Some((key.clone(), ty));
                     return err("`let` type inference probe finished", span);
                 }
             }
@@ -957,7 +958,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     Some(e) => {
                         let expected = match ty {
                             Some(t) => Some(ground_type(t, &self.subst.clone(), self.ctx)?),
-                            None => self.infer.solved_lets.get(&span_key(*span)).cloned(),
+                            None => self.infer.solved_lets.get(&span_key(*span, &name)).cloned(),
                         };
                         self.infer.unresolved = None;
                         let lowered = self.expr(e, expected.as_ref());
@@ -977,10 +978,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                                         }
                                         return Err(error);
                                     }
-                                    let key = span_key(*span);
+                                    let key = span_key(*span, &name);
                                     let mut ids = HashMap::new();
                                     let template = placeholder_template(&partial, &mut ids, &mut self.infer.next_placeholder);
-                                    for id in ids.values() { self.infer.placeholders.insert(*id, key); }
+                                    for id in ids.values() { self.infer.placeholders.insert(*id, key.clone()); }
                                     self.infer.templates.push((key, template.clone()));
                                     let id = self.fresh_local(Repr::Unit, template.clone());
                                     self.bind_mut(&name, id, template, is_mut);

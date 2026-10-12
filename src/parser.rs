@@ -1000,6 +1000,12 @@ impl Parser {
                     }
                 }
             }
+            TokKind::Ident(_)
+                if matches!(self.peek_at(1), TokKind::Not)
+                    && matches!(self.peek_at(2), TokKind::LParen | TokKind::LBracket) =>
+            {
+                return self.macro_call(start);
+            }
             TokKind::Ident(_) | TokKind::Keyword(Kw::SelfValue) | TokKind::Keyword(Kw::SelfType) => {
                 let path = self.path_or_self()?;
                 // Struct literal: `Path { ... }` — but only when a struct lit is
@@ -1024,6 +1030,165 @@ impl Parser {
             other => return Err(self.error(format!("expected expression, found {:?}", other))),
         };
         Ok(Expr { kind: Box::new(kind), span: start.to(self.prev_span()) })
+    }
+
+    // ---- built-in macros ----------------------------------------------------
+    // `name!(...)` expands here into ordinary expressions. Temporaries use `#`
+    // in their names, which no source identifier can contain.
+
+    fn macro_call(&mut self, start: Span) -> PResult<Expr> {
+        let name = self.ident()?;
+        self.expect(&TokKind::Not)?;
+        let close = if self.eat(&TokKind::LParen) {
+            TokKind::RParen
+        } else {
+            self.expect(&TokKind::LBracket)?;
+            TokKind::RBracket
+        };
+        match name.as_str() {
+            "vec" => self.vec_macro(start, &close),
+            "format" | "println" | "print" | "eprintln" | "panic" => {
+                let message = if self.at(&close) && name != "format" {
+                    None
+                } else {
+                    Some(self.format_args(&close, &name)?)
+                };
+                self.expect(&close)?;
+                let span = start.to(self.prev_span());
+                let call = |f: &str, arg: Expr| Expr {
+                    kind: Box::new(ExprKind::Call(Expr { kind: Box::new(ExprKind::Path(Path::single(f.to_string(), span))), span }, vec![arg])),
+                    span,
+                };
+                let text = |t: &str| Expr { kind: Box::new(ExprKind::Str(t.to_string())), span };
+                Ok(match (name.as_str(), message) {
+                    ("format", Some(m)) => m,
+                    ("println", m) => call("println", m.unwrap_or_else(|| text(""))),
+                    ("print", m) => call("print", m.unwrap_or_else(|| text(""))),
+                    ("eprintln", m) => call("stderr_line", m.unwrap_or_else(|| text(""))),
+                    (_, m) => call("panic", m.unwrap_or_else(|| text("explicit panic"))),
+                })
+            }
+            "assert" | "assert_eq" | "assert_ne" => self.assert_macro(start, &name, &close),
+            _ => Err(ParseError { msg: format!("unknown macro `{}!`", name), span: start }),
+        }
+    }
+
+    /// Comma-separated macro arguments up to (not including) `close`.
+    fn macro_args(&mut self, close: &TokKind) -> PResult<Vec<Expr>> {
+        let mut args = Vec::new();
+        while !self.at(close) {
+            args.push(self.delimited_expr()?);
+            if !self.eat(&TokKind::Comma) { break; }
+        }
+        Ok(args)
+    }
+
+    /// `"format string", args...` (the part inside `format!(...)`).
+    fn format_args(&mut self, close: &TokKind, macro_name: &str) -> PResult<Expr> {
+        let fmt_span = self.span();
+        let TokKind::Str(fmt) = self.peek().clone() else {
+            return Err(self.error(format!("`{}!` needs a string literal format", macro_name)));
+        };
+        self.bump();
+        let args = if self.eat(&TokKind::Comma) { self.macro_args(close)? } else { vec![] };
+        expand_format(&fmt, args, fmt_span)
+    }
+
+    /// `vec![]`, `vec![a, b, c]`, and `vec![x; n]`.
+    fn vec_macro(&mut self, start: Span, close: &TokKind) -> PResult<Expr> {
+        let mut items = Vec::new();
+        let mut repeat = None;
+        if !self.at(close) {
+            let first = self.delimited_expr()?;
+            if self.eat(&TokKind::Semi) {
+                repeat = Some((first, self.delimited_expr()?));
+            } else {
+                items.push(first);
+                if self.eat(&TokKind::Comma) { items.extend(self.macro_args(close)?); }
+            }
+        }
+        self.expect(close)?;
+        let span = start.to(self.prev_span());
+        let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+        let var = |n: &str| ex(ExprKind::Path(Path::single(n.to_string(), span)));
+        let let_ = |n: &str, is_mut: bool, init: Expr| Stmt::Let {
+            pattern: Pattern { kind: PatternKind::Binding { is_mut, name: n.to_string() }, span },
+            ty: None,
+            init: Some(init),
+            span,
+        };
+        let assoc = |f: &str, args: Vec<Expr>| ex(ExprKind::Call(
+            ex(ExprKind::Path(Path { segments: vec!["Vec".to_string(), f.to_string()], span })),
+            args,
+        ));
+        let push = |value: Expr| Stmt::Expr(ex(ExprKind::MethodCall { recv: var("vec#items"), method: "push".into(), args: vec![value], span }));
+        if items.is_empty() && repeat.is_none() {
+            return Ok(assoc("new", vec![]));
+        }
+        let stmts = match repeat {
+            // The element is evaluated once; every slot holds that same value.
+            Some((value, count)) => vec![
+                let_("vec#value", false, value),
+                let_("vec#count", false, count),
+                let_("vec#items", true, assoc("with_capacity", vec![var("vec#count")])),
+                Stmt::Expr(ex(ExprKind::For {
+                    pat: Pattern { kind: PatternKind::Wildcard, span },
+                    iter: ex(ExprKind::Range { lo: Some(ex(ExprKind::Int(0, crate::lexer::NumSuffix::None))), hi: Some(var("vec#count")), inclusive: false }),
+                    body: Block { stmts: vec![push(var("vec#value"))], tail: None, span },
+                })),
+            ],
+            None => {
+                let mut stmts = vec![let_("vec#items", true, assoc("new", vec![]))];
+                stmts.extend(items.into_iter().map(push));
+                stmts
+            }
+        };
+        Ok(ex(ExprKind::Block(Block { stmts, tail: Some(var("vec#items")), span })))
+    }
+
+    /// `assert!(cond[, fmt, args...])`, `assert_eq!(a, b[, ...])`, `assert_ne!`.
+    fn assert_macro(&mut self, start: Span, name: &str, close: &TokKind) -> PResult<Expr> {
+        let operands = if name == "assert" { 1 } else { 2 };
+        let mut exprs = Vec::new();
+        for i in 0..operands {
+            if i > 0 { self.expect(&TokKind::Comma)?; }
+            exprs.push(self.delimited_expr()?);
+        }
+        let message = if self.eat(&TokKind::Comma) && !self.at(close) { Some(self.format_args(close, name)?) } else { None };
+        self.expect(close)?;
+        let span = start.to(self.prev_span());
+        let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+        let default = match name {
+            "assert" => "assertion failed",
+            "assert_eq" => "assertion `left == right` failed",
+            _ => "assertion `left != right` failed",
+        };
+        let message = message.unwrap_or_else(|| ex(ExprKind::Str(default.to_string())));
+        let fail = Block {
+            stmts: vec![Stmt::Expr(ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".to_string(), span))), vec![message])))],
+            tail: None,
+            span,
+        };
+        if name == "assert" {
+            let cond = exprs.pop().unwrap();
+            return Ok(ex(ExprKind::If { cond: ex(ExprKind::Unary(UnOp::Not, cond)), then_branch: fail, else_branch: None }));
+        }
+        let right = exprs.pop().unwrap();
+        let left = exprs.pop().unwrap();
+        let var = |n: &str| ex(ExprKind::Path(Path::single(n.to_string(), span)));
+        let let_ = |n: &str, init: Expr| Stmt::Let {
+            pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: n.to_string() }, span },
+            ty: None,
+            init: Some(init),
+            span,
+        };
+        let op = if name == "assert_eq" { BinOp::Ne } else { BinOp::Eq };
+        let check = ex(ExprKind::If { cond: ex(ExprKind::Binary(op, var("assert#left"), var("assert#right"))), then_branch: fail, else_branch: None });
+        Ok(ex(ExprKind::Block(Block {
+            stmts: vec![let_("assert#left", left), let_("assert#right", right), Stmt::Expr(check)],
+            tail: None,
+            span,
+        })))
     }
 
     fn path_or_self(&mut self) -> PResult<Path> {
@@ -1304,6 +1469,84 @@ fn type_to_trait_ref(t: Type) -> Option<TraitRef> {
         TypeKind::Path(path, args) => Some(TraitRef { path, args, span: t.span }),
         _ => None,
     }
+}
+
+/// Expand a `format!` string and its arguments into a `String` expression.
+///
+/// Supports `{}` (the next argument), `{N}` (argument N), `{name}` (a variable
+/// in scope), and the escapes `{{` / `}}`. Each placeholder renders with
+/// `to_string()`. Arguments are evaluated once, in order. Format specs such
+/// as `{:?}` or `{:>5}` are not supported and are an error, as is an argument
+/// the string never uses.
+fn expand_format(fmt: &str, args: Vec<Expr>, span: Span) -> PResult<Expr> {
+    let fail = |msg: String| Err(ParseError { msg, span });
+    let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+    let arg_name = |i: usize| format!("format#{}", i);
+    let var = |n: String| ex(ExprKind::Path(Path::single(n, span)));
+    let to_string = |e: Expr| ex(ExprKind::MethodCall { recv: e, method: "to_string".into(), args: vec![], span });
+    let mut pieces: Vec<Expr> = Vec::new();
+    let mut literal = String::new();
+    let mut used = vec![false; args.len()];
+    let mut next = 0;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => { chars.next(); literal.push('{'); }
+            '}' if chars.peek() == Some(&'}') => { chars.next(); literal.push('}'); }
+            '}' => return fail("unmatched `}` in format string (write `}}` for a literal brace)".into()),
+            '{' => {
+                let mut spec = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(ch) => spec.push(ch),
+                        None => return fail("unterminated `{` in format string (write `{{` for a literal brace)".into()),
+                    }
+                }
+                let spec = spec.trim();
+                if spec.contains(':') {
+                    return fail(format!("format spec `{{{}}}` is not supported; only `{{}}`, `{{N}}`, and `{{name}}` are", spec));
+                }
+                let value = if spec.is_empty() || spec.chars().all(|ch| ch.is_ascii_digit()) {
+                    let index = if spec.is_empty() { next += 1; next - 1 } else { spec.parse::<usize>().unwrap() };
+                    if index >= args.len() {
+                        return fail(format!("format string uses argument {} but {} argument(s) were given", index, args.len()));
+                    }
+                    used[index] = true;
+                    var(arg_name(index))
+                } else if spec.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+                    && spec.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                {
+                    var(spec.to_string())
+                } else {
+                    return fail(format!("invalid format placeholder `{{{}}}`", spec));
+                };
+                if !literal.is_empty() {
+                    pieces.push(ex(ExprKind::Str(std::mem::take(&mut literal))));
+                }
+                pieces.push(to_string(value));
+            }
+            _ => literal.push(c),
+        }
+    }
+    if let Some(unused) = used.iter().position(|u| !u) {
+        return fail(format!("format argument {} is never used by the format string", unused));
+    }
+    if !literal.is_empty() || pieces.is_empty() {
+        pieces.push(ex(ExprKind::Str(literal)));
+    }
+    let joined = pieces.into_iter().reduce(|a, b| ex(ExprKind::Binary(BinOp::Add, a, b))).unwrap();
+    if args.is_empty() {
+        return Ok(joined);
+    }
+    // Bind each argument once, in order, then build the string.
+    let stmts = args.into_iter().enumerate().map(|(i, value)| Stmt::Let {
+        pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: arg_name(i) }, span },
+        ty: None,
+        init: Some(value),
+        span,
+    }).collect();
+    Ok(ex(ExprKind::Block(Block { stmts, tail: Some(joined), span })))
 }
 
 #[cfg(test)]

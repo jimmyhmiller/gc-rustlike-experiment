@@ -56,8 +56,23 @@ iteration a fresh `x`; `continue` is safe. `for x in items` visits a `Vec` or
 `Array` (any type with `len()` and indexing) in index order. `if let PAT = e`
 and `while let PAT = e` are `match` with a wildcard arm.
 
+Built-in macros expand in the parser:
+
+- `format!("...", args)` builds a `String`. `{}` takes the next argument, `{N}`
+  argument N, and `{name}` a variable in scope; `{{` and `}}` are literal
+  braces. Each value renders with `to_string()`. Arguments are evaluated once,
+  in order. Format specs (`{:?}`, `{:>5}`) are not supported and are an error,
+  as is an argument the string never uses.
+- `println!`, `print!`, `eprintln!`, and `panic!` take the same arguments.
+- `vec![a, b, c]`, `vec![]`, and `vec![x; n]`. In `vec![x; n]`, `x` is
+  evaluated once and every slot holds that same value (for a struct or a
+  collection, the same reference).
+- `assert!(cond)`, `assert_eq!(a, b)`, `assert_ne!(a, b)`, each with an
+  optional trailing format message.
+
 Known gaps: a method called directly on `None` cannot infer `T` from its
-arguments. There is no range indexing, no array literal syntax, and no macros.
+arguments. There is no range indexing, no array literal syntax, and no
+user-defined macros.
 
 ## Patterns
 

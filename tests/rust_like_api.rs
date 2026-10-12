@@ -429,3 +429,38 @@ fn pattern_exhaustiveness_and_refutability_are_checked() {
     // Booleans have two constructors.
     assert_eq!(run("fn main() -> i64 { match (true, false) { (true, _) => 1, (false, true) => 2, (false, false) => 3 } }"), 1);
 }
+
+#[test]
+fn format_vec_and_assert_macros() {
+    let r = run(r#"
+        struct P { x: i64 }
+        impl ToString for P { fn to_string(self) -> String { format!("P({})", self.x) } }
+        fn main() -> i64 {
+            let v = vec![1, 2, 3];
+            let names = vec!["a", "b"];
+            let zeros = vec![0; 4];
+            let empty: Vec<i64> = vec![];
+            let who = "world";
+            let s = format!("hello {who}, {} + {} = {}; {{x}} {0} {}", 1, 2, 3, P { x: 7 });
+            assert!(v.len() == 3);
+            assert_eq!(s, "hello world, 1 + 2 = 3; {x} 1 P(7)", "got {}", s);
+            assert_ne!(v[0], v[1]);
+            assert_eq!(names.join("|"), "a|b");
+            v.sum() + zeros.len() + empty.len()
+        }
+    "#);
+    assert_eq!(r, 10);
+    for (src, want) in [
+        (r#"format!("{:?}", 1)"#, "format spec `{:?}` is not supported"),
+        (r#"format!("{} {}", 1)"#, "uses argument 1 but 1 argument(s) were given"),
+        (r#"format!("{}", 1, 2)"#, "format argument 1 is never used"),
+        (r#"format!("a } b")"#, "unmatched `}`"),
+        (r#"nope!(1)"#, "unknown macro `nope!`"),
+    ] {
+        let msg = compile_error(&format!("fn main() -> i64 {{ let s = {}; 0 }}", src));
+        assert!(msg.contains(want), "{src}: {msg}");
+    }
+    let (ok, stderr) = run_cli("assert_fail", "fn main() -> i64 { assert_eq!(1 + 1, 3, \"math is {}\", \"broken\"); 0 }\n");
+    assert!(!ok);
+    assert!(stderr.contains("math is broken"), "{stderr}");
+}
