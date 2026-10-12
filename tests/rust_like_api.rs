@@ -299,3 +299,73 @@ fn compound_assignment_uses_operator_traits() {
     "#);
     assert_eq!(r, 42);
 }
+
+#[test]
+fn let_types_are_inferred_from_later_use() {
+    let r = run(r#"
+        struct Bag { items: Vec<String> }
+        fn total(v: Vec<i64>) -> i64 { v.sum() }
+        fn main() -> i64 {
+            let mut v = Vec::new();
+            let before = v.len();              // used before the use that types it
+            v.push(40);
+            let mut names = Vec::new();
+            let mut counts = HashMap::new();
+            names.push("a");                   // a later `let` solved first
+            counts.insert("a", 1);
+            let mut best = None;
+            for i in 0..3 { best = Some(i); }
+            let empty = Vec::new();            // typed by the call it is passed to
+            let items = Vec::new();            // typed by a struct field
+            let bag = Bag { items: items };
+            v[0] + before + names.len() + counts.get("a").unwrap() + best.unwrap() + total(empty) + bag.items.len() - 2
+        }
+    "#);
+    assert_eq!(r, 42);
+    let msg = compile_error("fn main() -> i64 { let v = Vec::new(); 0 }");
+    assert!(msg.contains("cannot infer the type of `v`; add a type annotation"), "{msg}");
+}
+
+#[test]
+fn for_loops_over_ranges_and_collections() {
+    let r = run(r#"
+        fn main() -> i64 {
+            let mut s = 0;
+            for i in 0..10 { s = s + i }                // tail without `;` sees this iteration's i
+            for i in 0..10 { if i % 2 == 0 { continue; } s += 100; }
+            for i in 3..=3 { s += i * 1000; }
+            let mut n = 0;
+            for _ in 9223372036854775806..=9223372036854775807 { n += 1; }   // no overflow past MAX
+            for _ in 5..=4 { n += 100; }
+            let mut v: Vec<i64> = Vec::new();
+            v.push(7); v.push(8);
+            for x in v { s += x * 10000; }
+            let mut a: Array<String> = Array::new(2);
+            a[0] = "ab"; a[1] = "c";
+            for w in a { s += w.len() * 1000000; }
+            s * 10 + n
+        }
+    "#);
+    // 45 + 500 + 3000 + 150000 + 3000000 = 3153545
+    assert_eq!(r, 31535452);
+}
+
+#[test]
+fn if_let_and_while_let() {
+    let r = run(r#"
+        enum Shape { Circle(i64), Square(i64), Dot }
+        fn area(s: Shape) -> i64 {
+            if let Shape::Circle(r) = s { r * 3 } else if let Shape::Square(w) = s { w * w } else { 0 }
+        }
+        fn main() -> i64 {
+            let mut stack: Vec<i64> = Vec::new();
+            for i in 1..=5 { stack.push(i); }
+            let mut total = 0;
+            while let Some(top) = stack.pop() { total += top; }
+            let none: Option<i64> = None;
+            if let Some(x) = none { total += x * 1000; }
+            total + area(Shape::Square(5)) + area(Shape::Circle(2)) + area(Shape::Dot)
+        }
+    "#);
+    assert_eq!(r, 15 + 25 + 6);
+}

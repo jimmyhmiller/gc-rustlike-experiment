@@ -1083,19 +1083,39 @@ impl Parser {
 
     fn if_expr(&mut self) -> PResult<Expr> {
         let start = self.expect_kw(Kw::If)?;
+        if self.eat_kw(Kw::Let) {
+            return self.if_let(start);
+        }
         let cond = self.expr_no_struct()?;
         let then_branch = self.block()?;
-        let else_branch = if self.eat_kw(Kw::Else) {
-            if self.at_kw(Kw::If) {
-                Some(self.if_expr()?)
-            } else {
-                Some(self.block_expr()?)
-            }
-        } else {
-            None
-        };
+        let else_branch = self.else_branch()?;
         let span = start.to(self.prev_span());
         Ok(Expr { kind: Box::new(ExprKind::If { cond, then_branch, else_branch }), span })
+    }
+
+    fn else_branch(&mut self) -> PResult<Option<Expr>> {
+        if !self.eat_kw(Kw::Else) {
+            return Ok(None);
+        }
+        if self.at_kw(Kw::If) { Ok(Some(self.if_expr()?)) } else { Ok(Some(self.block_expr()?)) }
+    }
+
+    /// `if let PAT = EXPR { then } [else ...]` is
+    /// `match EXPR { PAT => { then }, _ => else-or-() }`.
+    fn if_let(&mut self, start: Span) -> PResult<Expr> {
+        let pattern = self.pattern()?;
+        self.expect(&TokKind::Eq)?;
+        let scrutinee = self.expr_no_struct()?;
+        let then_branch = self.block()?;
+        let else_branch = self.else_branch()?;
+        let span = start.to(self.prev_span());
+        let then_span = then_branch.span;
+        let otherwise = else_branch.unwrap_or(Expr { kind: Box::new(ExprKind::Unit), span });
+        let arms = vec![
+            MatchArm { pattern, guard: None, body: Expr { kind: Box::new(ExprKind::Block(then_branch)), span: then_span }, span },
+            MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: otherwise, span },
+        ];
+        Ok(Expr { kind: Box::new(ExprKind::Match { scrutinee, arms }), span })
     }
 
     fn match_expr(&mut self) -> PResult<Expr> {
@@ -1119,6 +1139,28 @@ impl Parser {
 
     fn while_expr(&mut self) -> PResult<Expr> {
         let start = self.expect_kw(Kw::While)?;
+        if self.eat_kw(Kw::Let) {
+            // `while let PAT = EXPR { body }` is
+            // `loop { match EXPR { PAT => { body }, _ => break } }`.
+            let pattern = self.pattern()?;
+            self.expect(&TokKind::Eq)?;
+            let scrutinee = self.expr_no_struct()?;
+            let body = self.block()?;
+            let span = start.to(self.prev_span());
+            let body_span = body.span;
+            let arms = vec![
+                MatchArm { pattern, guard: None, body: Expr { kind: Box::new(ExprKind::Block(body)), span: body_span }, span },
+                MatchArm {
+                    pattern: Pattern { kind: PatternKind::Wildcard, span },
+                    guard: None,
+                    body: Expr { kind: Box::new(ExprKind::Break(None)), span },
+                    span,
+                },
+            ];
+            let matched = Expr { kind: Box::new(ExprKind::Match { scrutinee, arms }), span };
+            let body = Block { stmts: vec![], tail: Some(matched), span };
+            return Ok(Expr { kind: Box::new(ExprKind::Loop { body }), span });
+        }
         let cond = self.expr_no_struct()?;
         let body = self.block()?;
         let span = start.to(self.prev_span());

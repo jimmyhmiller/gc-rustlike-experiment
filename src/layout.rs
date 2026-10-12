@@ -57,9 +57,36 @@ pub struct LayoutRegistry<'a> {
 pub struct LayoutError(pub String);
 type R<T> = Result<T, LayoutError>;
 
+/// The registry's contents at a point in time; see [`LayoutRegistry::snapshot`].
+pub struct LayoutSnapshot {
+    ref_ids: HashMap<String, LayoutId>,
+    value_ids: HashMap<String, ValueId>,
+    layouts: usize,
+    values: usize,
+}
+
 impl<'a> LayoutRegistry<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
         LayoutRegistry { ctx, ref_ids: HashMap::new(), value_ids: HashMap::new(), layouts: vec![], values: vec![] }
+    }
+
+    /// Record the registry so a discarded lowering attempt can be undone.
+    /// Layouts are only ever appended, so lengths plus the intern maps suffice.
+    pub fn snapshot(&self) -> LayoutSnapshot {
+        LayoutSnapshot {
+            ref_ids: self.ref_ids.clone(),
+            value_ids: self.value_ids.clone(),
+            layouts: self.layouts.len(),
+            values: self.values.len(),
+        }
+    }
+
+    /// Drop everything registered since `snap`.
+    pub fn restore(&mut self, snap: LayoutSnapshot) {
+        self.ref_ids = snap.ref_ids;
+        self.value_ids = snap.value_ids;
+        self.layouts.truncate(snap.layouts);
+        self.values.truncate(snap.values);
     }
 
     /// The [`Repr`] of a ground type, registering any needed layouts.

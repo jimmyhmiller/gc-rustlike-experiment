@@ -88,9 +88,29 @@ struct Mono {
     spans: Vec<Span>,
 }
 
+/// `Mono`'s contents at a point in time; see [`Mono::snapshot`].
+struct MonoSnapshot {
+    ids: HashMap<String, FuncId>,
+    worklist: usize,
+    closures: usize,
+    spans: usize,
+}
+
 impl Mono {
     fn new() -> Self {
         Mono { ids: HashMap::new(), worklist: Vec::new(), closures: Vec::new(), spans: Vec::new() }
+    }
+    /// Record the monomorphizer so a discarded lowering attempt can be undone.
+    /// Everything but the interning map is append-only.
+    fn snapshot(&self) -> MonoSnapshot {
+        MonoSnapshot { ids: self.ids.clone(), worklist: self.worklist.len(), closures: self.closures.len(), spans: self.spans.len() }
+    }
+    /// Drop every instantiation, closure, and span added since `snap`.
+    fn restore(&mut self, snap: MonoSnapshot) {
+        self.ids = snap.ids;
+        self.worklist.truncate(snap.worklist);
+        self.closures.truncate(snap.closures);
+        self.spans.truncate(snap.spans);
     }
     /// Intern a source span, returning its 1-based `SpanId` (so `NO_SPAN`=0 stays
     /// reserved). Threaded onto construction/alloc Core nodes for file:line:col.
@@ -423,6 +443,107 @@ struct FnLowerer<'a, 'r, 'm> {
     ret_ty: Ty,
     /// True until an unannotated closure obtains a return constraint.
     infer_ret: bool,
+    /// Inference for unannotated `let`s; see `LetInference`.
+    infer: LetInference,
+}
+
+/// A source span as a map key.
+type SpanKey = (u32, u32, crate::lexer::SourceId);
+fn span_key(s: Span) -> SpanKey { (s.start, s.end, s.source) }
+
+/// State for inferring the type of `let x = Vec::new();` from a later use.
+///
+/// Lowering is single-pass and assigns representations immediately, so a
+/// `let` whose initializer leaves type parameters open cannot be lowered in
+/// place. Instead `lower_fn` retries: a normal attempt records the open `let`
+/// (`needs`); a probe attempt binds every open `let` to a placeholder type
+/// (`Ty::Infer` ids) and stops at the first type check that pins one
+/// (`solution`); the next attempt lowers that `let` with the solved type.
+#[derive(Default)]
+struct LetInference {
+    /// Types solved by earlier probes, keyed by the `let` statement's span.
+    solved_lets: HashMap<SpanKey, Ty>,
+    /// True during a probe attempt.
+    probing: bool,
+    /// Placeholder id -> the `let` it stands for.
+    placeholders: HashMap<u32, SpanKey>,
+    /// Each open `let`'s type, with placeholders for its unknowns.
+    templates: Vec<(SpanKey, Ty)>,
+    /// Placeholder solutions found so far in this probe.
+    solved: HashMap<u32, Ty>,
+    next_placeholder: u32,
+    /// Output of a normal attempt: the first open `let` and its binding name.
+    needs: Option<(Span, String)>,
+    /// Output of a probe: the first `let` whose type became fully known.
+    solution: Option<(SpanKey, Ty)>,
+    /// The partially known type behind the most recent "cannot infer" error.
+    unresolved: Option<Ty>,
+}
+
+/// Is `t` (or does it contain) a `let` placeholder?
+fn has_placeholder(t: &Ty, placeholders: &HashMap<u32, SpanKey>) -> bool {
+    match t {
+        Ty::Infer(n) => placeholders.contains_key(n),
+        Ty::Named { args, .. } | Ty::Tuple(args) => args.iter().any(|a| has_placeholder(a, placeholders)),
+        Ty::Array(e, _) => has_placeholder(e, placeholders),
+        Ty::Fn { params, ret } | Ty::ExternFn { params, ret } => {
+            params.iter().any(|p| has_placeholder(p, placeholders)) || has_placeholder(ret, placeholders)
+        }
+        Ty::Var(_) | Ty::Prim(_) => false,
+    }
+}
+
+/// Match `pattern` against `concrete`, recording each placeholder in
+/// `pattern` that lines up with a fully known type.
+fn bind_placeholders(pattern: &Ty, concrete: &Ty, placeholders: &HashMap<u32, SpanKey>, out: &mut HashMap<u32, Ty>) {
+    match (pattern, concrete) {
+        (Ty::Infer(n), _) if placeholders.contains_key(n) => {
+            if !has_var(concrete) && !is_never(concrete) {
+                out.insert(*n, concrete.clone());
+            }
+        }
+        (Ty::Named { name: pn, args: pa }, Ty::Named { name: cn, args: ca }) if pn == cn && pa.len() == ca.len() => {
+            for (p, c) in pa.iter().zip(ca) { bind_placeholders(p, c, placeholders, out); }
+        }
+        (Ty::Tuple(pa), Ty::Tuple(ca)) if pa.len() == ca.len() => {
+            for (p, c) in pa.iter().zip(ca) { bind_placeholders(p, c, placeholders, out); }
+        }
+        (Ty::Array(pe, _), Ty::Array(ce, _)) => bind_placeholders(pe, ce, placeholders, out),
+        (Ty::Fn { params: pp, ret: pr }, Ty::Fn { params: cp, ret: cr }) if pp.len() == cp.len() => {
+            for (p, c) in pp.iter().zip(cp) { bind_placeholders(p, c, placeholders, out); }
+            bind_placeholders(pr, cr, placeholders, out);
+        }
+        _ => {}
+    }
+}
+
+/// Replace solved placeholders in `t`.
+fn fill_placeholders(t: &Ty, solved: &HashMap<u32, Ty>) -> Ty {
+    match t {
+        Ty::Infer(n) => solved.get(n).cloned().unwrap_or_else(|| t.clone()),
+        Ty::Named { name, args } => Ty::Named { name: name.clone(), args: args.iter().map(|a| fill_placeholders(a, solved)).collect() },
+        Ty::Tuple(args) => Ty::Tuple(args.iter().map(|a| fill_placeholders(a, solved)).collect()),
+        Ty::Array(e, n) => Ty::Array(Box::new(fill_placeholders(e, solved)), *n),
+        Ty::Fn { params, ret } => Ty::Fn { params: params.iter().map(|p| fill_placeholders(p, solved)).collect(), ret: Box::new(fill_placeholders(ret, solved)) },
+        Ty::ExternFn { params, ret } => Ty::ExternFn { params: params.iter().map(|p| fill_placeholders(p, solved)).collect(), ret: Box::new(fill_placeholders(ret, solved)) },
+        Ty::Var(_) | Ty::Prim(_) => t.clone(),
+    }
+}
+
+/// Replace each distinct type variable in `t` with a fresh placeholder id.
+fn placeholder_template(t: &Ty, ids: &mut HashMap<String, u32>, next: &mut u32) -> Ty {
+    match t {
+        Ty::Var(v) => {
+            let id = *ids.entry(v.clone()).or_insert_with(|| { let id = *next; *next += 1; id });
+            Ty::Infer(id)
+        }
+        Ty::Named { name, args } => Ty::Named { name: name.clone(), args: args.iter().map(|a| placeholder_template(a, ids, next)).collect() },
+        Ty::Tuple(args) => Ty::Tuple(args.iter().map(|a| placeholder_template(a, ids, next)).collect()),
+        Ty::Array(e, n) => Ty::Array(Box::new(placeholder_template(e, ids, next)), *n),
+        Ty::Fn { params, ret } => Ty::Fn { params: params.iter().map(|p| placeholder_template(p, ids, next)).collect(), ret: Box::new(placeholder_template(ret, ids, next)) },
+        Ty::ExternFn { params, ret } => Ty::ExternFn { params: params.iter().map(|p| placeholder_template(p, ids, next)).collect(), ret: Box::new(placeholder_template(ret, ids, next)) },
+        Ty::Prim(_) | Ty::Infer(_) => t.clone(),
+    }
 }
 
 fn lower_fn<'a>(
@@ -456,6 +577,7 @@ fn lower_fn<'a>(
             local_tys: vec![],
             ret_ty: ret_ty.clone(),
             infer_ret: false,
+            infer: LetInference::default(),
         };
         let mut params = Vec::new();
         let mut extern_by_ref = Vec::new();
@@ -519,20 +641,69 @@ fn lower_fn<'a>(
         });
     }
 
+    // Unannotated-`let` inference: retry until no `let` is left open (see
+    // `LetInference`). Each discarded attempt's monomorphization and layout
+    // registrations are rolled back so they cannot leak placeholder types.
+    let mut solved_lets: HashMap<SpanKey, Ty> = HashMap::new();
+    loop {
+        let snap = (mono.snapshot(), reg.snapshot(), *count);
+        let mut infer = LetInference { solved_lets: solved_lets.clone(), ..LetInference::default() };
+        let result = lower_fn_attempt(job, ctx, reg, mono, count, &ret_ty, fn_span, &mut infer);
+        let Some((let_span, name)) = infer.needs.take() else { return result };
+        if result.is_ok() { return result; }
+        mono.restore(snap.0); reg.restore(snap.1); *count = snap.2;
+
+        let snap = (mono.snapshot(), reg.snapshot(), *count);
+        let mut probe = LetInference { solved_lets: solved_lets.clone(), probing: true, ..LetInference::default() };
+        let _ = lower_fn_attempt(job, ctx, reg, mono, count, &ret_ty, fn_span, &mut probe);
+        mono.restore(snap.0); reg.restore(snap.1); *count = snap.2;
+        match probe.solution.take() {
+            Some((key, ty)) if !solved_lets.contains_key(&key) => { solved_lets.insert(key, ty); }
+            _ => {
+                return err(
+                    format!("cannot infer the type of `{}`; add a type annotation (`let {}: Type = ...`)", name, name),
+                    let_span,
+                );
+            }
+        }
+    }
+}
+
+/// One attempt at lowering `job`'s body with the given `let` inference state.
+#[allow(clippy::too_many_arguments)]
+fn lower_fn_attempt<'a>(
+    job: &Job,
+    ctx: &'a TyCtx,
+    reg: &mut LayoutRegistry<'a>,
+    mono: &mut Mono,
+    count: &mut u32,
+    ret_ty: &Ty,
+    fn_span: crate::core::SpanId,
+    infer: &mut LetInference,
+) -> LResult<CoreFn> {
+    let ret_ty = ret_ty.clone();
     let mut lo = FnLowerer {
         ctx,
         reg,
         mono,
         count,
-        subst: subst.clone(),
+        subst: job.subst.clone(),
         scope: vec![HashMap::new()],
         locals: vec![],
         local_names: vec![],
         local_tys: vec![],
         ret_ty: ret_ty.clone(),
         infer_ret: false,
+        infer: std::mem::take(infer),
     };
+    let result = lower_fn_with(&mut lo, job, &ret_ty, fn_span);
+    *infer = std::mem::take(&mut lo.infer);
+    result
+}
 
+fn lower_fn_with(lo: &mut FnLowerer<'_, '_, '_>, job: &Job, ret_ty: &Ty, fn_span: crate::core::SpanId) -> LResult<CoreFn> {
+    let f = &job.f;
+    let ret_ty = ret_ty.clone();
     let mut params = Vec::new();
     // A method's implicit `self` parameter comes first.
     if f.has_self {
@@ -555,10 +726,21 @@ fn lower_fn<'a>(
     // Point a body/return type mismatch at the tail expression (or the function
     // body if there's no tail), so the caret lands on the offending value.
     let body_err_span = f.body.tail.as_ref().map(|t| t.span).unwrap_or(f.body.span);
-    check_assignable(&body_ty, &ret_ty, body_err_span)?;
+    lo.check_assignable(&body_ty, &ret_ty, body_err_span)?;
     let ret = lo.repr_of(&ret_ty, f.span)?;
 
-    Ok(CoreFn { name: job.mangled.clone(), params, extern_by_ref: vec![], ret, locals: lo.locals, local_names: lo.local_names, body, closure_captures: vec![], is_extern: false, span: fn_span })
+    Ok(CoreFn {
+        name: job.mangled.clone(),
+        params,
+        extern_by_ref: vec![],
+        ret,
+        locals: std::mem::take(&mut lo.locals),
+        local_names: std::mem::take(&mut lo.local_names),
+        body,
+        closure_captures: vec![],
+        is_extern: false,
+        span: fn_span,
+    })
 }
 
 /// Lower a surface type to a ground `Ty`, applying the instantiation subst.
@@ -598,7 +780,33 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// Repr of a type, via the shared layout registry.
     fn repr_of(&mut self, ty: &Ty, span: Span) -> LResult<Repr> {
         if is_never(ty) { return Ok(Repr::Unit); }
+        if has_placeholder(ty, &self.infer.placeholders) {
+            return err(format!("type `{}` is not yet known", ty_display(ty)), span);
+        }
+        if has_var(ty) { self.infer.unresolved = Some(ty.clone()); }
         self.reg.repr(ty).map_err(|e| LowerError { msg: e.0, span })
+    }
+
+    /// `actual` must be usable where `expected` is required. During a probe a
+    /// check that lines a `let` placeholder up with a known type solves it;
+    /// the probe stops at the first `let` whose type is then fully known.
+    fn check_assignable(&mut self, actual: &Ty, expected: &Ty, span: Span) -> LResult<()> {
+        let inf = &mut self.infer;
+        if inf.probing && (has_placeholder(actual, &inf.placeholders) || has_placeholder(expected, &inf.placeholders)) {
+            let mut found = HashMap::new();
+            bind_placeholders(expected, actual, &inf.placeholders, &mut found);
+            bind_placeholders(actual, expected, &inf.placeholders, &mut found);
+            inf.solved.extend(found);
+            for (key, template) in &inf.templates {
+                let ty = fill_placeholders(template, &inf.solved);
+                if !has_placeholder(&ty, &inf.placeholders) {
+                    inf.solution = Some((*key, ty));
+                    return err("`let` type inference probe finished", span);
+                }
+            }
+            return Ok(());
+        }
+        check_assignable(actual, expected, span)
     }
 
     fn fresh_local(&mut self, repr: Repr, ty: Ty) -> LocalId {
@@ -705,14 +913,40 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                         Some(e) => {
                             let expected = match ty {
                                 Some(t) => Some(ground_type(t, &self.subst.clone(), self.ctx)?),
-                                None => None,
+                                None => self.infer.solved_lets.get(&span_key(*span)).cloned(),
                             };
+                            self.infer.unresolved = None;
+                            let lowered = self.expr(e, expected.as_ref());
                             let (init_expr, init_ty) = {
-                                let (ce, at) = self.expr(e, expected.as_ref())?;
+                                let (ce, at) = match lowered {
+                                    Ok(v) => v,
+                                    Err(error) => {
+                                        // An unannotated `let` whose initializer leaves type
+                                        // parameters open (`Vec::new()`, `None`): its type
+                                        // comes from a later use. See `LetInference`.
+                                        let open = self.infer.unresolved.take()
+                                            .filter(|_| expected.is_none() && error.span == e.span);
+                                        let Some(partial) = open else { return Err(error) };
+                                        if !self.infer.probing {
+                                            if self.infer.needs.is_none() {
+                                                self.infer.needs = Some((*span, name.clone()));
+                                            }
+                                            return Err(error);
+                                        }
+                                        let key = span_key(*span);
+                                        let mut ids = HashMap::new();
+                                        let template = placeholder_template(&partial, &mut ids, &mut self.infer.next_placeholder);
+                                        for id in ids.values() { self.infer.placeholders.insert(*id, key); }
+                                        self.infer.templates.push((key, template.clone()));
+                                        let id = self.fresh_local(Repr::Unit, template.clone());
+                                        self.bind_mut(&name, id, template, is_mut);
+                                        continue;
+                                    }
+                                };
                                 // A `let x: T = e` whose `e` doesn't match `T` is
                                 // an error pointing at `e`.
                                 if let Some(exp) = &expected {
-                                    check_assignable(&at, exp, e.span)?;
+                                    self.check_assignable(&at, exp, e.span)?;
                                 }
                                 (ce, at)
                             };
@@ -817,7 +1051,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             ExprKind::Path(path) if path.is_single() => {
                 let name = path.last();
                 if let Some((id, ty)) = self.lookup(name) {
-                    let repr = self.repr_of(&ty, e.span)?;
+                    // A probe's placeholder-typed `let` has no layout yet; its
+                    // stand-in repr is only ever discarded.
+                    let repr = if has_placeholder(&ty, &self.infer.placeholders) {
+                        self.locals[id as usize].clone()
+                    } else {
+                        self.repr_of(&ty, e.span)?
+                    };
                     Ok((CoreExpr::new(CoreExprKind::Local(id), repr), ty))
                 } else if self.ctx.fns.contains_key(name) {
                     self.function_value(path, expected, e.span)
@@ -860,7 +1100,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::If { cond, then_branch, else_branch } => {
                 let (cc, ct) = self.expr(cond, Some(&Ty::bool()))?;
-                check_assignable(&ct, &Ty::bool(), cond.span)?;
+                self.check_assignable(&ct, &Ty::bool(), cond.span)?;
                 let (tb, tt) = self.block_expected(then_branch, expected)?;
                 // The else branch is checked against the then branch's type (or
                 // the outer expectation if the then branch was itself inferred).
@@ -873,7 +1113,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     None => (CoreBlock { stmts: vec![], tail: None }, Ty::unit()),
                 };
                 let result = if is_never(&tt) { et.clone() } else { tt.clone() };
-                check_assignable(&et, &result, e.span)?;
+                self.check_assignable(&et, &result, e.span)?;
                 let repr = self.repr_of(&result, e.span)?;
                 Ok((
                     CoreExpr::new(CoreExprKind::If(Box::new(cc), Box::new(tb), Box::new(eb)), repr),
@@ -900,7 +1140,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                             self.ret_ty = t.clone();
                             self.infer_ret = false;
                         }
-                        check_assignable(&t, &self.ret_ty.clone(), e.span)?;
+                        self.check_assignable(&t, &self.ret_ty.clone(), e.span)?;
                         Some(Box::new(ce))
                     }
                     None => {
@@ -908,7 +1148,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                             self.ret_ty = Ty::unit();
                             self.infer_ret = false;
                         }
-                        check_assignable(&Ty::unit(), &self.ret_ty, e.span)?;
+                        self.check_assignable(&Ty::unit(), &self.ret_ty.clone(), e.span)?;
                         None
                     }
                 };
@@ -920,7 +1160,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::While { cond, body } => {
                 let (cc, ct) = self.expr(cond, Some(&Ty::bool()))?;
-                check_assignable(&ct, &Ty::bool(), cond.span)?;
+                self.check_assignable(&ct, &Ty::bool(), cond.span)?;
                 let (cb, _) = self.block(body)?;
                 // while => loop { if !cond { break } body }
                 let break_blk = CoreBlock { stmts: vec![], tail: Some(CoreExpr::new(CoreExprKind::Break(None), Repr::Unit)) };
@@ -951,50 +1191,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::For { pat, iter, body } => {
-                // Only integer ranges `lo..hi` / `lo..=hi` in v0. Desugar to a
-                // counter `while` loop and re-lower.
-                let ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } = &*iter.kind else {
-                    return err("`for` only supports integer ranges `lo..hi` in v0", iter.span);
-                };
-                let PatternKind::Binding { name, .. } = &pat.kind else {
-                    return err("`for` pattern must be a simple binding in v0", pat.span);
-                };
-                let sp = e.span;
-                let var = || Expr { kind: Box::new(ExprKind::Path(Path::single(name.clone(), sp))), span: sp };
-                // cond: x < hi   (or x <= hi for inclusive)
-                let cmp = if *inclusive { BinOp::Le } else { BinOp::Lt };
-                let cond = Expr { kind: Box::new(ExprKind::Binary(cmp, var(), (*hi).clone())), span: sp };
-                // body + `x = x + 1;`
-                let incr = Expr {
-                    kind: Box::new(ExprKind::Assign {
-                        target: var(),
-                        op: None,
-                        value: Expr {
-                            kind: Box::new(ExprKind::Binary(BinOp::Add, var(),
-                                Expr { kind: Box::new(ExprKind::Int(1, crate::lexer::NumSuffix::None)), span: sp })),
-                            span: sp,
-                        },
-                    }),
-                    span: sp,
-                };
-                let mut wbody = body.clone();
-                wbody.stmts.push(Stmt::Expr(incr));
-                let while_expr = Expr { kind: Box::new(ExprKind::While { cond, body: wbody }), span: sp };
-                // { let mut x = lo; while ... { ... } }
-                let outer = Block {
-                    stmts: vec![
-                        Stmt::Let {
-                            pattern: Pattern { kind: PatternKind::Binding { is_mut: true, name: name.clone() }, span: sp },
-                            ty: None,
-                            init: Some((*lo).clone()),
-                            span: sp,
-                        },
-                        Stmt::Expr(while_expr),
-                    ],
-                    tail: None,
-                    span: sp,
-                };
-                self.expr(&Expr { kind: Box::new(ExprKind::Block(outer)), span: sp }, None)
+                let desugared = desugar_for(pat, iter, body, e.span)?;
+                self.expr(&desugared, None)
             }
 
             ExprKind::Break(v) => {
@@ -1049,12 +1247,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                         // `x += v` on a non-scalar uses the operator trait.
                         let load = CoreExpr::new(CoreExprKind::Local(id), repr);
                         let (call, ct) = self.overloaded_binary(*binop, load, ty.clone(), target, value, e.span)?;
-                        check_assignable(&ct, &ty, e.span)?;
+                        self.check_assignable(&ct, &ty, e.span)?;
                         return Ok((CoreExpr::new(CoreExprKind::Assign { local: id, value: Box::new(call) }, Repr::Unit), Ty::unit()));
                     }
                 }
                 let (cv, vt) = self.expr(value, Some(&ty))?;
-                check_assignable(&vt, &ty, e.span)?;
+                self.check_assignable(&vt, &ty, e.span)?;
                 let final_val = match op {
                     None => cv,
                     Some(binop) => {
@@ -1160,12 +1358,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         for gp in &gparams {
             match targ.get(gp) {
                 Some(t) => struct_args.push(t.clone()),
-                None => return err(format!("cannot infer `{}` for struct `{}`", gp, name), span),
+                None => {
+                    let args = gparams.iter().map(|g| targ.get(g).cloned().unwrap_or_else(|| Ty::Var(g.clone()))).collect();
+                    self.infer.unresolved = Some(Ty::Named { name: canon.clone(), args });
+                    return err(format!("cannot infer `{}` for struct `{}`", gp, name), span);
+                }
             }
         }
         let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(struct_args.iter().cloned()).collect();
         for (declared, actual) in &field_checks {
-            check_assignable(actual, &apply_subst(declared, &subst), span)?;
+            self.check_assignable(actual, &apply_subst(declared, &subst), span)?;
         }
         let ty = Ty::Named { name: canon.clone(), args: struct_args };
         let repr = self.repr_of(&ty, span)?;
@@ -1228,12 +1430,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         for gp in &gparams {
             match targ.get(gp) {
                 Some(t) => enum_args.push(t.clone()),
-                None => return err(format!("cannot infer `{}` for enum `{}`", gp, enum_name), span),
+                None => {
+                    let args = gparams.iter().map(|g| targ.get(g).cloned().unwrap_or_else(|| Ty::Var(g.clone()))).collect();
+                    self.infer.unresolved = Some(Ty::Named { name: enum_name.clone(), args });
+                    return err(format!("cannot infer `{}` for enum `{}`", gp, enum_name), span);
+                }
             }
         }
         let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(enum_args.iter().cloned()).collect();
         for (decl, actual) in &actuals {
-            check_assignable(actual, &apply_subst(decl, &subst), span)?;
+            self.check_assignable(actual, &apply_subst(decl, &subst), span)?;
         }
 
         let ty = Ty::Named { name: enum_name.clone(), args: enum_args };
@@ -1349,18 +1555,18 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         // Compound assign: read the current field first.
         let new_val = match op {
-            None => { let (cv, vt) = self.expr(value, Some(&fty))?; check_assignable(&vt, &fty, value.span)?; cv }
+            None => { let (cv, vt) = self.expr(value, Some(&fty))?; self.check_assignable(&vt, &fty, value.span)?; cv }
             Some(binop) => {
                 let frepr = self.repr_of(&fty, span)?;
                 let cur = CoreExpr::new(CoreExprKind::Field { base: Box::new(cbase.clone()), loc }, frepr.clone());
                 if !matches!(frepr, Repr::Scalar(_)) {
                     // `s.f += v` on a non-scalar field uses the operator trait.
                     let (call, ct) = self.overloaded_binary(*binop, cur, fty.clone(), base, value, span)?;
-                    check_assignable(&ct, &fty, span)?;
+                    self.check_assignable(&ct, &fty, span)?;
                     call
                 } else {
                     let (cv, vt) = self.expr(value, Some(&fty))?;
-                    check_assignable(&vt, &fty, value.span)?;
+                    self.check_assignable(&vt, &fty, value.span)?;
                     CoreExpr::new(CoreExprKind::Bin(*binop, Box::new(cur), Box::new(cv)), frepr)
                 }
             }
@@ -1442,7 +1648,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
             match &result_ty {
-                Some(rt) if !is_never(rt) => check_assignable(&bty, rt, arm.span)?,
+                Some(rt) if !is_never(rt) => self.check_assignable(&bty, rt, arm.span)?,
                 _ => result_ty = Some(bty),
             }
             carms.push(CoreArm { tag, binds, body });
@@ -1546,7 +1752,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let _ = (id, init);
                 }
                 let (cg, gt) = self.expr(g, Some(&Ty::bool()))?;
-                check_assignable(&gt, &Ty::bool(), g.span)?;
+                self.check_assignable(&gt, &Ty::bool(), g.span)?;
                 full_cond = Some(match full_cond {
                     Some(c) => CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(c), Box::new(cg)), Repr::Scalar(ScalarRepr::Bool)),
                     None => cg,
@@ -1559,7 +1765,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let covers = irrefutable && arm.guard.is_none();
             let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
             match &result_ty {
-                Some(rt) if !is_never(rt) => check_assignable(&bty, rt, arm.span)?,
+                Some(rt) if !is_never(rt) => self.check_assignable(&bty, rt, arm.span)?,
                 _ => result_ty = Some(bty),
             }
             // Move bindings out for emission.
@@ -1764,7 +1970,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let elem = self.repr_of(&elem_ty, span)?;
         let lid = self.reg.array_for(&elem).map_err(|e| LowerError { msg: e.0, span })?;
         let (clen, lt) = self.expr(len, Some(&Ty::i64()))?;
-        check_assignable(&lt, &Ty::i64(), len.span)?;
+        self.check_assignable(&lt, &Ty::i64(), len.span)?;
         let ty = Ty::Named { name: "Array".into(), args: vec![elem_ty] };
         let sid = self.mono.intern_span(span);
         Ok((CoreExpr::new(CoreExprKind::ArrayNew { layout: lid, len: Box::new(clen), elem }, Repr::Ref(lid)).at(sid), ty))
@@ -1780,7 +1986,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_get on a non-array".into(), span })?;
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
-        check_assignable(&it, &Ty::i64(), idx.span)?;
+        self.check_assignable(&it, &Ty::i64(), idx.span)?;
         // `array_get` yields `Option<T>` — `None` for an out-of-bounds index —
         // so the absence of a value is carried in the type rather than aborting.
         // The `elem` repr drives the in-bounds load; the CoreExpr repr is the
@@ -1801,7 +2007,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
-        check_assignable(&it, &Ty::i64(), idx.span)?;
+        self.check_assignable(&it, &Ty::i64(), idx.span)?;
         Ok((CoreExpr::new(CoreExprKind::ArrayGetChecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
     }
 
@@ -1812,7 +2018,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_get_unchecked on a non-array".into(), span })?;
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
-        check_assignable(&it, &Ty::i64(), idx.span)?;
+        self.check_assignable(&it, &Ty::i64(), idx.span)?;
         Ok((CoreExpr::new(CoreExprKind::ArrayGetUnchecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
     }
 
@@ -1841,9 +2047,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_set on a non-array".into(), span })?;
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
-        check_assignable(&it, &Ty::i64(), idx.span)?;
+        self.check_assignable(&it, &Ty::i64(), idx.span)?;
         let (cv, vt) = self.expr(val, Some(&elem_ty))?;
-        check_assignable(&vt, &elem_ty, val.span)?;
+        self.check_assignable(&vt, &elem_ty, val.span)?;
         Ok((CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(ca), index: Box::new(ci), value: Box::new(cv), elem }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
     }
 
@@ -1853,7 +2059,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Lower an argument and require it to be a String.
         let mut str_arg = |this: &mut Self, e: &Expr| -> LResult<CoreExpr> {
             let (ce, t) = this.expr(e, Some(&str_ty))?;
-            check_assignable(&t, &str_ty, e.span)?;
+            this.check_assignable(&t, &str_ty, e.span)?;
             Ok(ce)
         };
         match name {
@@ -1870,7 +2076,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             "char_to_str" => {
                 if args.len() != 1 { return err("`char_to_str` takes 1 argument", span); }
                 let (cp, cpt) = self.expr(&args[0], Some(&Ty::i64()))?;
-                check_assignable(&cpt, &Ty::i64(), args[0].span)?;
+                self.check_assignable(&cpt, &Ty::i64(), args[0].span)?;
                 let layout = self.string_layout_id(span)?;
                 Ok((
                     CoreExpr::new(CoreExprKind::StrFromChar { layout, cp: Box::new(cp) }, Repr::Ref(layout)),
@@ -1902,7 +2108,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 if args.len() != 2 { return err("`str_get` takes 2 arguments", span); }
                 let s = str_arg(self, &args[0])?;
                 let (i, it) = self.expr(&args[1], Some(&Ty::i64()))?;
-                check_assignable(&it, &Ty::i64(), args[1].span)?;
+                self.check_assignable(&it, &Ty::i64(), args[1].span)?;
                 Ok((CoreExpr::new(CoreExprKind::StrGet(Box::new(s), Box::new(i)), Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
             }
             "str_to_float" => {
@@ -1913,7 +2119,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             "float_bits" => {
                 if args.len() != 1 { return err("`float_bits` takes 1 argument", span); }
                 let (f, ft) = self.expr(&args[0], Some(&Ty::Prim(Prim::F64)))?;
-                check_assignable(&ft, &Ty::Prim(Prim::F64), args[0].span)?;
+                self.check_assignable(&ft, &Ty::Prim(Prim::F64), args[0].span)?;
                 Ok((CoreExpr::new(CoreExprKind::FloatBits(Box::new(f)), Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
             }
             "read_file" => {
@@ -1934,9 +2140,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 if args.len() != 3 { return err("`str_substring` takes 3 arguments", span); }
                 let s = str_arg(self, &args[0])?;
                 let (st, stt) = self.expr(&args[1], Some(&Ty::i64()))?;
-                check_assignable(&stt, &Ty::i64(), args[1].span)?;
+                self.check_assignable(&stt, &Ty::i64(), args[1].span)?;
                 let (en, ent) = self.expr(&args[2], Some(&Ty::i64()))?;
-                check_assignable(&ent, &Ty::i64(), args[2].span)?;
+                self.check_assignable(&ent, &Ty::i64(), args[2].span)?;
                 let layout = self.string_layout_id(span)?;
                 Ok((
                     CoreExpr::new(CoreExprKind::StrSubstring { layout, s: Box::new(s), start: Box::new(st), end: Box::new(en) }, Repr::Ref(layout)),
@@ -1988,7 +2194,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Field intrinsics take an i64 index as the second argument.
         let idx = if arity == 2 {
             let (i, it) = self.expr(&args[1], Some(&Ty::i64()))?;
-            check_assignable(&it, &Ty::i64(), args[1].span)?;
+            self.check_assignable(&it, &Ty::i64(), args[1].span)?;
             Some(i)
         } else {
             None
@@ -2260,11 +2466,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let (body_block, body_ty) = self.block_for_closure(body, declared_ret.as_ref())?;
         let ret_ty = match &declared_ret {
             Some(t) => {
-                check_assignable(&body_ty, t, span)?;
+                self.check_assignable(&body_ty, t, span)?;
                 t.clone()
             }
             None if !self.infer_ret => {
-                check_assignable(&body_ty, &self.ret_ty, span)?;
+                self.check_assignable(&body_ty, &self.ret_ty.clone(), span)?;
                 self.ret_ty.clone()
             }
             None => body_ty,
@@ -2373,7 +2579,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 arity(1)?;
                 let elem = self.repr_of(&elem_ty, span)?;
                 let (ci, it) = self.expr(&args[0], Some(&Ty::i64()))?;
-                check_assignable(&it, &Ty::i64(), args[0].span)?;
+                self.check_assignable(&it, &Ty::i64(), args[0].span)?;
                 let opt_ty = Ty::Named { name: "Option".to_string(), args: vec![elem_ty] };
                 let opt_repr = self.repr_of(&opt_ty, span)?;
                 Ok((CoreExpr::new(CoreExprKind::ArrayGet { array: Box::new(ca), index: Box::new(ci), elem }, opt_repr), opt_ty))
@@ -2474,7 +2680,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Re-apply now that all type vars are known, pointing each error at the
         // argument that caused it.
         for (declared, actual, arg_span) in &checks {
-            check_assignable(actual, &apply_subst(declared, &isubst), *arg_span)?;
+            self.check_assignable(actual, &apply_subst(declared, &isubst), *arg_span)?;
         }
 
         // Build the full substitution (impl generics + method generics + Self).
@@ -2559,7 +2765,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             cargs.push(ca);
         }
         for (declared, actual, arg_span) in &checks {
-            check_assignable(actual, &apply_subst(declared, &subst), *arg_span)?;
+            self.check_assignable(actual, &apply_subst(declared, &subst), *arg_span)?;
         }
 
         let ret_ty = match &m.ret {
@@ -2706,7 +2912,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let (cr, rt) = self.expr(r, Some(&lt))?;
         match op {
             Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr => {
-                check_assignable(&rt, &lt, span)?;
+                self.check_assignable(&rt, &lt, span)?;
                 if !is_numeric(&lt) {
                     return err("arithmetic on non-numeric type", span);
                 }
@@ -2714,7 +2920,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::Bin(op, Box::new(cl), Box::new(cr)), repr), lt))
             }
             Eq | Ne | Lt | Le | Gt | Ge => {
-                check_assignable(&rt, &lt, span)?;
+                self.check_assignable(&rt, &lt, span)?;
                 Ok((
                     CoreExpr::new(
                         CoreExprKind::Bin(op, Box::new(cl), Box::new(cr)),
@@ -2724,8 +2930,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 ))
             }
             And | Or => {
-                check_assignable(&lt, &Ty::bool(), span)?;
-                check_assignable(&rt, &Ty::bool(), span)?;
+                self.check_assignable(&lt, &Ty::bool(), span)?;
+                self.check_assignable(&rt, &Ty::bool(), span)?;
                 Ok((
                     CoreExpr::new(
                         CoreExprKind::Bin(op, Box::new(cl), Box::new(cr)),
@@ -2882,9 +3088,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             );
         }
         for (fp, cp) in f_params.iter().zip(cb_params.iter()) {
-            check_assignable(fp, cp, a.span)?;
+            self.check_assignable(fp, cp, a.span)?;
         }
-        check_assignable(&f_ret, cb_ret, a.span)?;
+        self.check_assignable(&f_ret, cb_ret, a.span)?;
         let mangled = mangle(&fq, &[]);
         let job = Job { f, subst: HashMap::new(), mangled, self_ty: None };
         let fid = self.mono.intern(job, self.count);
@@ -2921,7 +3127,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let mut cargs = Vec::new();
                 for (a, pt) in args.iter().zip(&fp) {
                     let (ca, at) = self.expr(a, Some(pt))?;
-                    check_assignable(&at, pt, a.span)?;
+                    self.check_assignable(&at, pt, a.span)?;
                     cargs.push(ca);
                 }
                 let ret_repr = self.repr_of(&fret, span)?;
@@ -2963,7 +3169,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if name == "panic" && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
             if args.len() != 1 { return err("panic takes one String", span); }
             let (message, actual) = self.expr(&args[0], Some(&Ty::Prim(Prim::Str)))?;
-            check_assignable(&actual, &Ty::Prim(Prim::Str), span)?;
+            self.check_assignable(&actual, &Ty::Prim(Prim::Str), span)?;
             return Ok((CoreExpr::new(CoreExprKind::Panic(Box::new(message)), Repr::Unit), never_ty()));
         }
         if name == "str_join_array" && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
@@ -2973,7 +3179,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let mut lowered = Vec::new();
             for (arg, ty) in args.iter().zip([array_ty, Ty::i64(), str_ty.clone()]) {
                 let (expr, actual) = self.expr(arg, Some(&ty))?;
-                check_assignable(&actual, &ty, arg.span)?;
+                self.check_assignable(&actual, &ty, arg.span)?;
                 lowered.push(expr);
             }
             let layout = self.string_layout_id(span)?;
@@ -3003,7 +3209,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let mut lowered = Vec::new();
             for (arg, ty) in args[1..].iter().zip([str_ty.clone(), str_ty.clone(), Ty::i64()]) {
                 let (expr, actual) = self.expr(arg, Some(&ty))?;
-                check_assignable(&actual, &ty, arg.span)?;
+                self.check_assignable(&actual, &ty, arg.span)?;
                 lowered.push(expr);
             }
             let Repr::Ref(response) = self.repr_of(&response_ty, span)? else { unreachable!() };
@@ -3087,9 +3293,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             // atom_cas(a, old, new) -> bool
             let (cold, oldt) = self.expr(&args[1], Some(&elem_ty))?;
-            check_assignable(&oldt, &elem_ty, args[1].span)?;
+            self.check_assignable(&oldt, &elem_ty, args[1].span)?;
             let (cnew, newt) = self.expr(&args[2], Some(&elem_ty))?;
-            check_assignable(&newt, &elem_ty, args[2].span)?;
+            self.check_assignable(&newt, &elem_ty, args[2].span)?;
             return Ok((
                 CoreExpr::new(
                     CoreExprKind::AtomCas { atom: Box::new(catom), old: Box::new(cold), new: Box::new(cnew) },
@@ -3106,7 +3312,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         {
             if args.len() != 2 { return err("`chan_new` takes capacity and message array", span); }
             let (ccap, actual) = self.expr(&args[0], Some(&Ty::i64()))?;
-            check_assignable(&actual, &Ty::i64(), span)?;
+            self.check_assignable(&actual, &Ty::i64(), span)?;
             let (buffer, buffer_ty) = self.expr(&args[1], None)?;
             let message_ty = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
             let message_repr = self.repr_of(&message_ty, span)?;
@@ -3125,9 +3331,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let expected = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
             if !matches!(self.repr_of(&expected, span)?, Repr::Ref(_)) { return err("channel intrinsic requires a reference message box", span); }
             let (cctrl, ctrl_ty) = self.expr(&args[1], Some(&Ty::Prim(Prim::RawPtr)))?;
-            check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
+            self.check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
             let (cval, actual) = self.expr(&args[2], Some(&expected))?;
-            check_assignable(&actual, &expected, span)?;
+            self.check_assignable(&actual, &expected, span)?;
             return Ok((
                 CoreExpr::new(CoreExprKind::ChanSend { buf: Box::new(cbuf), ctrl: Box::new(cctrl), value: Box::new(cval) }, Repr::Scalar(ScalarRepr::I64)),
                 Ty::i64(),
@@ -3139,7 +3345,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             if args.len() != 2 { return err("`chan_recv` takes 2 arguments (buf, ctrl)", span); }
             let (cbuf, bty) = self.expr(&args[0], None)?;
             let (cctrl, ctrl_ty) = self.expr(&args[1], Some(&Ty::Prim(Prim::RawPtr)))?;
-            check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
+            self.check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
             let elem_ty = array_elem_ty(&bty)
                 .ok_or_else(|| LowerError { msg: format!("`chan_recv` buffer must be an Array, found `{}`", ty_display(&bty)), span: args[0].span })?;
             let elem = self.repr_of(&elem_ty, span)?;
@@ -3156,7 +3362,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         {
             if args.len() != 1 { return err("channel waiter count takes one control handle", span); }
             let (ctrl, actual) = self.expr(&args[0], Some(&Ty::Prim(Prim::RawPtr)))?;
-            check_assignable(&actual, &Ty::Prim(Prim::RawPtr), span)?;
+            self.check_assignable(&actual, &Ty::Prim(Prim::RawPtr), span)?;
             let func = if name == "chan_waiting_senders" { "ai_chan_waiting_senders" } else { "ai_chan_waiting_receivers" };
             return Ok((CoreExpr::new(CoreExprKind::RuntimeCall { func, args: vec![ctrl], ret: Repr::Scalar(ScalarRepr::I64) }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()));
         }
@@ -3165,7 +3371,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         {
             if args.len() != 1 { return err(format!("`{}` takes 1 argument (ctrl)", name), span); }
             let (cctrl, ctrl_ty) = self.expr(&args[0], Some(&Ty::Prim(Prim::RawPtr)))?;
-            check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
+            self.check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
             let func = match name { "chan_sender_clone" => "ai_chan_sender_clone", "chan_close" => "ai_chan_close", _ => "ai_chan_sender_drop" };
             return Ok((
                 CoreExpr::new(CoreExprKind::RuntimeCall { func, args: vec![cctrl], ret: Repr::Unit }, Repr::Unit),
@@ -3434,7 +3640,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         for gp in &gparams {
             match targ.get(gp) {
                 Some(t) => inst_args.push(t.clone()),
-                None => return err(format!("cannot infer type parameter `{}` for `{}`", gp, name), span),
+                None => {
+                    if let Some(ret) = &f.ret {
+                        let declared = lower_type(ret, &gparams, self.ctx).map_err(conv)?;
+                        self.infer.unresolved = Some(apply_subst(&declared, &targ));
+                    }
+                    return err(format!("cannot infer type parameter `{}` for `{}`", gp, name), span);
+                }
             }
         }
 
@@ -3459,7 +3671,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // error at the argument's own span.
         let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(inst_args.iter().cloned()).collect();
         for (declared, actual, arg_span) in &arg_tys {
-            check_assignable(actual, &apply_subst(declared, &subst), *arg_span)?;
+            self.check_assignable(actual, &apply_subst(declared, &subst), *arg_span)?;
         }
 
         let mangled = mangle(&fq, &inst_args);
@@ -3493,7 +3705,9 @@ fn has_var(t: &Ty) -> bool {
         Ty::Named { args, .. } | Ty::Tuple(args) => args.iter().any(has_var),
         Ty::Array(e, _) => has_var(e),
         Ty::Fn { params, ret } | Ty::ExternFn { params, ret } => params.iter().any(has_var) || has_var(ret),
-        Ty::Prim(_) | Ty::Infer(_) => false,
+        Ty::Prim(_) => false,
+        // A `let` placeholder is an unknown; the never type is not.
+        Ty::Infer(n) => *n != u32::MAX,
     }
 }
 
@@ -3518,6 +3732,95 @@ fn unify_infer(declared: &Ty, actual: &Ty, out: &mut HashMap<String, Ty>) {
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+/// Names for a `for` loop's hidden state. `#` cannot appear in a source
+/// identifier, so these never collide with (or are visible to) user code.
+const FOR_INDEX: &str = "for#index";
+const FOR_END: &str = "for#end";
+const FOR_DONE: &str = "for#done";
+const FOR_ITEMS: &str = "for#items";
+
+/// Desugar `for pat in iter { body }` to a `while` loop.
+///
+/// - `lo..hi` / `lo..=hi`: the bounds are evaluated once. The loop variable is
+///   a fresh binding per iteration, and the counter advances before the body
+///   runs, so `continue` and a body that assigns the variable are both safe.
+///   An inclusive range stops after `hi` without computing `hi + 1`.
+/// - anything else is a collection with `len()` and indexing (`Vec`, `Array`):
+///   it is evaluated once and its elements are visited in index order.
+fn desugar_for(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> LResult<Expr> {
+    let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span: sp };
+    let var = |name: &str| ex(ExprKind::Path(Path::single(name.to_string(), sp)));
+    let int = |n: u64| ex(ExprKind::Int(n, crate::lexer::NumSuffix::None));
+    let let_ = |name: &str, is_mut: bool, init: Expr| Stmt::Let {
+        pattern: Pattern { kind: PatternKind::Binding { is_mut, name: name.to_string() }, span: sp },
+        ty: None,
+        init: Some(init),
+        span: sp,
+    };
+    let assign = |name: &str, value: Expr| Stmt::Expr(ex(ExprKind::Assign { target: var(name), op: None, value }));
+    let binding = match &pat.kind {
+        PatternKind::Binding { .. } | PatternKind::Wildcard => pat.clone(),
+        _ => return err("a `for` pattern must be a name or `_`", pat.span),
+    };
+    let bind_item = |value: Expr| Stmt::Let { pattern: binding.clone(), ty: None, init: Some(value), span: sp };
+    // The user's body runs as its own block, so its tail value is discarded
+    // and its bindings stay local to one iteration.
+    let user_body = Stmt::Expr(ex(ExprKind::Block(body.clone())));
+    let block = |stmts: Vec<Stmt>| Block { stmts, tail: None, span: sp };
+
+    let stmts = match &*iter.kind {
+        ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive: false } => vec![
+            let_(FOR_INDEX, true, lo.clone()),
+            let_(FOR_END, false, hi.clone()),
+            Stmt::Expr(ex(ExprKind::While {
+                cond: ex(ExprKind::Binary(BinOp::Lt, var(FOR_INDEX), var(FOR_END))),
+                body: block(vec![
+                    bind_item(var(FOR_INDEX)),
+                    assign(FOR_INDEX, ex(ExprKind::Binary(BinOp::Add, var(FOR_INDEX), int(1)))),
+                    user_body,
+                ]),
+            })),
+        ],
+        ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive: true } => vec![
+            let_(FOR_INDEX, true, lo.clone()),
+            let_(FOR_END, false, hi.clone()),
+            let_(FOR_DONE, true, ex(ExprKind::Binary(BinOp::Gt, var(FOR_INDEX), var(FOR_END)))),
+            Stmt::Expr(ex(ExprKind::While {
+                cond: ex(ExprKind::Unary(UnOp::Not, var(FOR_DONE))),
+                body: block(vec![
+                    bind_item(var(FOR_INDEX)),
+                    Stmt::Expr(ex(ExprKind::If {
+                        cond: ex(ExprKind::Binary(BinOp::Eq, var(FOR_INDEX), var(FOR_END))),
+                        then_branch: block(vec![assign(FOR_DONE, ex(ExprKind::Bool(true)))]),
+                        else_branch: Some(ex(ExprKind::Block(block(vec![
+                            assign(FOR_INDEX, ex(ExprKind::Binary(BinOp::Add, var(FOR_INDEX), int(1)))),
+                        ])))),
+                    })),
+                    user_body,
+                ]),
+            })),
+        ],
+        ExprKind::Range { .. } => return err("a `for` range needs both bounds (`lo..hi` or `lo..=hi`)", iter.span),
+        _ => vec![
+            let_(FOR_ITEMS, false, iter.clone()),
+            let_(FOR_INDEX, true, int(0)),
+            Stmt::Expr(ex(ExprKind::While {
+                cond: ex(ExprKind::Binary(
+                    BinOp::Lt,
+                    var(FOR_INDEX),
+                    ex(ExprKind::MethodCall { recv: var(FOR_ITEMS), method: "len".into(), args: vec![], span: sp }),
+                )),
+                body: block(vec![
+                    bind_item(ex(ExprKind::Index { base: var(FOR_ITEMS), index: var(FOR_INDEX) })),
+                    assign(FOR_INDEX, ex(ExprKind::Binary(BinOp::Add, var(FOR_INDEX), int(1)))),
+                    user_body,
+                ]),
+            })),
+        ],
+    };
+    Ok(ex(ExprKind::Block(block(stmts))))
+}
 
 fn block_of(e: CoreExpr) -> CoreBlock {
     CoreBlock { stmts: vec![], tail: Some(e) }

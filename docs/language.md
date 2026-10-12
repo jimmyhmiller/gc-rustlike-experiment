@@ -45,10 +45,20 @@ Two methods with the same name on the same type are an error, as is an
 attribute other than `#[value]`. A user item that shadows a prelude type or
 trait also drops the prelude's impls for it.
 
-Known gaps: a `let` without a type annotation cannot take its type from later
-use (`let mut v = Vec::new(); v.push(1)` needs `Vec<i64>`), and a method called
-directly on `None` cannot infer `T` from its arguments. There is no `for x in v`
-over a Vec, no `if let`/`while let`, no range indexing, and no macros.
+A `let` without a type annotation can take its type from a later use:
+`let mut v = Vec::new(); v.push(1);` makes `v` a `Vec<i64>`. The first type
+check that relates the binding to a known type decides it (an argument, an
+assignment, a struct field, a return). If nothing does, it is an error asking
+for an annotation.
+
+`for x in lo..hi` (and `lo..=hi`) evaluates the bounds once and gives each
+iteration a fresh `x`; `continue` is safe. `for x in items` visits a `Vec` or
+`Array` (any type with `len()` and indexing) in index order. `if let PAT = e`
+and `while let PAT = e` are `match` with a wildcard arm.
+
+Known gaps: a method called directly on `None` cannot infer `T` from its
+arguments. There are no tuple or nested `let` patterns, no range indexing, no
+array literals, and no macros.
 
 ## Match limits
 

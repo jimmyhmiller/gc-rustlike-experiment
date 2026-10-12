@@ -1,7 +1,7 @@
 fn main() -> i64 {
-  let a = str_replace("one,two,three", ",", " | ");      // longer
-  let b = str_replace("aXbXcXd", "X", "");               // remove
-  let c = str_replace("no match here", "zzz", "!");       // none
+  let a = "one,two,three".replace(",", " | ");           // longer
+  let b = "aXbXcXd".replace("X", "");                    // remove
+  let c = "no match here".replace("zzz", "!");           // none
   let ok1 = if a == "one | two | three" { 1 } else { 0 };
   let ok2 = if b == "abcd" { 1 } else { 0 };
   let ok3 = if c == "no match here" { 1 } else { 0 };
