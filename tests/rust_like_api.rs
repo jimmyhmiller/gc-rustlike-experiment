@@ -369,3 +369,63 @@ fn if_let_and_while_let() {
     "#);
     assert_eq!(r, 15 + 25 + 6);
 }
+
+#[test]
+fn nested_tuple_and_struct_patterns() {
+    let r = run(r#"
+        struct Point { x: i64, y: i64 }
+        enum Shape { Circle { r: i64 }, Rect(Point, Point), Empty }
+        enum Tree { Leaf(i64), Node(Tree, Tree) }
+        fn sum(t: Tree) -> i64 {
+            match t {
+                Tree::Node(Tree::Leaf(a), Tree::Leaf(b)) => a + b,
+                Tree::Node(l, r) => sum(l) + sum(r),
+                Tree::Leaf(v) => v,
+            }
+        }
+        fn area(s: Shape) -> i64 {
+            match s {
+                Shape::Circle { r } => 3 * r * r,
+                Shape::Rect(Point { x: x1, y: y1 }, Point { x: x2, .. }) => (x2 - x1) * y1,
+                Shape::Empty => 0,
+            }
+        }
+        fn classify(o: Option<Option<i64>>) -> i64 {
+            match o {
+                Some(Some(0)) => 1,
+                Some(Some(n)) if n > 10 => 2,
+                Some(Some(_)) => 3,
+                Some(None) => 4,
+                None => 5,
+            }
+        }
+        fn main() -> i64 {
+            let (a, (b, c)) = (1, (2, 3));
+            let Point { x, y } = Point { x: 4, y: 5 };
+            let t = Tree::Node(Tree::Node(Tree::Leaf(1), Tree::Leaf(2)), Tree::Leaf(3));
+            let shapes = area(Shape::Rect(Point { x: 1, y: 2 }, Point { x: 4, y: 0 })) + area(Shape::Circle { r: 2 }) + area(Shape::Empty);
+            let kinds = classify(Some(Some(0))) * 10000 + classify(Some(Some(50))) * 1000 + classify(Some(Some(5))) * 100
+                + classify(Some(None)) * 10 + classify(None);
+            (a + b + c + x + y) * 1000000000 + sum(t) * 10000000 + shapes * 100000 + kinds
+        }
+    "#);
+    assert_eq!(r, 15 * 1000000000 + 6 * 10000000 + 18 * 100000 + 12345);
+}
+
+#[test]
+fn pattern_exhaustiveness_and_refutability_are_checked() {
+    // A refutable payload does not cover its variant.
+    let msg = compile_error("enum E { A(i64), B } fn main() -> i64 { match E::A(1) { E::A(1) => 1, E::B => 2 } }");
+    assert!(msg.contains("non-exhaustive match"), "{msg}");
+    let msg = compile_error("fn main() -> i64 { match Some(Some(1)) { Some(Some(_)) => 1, None => 2 } }");
+    assert!(msg.contains("non-exhaustive match"), "{msg}");
+    // A guarded arm does not count toward coverage.
+    let msg = compile_error("fn main() -> i64 { let o: Option<i64> = None; match o { Some(n) if n > 0 => 1, None => 2 } }");
+    assert!(msg.contains("non-exhaustive match"), "{msg}");
+    let msg = compile_error("fn main() -> i64 { let o: Option<i64> = Some(1); let Some(x) = o; x }");
+    assert!(msg.contains("refutable pattern in `let`"), "{msg}");
+    let msg = compile_error("struct P { x: i64, y: i64 } fn main() -> i64 { let P { x } = P { x: 1, y: 2 }; x }");
+    assert!(msg.contains("does not mention every field"), "{msg}");
+    // Booleans have two constructors.
+    assert_eq!(run("fn main() -> i64 { match (true, false) { (true, _) => 1, (false, true) => 2, (false, false) => 3 } }"), 1);
+}

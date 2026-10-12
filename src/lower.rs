@@ -907,7 +907,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let (name, is_mut) = match &pattern.kind {
                         PatternKind::Binding { name, is_mut } => (name.clone(), *is_mut),
                         PatternKind::Wildcard => ("_".to_string(), false),
-                        _ => return err("only simple `let x =` patterns supported in v0", *span),
+                        _ => {
+                            let Some(init) = init else {
+                                return err("a destructuring `let` needs an initializer", *span);
+                            };
+                            diverges |= self.let_pattern(pattern, ty.as_ref(), init, *span, &mut stmts)?;
+                            continue;
+                        }
                     };
                     match init {
                         Some(e) => {
@@ -1017,6 +1023,28 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         self.pop_scope();
         Ok((CoreBlock { stmts, tail }, if diverges { never_ty() } else { ty }))
+    }
+
+    /// `let PAT = init;` for a tuple or struct pattern. The pattern must be
+    /// irrefutable. Returns whether the initializer diverges.
+    fn let_pattern(&mut self, pattern: &Pattern, ty: Option<&Type>, init: &Expr, span: Span, stmts: &mut Vec<CoreStmt>) -> LResult<bool> {
+        let expected = match ty {
+            Some(t) => Some(ground_type(t, &self.subst.clone(), self.ctx)?),
+            None => None,
+        };
+        let (cinit, ity) = self.expr(init, expected.as_ref())?;
+        if let Some(exp) = &expected {
+            self.check_assignable(&ity, exp, init.span)?;
+        }
+        let id = self.fresh_local(cinit.repr.clone(), ity.clone());
+        stmts.push(CoreStmt::Let(id, cinit));
+        let whole = CoreExpr::new(CoreExprKind::Local(id), self.locals[id as usize].clone());
+        let (cond, binds, _) = self.pattern_test(pattern, &whole, &ity, pattern.span)?;
+        if cond.is_some() {
+            return err("refutable pattern in `let`: use `if let` or `match`", span);
+        }
+        stmts.extend(binds.into_iter().map(|(bid, value)| CoreStmt::Let(bid, value)));
+        Ok(is_never(&ity))
     }
 
     /// Check + lower an expression. `expected` guides literal defaulting.
@@ -1276,7 +1304,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 ))
             }
 
-            ExprKind::StructLit { path, fields, .. } => self.struct_lit(path, fields, e.span),
+            ExprKind::StructLit { path, fields, .. } => {
+                let key = path.segments.join("::");
+                let is_struct = self.ctx.canon(path.last()).is_some_and(|c| self.ctx.structs.contains_key(&c));
+                if !is_struct && (self.ctx.variants.contains_key(&key) || self.ctx.variants.contains_key(path.last())) {
+                    self.variant_struct_lit(path, fields, expected, e.span)
+                } else {
+                    self.struct_lit(path, fields, e.span)
+                }
+            }
 
             ExprKind::Field { base, field } => self.field_access(base, field, e.span),
 
@@ -1321,6 +1357,35 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     /// A `Name { field: val, ... }` literal — struct OR an enum struct-variant.
+    /// `Enum::Variant { a: x, b }`: a variant with named fields, built like
+    /// the positional `Enum::Variant(x, b)` in declaration order.
+    fn variant_struct_lit(&mut self, path: &Path, fields: &[FieldInit], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let key = path.segments.join("::");
+        let (enum_name, tag) = self.ctx.variants.get(&key)
+            .or_else(|| self.ctx.variants.get(path.last()))
+            .cloned()
+            .ok_or_else(|| LowerError { msg: format!("unknown variant `{}`", key), span })?;
+        let names = self.variant_field_names(&enum_name, tag);
+        if names.is_empty() {
+            return err(format!("variant `{}` has no named fields; write `{}(..)`", path.last(), path.last()), span);
+        }
+        for f in fields {
+            if !names.contains(&f.name) {
+                return err(format!("variant `{}` has no field `{}`", path.last(), f.name), f.span);
+            }
+            if fields.iter().filter(|g| g.name == f.name).count() > 1 {
+                return err(format!("field `{}` is given twice", f.name), f.span);
+            }
+        }
+        let mut args = Vec::new();
+        for n in &names {
+            let f = fields.iter().find(|f| &f.name == n)
+                .ok_or_else(|| LowerError { msg: format!("missing field `{}` for variant `{}`", n, path.last()), span })?;
+            args.push(f.value.clone().unwrap_or_else(|| Expr { kind: Box::new(ExprKind::Path(Path::single(n.clone(), f.span))), span: f.span }));
+        }
+        self.variant_ctor(path, &args, expected, span)
+    }
+
     fn struct_lit(&mut self, path: &Path, fields: &[FieldInit], span: Span) -> LResult<(CoreExpr, Ty)> {
         let name = path.last();
         let canon = self.ctx.canon(name).unwrap_or_else(|| name.to_string());
@@ -1497,7 +1562,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 ));
             }
         };
-        let Ty::Named { name, args: struct_args } = &bty else {
+        self.field_read(cbase, &bty, fname, span)
+    }
+
+    /// Read field `fname` of the lowered struct value `cbase` of type `bty`.
+    fn field_read(&mut self, cbase: CoreExpr, bty: &Ty, fname: &str, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let Ty::Named { name, args: struct_args } = bty else {
             return err("field access on a non-struct", span);
         };
         let s = self.ctx.structs.get(name).cloned()
@@ -1505,7 +1575,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let StructBody::Named(def_fields) = &s.body else {
             return err("field access on a non-record struct", span);
         };
-        let idx = def_fields.iter().position(|f| &f.name == fname)
+        let idx = def_fields.iter().position(|f| f.name == fname)
             .ok_or_else(|| LowerError { msg: format!("no field `{}` on `{}`", fname, name), span })?;
         let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
         let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(struct_args.iter().cloned()).collect();
@@ -1706,63 +1776,32 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let sid = self.fresh_local(srepr.clone(), sty.clone());
         let scrut_local = |this: &Self| CoreExpr::new(CoreExprKind::Local(sid), this.locals[sid as usize].clone());
 
-        // Enum info, if the scrutinee is an enum (for variant patterns in a
-        // guarded match).
-        let enum_info: Option<(String, Vec<Ty>, Vec<(u32, Vec<Ty>)>)> = match &sty {
-            Ty::Named { name, args } if self.ctx.enums.contains_key(name) => {
-                let vs = self.enum_variants(name, args)?;
-                Some((name.clone(), args.clone(), vs))
-            }
-            _ => None,
-        };
-
         let mut result_ty: Option<Ty> = None;
-        // Build the chain bottom-up: start with the "no arm matched" tail.
-        // For an exhaustive match the final arm is a catch-all; otherwise we
-        // require coverage via a wildcard/binding (checked below).
-        let mut saw_irrefutable = false;
-        // Variant tags covered by an UNGUARDED variant arm (for enum
-        // exhaustiveness when there's no wildcard).
-        let mut covered_tags: std::collections::HashSet<u32> = std::collections::HashSet::new();
         struct Built { cond: Option<CoreExpr>, binds: Vec<(LocalId, CoreExpr)>, body: CoreExpr }
         let mut built: Vec<Built> = Vec::new();
 
         for arm in arms {
             self.push_scope();
-            // Track an unguarded variant arm's tag for exhaustiveness.
-            if arm.guard.is_none() {
-                if let (PatternKind::Variant { path, .. }, Some((en, _, vs))) = (&arm.pattern.kind, &enum_info) {
-                    if let Ok((tag, _)) = self.variant_in(en, path.last(), vs, arm.pattern.span) {
-                        covered_tags.insert(tag);
-                    }
-                }
-            }
-            // Compute the match condition and the bindings this pattern introduces.
-            let (cond, mut binds, irrefutable) =
-                self.pattern_test(&arm.pattern, &scrut_local(self), &sty, &enum_info, arm.pattern.span)?;
-            // A guard ANDs onto the condition (after bindings are in scope).
+            // The pattern's test, and the bindings to evaluate once it holds.
+            let (cond, mut binds, _) =
+                self.pattern_test(&arm.pattern, &scrut_local(self), &sty, arm.pattern.span)?;
+            // A guard runs after the bindings, which it may reference:
+            // `cond && { let binds...; guard }`. The bindings then stay
+            // assigned for the body.
             let mut full_cond = cond;
             if let Some(g) = &arm.guard {
-                // Bind names before lowering the guard so it can reference them.
-                // The binds reference the scrutinee local; emit them as lets
-                // inside the arm — but the guard needs them too, so we lower the
-                // guard with a temporary view of the scope.
-                for (id, init) in &binds {
-                    // already bound in scope by pattern_test; nothing to do here.
-                    let _ = (id, init);
-                }
                 let (cg, gt) = self.expr(g, Some(&Ty::bool()))?;
                 self.check_assignable(&gt, &Ty::bool(), g.span)?;
+                let bind_stmts: Vec<CoreStmt> = std::mem::take(&mut binds).into_iter().map(|(id, init)| CoreStmt::Let(id, init)).collect();
+                let guarded = CoreExpr::new(
+                    CoreExprKind::Block(Box::new(CoreBlock { stmts: bind_stmts, tail: Some(cg) })),
+                    Repr::Scalar(ScalarRepr::Bool),
+                );
                 full_cond = Some(match full_cond {
-                    Some(c) => CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(c), Box::new(cg)), Repr::Scalar(ScalarRepr::Bool)),
-                    None => cg,
+                    Some(c) => CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(c), Box::new(guarded)), Repr::Scalar(ScalarRepr::Bool)),
+                    None => guarded,
                 });
             }
-            if full_cond.is_none() {
-                saw_irrefutable = true;
-            }
-            // An unguarded irrefutable pattern (wildcard/binding) makes coverage.
-            let covers = irrefutable && arm.guard.is_none();
             let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
             match &result_ty {
                 Some(rt) if !is_never(rt) => self.check_assignable(&bty, rt, arm.span)?,
@@ -1772,29 +1811,23 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let arm_binds = std::mem::take(&mut binds);
             built.push(Built { cond: full_cond, binds: arm_binds, body });
             self.pop_scope();
-            if covers { saw_irrefutable = true; }
         }
 
-        // Exhaustive if there's an irrefutable (wildcard/binding) arm, OR the
-        // scrutinee is an enum and every variant tag is covered by an unguarded
-        // variant arm.
-        let enum_exhaustive = match &enum_info {
-            Some((_, _, variants)) => variants.iter().all(|(t, _)| covered_tags.contains(t)),
-            None => false,
-        };
-        if !saw_irrefutable && !enum_exhaustive {
+        // Exhaustiveness over the unguarded arms (a guard may always fail).
+        let unguarded: Vec<&Pattern> = arms.iter().filter(|a| a.guard.is_none()).map(|a| &a.pattern).collect();
+        if !self.match_exhaustive(&sty, &unguarded, span)? {
             return err(
                 "non-exhaustive match: add a `_` wildcard or binding arm to cover all cases",
                 span,
             );
         }
-        // The chain's innermost else is reached only if NO arm matched. When the
-        // match is exhaustive purely via enum-variant coverage (no wildcard), the
-        // LAST arm is guaranteed to match if reached, so we drop its condition —
-        // it becomes the unconditional base of the chain. (Its pattern bindings
-        // still apply.) This avoids a dangling empty `else` that would produce a
-        // malformed PHI in codegen.
-        if !saw_irrefutable && enum_exhaustive {
+        // The chain's innermost else is reached only if no arm matched, which
+        // exhaustiveness rules out. If the last arm is unguarded, any value
+        // reaching it matches it (every other unguarded arm already failed), so
+        // its test is dropped; this also avoids an empty value-less `else`.
+        // A guarded last arm keeps its test and gets an unreachable `else`.
+        let last_guarded = arms.last().is_some_and(|a| a.guard.is_some());
+        if !last_guarded {
             if let Some(last) = built.last_mut() {
                 last.cond = None;
             }
@@ -1803,43 +1836,32 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let rty = result_ty.unwrap_or_else(Ty::unit);
         let repr = self.repr_of(&rty, span)?;
 
-        // Fold the arms into nested ifs, from the last arm up. Each arm with
-        // bindings is wrapped as `{ let binds...; if cond { body } else { rest } }`
-        // so the pattern bindings are in scope for BOTH the condition (guard) and
-        // the body. The innermost "else" is unreachable (the exhaustiveness check
-        // guarantees a prior irrefutable arm covers it).
+        // Fold the arms into nested ifs, from the last arm up:
+        // `if cond { let binds...; body } else { rest }`. Bindings read the
+        // scrutinee's payloads, so they run only once the test has passed (a
+        // guarded arm already ran them inside its condition). The innermost
+        // "else" is unreachable: the exhaustiveness check guarantees coverage.
         let unit_repr = repr.clone();
-        let mut chain: Option<CoreExpr> = None;
+        let mut chain: Option<CoreExpr> = if last_guarded {
+            let msg = CoreExpr::new(CoreExprKind::ConstStr("no match arm applies (compiler invariant)".into()), Repr::Ref(self.string_layout_id(span)?));
+            Some(CoreExpr::new(CoreExprKind::Panic(Box::new(msg)), Repr::Unit))
+        } else {
+            None
+        };
         for b in built.into_iter().rev() {
             let bind_stmts: Vec<CoreStmt> = b.binds.into_iter().map(|(id, init)| CoreStmt::Let(id, init)).collect();
+            let arm_body = CoreBlock { stmts: bind_stmts, tail: Some(b.body) };
             let arm_expr = match b.cond {
-                None => {
-                    // Irrefutable arm: just `{ let binds...; body }`.
-                    CoreExpr::new(
-                        CoreExprKind::Block(Box::new(CoreBlock { stmts: bind_stmts, tail: Some(b.body) })),
-                        unit_repr.clone(),
-                    )
-                }
+                None => CoreExpr::new(CoreExprKind::Block(Box::new(arm_body)), unit_repr.clone()),
                 Some(cond) => {
-                    let then_block = CoreBlock { stmts: vec![], tail: Some(b.body) };
                     let else_block = match chain.take() {
                         Some(e) => CoreBlock { stmts: vec![], tail: Some(e) },
                         None => CoreBlock { stmts: vec![], tail: None },
                     };
-                    let iff = CoreExpr::new(
-                        CoreExprKind::If(Box::new(cond), Box::new(then_block), Box::new(else_block)),
+                    CoreExpr::new(
+                        CoreExprKind::If(Box::new(cond), Box::new(arm_body), Box::new(else_block)),
                         unit_repr.clone(),
-                    );
-                    // Wrap the `if` in a block that first emits the pattern binds,
-                    // so the guard (inside `cond`) can reference them.
-                    if bind_stmts.is_empty() {
-                        iff
-                    } else {
-                        CoreExpr::new(
-                            CoreExprKind::Block(Box::new(CoreBlock { stmts: bind_stmts, tail: Some(iff) })),
-                            unit_repr.clone(),
-                        )
-                    }
+                    )
                 }
             };
             chain = Some(arm_expr);
@@ -1854,23 +1876,28 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok((CoreExpr::new(CoreExprKind::Block(Box::new(block)), repr), rty))
     }
 
-    /// Compute the boolean test for a pattern against `scrut` (already a core
-    /// expr referencing the scrutinee local), plus any bindings it introduces
-    /// (each binding is bound into the current scope AND returned as a
-    /// (LocalId, init-expr) so the caller can emit the `let`). Returns
-    /// `(cond, binds, irrefutable)` where `cond == None` means "always matches".
+    /// Compute the test for `pat` against `scrut` (a core expr that is cheap to
+    /// repeat, normally a local) and the bindings it introduces. Returns
+    /// `(cond, binds, irrefutable)`; `cond == None` means it always matches.
+    ///
+    /// Sub-patterns are tested left to right with short-circuit `&&`, so a
+    /// payload is only read after its enum tag has been checked. Each binding
+    /// is a `(LocalId, init)` pair that the caller must evaluate only after
+    /// `cond` holds; the names are bound into the current scope here.
     fn pattern_test(
         &mut self,
         pat: &Pattern,
         scrut: &CoreExpr,
         sty: &Ty,
-        enum_info: &Option<(String, Vec<Ty>, Vec<(u32, Vec<Ty>)>)>,
         span: Span,
     ) -> LResult<(Option<CoreExpr>, Vec<(LocalId, CoreExpr)>, bool)> {
+        let bool_repr = Repr::Scalar(ScalarRepr::Bool);
+        let and_all = |conds: Vec<CoreExpr>| -> Option<CoreExpr> {
+            conds.into_iter().reduce(|a, b| CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(a), Box::new(b)), bool_repr.clone()))
+        };
         match &pat.kind {
             PatternKind::Wildcard => Ok((None, vec![], true)),
             PatternKind::Binding { name, is_mut } => {
-                // Bind the whole scrutinee to `name`.
                 let id = self.fresh_local(scrut.repr.clone(), sty.clone());
                 self.bind_mut(name, id, sty.clone(), *is_mut);
                 Ok((None, vec![(id, scrut.clone())], true))
@@ -1880,53 +1907,289 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((Some(cond), vec![], false))
             }
             PatternKind::Variant { path, payload } => {
-                let Some((enum_name, _eargs, variants)) = enum_info else {
-                    return err("variant pattern in a match on a non-enum", span);
-                };
-                let vlast = path.last();
-                let (tag, ptys) = self.variant_in(enum_name, vlast, variants, span)?;
-                if payload.len() != ptys.len() {
-                    return err(format!("variant `{}` binds {} fields, pattern has {}", vlast, ptys.len(), payload.len()), span);
+                let (tag, fields) = self.variant_fields(sty, path, span)?;
+                if payload.len() != fields.len() {
+                    return err(format!("variant `{}` has {} fields, pattern has {}", path.last(), fields.len(), payload.len()), span);
                 }
-                // tag check: load the enum tag and compare. For a reference enum
-                // the tag lives in the object; we expose it via a dedicated core
-                // read. Reuse the existing Match machinery is overkill here, so
-                // compare against an `EnumTag` read.
-                let tag_read = CoreExpr::new(CoreExprKind::EnumTag(Box::new(scrut.clone())), Repr::Scalar(ScalarRepr::I32));
-                let tag_const = CoreExpr::new(CoreExprKind::ConstInt(tag as u64, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
-                let cond = CoreExpr::new(CoreExprKind::Bin(BinOp::Eq, Box::new(tag_read), Box::new(tag_const)), Repr::Scalar(ScalarRepr::Bool));
-                // Bind payload fields (only simple bindings supported in the chain
-                // for now; nested patterns within a guarded/literal match are a
-                // later step).
-                // Reprs of all payload fields (the physical slot of each field
-                // depends on the full list — ptr and raw payloads are separate).
-                let payload_reprs: Vec<Repr> = ptys.iter().map(|t| self.repr_of(t, span)).collect::<LResult<_>>()?;
-                let mut binds = Vec::new();
-                for (i, (p, pty)) in payload.iter().zip(&ptys).enumerate() {
-                    let prepr = payload_reprs[i].clone();
-                    let field = CoreExpr::new(
-                        CoreExprKind::EnumPayload {
-                            scrutinee: Box::new(scrut.clone()),
-                            field: i as u32,
-                            repr: prepr.clone(),
-                            payload_reprs: payload_reprs.clone(),
-                        },
-                        prepr.clone(),
-                    );
-                    match &p.kind {
-                        PatternKind::Wildcard => {}
-                        PatternKind::Binding { name, is_mut } => {
-                            let id = self.fresh_local(prepr, pty.clone());
-                            self.bind_mut(name, id, pty.clone(), *is_mut);
-                            binds.push((id, field));
+                let subpatterns: Vec<&Pattern> = payload.iter().collect();
+                self.variant_test(scrut, tag, &fields, &subpatterns, span)
+            }
+            PatternKind::Struct { path, fields, rest } => {
+                if let Ty::Named { name, .. } = sty {
+                    if self.ctx.enums.contains_key(name) {
+                        // `Enum::Variant { a, b }`: a variant with named fields.
+                        let (tag, vfields) = self.variant_fields(sty, path, span)?;
+                        let names = self.variant_field_names(name, tag);
+                        let mut subpatterns: Vec<&Pattern> = Vec::new();
+                        let wildcard = Pattern { kind: PatternKind::Wildcard, span };
+                        let mut picked: Vec<Option<&Pattern>> = vec![None; vfields.len()];
+                        for (fname, fpat) in fields {
+                            let i = names.iter().position(|n| n == fname).ok_or_else(|| LowerError {
+                                msg: format!("variant `{}` has no field `{}`", path.last(), fname),
+                                span: fpat.span,
+                            })?;
+                            picked[i] = Some(fpat);
                         }
-                        _ => return err("nested patterns inside a guarded/scalar match are not yet supported", p.span),
+                        if !*rest && picked.iter().any(|p| p.is_none()) {
+                            return err(format!("pattern for `{}` does not mention every field; add `..`", path.last()), span);
+                        }
+                        for p in &picked { subpatterns.push(p.unwrap_or(&wildcard)); }
+                        return self.variant_test(scrut, tag, &vfields, &subpatterns, span);
                     }
                 }
-                Ok((Some(cond), binds, false))
+                let Ty::Named { name, .. } = sty else {
+                    return err(format!("struct pattern against `{}`", ty_display(sty)), span);
+                };
+                if name.rsplit("::").next() != Some(path.last()) {
+                    return err(format!("pattern for `{}` against a `{}`", path.last(), ty_display(sty)), span);
+                }
+                let def = self.ctx.structs.get(name).cloned()
+                    .ok_or_else(|| LowerError { msg: format!("`{}` is not a struct", name), span })?;
+                let StructBody::Named(def_fields) = &def.body else {
+                    return err(format!("`{}` has no named fields", path.last()), span);
+                };
+                if !*rest && fields.len() != def_fields.len() {
+                    return err(format!("pattern for `{}` does not mention every field; add `..`", path.last()), span);
+                }
+                let mut conds = Vec::new();
+                let mut binds = Vec::new();
+                let mut irrefutable = true;
+                for (fname, fpat) in fields {
+                    let (field, fty) = self.field_read(scrut.clone(), sty, fname, fpat.span)?;
+                    let (c, b, irr) = self.pattern_test(fpat, &field, &fty, fpat.span)?;
+                    conds.extend(c);
+                    binds.extend(b);
+                    irrefutable &= irr;
+                }
+                Ok((and_all(conds), binds, irrefutable))
             }
-            PatternKind::Tuple(_) => err("tuple patterns are not yet supported in v0", span),
-            PatternKind::Struct { .. } => err("struct patterns are not yet supported in v0", span),
+            PatternKind::Tuple(ps) => {
+                let Ty::Tuple(elems) = sty else {
+                    return err(format!("tuple pattern against `{}`", ty_display(sty)), span);
+                };
+                if ps.len() != elems.len() {
+                    return err(format!("tuple pattern has {} elements, the value has {}", ps.len(), elems.len()), span);
+                }
+                let mut conds = Vec::new();
+                let mut binds = Vec::new();
+                let mut irrefutable = true;
+                for (i, (p, ety)) in ps.iter().zip(elems).enumerate() {
+                    let erepr = self.repr_of(ety, p.span)?;
+                    let field = CoreExpr::new(
+                        CoreExprKind::Field { base: Box::new(scrut.clone()), loc: FieldLoc::ValueField { index: i as u32 } },
+                        erepr,
+                    );
+                    let (c, b, irr) = self.pattern_test(p, &field, ety, p.span)?;
+                    conds.extend(c);
+                    binds.extend(b);
+                    irrefutable &= irr;
+                }
+                Ok((and_all(conds), binds, irrefutable))
+            }
+        }
+    }
+
+    /// The test for an enum variant with the given payload sub-patterns: the
+    /// tag check first, then each payload's own test.
+    fn variant_test(
+        &mut self,
+        scrut: &CoreExpr,
+        tag: u32,
+        fields: &[Ty],
+        subpatterns: &[&Pattern],
+        span: Span,
+    ) -> LResult<(Option<CoreExpr>, Vec<(LocalId, CoreExpr)>, bool)> {
+        let bool_repr = Repr::Scalar(ScalarRepr::Bool);
+        let tag_read = CoreExpr::new(CoreExprKind::EnumTag(Box::new(scrut.clone())), Repr::Scalar(ScalarRepr::I32));
+        let tag_const = CoreExpr::new(CoreExprKind::ConstInt(tag as u64, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
+        let mut cond = CoreExpr::new(CoreExprKind::Bin(BinOp::Eq, Box::new(tag_read), Box::new(tag_const)), bool_repr.clone());
+        // The physical slot of each payload field depends on the whole list.
+        let payload_reprs: Vec<Repr> = fields.iter().map(|t| self.repr_of(t, span)).collect::<LResult<_>>()?;
+        let mut binds = Vec::new();
+        for (i, (p, fty)) in subpatterns.iter().zip(fields).enumerate() {
+            let field = CoreExpr::new(
+                CoreExprKind::EnumPayload {
+                    scrutinee: Box::new(scrut.clone()),
+                    field: i as u32,
+                    repr: payload_reprs[i].clone(),
+                    payload_reprs: payload_reprs.clone(),
+                },
+                payload_reprs[i].clone(),
+            );
+            let (c, b, _) = self.pattern_test(p, &field, fty, p.span)?;
+            if let Some(c) = c {
+                cond = CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(cond), Box::new(c)), bool_repr.clone());
+            }
+            binds.extend(b);
+        }
+        Ok((Some(cond), binds, false))
+    }
+
+    /// Is a match over `sty` with these unguarded arm patterns exhaustive?
+    /// A wildcard row is "useful" against the arms exactly when some value
+    /// matches none of them (Maranget's usefulness algorithm).
+    fn match_exhaustive(&mut self, sty: &Ty, patterns: &[&Pattern], span: Span) -> LResult<bool> {
+        let mut rows = Vec::new();
+        for p in patterns {
+            rows.push(vec![self.space_pat(p, sty, span)?]);
+        }
+        Ok(!self.useful(&rows, &[SpacePat::Wild], &[sty.clone()], span)?)
+    }
+
+    /// Normalize a pattern for the exhaustiveness check.
+    fn space_pat(&mut self, p: &Pattern, ty: &Ty, span: Span) -> LResult<SpacePat> {
+        Ok(match &p.kind {
+            PatternKind::Wildcard | PatternKind::Binding { .. } => SpacePat::Wild,
+            PatternKind::Literal(LitPattern::Bool(b)) => SpacePat::Ctor(*b as u32, vec![]),
+            PatternKind::Literal(lit) => SpacePat::Lit(format!("{:?}", lit)),
+            PatternKind::Variant { path, payload } => {
+                let (tag, fields) = self.variant_fields(ty, path, span)?;
+                let mut subs = Vec::new();
+                for (sp, st) in payload.iter().zip(&fields) { subs.push(self.space_pat(sp, st, span)?); }
+                SpacePat::Ctor(tag, subs)
+            }
+            PatternKind::Struct { path, fields, .. } => {
+                let (tag, names, tys) = match ty {
+                    Ty::Named { name, .. } if self.ctx.enums.contains_key(name) => {
+                        let (tag, tys) = self.variant_fields(ty, path, span)?;
+                        (tag, self.variant_field_names(name, tag), tys)
+                    }
+                    _ => {
+                        let (names, tys) = self.struct_field_tys(ty, span)?;
+                        (0, names, tys)
+                    }
+                };
+                let mut subs = Vec::new();
+                for (n, st) in names.iter().zip(&tys) {
+                    subs.push(match fields.iter().find(|(f, _)| f == n) {
+                        Some((_, sp)) => self.space_pat(sp, st, span)?,
+                        None => SpacePat::Wild,
+                    });
+                }
+                SpacePat::Ctor(tag, subs)
+            }
+            PatternKind::Tuple(ps) => {
+                let Ty::Tuple(elems) = ty else { return err("tuple pattern against a non-tuple", span) };
+                let mut subs = Vec::new();
+                for (sp, st) in ps.iter().zip(elems) { subs.push(self.space_pat(sp, st, span)?); }
+                SpacePat::Ctor(0, subs)
+            }
+        })
+    }
+
+    /// Every constructor of `ty` with its field types, or `None` when the
+    /// type has unboundedly many values (integers, strings, ...).
+    fn constructors(&mut self, ty: &Ty) -> LResult<Option<Vec<(u32, Vec<Ty>)>>> {
+        Ok(match ty {
+            Ty::Prim(Prim::Bool) => Some(vec![(0, vec![]), (1, vec![])]),
+            Ty::Tuple(elems) => Some(vec![(0, elems.clone())]),
+            Ty::Named { name, args } if self.ctx.enums.contains_key(name) => Some(self.enum_variants(name, args)?),
+            Ty::Named { name, .. } if self.ctx.structs.contains_key(name) => {
+                Some(vec![(0, self.struct_field_tys(ty, Span::new(0, 0))?.1)])
+            }
+            _ => None,
+        })
+    }
+
+    /// Field names and types of a struct type, in declaration order.
+    fn struct_field_tys(&mut self, ty: &Ty, span: Span) -> LResult<(Vec<String>, Vec<Ty>)> {
+        let Ty::Named { name, args } = ty else { return err("struct pattern against a non-struct", span) };
+        let s = self.ctx.structs.get(name).cloned()
+            .ok_or_else(|| LowerError { msg: format!("`{}` is not a struct", name), span })?;
+        let StructBody::Named(def_fields) = &s.body else { return err("struct pattern against a non-record struct", span) };
+        let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
+        let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(args.iter().cloned()).collect();
+        let mut names = Vec::new();
+        let mut tys = Vec::new();
+        for f in def_fields {
+            names.push(f.name.clone());
+            tys.push(apply_subst(&lower_type(&f.ty, &gparams, self.ctx).map_err(conv)?, &subst));
+        }
+        Ok((names, tys))
+    }
+
+    /// Is the pattern vector `q` (over column types `tys`) matched by some
+    /// value that no row of `rows` matches?
+    fn useful(&mut self, rows: &[Vec<SpacePat>], q: &[SpacePat], tys: &[Ty], span: Span) -> LResult<bool> {
+        if q.is_empty() {
+            return Ok(rows.is_empty());
+        }
+        let rest_tys = &tys[1..];
+        match &q[0] {
+            SpacePat::Ctor(c, subs) => {
+                let sub_tys = self.ctor_field_tys(&tys[0], *c)?;
+                let spec = specialize_ctor(rows, *c, subs.len());
+                let mut q2 = subs.clone();
+                q2.extend_from_slice(&q[1..]);
+                let mut t2 = sub_tys;
+                t2.extend_from_slice(rest_tys);
+                self.useful(&spec, &q2, &t2, span)
+            }
+            SpacePat::Lit(l) => {
+                let spec: Vec<Vec<SpacePat>> = rows.iter().filter_map(|r| match &r[0] {
+                    SpacePat::Lit(m) if m == l => Some(r[1..].to_vec()),
+                    SpacePat::Wild => Some(r[1..].to_vec()),
+                    _ => None,
+                }).collect();
+                self.useful(&spec, &q[1..], rest_tys, span)
+            }
+            SpacePat::Wild => {
+                let ctors = self.constructors(&tys[0])?;
+                let heads: std::collections::HashSet<u32> = rows.iter().filter_map(|r| match &r[0] {
+                    SpacePat::Ctor(c, _) => Some(*c),
+                    _ => None,
+                }).collect();
+                if let Some(ctors) = ctors.filter(|cs| !cs.is_empty() && cs.iter().all(|(c, _)| heads.contains(c))) {
+                    // Every constructor appears: the wildcard is useful if it
+                    // is useful under some constructor.
+                    for (c, sub_tys) in ctors {
+                        let spec = specialize_ctor(rows, c, sub_tys.len());
+                        let mut q2 = vec![SpacePat::Wild; sub_tys.len()];
+                        q2.extend_from_slice(&q[1..]);
+                        let mut t2 = sub_tys;
+                        t2.extend_from_slice(rest_tys);
+                        if self.useful(&spec, &q2, &t2, span)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                } else {
+                    // Some constructor is missing: only wildcard rows cover it.
+                    let default: Vec<Vec<SpacePat>> = rows.iter()
+                        .filter(|r| matches!(r[0], SpacePat::Wild))
+                        .map(|r| r[1..].to_vec())
+                        .collect();
+                    self.useful(&default, &q[1..], rest_tys, span)
+                }
+            }
+        }
+    }
+
+    /// The field types of constructor `c` of `ty`.
+    fn ctor_field_tys(&mut self, ty: &Ty, c: u32) -> LResult<Vec<Ty>> {
+        Ok(self.constructors(ty)?
+            .and_then(|cs| cs.into_iter().find(|(t, _)| *t == c).map(|(_, tys)| tys))
+            .unwrap_or_default())
+    }
+
+    /// The tag and payload types of the variant `path` of enum type `sty`.
+    fn variant_fields(&mut self, sty: &Ty, path: &Path, span: Span) -> LResult<(u32, Vec<Ty>)> {
+        let Ty::Named { name, args } = sty else {
+            return err(format!("variant pattern against `{}`", ty_display(sty)), span);
+        };
+        if !self.ctx.enums.contains_key(name) {
+            return err(format!("variant pattern against `{}`, which is not an enum", ty_display(sty)), span);
+        }
+        let variants = self.enum_variants(name, args)?;
+        self.variant_in(name, path.last(), &variants, span)
+    }
+
+    /// The field names of variant `tag` of `enum_name` (empty for tuple or
+    /// unit variants).
+    fn variant_field_names(&self, enum_name: &str, tag: u32) -> Vec<String> {
+        match self.ctx.enums.get(enum_name).and_then(|e| e.variants.get(tag as usize)).map(|v| &v.payload) {
+            Some(VariantPayload::Named(fields)) => fields.iter().map(|f| f.name.clone()).collect(),
+            _ => vec![],
         }
     }
 
@@ -3732,6 +3995,30 @@ fn unify_infer(declared: &Ty, actual: &Ty, out: &mut HashMap<String, Ty>) {
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+/// A pattern normalized for the exhaustiveness check: a wildcard, a
+/// constructor (enum variant tag, `false`/`true`, or the single constructor
+/// of a tuple or struct) with sub-patterns, or a literal of an unbounded type.
+#[derive(Clone)]
+enum SpacePat {
+    Wild,
+    Ctor(u32, Vec<SpacePat>),
+    Lit(String),
+}
+
+/// Rows whose head matches constructor `c`, with the head replaced by its
+/// `arity` sub-patterns (a wildcard head expands to wildcards).
+fn specialize_ctor(rows: &[Vec<SpacePat>], c: u32, arity: usize) -> Vec<Vec<SpacePat>> {
+    rows.iter().filter_map(|r| {
+        let mut out = match &r[0] {
+            SpacePat::Ctor(d, subs) if *d == c => subs.clone(),
+            SpacePat::Wild => vec![SpacePat::Wild; arity],
+            _ => return None,
+        };
+        out.extend_from_slice(&r[1..]);
+        Some(out)
+    }).collect()
+}
 
 /// Names for a `for` loop's hidden state. `#` cannot appear in a source
 /// identifier, so these never collide with (or are visible to) user code.

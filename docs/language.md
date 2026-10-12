@@ -57,15 +57,19 @@ iteration a fresh `x`; `continue` is safe. `for x in items` visits a `Vec` or
 and `while let PAT = e` are `match` with a wildcard arm.
 
 Known gaps: a method called directly on `None` cannot infer `T` from its
-arguments. There are no tuple or nested `let` patterns, no range indexing, no
-array literals, and no macros.
+arguments. There is no range indexing, no array literal syntax, and no macros.
 
-## Match limits
+## Patterns
 
-Tests cover enum variants, literal/scalar matches, bindings, guards, and
-exhaustiveness diagnostics. Lowering explicitly rejects nested patterns, tuple
-patterns, and struct patterns in the relevant paths. Do not describe pattern
-matching as complete or infer runtime support from the AST's pattern variants.
+`match`, `if let`, `while let`, and destructuring `let` accept wildcards,
+bindings, literals, enum variants (positional or `Variant { field, .. }`),
+tuples, and structs (`Point { x, y }`, `..` for the rest), nested to any
+depth. A pattern's sub-patterns are tested left to right, and a payload is read
+only after its variant tag has matched. `let` requires an irrefutable pattern.
+
+A `match` must be exhaustive. The check covers nested enum variants, `bool`,
+tuples, and structs; integers and strings need a catch-all arm. Guarded arms
+do not count toward coverage.
 
 ## Contracts needing work
 
