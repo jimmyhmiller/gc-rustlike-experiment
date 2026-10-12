@@ -17,6 +17,8 @@
 #[value]
 enum Option<T> { None, Some(T) }
 
+// Also a value enum, so `?`, `ok_or`, and `map_err` allocate nothing.
+#[value]
 enum Result<T, E> { Ok(T), Err(E) }
 
 // The result of `Ord::cmp`.
@@ -227,6 +229,9 @@ impl<T> Option<T> {
     }
     fn ok_or<E>(self, err: E) -> Result<T, E> {
         match self { Option::Some(x) => Result::Ok(x), Option::None => Result::Err(err) }
+    }
+    fn ok_or_else<E>(self, err: fn() -> E) -> Result<T, E> {
+        match self { Option::Some(x) => Result::Ok(x), Option::None => Result::Err(err()) }
     }
 }
 

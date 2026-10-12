@@ -781,7 +781,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn repr_of(&mut self, ty: &Ty, span: Span) -> LResult<Repr> {
         if is_never(ty) { return Ok(Repr::Unit); }
         if has_placeholder(ty, &self.infer.placeholders) {
-            return err(format!("type `{}` is not yet known", ty_display(ty)), span);
+            // Only a probe has placeholders, and its output is discarded: a
+            // stand-in repr lets it keep gathering constraints.
+            return Ok(Repr::Unit);
         }
         if has_var(ty) { self.infer.unresolved = Some(ty.clone()); }
         self.reg.repr(ty).map_err(|e| LowerError { msg: e.0, span })
@@ -902,114 +904,18 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let mut stmts = Vec::new();
         let mut diverges = false;
         for s in &b.stmts {
-            match s {
-                Stmt::Let { pattern, ty, init, span } => {
-                    let (name, is_mut) = match &pattern.kind {
-                        PatternKind::Binding { name, is_mut } => (name.clone(), *is_mut),
-                        PatternKind::Wildcard => ("_".to_string(), false),
-                        _ => {
-                            let Some(init) = init else {
-                                return err("a destructuring `let` needs an initializer", *span);
-                            };
-                            diverges |= self.let_pattern(pattern, ty.as_ref(), init, *span, &mut stmts)?;
-                            continue;
-                        }
-                    };
-                    match init {
-                        Some(e) => {
-                            let expected = match ty {
-                                Some(t) => Some(ground_type(t, &self.subst.clone(), self.ctx)?),
-                                None => self.infer.solved_lets.get(&span_key(*span)).cloned(),
-                            };
-                            self.infer.unresolved = None;
-                            let lowered = self.expr(e, expected.as_ref());
-                            let (init_expr, init_ty) = {
-                                let (ce, at) = match lowered {
-                                    Ok(v) => v,
-                                    Err(error) => {
-                                        // An unannotated `let` whose initializer leaves type
-                                        // parameters open (`Vec::new()`, `None`): its type
-                                        // comes from a later use. See `LetInference`.
-                                        let open = self.infer.unresolved.take()
-                                            .filter(|_| expected.is_none() && error.span == e.span);
-                                        let Some(partial) = open else { return Err(error) };
-                                        if !self.infer.probing {
-                                            if self.infer.needs.is_none() {
-                                                self.infer.needs = Some((*span, name.clone()));
-                                            }
-                                            return Err(error);
-                                        }
-                                        let key = span_key(*span);
-                                        let mut ids = HashMap::new();
-                                        let template = placeholder_template(&partial, &mut ids, &mut self.infer.next_placeholder);
-                                        for id in ids.values() { self.infer.placeholders.insert(*id, key); }
-                                        self.infer.templates.push((key, template.clone()));
-                                        let id = self.fresh_local(Repr::Unit, template.clone());
-                                        self.bind_mut(&name, id, template, is_mut);
-                                        continue;
-                                    }
-                                };
-                                // A `let x: T = e` whose `e` doesn't match `T` is
-                                // an error pointing at `e`.
-                                if let Some(exp) = &expected {
-                                    self.check_assignable(&at, exp, e.span)?;
-                                }
-                                (ce, at)
-                            };
-                            // P2 (DWARF): give the statement a source line for
-                            // stepping, unless the value already carries a more
-                            // precise span (e.g. a construction/alloc node).
-                            let init_expr = if init_expr.span == NO_SPAN {
-                                let sid = self.mono.intern_span(e.span);
-                                init_expr.at(sid)
-                            } else {
-                                init_expr
-                            };
-                            diverges |= is_never(&init_ty);
-                            let repr = init_expr.repr.clone();
-                            let id = self.fresh_local(repr, init_ty.clone());
-                            self.bind_mut(&name, id, init_ty, is_mut);
-                            stmts.push(CoreStmt::Let(id, init_expr));
-                        }
-                        // Deferred initialization: `let mut x: T;`. Requires a type
-                        // annotation (nothing to infer from) and `mut` (the binding
-                        // will be assigned later — see docs/mutability.md). The slot
-                        // is zero-initialized; a later `x = ...` fills it.
-                        None => {
-                            let Some(t) = ty else {
-                                return err("`let` without an initializer needs a type annotation (`let mut x: T;`)", *span);
-                            };
-                            if !is_mut {
-                                return err("a deferred-initialization `let` must be `mut` (it is assigned later): write `let mut`", *span);
-                            }
-                            let dty = ground_type(t, &self.subst.clone(), self.ctx)?;
-                            let repr = self.repr_of(&dty, *span)?;
-                            let id = self.fresh_local(repr.clone(), dty.clone());
-                            self.bind_mut(&name, id, dty.clone(), is_mut);
-                            // Zero-initialize so the slot is well-defined before the
-                            // first assignment (and GC-safe for ref slots → null).
-                            let zero = self.zero_value(&repr);
-                            stmts.push(CoreStmt::Let(id, zero));
-                        }
-                    }
-                }
-                Stmt::Expr(e) => {
-                    let (ce, statement_ty) = self.expr(e, None)?;
-                    diverges |= is_never(&statement_ty);
-                    let ce = if ce.span == NO_SPAN {
-                        let sid = self.mono.intern_span(e.span);
-                        ce.at(sid)
-                    } else {
-                        ce
-                    };
-                    stmts.push(CoreStmt::Expr(ce));
-                }
-                Stmt::Item(_) => return err("nested items not supported in v0", b.span),
+            if let Err(e) = self.block_stmt(s, b, &mut stmts, &mut diverges) {
+                if self.probe_tolerates() { continue; }
+                return Err(e);
             }
         }
         let (tail, ty) = match &b.tail {
             Some(e) => {
-                let (ce, t) = self.expr(e, expected)?;
+                let (ce, t) = match self.expr(e, expected) {
+                    Ok(v) => v,
+                    Err(_) if self.probe_tolerates() => (CoreExpr::new(CoreExprKind::Unit, Repr::Unit), Ty::unit()),
+                    Err(e) => return Err(e),
+                };
                 // P2 (DWARF): the block's tail/result expression is steppable.
                 let ce = if ce.span == NO_SPAN {
                     let sid = self.mono.intern_span(e.span);
@@ -1023,6 +929,122 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         self.pop_scope();
         Ok((CoreBlock { stmts, tail }, if diverges { never_ty() } else { ty }))
+    }
+
+    /// During a `let` inference probe, an error that has not solved anything
+    /// is skipped so later statements can still contribute constraints. The
+    /// probe's output is discarded; the real attempt reports every error.
+    fn probe_tolerates(&self) -> bool {
+        self.infer.probing && self.infer.solution.is_none()
+    }
+
+    /// Lower one statement of a block into `stmts`.
+    fn block_stmt(&mut self, s: &Stmt, b: &Block, stmts: &mut Vec<CoreStmt>, diverges: &mut bool) -> LResult<()> {
+        match s {
+            Stmt::Let { pattern, ty, init, span } => {
+                let (name, is_mut) = match &pattern.kind {
+                    PatternKind::Binding { name, is_mut } => (name.clone(), *is_mut),
+                    PatternKind::Wildcard => ("_".to_string(), false),
+                    _ => {
+                        let Some(init) = init else {
+                            return err("a destructuring `let` needs an initializer", *span);
+                        };
+                        *diverges |= self.let_pattern(pattern, ty.as_ref(), init, *span, stmts)?;
+                        return Ok(());
+                    }
+                };
+                match init {
+                    Some(e) => {
+                        let expected = match ty {
+                            Some(t) => Some(ground_type(t, &self.subst.clone(), self.ctx)?),
+                            None => self.infer.solved_lets.get(&span_key(*span)).cloned(),
+                        };
+                        self.infer.unresolved = None;
+                        let lowered = self.expr(e, expected.as_ref());
+                        let (init_expr, init_ty) = {
+                            let (ce, at) = match lowered {
+                                Ok(v) => v,
+                                Err(error) => {
+                                    // An unannotated `let` whose initializer leaves type
+                                    // parameters open (`Vec::new()`, `None`): its type
+                                    // comes from a later use. See `LetInference`.
+                                    let open = self.infer.unresolved.take()
+                                        .filter(|_| expected.is_none() && error.span == e.span);
+                                    let Some(partial) = open else { return Err(error) };
+                                    if !self.infer.probing {
+                                        if self.infer.needs.is_none() {
+                                            self.infer.needs = Some((*span, name.clone()));
+                                        }
+                                        return Err(error);
+                                    }
+                                    let key = span_key(*span);
+                                    let mut ids = HashMap::new();
+                                    let template = placeholder_template(&partial, &mut ids, &mut self.infer.next_placeholder);
+                                    for id in ids.values() { self.infer.placeholders.insert(*id, key); }
+                                    self.infer.templates.push((key, template.clone()));
+                                    let id = self.fresh_local(Repr::Unit, template.clone());
+                                    self.bind_mut(&name, id, template, is_mut);
+                                    return Ok(());
+                                }
+                            };
+                            // A `let x: T = e` whose `e` doesn't match `T` is
+                            // an error pointing at `e`.
+                            if let Some(exp) = &expected {
+                                self.check_assignable(&at, exp, e.span)?;
+                            }
+                            (ce, at)
+                        };
+                        // P2 (DWARF): give the statement a source line for
+                        // stepping, unless the value already carries a more
+                        // precise span (e.g. a construction/alloc node).
+                        let init_expr = if init_expr.span == NO_SPAN {
+                            let sid = self.mono.intern_span(e.span);
+                            init_expr.at(sid)
+                        } else {
+                            init_expr
+                        };
+                        *diverges |= is_never(&init_ty);
+                        let repr = init_expr.repr.clone();
+                        let id = self.fresh_local(repr, init_ty.clone());
+                        self.bind_mut(&name, id, init_ty, is_mut);
+                        stmts.push(CoreStmt::Let(id, init_expr));
+                    }
+                    // Deferred initialization: `let mut x: T;`. Requires a type
+                    // annotation (nothing to infer from) and `mut` (the binding
+                    // will be assigned later — see docs/mutability.md). The slot
+                    // is zero-initialized; a later `x = ...` fills it.
+                    None => {
+                        let Some(t) = ty else {
+                            return err("`let` without an initializer needs a type annotation (`let mut x: T;`)", *span);
+                        };
+                        if !is_mut {
+                            return err("a deferred-initialization `let` must be `mut` (it is assigned later): write `let mut`", *span);
+                        }
+                        let dty = ground_type(t, &self.subst.clone(), self.ctx)?;
+                        let repr = self.repr_of(&dty, *span)?;
+                        let id = self.fresh_local(repr.clone(), dty.clone());
+                        self.bind_mut(&name, id, dty.clone(), is_mut);
+                        // Zero-initialize so the slot is well-defined before the
+                        // first assignment (and GC-safe for ref slots → null).
+                        let zero = self.zero_value(&repr);
+                        stmts.push(CoreStmt::Let(id, zero));
+                    }
+                }
+            }
+            Stmt::Expr(e) => {
+                let (ce, statement_ty) = self.expr(e, None)?;
+                *diverges |= is_never(&statement_ty);
+                let ce = if ce.span == NO_SPAN {
+                    let sid = self.mono.intern_span(e.span);
+                    ce.at(sid)
+                } else {
+                    ce
+                };
+                stmts.push(CoreStmt::Expr(ce));
+            }
+            Stmt::Item(_) => return err("nested items not supported in v0", b.span),
+        }
+        Ok(())
     }
 
     /// `let PAT = init;` for a tuple or struct pattern. The pattern must be
@@ -1652,6 +1674,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
         let (cscrut, sty) = self.expr(scrutinee, None)?;
+        if self.infer.probing && has_placeholder(&sty, &self.infer.placeholders) {
+            return self.probe_match(&sty, arms, expected);
+        }
 
         // Dispatch: the fast tag-switch path handles a pure enum match with only
         // variant/wildcard arms and no guards. Anything else — a scalar/string
@@ -1756,6 +1781,59 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             _ => CoreExprKind::Match { scrutinee: Box::new(cscrut), arms: carms },
         };
         Ok((CoreExpr::new(node, repr), rty))
+    }
+
+    /// A `let` inference probe matching on a value whose type is still a
+    /// placeholder: bind each arm's names with placeholder types and lower
+    /// the guards and bodies only for the constraints they produce.
+    fn probe_match(&mut self, sty: &Ty, arms: &[MatchArm], expected: Option<&Ty>) -> LResult<(CoreExpr, Ty)> {
+        let mut result: Option<Ty> = None;
+        for arm in arms {
+            self.push_scope();
+            self.bind_probe_pattern(&arm.pattern, sty);
+            let mut lowered = Ok(());
+            if let Some(g) = &arm.guard {
+                lowered = self.expr(g, Some(&Ty::bool())).map(|_| ());
+            }
+            if lowered.is_ok() {
+                lowered = self.expr(&arm.body, expected).map(|(_, t)| {
+                    if result.is_none() && !is_never(&t) { result = Some(t); }
+                });
+            }
+            self.pop_scope();
+            if let Err(e) = lowered {
+                if !self.probe_tolerates() { return Err(e); }
+            }
+        }
+        Ok((CoreExpr::new(CoreExprKind::Unit, Repr::Unit), result.unwrap_or_else(Ty::unit)))
+    }
+
+    /// Bind a pattern's names for `probe_match`, as far as the type allows.
+    fn bind_probe_pattern(&mut self, p: &Pattern, ty: &Ty) {
+        match &p.kind {
+            PatternKind::Binding { name, is_mut } => {
+                let id = self.fresh_local(Repr::Unit, ty.clone());
+                self.bind_mut(name, id, ty.clone(), *is_mut);
+            }
+            PatternKind::Variant { path, payload } => {
+                if let Ok((_, fields)) = self.variant_fields(ty, path, p.span) {
+                    for (sp, fty) in payload.iter().zip(&fields) { self.bind_probe_pattern(sp, fty); }
+                }
+            }
+            PatternKind::Tuple(ps) => {
+                if let Ty::Tuple(elems) = ty {
+                    for (sp, ety) in ps.iter().zip(elems) { self.bind_probe_pattern(sp, ety); }
+                }
+            }
+            PatternKind::Struct { fields, .. } => {
+                if let Ok((names, tys)) = self.struct_field_tys(ty, p.span) {
+                    for (fname, sp) in fields {
+                        if let Some(i) = names.iter().position(|n| n == fname) { self.bind_probe_pattern(sp, &tys[i]); }
+                    }
+                }
+            }
+            PatternKind::Wildcard | PatternKind::Literal(_) => {}
+        }
     }
 
     /// Lower a match as a sequential if-else decision chain. Handles scalar /
@@ -3062,10 +3140,19 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         let enum_name = name.clone();
         let kind = enum_name.rsplit("::").next().unwrap();
-        let (ok_tag, err_tag) = match kind {
-            "Result" | "Option" => (0u32, 1u32),
+        let (ok_name, err_name) = match kind {
+            "Result" => ("Ok", "Err"),
+            "Option" => ("Some", "None"),
             _ => return err("`?` operand must be a Result or Option", span),
         };
+        let tag_of = |this: &Self, variant: &str| -> LResult<u32> {
+            this.ctx.enums.get(&enum_name)
+                .and_then(|e| e.variants.iter().position(|v| v.name == variant))
+                .map(|i| i as u32)
+                .ok_or_else(|| LowerError { msg: format!("`{}` has no variant `{}`", kind, variant), span })
+        };
+        let ok_tag = tag_of(self, ok_name)?;
+        let err_tag = tag_of(self, err_name)?;
         // Determine ok-payload type from the scrutinee's args.
         let variants = self.enum_variants(&enum_name, args)?;
         let ok_payload = variants.iter().find(|(t, _)| *t == ok_tag).map(|(_, p)| p.clone()).unwrap_or_default();
@@ -3082,9 +3169,6 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             return err("`?` return-type mismatch with the function", span);
         }
         let ret_repr = self.repr_of(&ret_ty, span)?;
-        let Repr::Ref(ret_lid) = ret_repr else {
-            return err("`?` on a value-enum return is not supported", span);
-        };
 
         // Ok arm: bind payload to a local; body = that local.
         let ok_local = self.fresh_local(ok_repr.clone(), ok_ty.clone());
@@ -3100,27 +3184,36 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let elocal = self.fresh_local(erepr.clone(), ety);
             (vec![elocal], vec![CoreExpr::new(CoreExprKind::Local(elocal), erepr)])
         };
-        // Build the return value: MakeVariant of the fn's return enum, err_tag.
-        // This is a real heap alloc (gen_alloc) — span it with the `?` location so
+        // Build the return value: the fn's return enum, err_tag. For a
+        // reference enum this is a heap alloc — span it with the `?` location so
         // `?`-induced allocations carry a file:line:col (best available for desugar).
         let _ = rargs;
         let sid = self.mono.intern_span(span);
-        let rebuilt = CoreExpr::new(
-            CoreExprKind::MakeVariant { layout: ret_lid, tag: err_tag, fields: err_fields },
-            Repr::Ref(ret_lid),
-        )
-        .at(sid);
+        let rebuilt = match ret_repr {
+            Repr::Ref(ret_lid) => CoreExpr::new(
+                CoreExprKind::MakeVariant { layout: ret_lid, tag: err_tag, fields: err_fields },
+                Repr::Ref(ret_lid),
+            )
+            .at(sid),
+            Repr::Value(ret_vid) => CoreExpr::new(
+                CoreExprKind::MakeValueVariant { value: ret_vid, tag: err_tag, fields: err_fields },
+                Repr::Value(ret_vid),
+            ),
+            _ => return err("`?` requires the function to return a Result/Option", span),
+        };
         let err_body = CoreExpr::new(CoreExprKind::Return(Some(Box::new(rebuilt))), Repr::Unit);
 
         let arms = vec![
             CoreArm { tag: ok_tag, binds: vec![ok_local], body: ok_body },
             CoreArm { tag: err_tag, binds: err_binds, body: err_body },
         ];
-        let m = CoreExpr::new(
-            CoreExprKind::Match { scrutinee: Box::new(cinner), arms },
-            ok_repr,
-        );
-        Ok((m, ok_ty))
+        // Value enums match on the inline aggregate's tag; reference enums on
+        // the heap object's tag word.
+        let node = match &cinner.repr {
+            Repr::Value(_) => CoreExprKind::ValueMatch { scrutinee: Box::new(cinner), arms },
+            _ => CoreExprKind::Match { scrutinee: Box::new(cinner), arms },
+        };
+        Ok((CoreExpr::new(node, ok_repr), ok_ty))
     }
 
     /// All (tag, payload-types) of an enum, with the enum's concrete type args

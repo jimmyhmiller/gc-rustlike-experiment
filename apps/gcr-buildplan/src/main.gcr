@@ -13,49 +13,41 @@ impl Ord for Running {
 }
 fn failure(message: String) -> i64 { stderr_line("gcr-buildplan: " + message); 1 }
 fn load(text: String) -> Result<Vec<Task>, String> {
-    let rows = match csv_parse(text, 2001, 3) { Ok(r) => r, Err(e) => { return Err(e.to_string()); } };
+    let rows = csv_parse(text, 2001, 3).map_err(|e| e.to_string())?;
     if rows.is_empty() { return Err("missing task,duration,depends header"); }
     let header = rows[0];
     if header.len() != 3 || header[0] != "task" || header[1] != "duration" || header[2] != "depends" {
         return Err("expected task,duration,depends header");
     }
-    let mut tasks: Vec<Task> = Vec::new();
-    let mut names: HashMap<String, i64> = HashMap::new();
-    let mut r = 1;
-    while r < rows.len() {
+    let mut tasks = Vec::new();
+    let mut names = HashMap::new();
+    for r in 1..rows.len() {
         let row = rows[r];
         if row.len() != 3 { return Err("wrong field count at record " + (r + 1).to_string()); }
         let name = row[0].trim();
         if name.is_empty() || name.contains(";") { return Err("task names must be nonempty and contain no semicolons"); }
         if names.contains_key(name) { return Err("duplicate task: " + name); }
-        let duration = match row[1].trim().parse_i64() { Some(n) => n, None => { return Err("invalid duration for " + name); } };
+        let duration = row[1].trim().parse_i64().ok_or_else(|| "invalid duration for " + name)?;
         if duration < 0 { return Err("negative duration for " + name); }
         names.insert(name, tasks.len());
         tasks.push(Task { name: name, duration: duration, depends: Vec::new(), children: Vec::new() });
-        r += 1;
     }
     let mut edges = 0;
-    r = 0;
-    while r < tasks.len() {
+    for r in 0..tasks.len() {
         let mut task = tasks[r];
         let text = rows[r + 1][2].trim();
-        if !text.is_empty() {
-            let dependencies = text.split(";");
-            let mut i = 0;
-            while i < dependencies.len() {
-                let name = dependencies[i].trim();
-                let index = match names.get(name) { Some(n) => n, None => { return Err("unknown dependency: " + name); } };
-                if index == r { return Err("self dependency: " + task.name); }
-                if task.depends.contains(index) { return Err("duplicate dependency for " + task.name); }
-                task.depends.push(index);
-                let mut parent = tasks[index];
-                parent.children.push(r);
-                edges += 1;
-                if edges > 10000 { return Err("dependency count exceeds 10000"); }
-                i += 1;
-            }
+        if text.is_empty() { continue; }
+        for dependency in text.split(";") {
+            let name = dependency.trim();
+            let index = names.get(name).ok_or_else(|| "unknown dependency: " + name)?;
+            if index == r { return Err("self dependency: " + task.name); }
+            if task.depends.contains(index) { return Err("duplicate dependency for " + task.name); }
+            task.depends.push(index);
+            let mut parent = tasks[index];
+            parent.children.push(r);
+            edges += 1;
+            if edges > 10000 { return Err("dependency count exceeds 10000"); }
         }
-        r += 1;
     }
     Ok(tasks)
 }
@@ -68,14 +60,12 @@ fn schedule(tasks: Vec<Task>, worker_count: i64) -> Result<Schedule, String> {
     let mut assignments: Array<i64> = Array::new(count);
     let mut complete: Array<bool> = Array::new(count);
     let mut busy: Array<bool> = Array::new(worker_count);
-    let mut ready: MinHeap<Ready> = MinHeap::new();
-    let mut running: MinHeap<Running> = MinHeap::new();
-    let mut i = 0;
-    while i < count {
+    let mut ready = MinHeap::new();
+    let mut running = MinHeap::new();
+    for i in 0..count {
         let task = tasks[i];
         pending[i] = task.depends.len();
         if task.depends.is_empty() { ready.push(Ready { name: task.name, index: i }); }
-        i += 1;
     }
     let mut completed = 0;
     let mut now = 0;
@@ -84,7 +74,7 @@ fn schedule(tasks: Vec<Task>, worker_count: i64) -> Result<Schedule, String> {
         while running.len() < worker_count && !ready.is_empty() {
             let job = ready.pop().expect("ready queue invariant");
             let task = tasks[job.index];
-            let end = match now.checked_add(task.duration) { Some(n) => n, None => { return Err("schedule duration overflow"); } };
+            let end = now.checked_add(task.duration).ok_or("schedule duration overflow")?;
             let mut worker = 0;
             while busy[worker] { worker += 1; }
             busy[worker] = true;
@@ -94,56 +84,46 @@ fn schedule(tasks: Vec<Task>, worker_count: i64) -> Result<Schedule, String> {
             running.push(Running { name: task.name, index: job.index, finish: end, worker: worker });
         }
         if running.is_empty() {
-            let mut blocked: Vec<String> = Vec::new();
-            i = 0;
-            while i < count { if !complete[i] { blocked.push(tasks[i].name); } i += 1; }
+            let mut blocked = Vec::new();
+            for i in 0..count { if !complete[i] { blocked.push(tasks[i].name); } }
             blocked.sort();
             return Err("dependency cycle or blocked tasks: " + blocked.join(", "));
         }
         now = running.peek().expect("running queue invariant").finish;
         // Finish every job at this instant before dispatching lexically ready jobs.
-        loop {
-            match running.peek() {
-                Some(event) => { if event.finish != now { break; } },
-                None => { break; }
-            };
-            let event = running.pop().expect("running queue invariant");
+        while let Some(event) = running.peek() {
+            if event.finish != now { break; }
+            running.pop();
             let task = tasks[event.index];
             busy[event.worker] = false;
             complete[event.index] = true;
             completed += 1;
-            let path_end = match earliest[event.index].checked_add(task.duration) { Some(n) => n, None => { return Err("critical path overflow"); } };
+            let path_end = earliest[event.index].checked_add(task.duration).ok_or("critical path overflow")?;
             critical = critical.max(path_end);
-            i = 0;
-            while i < task.children.len() {
-                let child = task.children[i];
+            for child in task.children {
                 let remaining = pending[child] - 1;
                 pending[child] = remaining;
                 earliest[child] = earliest[child].max(path_end);
                 if remaining == 0 { ready.push(Ready { name: tasks[child].name, index: child }); }
-                i += 1;
             }
         }
     }
     Ok(Schedule { tasks: tasks, starts: starts, finishes: finishes, workers: assignments, makespan: now, critical: critical })
 }
 fn render(plan: Schedule, workers: i64) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts = Vec::new();
     parts.push("{\"workers\":" + workers.to_string() + ",\"makespan\":");
     parts.push(plan.makespan.to_string() + ",\"critical_path\":" + plan.critical.to_string());
     parts.push(",\"tasks\":[");
-    let mut order: Vec<Ready> = Vec::new();
-    let mut i = 0;
-    while i < plan.tasks.len() { order.push(Ready { name: plan.tasks[i].name, index: i }); i += 1; }
+    let mut order = Vec::new();
+    for i in 0..plan.tasks.len() { order.push(Ready { name: plan.tasks[i].name, index: i }); }
     order.sort();
-    i = 0;
-    while i < order.len() {
+    for i in 0..order.len() {
         if i > 0 { parts.push(","); }
         let job = order[i];
         parts.push("{\"task\":" + json_quote(job.name) + ",\"start\":");
         parts.push(plan.starts[job.index].to_string() + ",\"finish\":" + plan.finishes[job.index].to_string());
         parts.push(",\"worker\":" + plan.workers[job.index].to_string() + "}");
-        i += 1;
     }
     parts.push("]}");
     parts.join("")
@@ -151,7 +131,7 @@ fn render(plan: Schedule, workers: i64) -> String {
 fn main() -> i64 {
     let args = match process_args() { Ok(a) => a, Err(e) => { return failure(e.to_string()); } };
     if args.len() != 4 { stderr_line("usage: gcr-buildplan <tasks.csv> <workers:1..64> <output.json|->"); return 2; }
-    let workers = match args[2].parse_i64() { Some(n) => n, None => 0 };
+    let workers = args[2].parse_i64().unwrap_or(0);
     if workers < 1 || workers > 64 { return failure("worker count must be between 1 and 64"); }
     let text = match fs_read_text(args[1], 1048576) { Ok(s) => s, Err(e) => { return failure(e.to_string()); } };
     let tasks = match load(text) { Ok(t) => t, Err(e) => { return failure(e); } };
