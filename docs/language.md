@@ -81,9 +81,13 @@ Built-in macros expand in the parser:
 no references there are no borrowed slices. Indices are bytes for a `String`,
 and an out-of-range bound aborts.
 
+Array literals `[a, b, c]` and `[x; n]` build a fixed-length `[T; N]`
+(`n` must then be an integer literal), or an `Array<T>` where one is expected.
+Both share the runtime array object: indexing, `len()`, `get`, and `for` work
+on either. In `[x; n]`, every slot holds the same value.
+
 Known gaps: a method called directly on `None` cannot infer `T` from its
-arguments. There is no array literal syntax and there are no user-defined
-macros.
+arguments, and there are no user-defined macros.
 
 ## Patterns
 

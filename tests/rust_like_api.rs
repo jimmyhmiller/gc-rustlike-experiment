@@ -544,3 +544,32 @@ fn self_tail_call_beside_a_value_return_in_nested_if() {
     "#);
     assert_eq!(r, 43);
 }
+
+#[test]
+fn array_literals() {
+    let r = run(r#"
+        struct P { x: i64 }
+        fn total(a: [i64; 3]) -> i64 { let mut s = 0; for x in a { s += x; } s }
+        fn main() -> i64 {
+            let a = [10, 20, 12];
+            let mut b: [i64; 4] = [0; 4];
+            b[2] = 5;
+            let names = ["x", "yy"];
+            let dynamic: Array<i64> = [1, 2, 3, 4, 5];
+            let n = 3;
+            let filled: Array<String> = ["z"; n];
+            let ps = [P { x: 1 }, P { x: 2 }];
+            total(a) + b[2] + b.len() + names[1].len() + dynamic.len() + filled.len() + ps[1].x
+        }
+    "#);
+    assert_eq!(r, 63);
+    for (src, want) in [
+        ("let a: [i64; 2] = [1, 2, 3];", "expected an array of length 2, this literal has length 3"),
+        ("let a = [];", "cannot infer the element type of an empty array literal"),
+        ("let n = 2; let a = [0; n];", "must be an integer literal"),
+        ("let a = [1, \"x\"];", "type mismatch: expected `i64`, found `String`"),
+    ] {
+        let msg = compile_error(&format!("fn main() -> i64 {{ {src} 0 }}"));
+        assert!(msg.contains(want), "{src}: {msg}");
+    }
+}

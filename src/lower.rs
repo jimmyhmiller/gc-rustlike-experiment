@@ -353,9 +353,12 @@ fn ty_display(ty: &Ty) -> String {
     }
 }
 
+/// The element type of an `Array<T>` or a fixed-length `[T; N]` (which share
+/// the runtime array object).
 fn array_elem_ty(ty: &Ty) -> Option<Ty> {
     match ty {
         Ty::Named { name, args } if name.rsplit("::").next() == Some("Array") && !args.is_empty() => Some(args[0].clone()),
+        Ty::Array(elem, _) => Some((**elem).clone()),
         _ => None,
     }
 }
@@ -1375,8 +1378,112 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.closure(params, ret, body, expected, e.span)
             }
 
+            ExprKind::Array(lit) => self.array_literal(lit, expected, e.span),
+
             other => err(format!("expression not supported in v0 slice: {:?}", disc(other)), e.span),
         }
+    }
+
+    /// `[a, b, c]` and `[x; n]`. The value is a fixed-length array `[T; N]`,
+    /// or an `Array<T>` where one is expected (then `n` may be computed at
+    /// run time). Both share the runtime array object. In `[x; n]`, `x` is
+    /// evaluated once and every slot holds that same value.
+    fn array_literal(&mut self, lit: &ArrayLit, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let (want_elem, dynamic) = match expected {
+            Some(Ty::Array(e, _)) => (Some((**e).clone()), false),
+            Some(t) => match array_elem_ty(t) { Some(e) => (Some(e), true), None => (None, false) },
+            None => (None, false),
+        };
+        let i64_repr = Repr::Scalar(ScalarRepr::I64);
+        let int = |n: u64| CoreExpr::new(CoreExprKind::ConstInt(n, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+        // Lower the elements (or the repeated value and its count).
+        let (elem_ty, values, count): (Ty, Vec<CoreExpr>, CoreExpr) = match lit {
+            ArrayLit::Elems(es) => {
+                let mut elem_ty = want_elem.clone();
+                let mut values = Vec::new();
+                for el in es {
+                    let (cv, vt) = self.expr(el, elem_ty.as_ref())?;
+                    match &elem_ty {
+                        Some(t) => self.check_assignable(&vt, &t.clone(), el.span)?,
+                        None => elem_ty = Some(vt),
+                    }
+                    values.push(cv);
+                }
+                let elem_ty = elem_ty.ok_or_else(|| LowerError {
+                    msg: "cannot infer the element type of an empty array literal; annotate its type".into(),
+                    span,
+                })?;
+                (elem_ty, values, int(es.len() as u64))
+            }
+            ArrayLit::Repeat(value, count) => {
+                let (cv, vt) = self.expr(value, want_elem.as_ref())?;
+                if let Some(t) = &want_elem { self.check_assignable(&vt, &t.clone(), value.span)?; }
+                let (cc, ct) = self.expr(count, Some(&Ty::i64()))?;
+                self.check_assignable(&ct, &Ty::i64(), count.span)?;
+                (want_elem.unwrap_or(vt), vec![cv], cc)
+            }
+        };
+        let ty = if dynamic {
+            Ty::Named { name: "Array".into(), args: vec![elem_ty.clone()] }
+        } else {
+            let n = match lit {
+                ArrayLit::Elems(es) => es.len() as u64,
+                ArrayLit::Repeat(_, count) => match &*count.kind {
+                    ExprKind::Int(n, _) => *n,
+                    _ => return err("the length in `[x; n]` must be an integer literal (or the literal must initialize an `Array<T>`)", count.span),
+                },
+            };
+            if let Some(Ty::Array(_, want)) = expected {
+                if *want != n {
+                    return err(format!("expected an array of length {}, this literal has length {}", want, n), span);
+                }
+            }
+            Ty::Array(Box::new(elem_ty.clone()), n)
+        };
+        let Repr::Ref(layout) = self.repr_of(&ty, span)? else {
+            return err("array literal without an array representation", span);
+        };
+        let elem = self.repr_of(&elem_ty, span)?;
+        let arr = self.fresh_local(Repr::Ref(layout), ty.clone());
+        let local = |id: LocalId, repr: Repr| CoreExpr::new(CoreExprKind::Local(id), repr);
+        let set = |index: CoreExpr, value: CoreExpr| CoreStmt::Expr(CoreExpr::new(
+            CoreExprKind::ArraySet { array: Box::new(local(arr, Repr::Ref(layout))), index: Box::new(index), value: Box::new(value), elem: elem.clone() },
+            Repr::Scalar(ScalarRepr::I64),
+        ));
+        let mut stmts = Vec::new();
+        match lit {
+            ArrayLit::Elems(_) => {
+                stmts.push(CoreStmt::Let(arr, CoreExpr::new(CoreExprKind::ArrayNew { layout, len: Box::new(count), elem: elem.clone() }, Repr::Ref(layout))));
+                for (i, v) in values.into_iter().enumerate() {
+                    stmts.push(set(int(i as u64), v));
+                }
+            }
+            ArrayLit::Repeat(..) => {
+                // let n = count; let arr = new(n); let v = value; let mut i = 0;
+                // loop { if i >= n { break } arr[i] = v; i = i + 1 }
+                let n = self.fresh_local(i64_repr.clone(), Ty::i64());
+                let v = self.fresh_local(elem.clone(), elem_ty.clone());
+                let i = self.fresh_local(i64_repr.clone(), Ty::i64());
+                stmts.push(CoreStmt::Let(n, count));
+                stmts.push(CoreStmt::Let(arr, CoreExpr::new(CoreExprKind::ArrayNew { layout, len: Box::new(local(n, i64_repr.clone())), elem: elem.clone() }, Repr::Ref(layout))));
+                stmts.push(CoreStmt::Let(v, values.into_iter().next().unwrap()));
+                stmts.push(CoreStmt::Let(i, int(0)));
+                let done = CoreExpr::new(CoreExprKind::Bin(BinOp::Ge, Box::new(local(i, i64_repr.clone())), Box::new(local(n, i64_repr.clone()))), Repr::Scalar(ScalarRepr::Bool));
+                let exit = CoreExpr::new(CoreExprKind::If(
+                    Box::new(done),
+                    Box::new(CoreBlock { stmts: vec![], tail: Some(CoreExpr::new(CoreExprKind::Break(None), Repr::Unit)) }),
+                    Box::new(CoreBlock { stmts: vec![], tail: None }),
+                ), Repr::Unit);
+                let step = CoreExpr::new(CoreExprKind::Assign {
+                    local: i,
+                    value: Box::new(CoreExpr::new(CoreExprKind::Bin(BinOp::Add, Box::new(local(i, i64_repr.clone())), Box::new(int(1))), i64_repr.clone())),
+                }, Repr::Unit);
+                let body = CoreBlock { stmts: vec![CoreStmt::Expr(exit), set(local(i, i64_repr.clone()), local(v, elem.clone())), CoreStmt::Expr(step)], tail: None };
+                stmts.push(CoreStmt::Expr(CoreExpr::new(CoreExprKind::Loop(Box::new(body)), Repr::Unit)));
+            }
+        }
+        let sid = self.mono.intern_span(span);
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts, tail: Some(local(arr, Repr::Ref(layout))) })), Repr::Ref(layout)).at(sid), ty))
     }
 
     /// A `Name { field: val, ... }` literal — struct OR an enum struct-variant.

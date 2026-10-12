@@ -8,9 +8,7 @@ use gcrust::lower::lower_program;
 use gcrust::resolve::resolve_module;
 
 /// (file, reason) for programs that do not compile yet.
-const KNOWN_FAILURES: &[(&str, &str)] = &[
-    ("tuples_arrays.gcr", "fixed-size array literals `[a, b]` / `[x; n]` are not lowered"),
-];
+const KNOWN_FAILURES: &[(&str, &str)] = &[];
 
 fn run(src: &str) -> Result<i64, String> {
     let (module, _) = parse_with_prelude(src).map_err(|e| e.msg)?;
