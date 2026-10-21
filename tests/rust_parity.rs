@@ -655,3 +655,41 @@ fn slice_patterns_and_const_generics() {
         }
     "#), 3);
 }
+
+#[test]
+fn index_trait_closure_struct_params_assoc_inference_and_let_chains() {
+    assert_eq!(run(r#"
+        use std::ops::Index;
+        struct Grid { cells: Vec<i64>, w: usize }
+        impl Index<(usize, usize)> for Grid {
+            type Output = i64;
+            fn index(self, p: (usize, usize)) -> i64 { self.cells[p.0 * self.w + p.1] }
+        }
+        struct Button<F> where F: Fn(i64) -> String { label: String, on_click: F }
+        impl<F> Button<F> where F: Fn(i64) -> String {
+            fn new(label: String, f: F) -> Button<F> { Button { label, on_click: f } }
+            fn click(self, n: i64) -> String { format!("{}: {}", self.label, (self.on_click)(n)) }
+        }
+        struct Countdown { n: i64 }
+        impl Iterator for Countdown {
+            fn next(mut self) -> Option<i64> { if self.n == 0 { None } else { self.n -= 1; Some(self.n) } }
+        }
+        fn classify(a: Option<i64>, b: Option<i64>) -> String {
+            if let Some(x) = a && x > 0 && let Some(y) = b && y > x { format!("{} < {}", x, y) }
+            else if a.is_some() || b.is_some() { "partial".to_string() }
+            else { "none".to_string() }
+        }
+        fn main() -> i64 {
+            let g = Grid { cells: vec![1, 2, 3, 4], w: 2 };
+            assert_eq!(g[(1, 0)], 3);
+            let b = Button::new("ok".to_string(), |n| format!("clicked {}", n));
+            assert_eq!(b.click(2), "ok: clicked 2");
+            assert_eq!(Countdown { n: 3 }.collect::<Vec<_>>(), vec![2, 1, 0]);
+            assert_eq!(classify(Some(1), Some(5)) + "|" + &classify(Some(9), Some(2)) + "|" + &classify(None, None), "1 < 5|partial|none");
+            let mut v = vec![1, 2, 3, 10, 4];
+            let mut n = 0;
+            while let Some(x) = v.pop() && x < 10 { n += x; }
+            n
+        }
+    "#.replace("&classify", "classify").as_str()), 4);
+}

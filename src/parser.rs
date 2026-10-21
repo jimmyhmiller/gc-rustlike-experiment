@@ -14,7 +14,7 @@ pub struct ParseError {
 }
 
 pub fn parse_module(tokens: &[Token]) -> Result<Module, ParseError> {
-    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() };
+    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() };
     let mut items = Vec::new();
     while !p.at(&TokKind::Eof) {
         items.extend(p.items()?);
@@ -63,6 +63,10 @@ struct Parser {
     /// the `slice#..` name binding the whole value; arms built from the
     /// pattern run them before the guard and body.
     slice_lets: std::collections::HashMap<String, Vec<Stmt>>,
+    /// Structs whose type parameters were closure-bounded
+    /// (`struct Cache<F: Fn(i64) -> i64>`): those parameters are replaced by
+    /// the closure type, and their positions dropped from later `Cache<..>`.
+    closure_struct_params: std::collections::HashMap<String, Vec<usize>>,
 }
 
 /// A loop being parsed. `break value` assigns `loop#N`; a `break 'label` or
@@ -259,6 +263,12 @@ fn subst_type(t: &mut Type, map: &[(String, Type)]) {
     }
 }
 
+/// One part of a let chain.
+enum ChainPart {
+    Let(Vec<(Pattern, Vec<Expr>)>, Expr),
+    Cond(Expr),
+}
+
 /// A parsed `#[name]` or `#[name(arg, ...)]` attribute.
 struct Attr {
     name: String,
@@ -419,7 +429,7 @@ impl Parser {
                 let mut tokens = crate::lexer::lex_with_source(&source, at.source)
                     .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
                 for t in &mut tokens { t.span = at; }
-                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() };
+                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() };
                 while !p.at(&TokKind::Eof) {
                     let items = p.items().map_err(|e| ParseError { msg: format!("in derived `{}`: {}", trait_name, e.msg), span: at })?;
                     self.pending.extend(items);
@@ -615,7 +625,13 @@ impl Parser {
         self.expect_kw(Kw::Struct)?;
         let name = self.ident()?;
         let generics = self.generics()?;
-        let generics = self.maybe_where(generics)?;
+        let mut generics = self.maybe_where(generics)?;
+        let before: Vec<String> = generics.params.iter().map(|p| p.name.clone()).collect();
+        let closures = closure_params(&mut generics);
+        if !closures.is_empty() {
+            let positions = before.iter().enumerate().filter(|(_, n)| closures.iter().any(|(c, _)| c == *n)).map(|(i, _)| i).collect();
+            self.closure_struct_params.insert(name.clone(), positions);
+        }
         let body = if self.at(&TokKind::LBrace) {
             self.bump();
             let mut fields = Vec::new();
@@ -644,6 +660,14 @@ impl Parser {
             self.expect(&TokKind::Semi)?;
             StructBody::Unit
         };
+        let mut body = body;
+        if !closures.is_empty() {
+            match &mut body {
+                StructBody::Named(fields) => for f in fields { subst_type(&mut f.ty, &closures); },
+                StructBody::Tuple(tys) => for t in tys { subst_type(t, &closures); },
+                StructBody::Unit => {}
+            }
+        }
         Ok(StructDef { vis, is_value, name, generics, body, span: start.to(self.prev_span()) })
     }
 
@@ -789,7 +813,9 @@ impl Parser {
         } else {
             (None, first)
         };
-        let generics = self.maybe_where(generics)?;
+        let mut generics = self.maybe_where(generics)?;
+        // `impl<F: Fn(i64) -> i64> Cache<F>`: `F` is the closure type.
+        let closures = closure_params(&mut generics);
         self.expect(&TokKind::LBrace)?;
         let mut items = Vec::new();
         let mut assoc_types = Vec::new();
@@ -811,6 +837,12 @@ impl Parser {
             items.push(self.fn_def(vis)?);
         }
         self.expect(&TokKind::RBrace)?;
+        if !closures.is_empty() {
+            for f in &mut items {
+                for p in &mut f.params { subst_type(&mut p.ty, &closures); }
+                if let Some(r) = &mut f.ret { subst_type(r, &closures); }
+            }
+        }
         Ok(ImplBlock { generics, trait_ref, self_ty, items, assoc_types, consts, span: start.to(self.prev_span()) })
     }
 
@@ -1190,7 +1222,10 @@ impl Parser {
             }
             TokKind::Ident(_) => {
                 let path = self.path()?;
-                let args = self.opt_type_args()?;
+                let mut args = self.opt_type_args()?;
+                if let Some(positions) = self.closure_struct_params.get(path.last()) {
+                    for &i in positions.iter().rev() { if i < args.len() { args.remove(i); } }
+                }
                 TypeKind::Path(path, args)
             }
             other => return Err(self.error(format!("expected type, found {:?}", other))),
@@ -1958,7 +1993,7 @@ impl Parser {
             let mut all = toks.to_vec();
             let eof_span = toks.last().map(|t| t.span).unwrap_or(at);
             all.push(Token { kind: TokKind::Eof, span: eof_span });
-            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() };
+            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() };
             let ok = match kind {
                 "expr" => p.delimited_expr().is_ok(),
                 "ty" => p.ty().is_ok(),
@@ -1977,7 +2012,7 @@ impl Parser {
     fn sub_parser(&self, mut tokens: Vec<Token>, at: Span) -> Parser {
         let eof_span = tokens.last().map(|t| t.span).unwrap_or(at);
         tokens.push(Token { kind: TokKind::Eof, span: eof_span });
-        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() }
+        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() }
     }
 
     /// An expansion in expression position: its tokens as the body of a block,
@@ -2203,8 +2238,71 @@ impl Parser {
         })
     }
 
+    /// A let chain: `let P = e && cond && let Q = f` (Rust 2024), as its
+    /// parts. `None` (with the cursor restored) for a condition without a
+    /// `let`, or a single `let` (handled as `if let`).
+    fn let_chain(&mut self) -> PResult<Option<Vec<ChainPart>>> {
+        let save = self.pos;
+        let mut parts = Vec::new();
+        let mut lets = 0;
+        loop {
+            self.no_struct += 1;
+            let part = if self.eat_kw(Kw::Let) {
+                lets += 1;
+                let alts = self.pattern_alts();
+                let alts = match alts { Ok(a) => a, Err(e) => { self.no_struct -= 1; return Err(e); } };
+                if let Err(e) = self.expect(&TokKind::Eq) { self.no_struct -= 1; return Err(e); }
+                // Above `&&`, so the chain's next part is not swallowed.
+                let e = self.expr_bp(7);
+                self.no_struct -= 1;
+                ChainPart::Let(alts, e?)
+            } else {
+                let e = self.expr_bp(7);
+                self.no_struct -= 1;
+                ChainPart::Cond(e?)
+            };
+            parts.push(part);
+            if !self.eat(&TokKind::AndAnd) { break; }
+        }
+        if lets == 0 || (lets == 1 && parts.len() == 1) || !self.at(&TokKind::LBrace) {
+            self.pos = save;
+            return Ok(None);
+        }
+        Ok(Some(parts))
+    }
+
+    /// `if`/`while` over a let chain: nested matches and ifs that fall to
+    /// `otherwise` at the first failing part.
+    fn chain_expr(&self, parts: Vec<ChainPart>, then: Expr, otherwise: Expr, span: Span) -> Expr {
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let mut acc = then;
+        for part in parts.into_iter().rev() {
+            acc = match part {
+                ChainPart::Cond(c) => ex(ExprKind::If {
+                    cond: c,
+                    then_branch: Block { stmts: vec![], tail: Some(acc), span },
+                    else_branch: Some(otherwise.clone()),
+                }),
+                ChainPart::Let(alts, scrutinee) => {
+                    let mut arms: Vec<MatchArm> = alts.into_iter().map(|(p, g)| self.arm(p, g, None, acc.clone(), span)).collect();
+                    arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: otherwise.clone(), span });
+                    ex(ExprKind::Match { scrutinee, arms })
+                }
+            };
+        }
+        acc
+    }
+
     fn if_expr(&mut self) -> PResult<Expr> {
         let start = self.expect_kw(Kw::If)?;
+        if let Some(parts) = self.let_chain()? {
+            let then_branch = self.block()?;
+            let else_branch = self.else_branch()?;
+            let span = start.to(self.prev_span());
+            let then = Expr { kind: std::sync::Arc::new(ExprKind::Block(then_branch)), span };
+            let otherwise = else_branch.unwrap_or(Expr { kind: std::sync::Arc::new(ExprKind::Unit), span });
+            return Ok(self.chain_expr(parts, then, otherwise, span));
+        }
         if self.eat_kw(Kw::Let) {
             return self.if_let(start);
         }
@@ -2265,6 +2363,13 @@ impl Parser {
 
     fn while_expr(&mut self) -> PResult<Expr> {
         let start = self.expect_kw(Kw::While)?;
+        if let Some(parts) = self.let_chain()? {
+            let body = self.block()?;
+            let span = start.to(self.prev_span());
+            let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+            let chained = self.chain_expr(parts, ex(ExprKind::Block(body)), ex(ExprKind::Break(None)), span);
+            return Ok(ex(ExprKind::Loop { body: Block { stmts: vec![], tail: Some(chained), span } }));
+        }
         if self.eat_kw(Kw::Let) {
             // `while let PAT = EXPR { body }` is
             // `loop { match EXPR { PAT => { body }, _ => break } }`.

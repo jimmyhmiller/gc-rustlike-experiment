@@ -24,7 +24,8 @@ independent copy. Lookups that may fail return Option rather than a sentinel:
 Operators on non-scalar types dispatch to trait methods: `a + b` calls
 `Add::add` (likewise Sub/Mul/Div/Rem), `a == b` calls `Eq::eq`, and `a < b`
 calls `Ord::cmp`, which returns `Ordering`. `x[i]` on a non-array type calls
-`Index::index` and `x[i] = v` calls `IndexSet::index_set`. Each requires an impl
+`Index::index` (`trait Index<Idx> { type Output; .. }`, as Rust's) and
+`x[i] = v` calls `IndexSet::index_set`. Each requires an impl
 of that trait; an inherent method of the same name does not qualify. Vec
 indexing aborts with a diagnostic outside `0..len`.
 
@@ -135,7 +136,7 @@ These follow Rust; differences come from having no references.
   takes the impl from the expected type, and `T::f()` calls it on a type
   parameter.
 - **Closures.** `F: Fn(A) -> R` (and `FnMut`, `FnOnce`, in `where` clauses
-  too), `impl Fn(A) -> R`, and `dyn Fn(A) -> R` are the closure type
+  too, and on struct and impl parameters: `struct Cache<F: Fn(i64) -> i64>`), `impl Fn(A) -> R`, and `dyn Fn(A) -> R` are the closure type
   `fn(A) -> R`. An argument's `impl Trait` is an anonymous type parameter.
   `move` is accepted. A closure that assigns a captured `let mut` variable
   shares it with the enclosing function, so `let mut n = 0; let mut inc = ||
@@ -152,7 +153,8 @@ These follow Rust; differences come from having no references.
   whatever concrete type the body produces; each instantiation is inferred
   from its body, and callers see that type. A function returning
   `impl Trait` cannot call itself.
-- **Associated types.** `type Item;` in a trait, `type Item = T;` in an impl,
+- **Associated types.** `type Item;` in a trait, `type Item = T;` in an impl
+  (an impl may leave it out when its method signatures determine it),
   `Self::Item`, `I::Item`, `<T as Trait>::Item`, and bounds such as
   `I: Iterator<Item = i64>`.
 - **Iterators.** `Iterator` is lazy: `map`, `filter`, `filter_map`,
@@ -170,7 +172,8 @@ These follow Rust; differences come from having no references.
   (`'outer: for ..` with `break 'outer [value]` and `continue 'outer`);
   `let PAT = e else { .. };`; `matches!(e, PAT [if guard])`; `let x;`
   assigned later (its type comes from the first assignment, and the binding
-  may be reassigned); `for c in 'a'..='z'`.
+  may be reassigned); `for c in 'a'..='z'`; let chains
+  (`if let Some(x) = a && x > 0 && let Some(y) = b { .. }`, also in `while`).
 - **Items and paths.** `const` and `static` items (a `static` is a constant);
   nested `fn`s and other items inside functions (hoisted beside the enclosing
   item; like Rust's, they capture nothing); `pub(crate)`/`pub(super)` (all

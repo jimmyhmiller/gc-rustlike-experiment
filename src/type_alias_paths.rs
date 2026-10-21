@@ -443,6 +443,27 @@ impl Qualifier<'_> {
         Ok(())
     }
 }
+/// The part of `actual` (an impl's written type) standing where `declared`
+/// (the trait's) says `Self::name`.
+fn infer_assoc(declared: &Type, actual: &Type, name: &str) -> Option<Type> {
+    match (&declared.kind, &actual.kind) {
+        (TypeKind::Path(p, _), _) if p.segments.len() == 2 && p.segments[0] == "Self" && p.segments[1] == name => {
+            // The impl may also write `Self::Item` itself, which says nothing.
+            match &actual.kind {
+                TypeKind::Path(ap, _) if ap.segments.first().is_some_and(|s| s == "Self") => None,
+                _ => Some(actual.clone()),
+            }
+        }
+        (TypeKind::Path(dp, da), TypeKind::Path(ap, aa)) if dp.last() == ap.last() && da.len() == aa.len() =>
+            da.iter().zip(aa).find_map(|(d, a)| infer_assoc(d, a, name)),
+        (TypeKind::Tuple(ds), TypeKind::Tuple(as_)) if ds.len() == as_.len() => ds.iter().zip(as_).find_map(|(d, a)| infer_assoc(d, a, name)),
+        (TypeKind::Array(d, _), TypeKind::Array(a, _)) => infer_assoc(d, a, name),
+        (TypeKind::Fn(dp, dr), TypeKind::Fn(ap, ar)) if dp.len() == ap.len() => dp.iter().zip(ap).find_map(|(d, a)| infer_assoc(d, a, name))
+            .or_else(|| match (dr, ar) { (Some(d), Some(a)) => infer_assoc(d, a, name), _ => None }),
+        _ => None,
+    }
+}
+
 /// Replace `Self` and the named parameters in a written type.
 fn subst_written(t: &mut Type, map: &[(String, Type)]) {
     match &mut t.kind {
@@ -556,8 +577,25 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         if let Some(tr) = &mut i.trait_ref {
             let me = i.self_ty.clone();
             q.trait_ref(tr, &scope, &me)?;
-            // Associated types the impl leaves out take the trait's defaults.
+            // Associated types the impl leaves out take the trait's defaults,
+            // or are read off the impl's method signatures (`fn next(..) ->
+            // Option<i64>` against `Option<Self::Item>` gives `Item = i64`).
             if let Some(def) = g.traits.get(&tr.path.segments.join("::")) {
+                for item in &def.items {
+                    let TraitItem::AssocType(name) = item else { continue };
+                    if i.assoc_types.iter().any(|(n, _)| n == name) || def.assoc_defaults.iter().any(|(n, _)| n == name) { continue; }
+                    let found = def.items.iter().find_map(|ti| {
+                        let (mname, params, ret) = match ti {
+                            TraitItem::Required(f) => (&f.name, &f.params, &f.ret),
+                            TraitItem::Provided(f) => (&f.name, &f.params, &f.ret),
+                            _ => return None,
+                        };
+                        let m = i.items.iter().find(|m| &m.name == mname)?;
+                        let from_ret = match (ret, &m.ret) { (Some(t), Some(a)) => infer_assoc(t, a, name), _ => None };
+                        from_ret.or_else(|| params.iter().zip(&m.params).find_map(|(t, a)| infer_assoc(&t.ty, &a.ty, name)))
+                    });
+                    if let Some(t) = found { i.assoc_types.push((name.clone(), t)); }
+                }
                 for (name, default) in &def.assoc_defaults {
                     if i.assoc_types.iter().any(|(n, _)| n == name) { continue; }
                     let mut map: Vec<(String, Type)> = def.generics.params.iter().zip(&tr.args).map(|(p, a)| (p.name.clone(), a.clone())).collect();
