@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use crate::gc::field::{read_varlen_bytes, read_varlen_count};
 use crate::gc::heap::Heap;
-use crate::gc::reflect::{FieldMeta, FieldTy, ScalarKind, TypeKind};
+use crate::gc::{IdentityPtrPolicy, PtrPolicy};
+use crate::gc::reflect::{FieldMeta, FieldTy, ScalarKind, TypeKind, VariantMeta};
 use crate::gc::scan::scan_object;
 use crate::gc::type_info::{TypeInfo, VarLenKind};
 
@@ -35,7 +36,16 @@ use crate::gc::type_info::{TypeInfo, VarLenKind};
 /// # Safety
 /// All allocated objects must be valid (initialized headers, written varlen
 /// counts) — true for any object the mutator has finished allocating.
+/// Uses `IdentityPtrPolicy`. For tagged references use `dump_heap_text_with_policy`.
 pub unsafe fn dump_heap_text(heap: &Heap) -> String {
+    unsafe { dump_heap_text_with_policy::<IdentityPtrPolicy>(heap) }
+}
+
+/// Render a snapshot using the heap collector's pointer encoding.
+///
+/// # Safety
+/// As `dump_heap_text`; `P` must match every traced reference in the heap.
+pub unsafe fn dump_heap_text_with_policy<P: PtrPolicy>(heap: &Heap) -> String {
     // Read the live heap under STW so no mutator mutates/relocates mid-walk.
     let _pause = heap.pause_world();
     // Pass 1: collect object pointers in walk order and assign stable ids.
@@ -67,7 +77,7 @@ pub unsafe fn dump_heap_text(heap: &Heap) -> String {
 
     // Pass 2: render each object.
     for (id, &(obj, type_id)) in objs.iter().enumerate() {
-        let rendered = unsafe { render_object(heap, obj, type_id, &id_of) };
+        let rendered = unsafe { render_object::<P>(heap, obj, type_id, &id_of) };
         let _ = writeln!(out, "#{id} {rendered}");
     }
     out
@@ -83,6 +93,12 @@ struct Node {
     refs: Vec<usize>,
 }
 
+/// Pointer-free graph data that remains valid after the inspection pause.
+struct GraphNode {
+    bytes: usize,
+    refs: Vec<usize>,
+}
+
 /// Collect the live heap as a graph: every object with its size and outgoing
 /// reference edges (resolved to walk-order ids). Edges come from `scan_object`,
 /// so they match the GC's own view (including interior pointers in flattened
@@ -90,7 +106,7 @@ struct Node {
 ///
 /// # Safety
 /// The heap must be quiescent; all objects valid.
-unsafe fn collect_graph(heap: &Heap) -> Vec<Node> {
+unsafe fn collect_graph<P: PtrPolicy>(heap: &Heap) -> Vec<Node> {
     let mut objs: Vec<(*mut u8, u16, usize)> = Vec::new();
     let mut id_of: HashMap<usize, usize> = HashMap::new();
     unsafe {
@@ -103,19 +119,21 @@ unsafe fn collect_graph(heap: &Heap) -> Vec<Node> {
             objs.push((obj, info.type_id, info.allocation_size(varlen_len)));
         });
     }
+    let channel_edges = heap.channel_edges();
     let mut nodes = Vec::with_capacity(objs.len());
     for &(obj, type_id, bytes) in &objs {
         let info = heap.type_info_by_id(type_id);
         let mut refs = Vec::new();
         unsafe {
-            scan_object(obj, info, |slot| {
-                let p = (slot as *const *mut u8).read() ;
-                if !p.is_null() {
+            let mut visit = |slot: *mut u64| {
+                if let Some(p) = P::try_decode_ptr(slot.read()) {
                     if let Some(&id) = id_of.get(&(p as usize)) {
                         refs.push(id);
                     }
                 }
-            });
+            };
+            scan_object(obj, info, &mut visit);
+            channel_edges.trace(obj, &mut visit);
         }
         nodes.push(Node { obj, type_id, bytes, refs });
     }
@@ -145,7 +163,7 @@ fn dom_intersect(mut a: usize, mut b: usize, idom: &[usize], rpo_num: &[usize]) 
 /// the Cooper-Harvey-Kennedy iterative dominator algorithm — simple and fine for
 /// exploration-scale heaps. (Previously seeded from an in-degree-0 *proxy*, which
 /// mis-handles cycles and root-held-yet-referenced objects.)
-fn retained_sizes(nodes: &[Node], seed_roots: &[usize]) -> Vec<usize> {
+fn retained_sizes(nodes: &[GraphNode], seed_roots: &[usize]) -> Vec<usize> {
     let n = nodes.len();
     if n == 0 {
         return vec![];
@@ -276,12 +294,21 @@ fn retained_sizes(nodes: &[Node], seed_roots: &[usize]) -> Vec<usize> {
 ///
 /// # Safety
 /// All allocated objects must be valid (headers + varlen counts written).
+/// Uses `IdentityPtrPolicy`. For tagged references use `dump_heap_json_with_policy`.
 pub unsafe fn dump_heap_json(heap: &Heap) -> String {
-    // Read the live heap under STW (see dump_heap_text). Time the whole snapshot
-    // so the STW pause is reported, never hidden (`snapshot_pause_ns`).
+    unsafe { dump_heap_json_with_policy::<IdentityPtrPolicy>(heap) }
+}
+
+/// Render a snapshot using the heap collector's pointer encoding.
+///
+/// # Safety
+/// As `dump_heap_json`; `P` must match every traced reference in the heap.
+pub unsafe fn dump_heap_json_with_policy<P: PtrPolicy>(heap: &Heap) -> String {
+    // Capture managed bytes under STW. The reported duration includes acquiring
+    // the pause and copying the capture, excluding subsequent owned analysis.
     let t0 = Instant::now();
     let _pause = heap.pause_world();
-    let nodes = unsafe { collect_graph(heap) };
+    let nodes = unsafe { collect_graph::<P>(heap) };
     let id_of: HashMap<usize, usize> =
         nodes.iter().enumerate().map(|(i, n)| (n.obj as usize, i)).collect();
 
@@ -302,7 +329,7 @@ pub unsafe fn dump_heap_json(heap: &Heap) -> String {
     // by a root slot (globals + parked thread frames + permanent extras).
     let mut root_ids: Vec<usize> = Vec::new();
     unsafe {
-        heap.visit_roots(&mut |obj| {
+        heap.visit_roots_with_policy::<P>(&mut |obj| {
             if let Some(&id) = id_of.get(&(obj as usize)) {
                 root_ids.push(id);
             }
@@ -310,6 +337,17 @@ pub unsafe fn dump_heap_json(heap: &Heap) -> String {
     }
     root_ids.sort_unstable();
     root_ids.dedup();
+
+    // Copy every rendered field while the world is paused. No managed reads
+    // follow this capture; graph analysis and JSON formatting use owned data.
+    let rendered: Vec<(String, String)> = nodes.iter().map(|node| {
+        (type_name(heap, node.type_id), unsafe { render_object::<P>(heap, node.obj, node.type_id, &id_of) })
+    }).collect();
+    let reachability_complete = !heap.saw_extra_roots();
+    let gc_collections = heap.minor_collections() + heap.collections();
+    let nodes: Vec<GraphNode> = nodes.into_iter().map(|node| GraphNode { bytes: node.bytes, refs: node.refs }).collect();
+    drop(_pause);
+    let pause_ns = t0.elapsed().as_nanos();
 
     // Reachability from the real roots — distinguishes live objects from
     // uncollected garbage (e.g. at program end most of the heap is unreachable).
@@ -356,30 +394,15 @@ pub unsafe fn dump_heap_json(heap: &Heap) -> String {
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     top.truncate(10);
 
-    // Loud guard (heap-explorer P1 nit): visit_roots covers only PERSISTENT
-    // roots; if a collection ever used transient per-call extra_roots, a snapshot
-    // could under-report reachability. Warn rather than silently mislead.
-    if heap.saw_extra_roots() {
-        eprintln!(
-            "gc-rust: WARNING: heap snapshot reachability may under-report — a \
-             collection used per-call extra_roots, which visit_roots does not \
-             cover. Register such roots via register_permanent_extra to include them."
-        );
-    }
-
     let reachable_count = reachable.iter().filter(|&&r| r).count();
-    // Total collections so far — a COARSE heap-age tag (not a unique monotonic GC
-    // index); fine for ordering/diffing snapshots, don't read it as a serial id.
-    let gc_collections = heap.minor_collections() + heap.collections();
-    let pause_ns = t0.elapsed().as_nanos();
 
     // ---- Emit JSON (hand-built; gcrust-rt has no serde) -------------------
     let mut out = String::new();
     out.push_str("{\n  \"summary\": {");
     let _ = write!(
         out,
-        "\"version\": 1, \"gc_collections\": {}, \"snapshot_pause_ns\": {}, ",
-        gc_collections, pause_ns
+        "\"version\": 1, \"gc_collections\": {}, \"snapshot_pause_ns\": {}, \"reachability_complete\": {}, ",
+        gc_collections, pause_ns, reachability_complete
     );
     let _ = write!(
         out,
@@ -411,17 +434,17 @@ pub unsafe fn dump_heap_json(heap: &Heap) -> String {
     }
     out.push_str("]},\n  \"objects\": [\n");
     for (id, n) in nodes.iter().enumerate() {
-        let render = unsafe { render_object(heap, n.obj, n.type_id, &id_of) };
+        let (name, render) = &rendered[id];
         let refs: Vec<String> = n.refs.iter().map(|r| r.to_string()).collect();
         let _ = write!(
             out,
             "    {{\"id\": {}, \"type\": {}, \"bytes\": {}, \"retained_bytes\": {}, \"reachable\": {}, \"render\": {}, \"refs\": [{}]}}",
             id,
-            json_str(&type_name(heap, n.type_id)),
+            json_str(name),
             n.bytes,
             retained[id],
             reachable[id],
-            json_str(&render),
+            json_str(render),
             refs.join(", "),
         );
         out.push_str(if id + 1 < nodes.len() { ",\n" } else { "\n" });
@@ -461,11 +484,13 @@ fn type_name(heap: &Heap, type_id: u16) -> String {
     }
 }
 
+type ReferenceProjection = HashMap<usize, usize>;
+
 /// Render one object's contents (without its `#id` prefix).
 ///
 /// # Safety
 /// `obj` must be a valid object of `type_id`.
-unsafe fn render_object(
+unsafe fn render_object<P: PtrPolicy>(
     heap: &Heap,
     obj: *mut u8,
     type_id: u16,
@@ -477,24 +502,41 @@ unsafe fn render_object(
     };
     match &meta.kind {
         TypeKind::Struct { fields } => {
-            let body = unsafe { render_fields(heap, obj, 0, fields, id_of) };
+            let body = unsafe { render_fields::<P>(heap, obj, 0, fields, id_of, &ReferenceProjection::new()) };
             format!("{} {{ {} }}", meta.name, body)
         }
         TypeKind::Enum {
             tag_offset,
             variants,
         } => {
-            let tag = unsafe { read_u32(obj, *tag_offset as usize) };
-            match variants.iter().find(|v| v.tag == tag) {
-                Some(v) if v.fields.is_empty() => format!("{}::{}", meta.name, v.name),
-                Some(v) => {
-                    let body = unsafe { render_fields(heap, obj, 0, &v.fields, id_of) };
-                    format!("{}::{}({})", meta.name, v.name, body)
-                }
-                None => format!("{}::<unknown tag {}>", meta.name, tag),
-            }
+            unsafe { render_enum::<P>(heap, obj, 0, &meta.name, *tag_offset, variants, id_of, &ReferenceProjection::new()) }
         }
         TypeKind::Opaque => unsafe { render_opaque(&meta.name, obj, info) },
+    }
+}
+
+/// Render an enum at an object-relative base. Tags and payload field offsets
+/// in inline value metadata are relative to that base, including nested values.
+/// # Safety
+/// Metadata must describe initialized storage within this valid object.
+unsafe fn render_enum<P: PtrPolicy>(
+    heap: &Heap,
+    obj: *mut u8,
+    base: usize,
+    name: &str,
+    tag_offset: u16,
+    variants: &[VariantMeta],
+    id_of: &HashMap<usize, usize>,
+    projection: &ReferenceProjection,
+) -> String {
+    let tag = unsafe { read_u32(obj, base + tag_offset as usize) };
+    match variants.iter().find(|variant| variant.tag == tag) {
+        Some(variant) if variant.fields.is_empty() => format!("{name}::{}", variant.name),
+        Some(variant) => {
+            let body = unsafe { render_fields::<P>(heap, obj, base, &variant.fields, id_of, projection) };
+            format!("{name}::{}({body})", variant.name)
+        }
+        None => format!("{name}::<unknown tag {tag}>"),
     }
 }
 
@@ -505,16 +547,17 @@ unsafe fn render_object(
 ///
 /// # Safety
 /// `obj` must be a valid object whose layout includes all `fields` at `base`.
-unsafe fn render_fields(
+unsafe fn render_fields<P: PtrPolicy>(
     heap: &Heap,
     obj: *mut u8,
     base: usize,
     fields: &[FieldMeta],
     id_of: &HashMap<usize, usize>,
+    projection: &ReferenceProjection,
 ) -> String {
     let mut parts = Vec::with_capacity(fields.len());
     for f in fields {
-        let val = unsafe { render_field_value(heap, obj, base, f, id_of) };
+        let val = unsafe { render_field_value::<P>(heap, obj, base, f, id_of, projection) };
         // Positional fields ("0", "1", …) render value-only for tuple-ish look.
         if f.name.chars().all(|c| c.is_ascii_digit()) {
             parts.push(val);
@@ -529,39 +572,52 @@ unsafe fn render_fields(
 ///
 /// # Safety
 /// `obj` must be valid and `base + f.offset` in bounds for it.
-unsafe fn render_field_value(
+unsafe fn render_field_value<P: PtrPolicy>(
     heap: &Heap,
     obj: *mut u8,
     base: usize,
     f: &FieldMeta,
     id_of: &HashMap<usize, usize>,
+    projection: &ReferenceProjection,
 ) -> String {
     let foff = base + f.offset as usize;
     let at = unsafe { obj.add(foff) };
-    match f.ty {
+    match &f.ty {
         FieldTy::Ref(_) => {
-            let p = unsafe { (at as *const *mut u8).read_unaligned() };
-            if p.is_null() {
-                "null".to_string()
-            } else if let Some(id) = id_of.get(&(p as usize)) {
+            let at = unsafe { obj.add(projection.get(&foff).copied().unwrap_or(foff)) };
+            let Some(p) = P::try_decode_ptr(unsafe { at.cast::<u64>().read_unaligned() }).filter(|p| !p.is_null()) else {
+                return "null".to_string();
+            };
+            if let Some(id) = id_of.get(&(p as usize)) {
                 format!("#{id}")
             } else {
                 // Points outside the walked spaces (e.g. a permanent/global).
                 format!("@{:p}", p)
             }
         }
-        FieldTy::Scalar(k) => unsafe { render_scalar(at, k) },
-        FieldTy::Value(vid) => match heap.value_meta_by_id(vid) {
-            // Recurse into a flattened value aggregate: its field offsets are
-            // value-relative, so render them with `base = foff`.
-            Some(vm) => match &vm.kind {
-                TypeKind::Struct { fields } => {
-                    let body = unsafe { render_fields(heap, obj, foff, fields, id_of) };
-                    format!("{} {{ {} }}", vm.name, body)
-                }
-                _ => format!("{} <value>", vm.name),
-            },
-            None => "<value>".to_string(),
+        FieldTy::Scalar(k) => unsafe { render_scalar(at, *k) },
+        FieldTy::Value(vid) | FieldTy::ProjectedValue { value_id: vid, .. } => {
+            let mapped = match &f.ty {
+                FieldTy::ProjectedValue { reference_offsets, .. } => Some(reference_offsets.iter().map(|&(child, enclosing)| {
+                    let source = base + enclosing as usize;
+                    (foff + child as usize, projection.get(&source).copied().unwrap_or(source))
+                }).collect::<ReferenceProjection>()),
+                _ => None,
+            };
+            let projection = mapped.as_ref().unwrap_or(projection);
+            match heap.value_meta_by_id(*vid) {
+                Some(value) => match &value.kind {
+                    TypeKind::Struct { fields } => {
+                        let body = unsafe { render_fields::<P>(heap, obj, foff, fields, id_of, projection) };
+                        format!("{} {{ {} }}", value.name, body)
+                    }
+                    TypeKind::Enum { tag_offset, variants } => unsafe {
+                        render_enum::<P>(heap, obj, foff, &value.name, *tag_offset, variants, id_of, projection)
+                    },
+                    TypeKind::Opaque => format!("{} <value>", value.name),
+                },
+                None => "<value>".to_string(),
+            }
         },
     }
 }
@@ -630,8 +686,18 @@ unsafe fn render_opaque(name: &str, obj: *mut u8, info: &TypeInfo) -> String {
 mod tests {
     use super::*;
 
-    fn node(bytes: usize, refs: Vec<usize>) -> Node {
-        Node { obj: core::ptr::null_mut(), type_id: 0, bytes, refs }
+    fn node(bytes: usize, refs: Vec<usize>) -> GraphNode {
+        GraphNode { bytes, refs }
+    }
+
+    #[test]
+    fn snapshot_marks_transient_root_reachability_without_output_side_effects() {
+        use crate::gc::{Full, IdentityPtrPolicy, AtomicRootSet};
+        let heap = Heap::new::<Full>(1 << 16, vec![]);
+        let empty_roots = AtomicRootSet::new();
+        unsafe { heap.collect::<IdentityPtrPolicy>(&[&empty_roots]); }
+        let json = unsafe { dump_heap_json(&heap) };
+        assert!(json.contains("\"reachability_complete\": false"));
     }
 
     #[test]
@@ -672,5 +738,85 @@ mod tests {
     #[test]
     fn retained_empty() {
         assert_eq!(retained_sizes(&[], &[]), Vec::<usize>::new());
+    }
+}
+
+#[cfg(test)]
+#[path = "inspection_policy_tests.rs"]
+mod inspection_policy_tests;
+
+
+#[cfg(test)]
+mod inline_enum_tests {
+    use super::*;
+    use crate::gc::{Compact, Full, ObjHeader};
+    use crate::gc::reflect::{TypeMeta, ValueMeta, VariantMeta};
+
+    struct Tagged;
+    impl PtrPolicy for Tagged {
+        fn try_decode_ptr(bits: u64) -> Option<*mut u8> {
+            (bits & 7 == 3).then_some((bits & !7) as *mut u8)
+        }
+        fn encode_ptr(pointer: *mut u8) -> u64 { pointer as u64 | 3 }
+    }
+
+    fn check<H: ObjHeader, P: PtrPolicy>() {
+        let header = H::SIZE as u16;
+        let holder = TypeInfo::for_header(H::SIZE).with_raw_bytes(24)
+            .with_owned_interior_ptrs(vec![header + 16]);
+        let leaf = TypeInfo::for_header(H::SIZE).with_type_id(1);
+        let heap = Heap::new::<H>(65536, vec![holder.clone(), leaf.clone()]);
+        heap.set_type_meta(vec![
+            TypeMeta { type_id: 0, name: "Holder".into(), kind: TypeKind::Struct { fields: vec![
+                FieldMeta { name: "value".into(), offset: header + 8, ty: FieldTy::Value(0) },
+            ] } },
+            TypeMeta { type_id: 1, name: "Leaf".into(), kind: TypeKind::Opaque },
+        ]);
+        heap.set_value_meta(vec![ValueMeta { value_id: 0, name: "Choice".into(), kind: TypeKind::Enum {
+            tag_offset: 4,
+            variants: vec![
+                VariantMeta { name: "Empty".into(), tag: 0, fields: vec![] },
+                VariantMeta { name: "Some".into(), tag: 1, fields: vec![FieldMeta {
+                    name: "0".into(), offset: 8, ty: FieldTy::Ref(1),
+                }] },
+            ],
+        } }]);
+        unsafe {
+            let child = heap.alloc_obj::<H>(&leaf, 0);
+            assert!(!child.is_null());
+            for tag in [0u32, 1, 99] {
+                let object = heap.alloc_obj::<H>(&holder, 0);
+                assert!(!object.is_null());
+                object.add(H::SIZE + 12).cast::<u32>().write(tag);
+                object.add(H::SIZE + 16).cast::<u64>().write(if tag == 1 { P::encode_ptr(child) } else { P::encode_ptr(std::ptr::null_mut()) });
+                heap.globals.add(P::encode_ptr(object));
+            }
+            for iteration in 0..3 {
+                if iteration > 0 { heap.collect::<P>(&[]); }
+                let mut child_id = None;
+                let mut index = 0;
+                heap.walk_live_objects(&mut |_, info| {
+                    if info.type_id == 1 { child_id = Some(index); }
+                    index += 1;
+                });
+                assert_eq!(index, 4);
+                let payload = format!("Choice::Some(#{})", child_id.unwrap());
+                let text = dump_heap_text_with_policy::<P>(&heap);
+                assert!(text.contains("Holder { value: Choice::Empty }"), "{text}");
+                assert!(text.contains(&format!("Holder {{ value: {payload} }}")), "{text}");
+                assert!(text.contains("Holder { value: Choice::<unknown tag 99> }"), "{text}");
+                let json = dump_heap_json_with_policy::<P>(&heap);
+                assert!(json.contains(&payload), "{json}");
+                assert!(json.contains("\"reachable_objects\": 4"), "{json}");
+            }
+        }
+    }
+
+    #[test]
+    fn collector_snapshot_renders_inline_enum_tags_and_reference_payloads() {
+        check::<Compact, IdentityPtrPolicy>();
+        check::<Full, IdentityPtrPolicy>();
+        check::<Compact, Tagged>();
+        check::<Full, Tagged>();
     }
 }

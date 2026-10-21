@@ -1,5 +1,13 @@
+#[path = "shared_metadata.rs"]
+mod shared_metadata;
+pub(crate) use shared_metadata::{SharedMetadata, SharedMetadataWeak};
 use core::cell::{Cell, RefCell};
-use std::sync::{Arc, Mutex};
+#[path = "initialized_ranges.rs"]
+mod initialized_ranges;
+pub(crate) use initialized_ranges::InitializedRanges;
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::Arc;
 
 use crate::gc::field::{init_header, read_type_id, read_varlen_count, write_varlen_count};
 use crate::gc::header::{Compact, HeaderLayout, ObjHeader};
@@ -25,6 +33,9 @@ pub trait HeapWalker {
     ///
     /// # Safety
     /// All objects must be valid (headers initialized, varlen counts written).
+    /// Mutators must be stopped or the caller must have exclusive arena access.
+    /// Keep allocation extents stable throughout capture and do not collect or
+    /// invalidate objects from the visitor.
     unsafe fn walk(&self, type_table: &[TypeInfo], visitor: &mut dyn FnMut(*mut u8, &TypeInfo));
 }
 
@@ -96,7 +107,7 @@ impl AllocWindow {
     pub unsafe fn point_at(&self, space: &AtomicBumpAllocator, limit: usize) {
         assert!(limit <= space.size(), "allocation window exceeds its arena");
         self.cursor.store(
-            &*space.cursor as *const AtomicUsize as *mut u8,
+            space.cursor.as_raw().cast::<u8>(),
             Ordering::Release,
         );
         self.base.store(space.base, Ordering::Release);
@@ -294,6 +305,9 @@ impl Drop for BumpAllocator {
 // ─── AtomicBumpAllocator ────────────────────────────────────────────
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::runtime::metadata_allocator::MetadataAllocator;
+
+type BufferRegistry = allocator_api2::vec::Vec<SharedMetadata<BufferExtent>, MetadataAllocator>;
 
 /// Thread-safe bump allocator using an atomic cursor.
 ///
@@ -306,11 +320,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Uses `fetch_add` with a CAS retry loop for alignment.
 pub struct AtomicBumpAllocator {
     epoch: AtomicUsize,
-    buffers: Mutex<Vec<Arc<BufferExtent>>>,
+    buffers: Mutex<BufferRegistry>,
     base: *mut u8,
-    // AllocWindow exports this address; boxing keeps it stable when the
-    // allocator or its owning Heap moves during construction.
-    cursor: Box<AtomicUsize>,
+    // Keep exported cursor aliases valid when the allocator or Heap moves.
+    cursor: crate::abi_storage::AbiStorage<AtomicUsize>,
     size: usize,
     type_id_offset: usize,
     header: HeaderLayout,
@@ -324,8 +337,18 @@ unsafe impl Send for AtomicBumpAllocator {}
 unsafe impl Sync for AtomicBumpAllocator {}
 
 impl AtomicBumpAllocator {
+    #[cfg(test)]
+    pub(crate) fn collector_cursor_backing_bytes(&self) -> usize {
+        crate::abi_storage::AbiStorage::<AtomicUsize>::allocation_bytes()
+    }
     /// Create a new atomic bump allocator that owns a region of `size` bytes.
     pub fn new<H: ObjHeader>(size: usize) -> Self {
+        Self::with_metadata_allocator::<H>(size, MetadataAllocator::default())
+    }
+
+    /// Own an arena while retaining an accounting owner for its TLAB registry.
+    /// Managed region bytes and record/control allocations have separate scopes.
+    pub(crate) fn with_metadata_allocator<H: ObjHeader>(size: usize, allocator: MetadataAllocator) -> Self {
         assert!(size > 0, "arena size must be positive");
         assert!(
             HeaderLayout::of::<H>().supported_by_atomic_arena(),
@@ -334,11 +357,12 @@ impl AtomicBumpAllocator {
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "AtomicBumpAllocator: allocation failed");
+        let cursor = crate::abi_storage::AbiStorage::new_in(AtomicUsize::new(0), &allocator);
         Self {
             epoch: AtomicUsize::new(0),
-            buffers: Mutex::new(Vec::new()),
+            buffers: Mutex::new(BufferRegistry::new_in(allocator)),
             base,
-            cursor: Box::new(AtomicUsize::new(0)),
+            cursor,
             size,
             type_id_offset: H::TYPE_ID_OFFSET,
             header: HeaderLayout::of::<H>(),
@@ -359,6 +383,18 @@ impl AtomicBumpAllocator {
         self.buffers.lock().unwrap().clear();
         self.epoch.fetch_add(1, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_registry_backing_bytes(&self) -> usize {
+        self.buffers.lock().unwrap().capacity() * core::mem::size_of::<SharedMetadata<BufferExtent>>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inventory_buffer_records(&self, records: &mut std::collections::HashMap<usize, usize>) {
+        for record in self.buffers.lock().unwrap().iter() {
+            records.insert(SharedMetadata::allocation_identity(record), SharedMetadata::<BufferExtent>::allocation_bytes());
+        }
     }
 
     /// Number of bytes currently used.
@@ -414,7 +450,7 @@ impl AtomicBumpAllocator {
     pub(crate) unsafe fn reserve_batch(
         &self,
         layouts: &[(usize, usize)],
-        addresses: &mut Vec<*mut u8>,
+        addresses: &mut allocator_api2::vec::Vec<*mut u8, impl allocator_api2::alloc::Allocator>,
     ) -> bool {
         loop {
             let cur = self.cursor.load(Ordering::Relaxed);
@@ -546,10 +582,18 @@ pub(crate) struct Tlab {
     allocator: usize,
     epoch: usize,
     pub(crate) window: InlineTlab,
-    extent: Option<Arc<BufferExtent>>,
+    extent: Option<SharedMetadata<BufferExtent>>,
     target_bytes: usize,
 }
 impl Tlab {
+    #[cfg(test)]
+    pub(crate) fn metadata_record(&self) -> Option<(usize, usize)> {
+        self.extent.as_ref().map(|record| (
+            SharedMetadata::allocation_identity(record),
+            SharedMetadata::<BufferExtent>::allocation_bytes(),
+        ))
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             allocator: 0,
@@ -559,6 +603,9 @@ impl Tlab {
             target_bytes: 2048,
         }
     }
+    /// Standalone checked adapter for allocator tests. Production allocations
+    /// receive a heap-bound validated request and use alloc_sized directly.
+    #[cfg(test)]
     pub(crate) fn alloc(
         &mut self,
         space: &AtomicBumpAllocator,
@@ -579,6 +626,7 @@ impl Tlab {
     /// Allocate a size from a layout already validated against this arena.
     /// Caller must own this TLAB between safepoints. Size must be positive,
     /// eight-byte aligned, at most 8192 bytes, and cover the complete object.
+    #[inline]
     pub(crate) unsafe fn alloc_sized(&mut self, space: &AtomicBumpAllocator, size: usize) -> *mut u8 {
         debug_assert!(size > 0 && size <= 8192 && size % 8 == 0);
         let align = 8;
@@ -631,12 +679,17 @@ impl Tlab {
     }
 }
 impl AtomicBumpAllocator {
+    // Refill is rare relative to allocation from an initialized TLAB. Keep
+    // native allocation, locking and metadata growth out of the hot function's
+    // register allocation and instruction footprint.
+    #[cold]
+    #[inline(never)]
     fn reserve_buffer(
         &self,
         minimum: usize,
         align: usize,
         target: usize,
-    ) -> Option<Arc<BufferExtent>> {
+    ) -> Option<SharedMetadata<BufferExtent>> {
         loop {
             let cur = self.cursor.load(Ordering::Relaxed);
             let start = cur.checked_add(align - 1)? & !(align - 1);
@@ -656,59 +709,38 @@ impl AtomicBumpAllocator {
             {
                 continue;
             }
-            let extent = Arc::new(BufferExtent {
+            let mut buffers = self.buffers.lock().unwrap();
+            let extent = SharedMetadata::new_in(BufferExtent {
                 start,
                 end,
                 initialized: AtomicUsize::new(start),
-            });
-            self.buffers.lock().unwrap().push(extent.clone());
+            }, buffers.allocator());
+            buffers.push(extent.clone());
             return Some(extent);
         }
     }
 
     /// Initialized object regions, excluding every active or retired TLAB tail.
     /// Caller must have stopped mutators before interpreting these boundaries.
-    pub(crate) fn initialized_ranges(&self) -> Vec<core::ops::Range<usize>> {
+    pub(crate) fn initialized_ranges(&self) -> InitializedRanges<allocator_api2::alloc::Global> {
+        self.initialized_ranges_in(allocator_api2::alloc::Global)
+    }
+
+    pub(crate) fn initialized_ranges_in<A: allocator_api2::alloc::Allocator>(&self, allocator: A) -> InitializedRanges<A> {
         let used = self.used();
-        let mut holes: Vec<_> = self
-            .buffers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|b| b.initialized.load(Ordering::Relaxed)..b.end)
-            .filter(|r| !r.is_empty())
-            .collect();
-        holes.sort_unstable_by_key(|r| r.start);
-        let mut ranges = Vec::with_capacity(holes.len() + 1);
-        let mut start = 0;
-        for hole in holes {
-            if start < hole.start {
-                ranges.push(start..hole.start);
-            }
-            start = hole.end;
-        }
-        if start < used {
-            ranges.push(start..used);
-        }
-        ranges
+        let buffers = self.buffers.lock().unwrap();
+        InitializedRanges::capture(used, &buffers, allocator)
     }
-}
 
-impl Alloc for AtomicBumpAllocator {
-    fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
-        let ptr = unsafe { self.alloc_uninitialized(info, varlen_len) };
-        if !ptr.is_null() {
-            unsafe {
-                core::ptr::write_bytes(ptr, 0, info.allocation_size(varlen_len));
-            }
-        }
-        ptr
+    /// Same validity/quiescence contract as HeapWalker::walk. Capture completes
+    /// and releases the buffer registry lock before any visitor is invoked.
+    pub(crate) unsafe fn walk_in<A: allocator_api2::alloc::Allocator>(&self, type_table: &[TypeInfo], allocator: A, visitor: &mut dyn FnMut(*mut u8, &TypeInfo)) {
+        let ranges = self.initialized_ranges_in(allocator);
+        unsafe { self.walk_ranges(type_table, ranges, visitor) };
     }
-}
 
-impl HeapWalker for AtomicBumpAllocator {
-    unsafe fn walk(&self, type_table: &[TypeInfo], visitor: &mut dyn FnMut(*mut u8, &TypeInfo)) {
-        for range in self.initialized_ranges() {
+    unsafe fn walk_ranges<A: allocator_api2::alloc::Allocator>(&self, type_table: &[TypeInfo], ranges: InitializedRanges<A>, visitor: &mut dyn FnMut(*mut u8, &TypeInfo)) {
+        for range in &ranges {
             let mut offset = range.start;
             while offset < range.end {
                 let ptr = unsafe { self.base.add(offset) };
@@ -731,6 +763,25 @@ impl HeapWalker for AtomicBumpAllocator {
                 offset = ((offset + obj_size) + align - 1) & !(align - 1);
             }
         }
+    }
+
+}
+
+impl Alloc for AtomicBumpAllocator {
+    fn alloc(&self, info: &TypeInfo, varlen_len: usize) -> *mut u8 {
+        let ptr = unsafe { self.alloc_uninitialized(info, varlen_len) };
+        if !ptr.is_null() {
+            unsafe {
+                core::ptr::write_bytes(ptr, 0, info.allocation_size(varlen_len));
+            }
+        }
+        ptr
+    }
+}
+
+impl HeapWalker for AtomicBumpAllocator {
+    unsafe fn walk(&self, type_table: &[TypeInfo], visitor: &mut dyn FnMut(*mut u8, &TypeInfo)) {
+        unsafe { self.walk_ranges(type_table, self.initialized_ranges(), visitor) };
     }
 }
 
@@ -809,7 +860,7 @@ mod reservation_tests {
     #[test]
     fn batch_reservation_uses_exact_extents_and_does_not_advance_on_failure() {
         let allocator = AtomicBumpAllocator::new::<Full>(128);
-        let mut addresses = Vec::new();
+        let mut addresses = allocator_api2::vec::Vec::new();
         assert!(unsafe { allocator.reserve_batch(&[(24, 8), (32, 8), (16, 8)], &mut addresses) });
         assert_eq!(allocator.used(), 72);
         assert_eq!(
@@ -856,6 +907,33 @@ mod tlab_tests {
     use crate::gc::Full;
 
     #[test]
+    fn collector_range_snapshot_walker_releases_registry_lock_before_callbacks() {
+        use crate::runtime::{allocation_counter::AllocationCounter, metadata_allocator::MetadataAllocator};
+        let counter = Arc::<AllocationCounter>::default();
+        let allocator = MetadataAllocator::new(&counter);
+        let space = AtomicBumpAllocator::new::<Full>(128 * 1024);
+        let info = TypeInfo::for_header(Full::SIZE).with_fields(1);
+        let mut tlabs: Vec<_> = (0..4).map(|_| Tlab::new()).collect();
+        for tlab in &mut tlabs {
+            let object = tlab.alloc(&space, &info, 0);
+            assert!(!object.is_null());
+            unsafe { init_header::<Full>(object, 0) };
+        }
+        let mut visits = 0;
+        unsafe { space.walk_in(&[info], &allocator, &mut |_, _| {
+            assert!(counter.bytes() > 0, "outer walk keeps its backing charged");
+            assert!(space.buffers.try_lock().is_ok(), "visitor must not inherit the buffer lock");
+            let nested = space.initialized_ranges_in(&allocator);
+            assert_eq!(nested.len(), 4);
+            drop(nested);
+            visits += 1;
+        }); }
+        assert_eq!(visits, 4);
+        assert_eq!(counter.bytes(), 0);
+        assert_eq!(Arc::strong_count(&counter), 2);
+    }
+
+    #[test]
     fn initialized_walk_skips_poisoned_active_and_retired_tails() {
         let space = AtomicBumpAllocator::new::<Full>(128 * 1024);
         let info = TypeInfo::for_header(Full::SIZE).with_fields(1);
@@ -877,7 +955,7 @@ mod tlab_tests {
         drop(first);
         let mut count = 0;
         unsafe {
-            space.walk(&[info], &mut |_, _| count += 1);
+            space.walk(&[info.clone()], &mut |_, _| count += 1);
         }
         assert_eq!(count, 2);
         // Reusing an active buffer must zero newly allocated fields despite the
@@ -957,8 +1035,8 @@ mod allocation_boundary_tests {
         let bump = BumpAllocator::new::<Full>(4096);
         let atomic = AtomicBumpAllocator::new::<Full>(4096);
         let bytes = TypeInfo::for_header(Full::SIZE).with_varlen_bytes(0);
-        let over_aligned = bytes.with_align_log2(6);
-        let mut invalid_align = bytes;
+        let over_aligned = bytes.clone().with_align_log2(6);
+        let mut invalid_align = bytes.clone();
         invalid_align.align_log2 = usize::BITS as u8;
         for allocator in [&bump as &dyn Alloc, &atomic as &dyn Alloc] {
             assert!(allocator.alloc(&bytes, usize::MAX).is_null());
@@ -980,7 +1058,7 @@ mod allocation_boundary_tests {
         let bytes = TypeInfo::for_header(Full::SIZE).with_varlen_bytes(0);
         let mut tlab = Tlab::new();
         assert!(tlab.alloc(&space, &bytes, usize::MAX).is_null());
-        assert!(tlab.alloc(&space, &bytes.with_align_log2(6), 0).is_null());
+        assert!(tlab.alloc(&space, &bytes.clone().with_align_log2(6), 0).is_null());
         assert_eq!(space.used(), 0);
         assert!(space.buffers.lock().unwrap().is_empty());
         assert!(!tlab.alloc(&space, &bytes, 8).is_null());
@@ -1001,7 +1079,7 @@ mod allocation_boundary_tests {
     #[test]
     fn invalid_batch_alignment_does_not_advance_shared_cursor() {
         let space = AtomicBumpAllocator::new::<Full>(4096);
-        let mut addresses = Vec::new();
+        let mut addresses = allocator_api2::vec::Vec::new();
         for layouts in [&[(24, 8), (64, 64)][..], &[(0, 8)][..], &[(16, 0)][..]] {
             assert!(!unsafe { space.reserve_batch(layouts, &mut addresses) });
             assert_eq!(space.used(), 0);
@@ -1017,7 +1095,7 @@ mod allocation_boundary_tests {
         let base = unsafe { storage.as_mut_ptr().add(8) };
         let bump = unsafe { BumpAllocator::from_region::<Compact>(base, 4096) };
         let normal = TypeInfo::for_header(Compact::SIZE).with_fields(1);
-        let mut aligned = normal.with_align_log2(6);
+        let mut aligned = normal.clone().with_align_log2(6);
         aligned.type_id = 1;
         let mut expected = Vec::new();
         for info in [&normal, &aligned, &normal, &aligned] {
@@ -1027,7 +1105,7 @@ mod allocation_boundary_tests {
             expected.push(ptr);
         }
         let mut visited = Vec::new();
-        unsafe { bump.walk(&[normal, aligned], &mut |ptr, _| visited.push(ptr)); }
+        unsafe { bump.walk(&[normal.clone(), aligned.clone()], &mut |ptr, _| visited.push(ptr)); }
         assert_eq!(visited, expected);
         unsafe { bump.reset(); }
         visited.clear();
@@ -1090,7 +1168,7 @@ mod header_contract_tests {
     #[test]
     fn same_sized_header_with_different_type_id_offset_is_rejected() {
         let info = TypeInfo::for_header(Full::SIZE).with_type_id(1);
-        let heap = crate::gc::Heap::new::<Full>(64, vec![info.with_type_id(0), info]);
+        let heap = crate::gc::Heap::new::<Full>(64, vec![info.clone().with_type_id(0), info.clone()]);
         // Exclusive heap access. Size/alignment alone are insufficient: later
         // collection would otherwise read the type id at the wrong offset.
         assert!(unsafe { heap.alloc_obj::<OffsetHeader>(&info, 0) }.is_null());
@@ -1145,5 +1223,103 @@ mod header_contract_tests {
     fn zero_sized_arenas_are_rejected_before_native_allocation() {
         assert!(std::panic::catch_unwind(|| BumpAllocator::new::<Compact>(0)).is_err());
         assert!(std::panic::catch_unwind(|| AtomicBumpAllocator::new::<Compact>(0)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod buffer_registry_storage_tests {
+    use super::*;
+    use crate::runtime::{allocation_counter::AllocationCounter, allocation_probe};
+    #[test]
+    fn collector_tlab_registry_empty_owner_and_exact_backing_request() {
+        let counter = Arc::<AllocationCounter>::default();
+        let arena = AtomicBumpAllocator::with_metadata_allocator::<crate::gc::Full>(
+            4096,
+            MetadataAllocator::new(&counter),
+        );
+        assert_eq!(counter.bytes(), arena.collector_cursor_backing_bytes());
+        assert_eq!(Arc::strong_count(&counter), 3);
+        let mut buffers = arena.buffers.lock().unwrap();
+        assert_eq!(buffers.capacity(), 0);
+        // Acquire the registry lock before observing vector requests: macOS
+        // mutex first-use control allocation is a separate ownership domain.
+        allocation_probe::start();
+        buffers.reserve_exact(7);
+        let request = allocation_probe::finish_bytes();
+        assert_eq!((request.0, request.1, request.3), (1, 0, 0));
+        assert_eq!(counter.bytes(), request.2 + arena.collector_cursor_backing_bytes());
+        assert_eq!(
+            counter.bytes(),
+            buffers.capacity() * std::mem::size_of::<SharedMetadata<BufferExtent>>() + arena.collector_cursor_backing_bytes()
+        );
+        drop(buffers);
+        drop(arena);
+        assert_eq!(counter.bytes(), 0);
+        assert_eq!(Arc::strong_count(&counter), 1);
+    }
+    #[test]
+    fn collector_tlab_registry_reset_retains_charge_and_reuses_backing() {
+        let counter = Arc::<AllocationCounter>::default();
+        let arena = AtomicBumpAllocator::with_metadata_allocator::<crate::gc::Full>(
+            4096,
+            MetadataAllocator::new(&counter),
+        );
+        let old: Vec<_> = (0..9)
+            .map(|_| arena.reserve_buffer(16, 8, 64).unwrap())
+            .collect();
+        let capacity = arena.buffers.lock().unwrap().capacity();
+        let retained = counter.bytes();
+        assert_eq!(
+            retained,
+            capacity * std::mem::size_of::<SharedMetadata<BufferExtent>>() + arena.collector_cursor_backing_bytes()
+                + old.len() * SharedMetadata::<BufferExtent>::allocation_bytes()
+        );
+        assert!(old.iter().all(|r| SharedMetadata::strong_count(r) == 2));
+        // No objects were allocated and no mutator or walker is active. These
+        // retained metadata observers never access the managed region.
+        unsafe {
+            arena.reset();
+        }
+        assert_eq!(arena.used(), 0);
+        assert_eq!(counter.bytes(), retained);
+        assert!(old.iter().all(|r| SharedMetadata::strong_count(r) == 1));
+        let new: Vec<_> = (0..9)
+            .map(|_| arena.reserve_buffer(16, 8, 64).unwrap())
+            .collect();
+        assert_eq!(counter.bytes(), retained + new.len() * SharedMetadata::<BufferExtent>::allocation_bytes());
+        assert_eq!(arena.buffers.lock().unwrap().capacity(), capacity);
+        for (old, new) in old.iter().zip(&new) {
+            assert!(!SharedMetadata::ptr_eq(old, new));
+            assert_eq!((old.start, old.end), (new.start, new.end));
+        }
+        drop(arena);
+        assert_eq!(counter.bytes(), (old.len() + new.len()) * SharedMetadata::<BufferExtent>::allocation_bytes());
+        assert_eq!(Arc::strong_count(&counter), 1 + old.len() + new.len());
+        assert!(new.iter().all(|r| SharedMetadata::strong_count(r) == 1));
+        drop(old);
+        assert_eq!(counter.bytes(), new.len() * SharedMetadata::<BufferExtent>::allocation_bytes());
+        drop(new);
+        assert_eq!(counter.bytes(), 0);
+        assert_eq!(Arc::strong_count(&counter), 1);
+    }
+    #[test]
+    fn collector_tlab_registry_counter_outlives_constructor_borrow() {
+        let (arena, observer) = {
+            let counter = Arc::<AllocationCounter>::default();
+            let arena = AtomicBumpAllocator::with_metadata_allocator::<crate::gc::Full>(
+                4096,
+                MetadataAllocator::new(&counter),
+            );
+            let record = arena.reserve_buffer(16, 8, 64).unwrap();
+            assert_eq!((record.start, record.end), (0, 64));
+            (arena, Arc::downgrade(&counter))
+        };
+        {
+            let counter = observer.upgrade().expect("registry owns its counter");
+            assert!(counter.bytes() > 0);
+            assert_eq!(Arc::strong_count(&counter), 4);
+        }
+        drop(arena);
+        assert!(observer.upgrade().is_none());
     }
 }

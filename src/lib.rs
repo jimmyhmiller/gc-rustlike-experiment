@@ -13,6 +13,7 @@ mod codegen_effects;
 pub mod compile;
 pub mod core;
 pub mod diag;
+mod definite_init;
 pub mod emit;
 // `gc` and `runtime` live in the LLVM-free `gcrust-rt` crate so AOT binaries
 // can statically link them without LLVM. Re-export under their original paths.
@@ -22,9 +23,14 @@ pub mod lexer;
 pub mod lower;
 pub mod manifest;
 pub mod parser;
+mod derive;
+mod capture;
+mod macros;
 pub mod resolve;
 pub use gcrust_rt::runtime;
 pub mod types;
+mod type_alias;
+mod trait_solver;
 
 mod codegen_escape;
 mod codegen_liveness;

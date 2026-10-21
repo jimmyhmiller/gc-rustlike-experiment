@@ -15,11 +15,10 @@ impl Alloc for SemiSpace {
 /// High bit of an object header word indicates the object has been moved
 /// by the collector; the low 63 bits hold the to-space address.
 ///
-/// Valid heap pointers use at most 48 bits on current hardware, and the
-/// original header word (u16 type_id + zero padding) never has bit 63
-/// set, so this is a safe sentinel. (Earlier revisions used bit 0, but
-/// that broke when headers switched from `*const TypeInfo` — always
-/// aligned — to a u16 type_id, which can be odd.)
+/// The encoding requires heap addresses with bit 63 clear and an original
+/// header that leaves that marker clear. Built-in headers store IDs in the
+/// numeric low 16 bits, avoiding a type-ID/marker overlap on either byte order.
+/// Bit 0 cannot be used: valid unforwarded type IDs and enum tags can be odd.
 pub const FORWARDING_BIT: u64 = 1 << 63;
 
 /// If `ptr`'s header word is a forwarding entry, return the to-space
@@ -59,6 +58,9 @@ pub unsafe fn follow_forwarding(ptr: *const u8) -> *const u8 {
 pub trait PtrPolicy {
     /// If `bits` encodes a heap pointer, return the raw pointer.
     /// Return `None` for immediates (fixnums, booleans, nil, etc.).
+    /// Called by collectors and mutator barriers, including within object
+    /// access scopes. It must support concurrent calls without a managed
+    /// safepoint or reentry into managed execution.
     fn try_decode_ptr(bits: u64) -> Option<*mut u8>;
 
     /// Encode a raw heap pointer back into a tagged `u64` value.
@@ -162,6 +164,8 @@ impl SemiSpace {
     }
 
     /// Run a Cheney collection, rewriting every registered root and object slot.
+    /// A panic during collection aborts the process; partially relocated storage
+    /// has no rollback protocol and cannot be reused after a caught panic.
     /// # Safety
     /// All objects must have initialized headers/lengths matching `type_table`
     /// and valid pointer representations for `P`. Roots must enumerate all
@@ -169,6 +173,16 @@ impl SemiSpace {
     /// No allocation, object access or independent scan may run concurrently.
     /// Reload references from rewritten roots after collection.
     pub unsafe fn collect<P: PtrPolicy>(
+        &mut self,
+        type_table: &[TypeInfo],
+        roots: &mut [&dyn RootSource],
+    ) {
+        crate::gc::failure::abort_on_collection_panic(|| unsafe {
+            self.collect_inner::<P>(type_table, roots);
+        });
+    }
+
+    unsafe fn collect_inner<P: PtrPolicy>(
         &mut self,
         type_table: &[TypeInfo],
         roots: &mut [&dyn RootSource],

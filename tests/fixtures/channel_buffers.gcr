@@ -1,0 +1,25 @@
+struct BufferedMessage { number: i64, text: String, payload: Array<i64> }
+fn main() -> i64 {
+    let worker = Thread::spawn(|| {
+        let mut sum = 0;
+        for i in 0..256 { let mut a: Array<i64> = Array::new(4096); a[4095] = i; sum = sum + a[4095]; }
+        sum
+    });
+    for i in 0..64 {
+        let queue: Channel<BufferedMessage> = Channel::new(8193);
+        let mut payload: Array<i64> = Array::new(16);
+        payload[15] = i;
+        queue.send(BufferedMessage { number: i, text: i.to_string(), payload: payload });
+        queue.close();
+        let message = queue.recv_value();
+        if message.number != i || message.text != i.to_string() || message.payload[15] != i {
+            panic("large channel cleanup lost message roots");
+        }
+        match queue.recv() { Some(_) => panic("closed queue not drained"), None => () };
+        let empty: Channel<i64> = Channel::new(8193);
+        empty.close(); empty.close();
+    }
+    if worker.join() != 32640 { panic("allocation worker failed"); }
+    print_int(42);
+    0
+}

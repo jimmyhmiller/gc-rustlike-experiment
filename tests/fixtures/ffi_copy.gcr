@@ -1,0 +1,42 @@
+// Large native copies must keep caller roots and mutable owners current.
+struct CopySentinel { value: i64, text: String }
+extern "C" fn strlen(text: RawPtr) -> i64;
+extern "C" fn memset(mut bytes: RawPtr, value: i32, count: i64) -> RawPtr;
+fn main() -> i64 {
+    let worker = Thread::spawn(|| {
+        let mut sum = 0;
+        for i in 0..128 {
+            let mut scratch: Array<i64> = Array::new(8192);
+            scratch[8191] = i;
+            sum = sum + scratch[8191];
+        }
+        sum
+    });
+    let keep = CopySentinel { value: 42, text: "still rooted" };
+    let mut text = "é🦀a";
+    for _ in 0..17 { text = text + text; }
+    let mut bytes: Array<u8> = Array::new(65537);
+    let mut words: Array<u16> = Array::new(32769);
+    let mut integers: Array<i32> = Array::new(16385);
+    let mut longs: Array<i64> = Array::new(8193);
+    let mut flags: Array<bool> = Array::new(65537);
+    for _ in 0..32 {
+        if unsafe { strlen(as_c_bytes(text)) } != 917504 { panic("string copy corrupt"); }
+        unsafe {
+            memset(as_c_bytes(bytes), 7, 65537);
+            memset(as_c_bytes(words), 1, 65538);
+            memset(as_c_bytes(integers), 127, 65540);
+            memset(as_c_bytes(longs), 1, 65544);
+            memset(as_c_bytes(flags), 255, 65537);
+        }
+        if bytes[0] != 7u8 || bytes[65536] != 7u8 { panic("byte copy corrupt"); }
+        if words[0] != 257u16 || words[32768] != 257u16 { panic("word copy corrupt"); }
+        if integers[0] != 2139062143i32 || integers[16384] != 2139062143i32 { panic("integer copy corrupt"); }
+        if longs[0] != 72340172838076673 || longs[8192] != 72340172838076673 { panic("long copy corrupt"); }
+        if !flags[0] || !flags[65536] { panic("boolean copy corrupt"); }
+        if keep.value != 42 || keep.text != "still rooted" || text.len() != 917504 { panic("caller root corrupt"); }
+    }
+    if worker.join() != 8128 { panic("worker corrupt"); }
+    print_int(42);
+    0
+}

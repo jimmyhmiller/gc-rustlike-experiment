@@ -1,0 +1,19 @@
+// Sibling native arguments force pressure collection during allocation.
+extern "C" fn memcmp(a: RawPtr, b: RawPtr, bytes: i64) -> i32;
+fn main() -> i64 {
+    let values: Array<u8> = Array::new(1048576);
+    if unsafe { memcmp(as_c_bytes(values), as_c_bytes(values), 1048576) } != 0i32 {
+        panic("native pressure lost array source");
+    }
+    if values[0] != 0u8 || values[1048575] != 0u8 { panic("array caller root lost"); }
+    let mut text = "é🦀a";
+    for _ in 0..19 { text = text + text; }
+    if unsafe { memcmp(as_c_bytes(text), as_c_bytes(text), 3670016) } != 0i32 {
+        panic("native pressure lost String source");
+    }
+    if text.len() != 3670016 || values.len() != 1048576 || values[0] != 0u8 {
+        panic("native pressure lost caller roots");
+    }
+    print_int(42);
+    0
+}

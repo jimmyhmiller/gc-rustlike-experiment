@@ -29,7 +29,7 @@ fn run_stress(src: &str) -> Result<i64, String> {
     let (module, _) = parse_with_prelude(src).map_err(|e| format!("parse: {e:?}"))?;
     let resolved = resolve_module(module).map_err(|e| format!("resolve: {e:?}"))?;
     let prog = lower_program(&resolved.globals).map_err(|e| format!("lower: {}", e.msg))?;
-    jit_run_i64_gc(&prog, true).map_err(|e| format!("codegen/run: {}", e.0))
+    unsafe { jit_run_i64_gc(&prog, true) }.map_err(|e| format!("codegen/run: {}", e.0))
 }
 
 struct Rng(u64);

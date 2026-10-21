@@ -14,13 +14,13 @@ fn run(src: &str) -> i64 {
     let (module, _) = parse_with_prelude(src).unwrap();
     let resolved = resolve_module(module).unwrap();
     let prog = lower_program(&resolved.globals).unwrap();
-    jit_run_i64(&prog).unwrap()
+    unsafe { jit_run_i64(&prog) }.unwrap()
 }
 fn run_stress(src: &str) -> i64 {
     let (module, _) = parse_with_prelude(src).unwrap();
     let resolved = resolve_module(module).unwrap();
     let prog = lower_program(&resolved.globals).unwrap();
-    jit_run_i64_gc(&prog, true).unwrap()
+    unsafe { jit_run_i64_gc(&prog, true) }.unwrap()
 }
 fn lower_err(src: &str) -> Option<String> {
     let (module, _) = parse_with_prelude(src).unwrap();

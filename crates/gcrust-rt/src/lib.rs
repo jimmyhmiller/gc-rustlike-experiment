@@ -11,5 +11,7 @@
 //! The main `gcrust` crate re-exports `gcrust_rt::gc` and `gcrust_rt::runtime`
 //! so existing `crate::gc` / `crate::runtime` paths keep working.
 
+mod abi_storage;
+
 pub mod gc;
 pub mod runtime;

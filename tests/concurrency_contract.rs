@@ -52,7 +52,7 @@ fn synchronized_publication_jit_and_aot_with_moving_gc() {
     let (module, _) = parse_with_prelude(SOURCE).unwrap();
     let resolved = resolve_module(module).unwrap();
     let program = lower_program(&resolved.globals).unwrap();
-    assert_eq!(jit_run_i64_gc(&program, true).unwrap(), 0);
+    assert_eq!(unsafe { jit_run_i64_gc(&program, true) }.unwrap(), 0);
     let binary = std::env::temp_dir().join(format!("gcr-contract-{}", std::process::id()));
     let source = binary.with_extension("gcr");
     std::fs::write(&source, SOURCE).unwrap();

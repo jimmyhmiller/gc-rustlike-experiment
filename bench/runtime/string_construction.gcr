@@ -1,0 +1,18 @@
+// Native construction control: compare complete ASCII/Unicode output under GC.
+fn main() -> i64 {
+    let args = process_args().expect("arguments");
+    if args.len() != 3 { return 2; }
+    let mut text = if args[1] == "unicode" { "λ" } else { "a" };
+    for _ in 0..14 { text = text + text; }
+    let expected = text + text;
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(text); parts.push(text);
+    let mut checksum = 0;
+    for _ in 0..2000 {
+        let result = if args[2] == "join" { parts.join("") } else { text + text };
+        if result != expected { return 3; }
+        checksum += result.len();
+    }
+    print!("{}", checksum);
+    0
+}

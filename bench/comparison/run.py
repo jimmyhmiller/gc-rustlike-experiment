@@ -34,9 +34,9 @@ def build(name, size, main, warm, samples, rust_opt, env):
 fn main() -> i64 {{
     let mut i = 0;
     while i < {warm + samples} {{
-        let start = benchmark_clock_ns();
+        let start = unsafe {{ benchmark_clock_ns() }};
         let result = workload();
-        let elapsed = benchmark_clock_ns() - start;
+        let elapsed = unsafe {{ benchmark_clock_ns() }} - start;
         println("@sample");
         print_int(i);
         print_int(elapsed);

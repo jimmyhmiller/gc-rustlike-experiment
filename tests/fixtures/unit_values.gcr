@@ -1,0 +1,47 @@
+struct Heap { first: (), n: i64, middle: (), text: String, last: () }
+    #[value] struct Inline { first: (), n: i64, middle: (), text: String, last: () }
+    struct Trace { n: i64 }
+    enum RefEnum { Item((), i64, (), String, ()) }
+    #[value] enum ValueEnum { Item((), i64, (), String, ()) }
+    fn consume(unit: ()) -> i64 { 1 }
+    fn produce(trace: Trace) -> Heap { mark(trace, 5); Heap { first: (), n: 0, middle: (), text: "temporary", last: () } }
+    fn mark(mut trace: Trace, digit: i64) { trace.n = trace.n * 10 + digit }
+    fn set(mut heap: Heap) { heap.n = 7 }
+    fn set_unit(mut heap: Heap, trace: Trace) { heap.first = mark(trace, 2) }
+    fn set_array(mut a: Array<()>, trace: Trace) { a[1] = mark(trace, 4) }
+    fn main() -> i64 {
+        let trace = Trace { n: 0 };
+        let mut heap = Heap { last: mark(trace, 1), first: (), n: 0, middle: (), text: "rooted" };
+        set(heap); set_unit(heap, trace);
+        let value = Inline { first: (), n: 8, middle: (), text: "inline", last: () };
+        let tuple = ((), 9, (), "tuple", ());
+        let (u0, number, u2, text, u4) = tuple;
+        if value.n != 8 || value.text != "inline" || number != 9 || text != "tuple" { return 1; }
+        let mut a: Array<()> = Array::new(3);
+        let units = [mark(trace, 3); 2];
+        set_array(a, trace);
+        a[0]; a[2]; units[0];
+        if a.len() != 3 || units.len() != 2 { return 2; }
+        if !a.get(0).is_some() || !a.get(3).is_none() { return 3; }
+        let closure = || consume(u2);
+        if closure() != 1 || consume(value.first) != 1 || consume(heap.last) != 1 { return 4; }
+        let mut values: Vec<()> = Vec::new(); values.push(()); values.push(heap.first);
+        values[0];
+        if values.len() != 2 || !values.pop().is_some() { return 5; }
+        let reference = RefEnum::Item((), 10, (), "reference", ());
+        let inline = ValueEnum::Item((), 11, (), "enum", ());
+        let ref_score = match reference { RefEnum::Item(a, n, c, text, e) => consume(a) + n + text.len() };
+        let inline_score = match inline { ValueEnum::Item(a, n, c, text, e) => consume(c) + n + text.len() };
+        if ref_score != 20 || inline_score != 16 || trace.n != 1234 { return 6; }
+        consume(produce(trace).first);
+        if trace.n != 12345 { return 11; }
+        let thread = Thread::spawn(|| { consume(u0); });
+        consume(thread.join());
+        let channel: Channel<()> = Channel::new(1);
+        channel.send(()).expect("send");
+        if !channel.recv().is_some() { return 9; }
+        if field_count(heap) != 2 || field_name(heap, 0) != "n" || field_i64(heap, 0) != 7 { return 10; }
+        for i in 0..100 { let s = i.to_string(); if s.len() == 0 { return 7; } }
+        if heap.n != 7 || value.text != "inline" || tuple.3 != "tuple" { return 8; }
+        42
+    }

@@ -3,6 +3,9 @@
 This document proposes work. None of the gates below has been signed off.
 Current evidence and failures live in [STATUS.md](STATUS.md).
 
+The broader language/developer ecosystem backlog is in [ROADMAP.md](ROADMAP.md).
+Item 1 is underway; its contract and audit ledger are in [SAFETY.md](SAFETY.md).
+
 ## Choose a release target
 
 Start with one application and one declared platform. The locally assessed host
@@ -21,8 +24,10 @@ installation, compatibility, and dependency distribution. These scopes differ.
 
 The observed stack overflow, stale scalar-operand store, channel lock deadlock,
 and native-call root/buffer defects have causal fixes and regression coverage.
-The full workspace and unreduced 50-iteration debug/release concurrency checks
-pass locally. Preserve these checks and extend them into automated, bounded gates.
+Historical full-workspace and unreduced 50-iteration debug/release concurrency
+results are recorded in STATUS.md. Current checkpoint gates and source snapshots
+are listed there separately. Preserve the checks and extend automated bounded
+validation and scheduled soaks.
 
 Acceptance:
 
@@ -63,10 +68,19 @@ and the managed-access audit is still incomplete. Mutable fields/array slots now
 use SC accesses and aggregate snapshots; finish GC/barrier and memory-safety
 boundary audits before removing Sync restrictions. Ordinary Vec/Map require
 external synchronization for shared mutation; concurrent versions are separate APIs.
-Root-owned completion records now support repeated/concurrent joins without
-freeing aliased native handles. Root exit drains descendants and releases records;
-metadata grows with total spawns until then. Nested scopes, earlier reclamation,
-structured outcomes, cancellation and async remain required.
+Completion records support repeated/concurrent joins without invalidating aliases.
+Safe Thread, AtomicI64 and Channel metadata follows weak managed owners; raw
+unbound records retain execution lifetime. Finished native threads are joined by
+completion-triggered reaping while preserving cached results. Root exit drains
+descendants and worker TLS before code retirement. Synchronous native entries and
+nested-context suspension are implemented. Structured child-task scopes, typed
+outcomes, cancellation and async remain required. Native queue-buffer pressure
+can request complete collection; metadata/stack accounting, hard admission limits
+and measured application/RSS/throughput/pause budgets remain open. Dynamic layout
+interior-pointer buffers are now owned by their type tables instead of leaked
+across embedded executions. Concurrent global SATB retention is bounded by
+source-address deduplication and packed chunks rather than write count; broader
+metadata accounting, producer limits and application budgets remain required.
 
 Acceptance:
 

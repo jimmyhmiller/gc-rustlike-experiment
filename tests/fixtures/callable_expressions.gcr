@@ -1,0 +1,40 @@
+struct Boxed { value: i64 }
+struct Handler { action: fn(i64) -> i64 }
+struct Trace { value: i64 }
+
+fn make(text: String) -> fn(i64) -> i64 { |n: i64| text.len() + n }
+fn select(mut trace: Trace) -> fn(i64) -> i64 {
+    trace.value = trace.value * 10 + 1;
+    |n: i64| n
+}
+fn argument(mut trace: Trace) -> i64 {
+    trace.value = trace.value * 10 + 2;
+    42
+}
+fn allocate() -> i64 {
+    let mut values: Vec<Boxed> = Vec::new();
+    let mut i = 0;
+    while i < 80 { values.push(Boxed { value: i }); i = i + 1; }
+    values[40].value
+}
+fn identity<T>(value: T) -> T { value }
+fn main() -> i64 {
+    assert_eq!((|| 42)(), 42);
+    assert_eq!((|x| x + 1)(41), 42);
+    assert_eq!(({ |x| x + 1 })(41), 42);
+    assert_eq!(make("captured")(34), 42);
+    assert_eq!((if true { |x: i64| x + 1 } else { |x: i64| x + 2 })(41), 42);
+    let handler = Handler { action: |n: i64| n + 1 };
+    assert_eq!((handler.action)(41), 42);
+    let functions: Array<fn() -> i64> = [|| 42, || 43];
+    assert_eq!(functions[0](), 42);
+    let trace = Trace { value: 0 };
+    assert_eq!(select(trace)(argument(trace)), 42);
+    assert_eq!(trace.value, 12);
+    // Callee env captures must stay rooted while the argument allocates.
+    assert_eq!(make("ok")(allocate()), 42);
+    assert_eq!((|items: Array<i64>| items.len() + 42)([]), 42);
+    assert_eq!((|f: fn(i64) -> i64| f(42))(identity), 42);
+    (|_: ()| {})(());
+    42
+}

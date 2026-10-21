@@ -12,9 +12,27 @@
 
 use crate::lexer::Span;
 
+// Diagnostics can receive synthesized spans as well as lexer spans. Normalize
+// before slicing; an invalid location must not hide the original error.
+fn floor_char_boundary(src: &str, offset: usize) -> usize {
+    let mut offset = offset.min(src.len());
+    while !src.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn ceil_char_boundary(src: &str, offset: usize) -> usize {
+    let mut offset = offset.min(src.len());
+    while !src.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
+}
+
 /// Map a byte offset to a 1-based (line, column).
 pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
-    let offset = offset.min(src.len());
+    let offset = floor_char_boundary(src, offset);
     let mut line = 1usize;
     let mut col = 1usize;
     for (i, ch) in src.char_indices() {
@@ -34,7 +52,7 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// The full text of the line containing `offset` (without its newline), plus the
 /// 1-based line number.
 fn line_text(src: &str, offset: usize) -> (usize, &str) {
-    let offset = offset.min(src.len());
+    let offset = floor_char_boundary(src, offset);
     let line_start = src[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line_end = src[offset..].find('\n').map(|i| offset + i).unwrap_or(src.len());
     let line_no = src[..line_start].bytes().filter(|b| *b == b'\n').count() + 1;
@@ -53,7 +71,7 @@ pub fn render(file: &str, src: &str, span: Span, msg: &str) -> String {
     // A span may point outside `src` — most commonly into the injected prelude,
     // whose text is lexed separately. Re-render against the prelude source so the
     // user still sees the offending stdlib line with carets.
-    if (span.start as usize) >= src.len() {
+    if (span.start as usize) > src.len() {
         if (span.start as usize) < PRELUDE_SRC.len() {
             let inner = render_in("<std>", PRELUDE_SRC, span, msg);
             return format!("{}\n note: this error is in the standard library (prelude)", inner);
@@ -65,8 +83,8 @@ pub fn render(file: &str, src: &str, span: Span, msg: &str) -> String {
 
 /// Render a diagnostic for `span` known to index into `src`.
 fn render_in(file: &str, src: &str, span: Span, msg: &str) -> String {
-    let start = span.start as usize;
-    let end = (span.end as usize).max(start + 1).min(src.len());
+    let start = floor_char_boundary(src, span.start as usize);
+    let end = ceil_char_boundary(src, (span.end as usize).max(start));
     let (line, col) = line_col(src, start);
     let (line_no, text) = line_text(src, start);
     debug_assert_eq!(line, line_no);
@@ -93,6 +111,31 @@ fn render_in(file: &str, src: &str, span: Span, msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eof_diagnostics_stay_in_the_user_source() {
+        for (src, location) in [("", "1:1"), ("fn main() {", "1:12"), ("fn main() {\n", "2:1")] {
+            let out = render("app.gcr", src, Span::new(src.len(), src.len()), "expected closing brace");
+            assert!(out.contains(&format!("app.gcr:{location}")), "{out}");
+            assert!(!out.contains("standard library"), "{out}");
+            assert!(out.contains('^'), "{out}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_spans_inside_utf8_scalars_are_normalized() {
+        let src = "aé🦀z";
+        for start in 0..=src.len() {
+            for end in start..=src.len() + 1 {
+                let out = render("unicode.gcr", src, Span::new(start, end), "bad span");
+                assert!(out.contains("unicode.gcr:1:"), "{out}");
+                assert!(out.contains(src), "{out}");
+                assert!(out.contains('^'), "{out}");
+            }
+        }
+        assert_eq!(line_col(src, 2), (1, 2));
+        assert_eq!(line_col(src, 4), (1, 3));
+    }
 
     #[test]
     fn line_col_basic() {

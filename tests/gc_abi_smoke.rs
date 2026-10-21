@@ -40,19 +40,16 @@ fn call_result<'ctx>(cs: CallSiteValue<'ctx>) -> BasicValueEnum<'ctx> {
     }
 }
 
-/// Test-only extern: trigger a GC from inside JIT'd code. The runtime context
-/// pointer is threaded through a thread-local so the JIT'd function only needs
-/// the `Thread*` it already has.
-use std::cell::Cell;
-thread_local! {
-    static FORCE_GC_CTX: Cell<*const RuntimeContext> = const { Cell::new(std::ptr::null()) };
-}
-
+/// Test-only extern: publish the active JIT frame and collect through its heap.
 #[unsafe(no_mangle)]
 extern "C" fn gcr_test_force_gc(thread: *mut Thread) {
-    let ctx = FORCE_GC_CTX.with(|c| c.get());
-    assert!(!ctx.is_null(), "force-gc context not installed");
-    unsafe { (*ctx).force_collect(&*thread) };
+    unsafe {
+        let thread = &*thread;
+        let state = &*thread.dyna_thread;
+        state.set_parked_jit_fp(thread.top_frame as *const u8);
+        (*thread.heap).mutator_triggered_gc::<gcrust::gc::IdentityPtrPolicy>(state);
+        state.clear_parked_jit_fp();
+    }
 }
 
 #[test]
@@ -259,15 +256,10 @@ fn jit_object_survives_collection_via_precise_roots() {
     ee.add_global_mapping(&alloc_fixed, runtime::ai_gc_alloc_fixed as *const () as usize);
     ee.add_global_mapping(&force_gc, gcr_test_force_gc as *const () as usize);
 
-    FORCE_GC_CTX.with(|c| c.set(&ctx as *const RuntimeContext));
-
-    let thread_ptr = ctx.thread_ptr();
     type RoundtripFn = unsafe extern "C" fn(*mut Thread) -> *mut u8;
     let f: RoundtripFn = unsafe { std::mem::transmute(ee.get_function_address("roundtrip").unwrap()) };
 
-    let returned_child = unsafe { f(thread_ptr) };
-
-    FORCE_GC_CTX.with(|c| c.set(std::ptr::null()));
+    let returned_child = ctx.enter(|thread| unsafe { f(thread) });
 
     // The collection happened. The returned pointer is obj.field0 read AFTER
     // the GC, through the relocated obj. It must be non-null, live in the

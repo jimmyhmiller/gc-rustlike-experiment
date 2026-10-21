@@ -32,7 +32,7 @@ fn run_project(dir: &PathBuf) -> Result<i64, String> {
     let (module, _) = parse_file_with_prelude(&main).map_err(|e| e.msg)?;
     let resolved = resolve_module(module).map_err(|e| e.msg)?;
     let prog = lower_program(&resolved.globals).map_err(|e| e.msg)?;
-    jit_run_i64(&prog).map_err(|e| e.0)
+    unsafe { jit_run_i64(&prog) }.map_err(|e| e.0)
 }
 
 #[test]

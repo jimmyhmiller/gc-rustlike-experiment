@@ -25,7 +25,7 @@ pub unsafe fn scan_object(obj: *mut u8, info: &TypeInfo, mut visitor: impl FnMut
     }
 
     // Visit interior pointers (refs embedded in flattened value fields).
-    for &off in info.interior_ptrs {
+    for &off in info.interior_ptrs.iter() {
         let slot = unsafe { obj.add(off as usize) as *mut u64 };
         visitor(slot);
     }

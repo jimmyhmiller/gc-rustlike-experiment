@@ -1,0 +1,38 @@
+struct Trace { digits: i64 }
+struct Cell { n: i64, text: String }
+struct Grid { cells: Array<i64>, trace: Trace }
+impl Index<i64> for Grid {
+    fn index(self, i: i64) -> i64 { mark(self.trace, 2); self.cells[i] }
+}
+impl IndexSet<i64> for Grid {
+    fn index_set(mut self, i: i64, v: i64) { mark(self.trace, 4); self.cells[i] = v }
+}
+fn mark(mut trace: Trace, digit: i64) { trace.digits = trace.digits * 10 + digit }
+fn choose(trace: Trace) -> i64 { mark(trace, 1); 0 }
+fn rhs(trace: Trace) -> i64 { mark(trace, 3); for i in 0..100 { let s = i.to_string(); if s.len() == 0 { return 99; } } 5 }
+fn changing_rhs(mut a: Array<i64>, trace: Trace) -> i64 { a[0] = 100; rhs(trace) }
+fn field_rhs(mut cells: Array<Cell>, trace: Trace) -> i64 { cells[0] = Cell { n: 99, text: "replacement" }; rhs(trace) }
+fn main() -> i64 {
+    let mut trace = Trace { digits: 0 };
+    let mut a: Array<i64> = Array::new(2); a[0] = 7; a[1] = 8;
+    a[choose(trace)] += changing_rhs(a, trace);
+    if trace.digits != 13 || a[0] != 12 || a[1] != 8 { return 1; }
+    trace.digits = 0;
+    let mut cells: Array<Cell> = Array::new(1); cells[0] = Cell { n: 7, text: "original" };
+    let original = cells[0];
+    cells[choose(trace)].n += field_rhs(cells, trace);
+    if trace.digits != 13 || original.n != 12 || original.text != "original" || cells[0].n != 99 { return 2; }
+    trace.digits = 0;
+    let mut grid = Grid { cells: a, trace: trace }; grid.cells[0] = 7;
+    grid[choose(trace)] += rhs(trace);
+    if trace.digits != 1234 || grid.cells[0] != 12 { return 3; }
+    trace.digits = 0;
+    let mut values: Vec<i64> = Vec::new(); values.push(7);
+    values[choose(trace)] += rhs(trace);
+    if trace.digits != 13 || values[0] != 12 { return 4; }
+    trace.digits = 0;
+    let mut strings = ["left"];
+    strings[choose(trace)] += "right";
+    if trace.digits != 1 || strings[0] != "leftright" { return 5; }
+    42
+}

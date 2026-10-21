@@ -7,7 +7,7 @@ fn run(src: &str) -> i64 {
     let (m, _) = parse_with_prelude(src).unwrap();
     let r = resolve_module(m).unwrap();
     let p = lower_program(&r.globals).unwrap();
-    jit_run_i64_gc(&p, true).unwrap()
+    unsafe { jit_run_i64_gc(&p, true) }.unwrap()
 }
 
 #[test]
@@ -133,10 +133,10 @@ fn embedded_jit_arguments_are_independent_and_inherited_by_threads() {
     let r = resolve_module(m).unwrap();
     let p = lower_program(&r.globals).unwrap();
     for (arg, expected) in [("λ", 4), ("abc", 6), ("", 0)] {
-        assert_eq!(jit_run_i64_with_args(&p, GcRunMode::Stress, vec!["embedded".into(), arg.into()]).unwrap(), expected);
+        assert_eq!(unsafe { jit_run_i64_with_args(&p, GcRunMode::Stress, vec!["embedded".into(), arg.into()]) }.unwrap(), expected);
     }
     #[cfg(unix)] {
         use std::os::unix::ffi::OsStringExt;
-        assert_eq!(jit_run_i64_with_args(&p, GcRunMode::Stress, vec!["embedded".into(), std::ffi::OsString::from_vec(vec![0xff])]).unwrap(), 6);
+        assert_eq!(unsafe { jit_run_i64_with_args(&p, GcRunMode::Stress, vec!["embedded".into(), std::ffi::OsString::from_vec(vec![0xff])]) }.unwrap(), 6);
     }
 }

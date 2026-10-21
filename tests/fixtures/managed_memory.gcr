@@ -1,3 +1,26 @@
+struct RefCounter { n: i64 }
+fn increment_reference(counter: Atom<RefCounter>) -> i64 {
+    for i in 0..64 {
+        let mut committed = false;
+        while !committed {
+            let old = counter.deref();
+            let new = RefCounter { n: old.n + 1 };
+            committed = counter.compare_and_set(old, new);
+        }
+    }
+    0
+}
+fn reference_atom_contract() -> i64 {
+    let first = RefCounter { n: 0 };
+    let equal = RefCounter { n: 0 };
+    let counter: Atom<RefCounter> = Atom::new(first);
+    if counter.compare_and_set(equal, first) { return 60; }
+    let a = Thread::spawn(|| increment_reference(counter));
+    let b = Thread::spawn(|| increment_reference(counter));
+    if a.join() != 0 || b.join() != 0 { return 61; }
+    if counter.deref().n != 128 { return 62; }
+    0
+}
 #[value] struct Flag { n: i64 }
 struct Flags { x: Flag, y: i64 }
 impl Sync for Flags {}
@@ -31,7 +54,25 @@ fn write(mut shared: Shared, mut values: Array<State>, mut words: Array<i64>, co
     }
     0
 }
+fn scalar_atom_contract() -> i64 {
+    let byte: Atom<i8> = Atom::new(-128 as i8);
+    if !byte.compare_and_set(-128 as i8, 127 as i8) || byte.deref() != 127 as i8 { return 63; }
+    let word: Atom<u16> = Atom::new(65535 as u16);
+    if !word.compare_and_set(65535 as u16, 0 as u16) || word.deref() != 0 as u16 { return 64; }
+    let float: Atom<f32> = Atom::new(-0.0 as f32);
+    if float.compare_and_set(0.0 as f32, 1.0 as f32) { return 65; }
+    if !float.compare_and_set(-0.0 as f32, 2.5 as f32) || float.deref() != 2.5 as f32 { return 66; }
+    let nan = 0.0 / 0.0;
+    let wide: Atom<f64> = Atom::new(nan);
+    let bits = wide.deref();
+    if !wide.compare_and_set(bits, 3.0) || wide.deref() != 3.0 { return 67; }
+    0
+}
 fn main() -> i64 {
+    let scalar_error = scalar_atom_contract();
+    if scalar_error != 0 { return scalar_error; }
+    let reference_error = reference_atom_contract();
+    if reference_error != 0 { return reference_error; }
     // Mixed aggregate/scalar store-buffering must never observe both zero.
     for iteration in 0..128 {
         let flags = Flags { x: Flag { n: 0 }, y: 0 };
@@ -66,6 +107,15 @@ fn main() -> i64 {
             if error != 0 { return 20 + error; }
             let array_error = check(values[0]);
             if array_error != 0 { return 30 + array_error; }
+            let reflected = field_i64(shared, 1);
+            if reflected != 123456789 && reflected != -987654321 { return 46; }
+            let reflected_narrow = field_i64(shared, 3);
+            if reflected_narrow != -128 && reflected_narrow != 127 { return 47; }
+            let reflected_float = field_i64(shared, 5);
+            if reflected_float != float_bits(1.5) && reflected_float != float_bits(-2.25) { return 48; }
+            if field_i64(shared, 2) == 0 { return 49; }
+            let reflected_bool = field_i64(shared, 4);
+            if reflected_bool != 0 && reflected_bool != 1 { return 51; }
             let scalar = shared.scalar;
             if scalar != 123456789 && scalar != -987654321 { return 40; }
             let reference = shared.reference;

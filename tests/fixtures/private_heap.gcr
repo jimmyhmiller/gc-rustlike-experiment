@@ -33,11 +33,11 @@ fn main() -> i64 {
     let mut shared: Array<Item> = Array::new(2);
     shared[0] = Item { value: 10 };
     shared[1] = Item { value: 20 };
-    let first = thread_spawn(|| private_work(128) + shared_work(shared,0));
-    let second = thread_spawn(|| private_work(129) + shared_work(shared,1));
+    let first = (unsafe { thread_spawn(|| private_work(128) + shared_work(shared,0)) });
+    let second = (unsafe { thread_spawn(|| private_work(129) + shared_work(shared,1)) });
     let own = private_work(130);
-    let a = thread_join(first);
-    let b = thread_join(second);
+    let a = (unsafe { thread_join(first) });
+    let b = (unsafe { thread_join(second) });
     print_int(own+a+b);
     0
 }

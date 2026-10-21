@@ -16,7 +16,7 @@ pub(crate) fn outline(program: &CoreProgram) -> Outlined {
     for (id, function) in program.funcs.iter().enumerate() {
         if function.is_extern
             || !function.closure_captures.is_empty()
-            || function.name.starts_with("__closure_")
+            || function.is_closure
         {
             continue;
         }
@@ -166,7 +166,7 @@ mod tests {
         );
         let expanded = outline(&program);
         assert_eq!(expanded.helpers.len(), 1);
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 63);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 63);
         let context = inkwell::context::Context::create();
         let compiled = crate::codegen::codegen(&context, &program).unwrap();
         assert!(

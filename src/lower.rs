@@ -15,15 +15,47 @@ use crate::types::{Prim, Ty, TyCtx, lower_type, suffix_prim};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LowerError {
     pub msg: String,
     pub span: Span,
 }
 type LResult<T> = Result<T, LowerError>;
+#[cfg(test)]
+thread_local! {
+    static PROBE_WORK: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};
+    static EXPR_WORK: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};
+}
+#[cfg(test)]
+pub(crate) fn reset_probe_work() { PROBE_WORK.with(|n|n.set(0)); EXPR_WORK.with(|n|n.set(0)); }
+#[cfg(test)]
+pub(crate) fn probe_work() -> usize {PROBE_WORK.with(|n|n.get())}
+#[cfg(test)]
+pub(crate) fn expr_work() -> usize {EXPR_WORK.with(|n|n.get())}
+
+
+/// A method operand may already have been evaluated into a typed place local.
+/// Keeping that fact in Core avoids synthesizing source names during lowering.
+enum MethodArg<'a> {
+    Source(&'a Expr),
+    Lowered(CoreExpr, Ty, Span),
+}
 
 fn err<T>(msg: impl Into<String>, span: Span) -> LResult<T> {
     Err(LowerError { msg: msg.into(), span })
+}
+
+/// These primitives expose representation/handle obligations. Public typed
+/// wrappers discharge those obligations inside explicit unsafe blocks.
+pub fn native_intrinsic_requires_unsafe(name: &str) -> bool {
+    matches!(name,
+        "ptr_read_i64" | "thread_spawn" | "thread_join" | "thread_bind_owner" | "atomic_i64_bind_owner"
+        | "atomic_i64_new" | "atomic_i64_load" | "atomic_i64_store"
+        | "atomic_i64_fetch_add" | "atomic_i64_cas"
+        | "atom_load" | "atom_cas"
+        | "chan_bind_owner" | "chan_new" | "chan_send" | "chan_recv" | "chan_close"
+        | "chan_sender_clone" | "chan_sender_drop"
+        | "chan_waiting_senders" | "chan_waiting_receivers")
 }
 
 /// Levenshtein edit distance between two short identifiers (for "did you mean?"
@@ -64,7 +96,7 @@ fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// the type-parameter substitution to apply, and the mangled name. Works for
 /// free functions AND impl methods (methods aren't in `ctx.fns`, so we carry
 /// the `FnDef` directly).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Job {
     f: Rc<FnDef>,
     subst: HashMap<String, Ty>,
@@ -74,10 +106,24 @@ struct Job {
     self_ty: Option<Ty>,
 }
 
-/// Drives monomorphization: assigns each needed instantiation (keyed by its
-/// mangled name) a [`FuncId`] and keeps a worklist of jobs to lower.
+/// Source identity and ground types determine an instantiation. Display names
+/// are deliberately excluded: qualified names and type spellings can collide.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct InstantiationKey {
+    source: crate::lexer::SourceId,
+    start: u32,
+    end: u32,
+    /// Functions a macro expands share their body's span; the name keeps
+    /// each expansion distinct.
+    name: String,
+    subst: Vec<(String, Ty)>,
+    self_ty: Option<Ty>,
+}
+
+/// Drives monomorphization: assigns each needed instantiation (keyed by source identity and ground types) a [`FuncId`] and keeps a worklist of jobs to lower.
+#[derive(Clone, PartialEq)]
 struct Mono {
-    ids: HashMap<String, FuncId>,
+    ids: HashMap<InstantiationKey, FuncId>,
     worklist: Vec<(FuncId, Job)>,
     /// Fully-formed lifted closure functions, keyed by their FuncId, to be
     /// installed into `prog.funcs` by the driver.
@@ -90,7 +136,7 @@ struct Mono {
 
 /// `Mono`'s contents at a point in time; see [`Mono::snapshot`].
 struct MonoSnapshot {
-    ids: HashMap<String, FuncId>,
+    ids: HashMap<InstantiationKey, FuncId>,
     worklist: usize,
     closures: usize,
     spans: usize,
@@ -124,15 +170,21 @@ impl Mono {
         *count += 1;
         id
     }
-    /// Get (or assign) the FuncId for a job (keyed by mangled name), queueing it
+    /// Get (or assign) the FuncId for a job (keyed by source identity and ground types), queueing it
     /// for lowering the first time it's seen.
     fn intern(&mut self, job: Job, count: &mut u32) -> FuncId {
-        if let Some(id) = self.ids.get(&job.mangled) {
+        let mut subst: Vec<_> = job.subst.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
+        subst.sort_by(|a, b| a.0.cmp(&b.0));
+        let key = InstantiationKey {
+            source: job.f.span.source, start: job.f.span.start, end: job.f.span.end,
+            name: job.f.name.clone(), subst, self_ty: job.self_ty.clone(),
+        };
+        if let Some(id) = self.ids.get(&key) {
             return *id;
         }
         let id = *count;
         *count += 1;
-        self.ids.insert(job.mangled.clone(), id);
+        self.ids.insert(key, id);
         self.worklist.push((id, job));
         id
     }
@@ -146,19 +198,60 @@ fn mangle(fq: &str, args: &[Ty]) -> String {
     }
 }
 
+/// Rust's other entry signatures, `fn main()` and `fn main() -> Result<(), E>`,
+/// run through a generated `fn main() -> i64` wrapper: `()` and `Ok(())` exit
+/// 0, and `Err(e)` prints `Error: {e:?}` to stderr and exits 1.
+fn wrap_entry(ctx: &mut TyCtx) -> LResult<()> {
+    let Some(main_f) = ctx.fns.get("main").cloned() else { return Ok(()) };
+    if main_f.is_extern || !main_f.generics.params.is_empty() || !main_f.params.is_empty() {
+        return Ok(());
+    }
+    let ret = main_f.ret.as_ref().map(|t| lower_type(t, &[], ctx)).transpose().map_err(conv)?;
+    let body = match &ret {
+        None | Some(Ty::Prim(Prim::Unit)) => "{ __gcr_user_main(); 0 }",
+        Some(Ty::Named { name, args }) if name == "Result" && args.first().is_some_and(Ty::is_unit) =>
+            "{ match __gcr_user_main() { Result::Ok(_) => 0, Result::Err(e) => { eprintln!(\"Error: {:?}\", e); 1 } } }",
+        _ => return Ok(()),
+    };
+    let source = format!("fn main() -> i64 {}", body);
+    // The wrapper reports at the user's body; it needs its own span (a
+    // function's span is its instantiation identity).
+    let at = main_f.body.span;
+    let mut tokens = crate::lexer::lex_with_source(&source, at.source).expect("entry wrapper lexes");
+    for t in &mut tokens { t.span = at; }
+    let module = crate::parser::parse_module(&tokens).expect("entry wrapper parses");
+    let Some(ItemKind::Fn(wrapper)) = module.items.into_iter().next().map(|i| i.kind) else { unreachable!() };
+    let mut user = (*main_f).clone();
+    user.name = "__gcr_user_main".into();
+    ctx.fns.insert("__gcr_user_main".into(), Rc::new(user));
+    ctx.fns.insert("main".into(), Rc::new(wrapper));
+    Ok(())
+}
+
 pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
-    let ctx = TyCtx::from_globals(globals);
+    let mut ctx = TyCtx::from_globals(globals);
+    wrap_entry(&mut ctx)?;
+    let ctx = ctx;
+    let _normalizer = crate::types::enter_normalizer(&ctx);
     let mut reg = LayoutRegistry::new(&ctx);
     let mut prog = CoreProgram::default();
     let mut mono = Mono::new();
     let mut count: u32 = 0;
 
     // Seed from `main` (which must be non-generic).
-    let main_fq = ctx.fns.keys().find(|k| k.rsplit("::").next().unwrap() == "main").cloned();
+    let main_fq = ctx.fns.contains_key("main").then(|| "main".to_string());
     let Some(main_fq) = main_fq else {
         return err("no `main` function found", Span::new(0, 0));
     };
     let main_f = ctx.fns[&main_fq].clone();
+    if main_f.is_extern || !main_f.generics.params.is_empty() || !main_f.params.is_empty() {
+        return err("entry point must be a non-generic `fn main() -> i64`", main_f.span);
+    }
+    let ret = main_f.ret.as_ref().map(|t| lower_type(t, &[], &ctx)).transpose().map_err(conv)?;
+    if ret != Some(Ty::Prim(Prim::I64)) {
+        return err("entry point must return i64", main_f.span);
+    }
+
     let entry = mono.intern(
         Job { f: main_f, subst: HashMap::new(), mangled: main_fq, self_ty: None },
         &mut count,
@@ -202,6 +295,7 @@ pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgr
 /// instantiation.
 pub fn check_program(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<LowerError>> {
     let ctx = TyCtx::from_globals(globals);
+    let _normalizer = crate::types::enter_normalizer(&ctx);
     let mut errors = Vec::new();
 
     // Free functions: check each non-generic one in a throwaway lowering context.
@@ -232,7 +326,7 @@ fn install_fn(prog: &mut CoreProgram, id: FuncId, f: CoreFn) {
 }
 
 fn placeholder_fn() -> CoreFn {
-    CoreFn { name: String::new(), params: vec![], extern_by_ref: vec![], ret: Repr::Unit, locals: vec![], local_names: vec![], body: CoreBlock { stmts: vec![], tail: None }, closure_captures: vec![], is_extern: false, span: crate::core::NO_SPAN }
+    CoreFn { name: String::new(), params: vec![], extern_by_ref: vec![], ret: Repr::Unit, locals: vec![], local_names: vec![], body: CoreBlock { stmts: vec![], tail: None }, closure_captures: vec![], is_closure: false, is_extern: false, span: crate::core::NO_SPAN }
 }
 
 /// Collect free variable names referenced in `e`: single-segment path uses that
@@ -269,7 +363,7 @@ fn collect_free_vars(e: &Expr, params: &[&str], bound: &mut Vec<String>, out: &m
             ArrayLit::Elems(es) => for x in es { collect_free_vars(x, params, bound, out); },
             ArrayLit::Repeat(v, n) => { collect_free_vars(v, params, bound, out); collect_free_vars(n, params, bound, out); }
         },
-        ExprKind::Block(b) => collect_free_in_block(b, params, bound, out),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => collect_free_in_block(b, params, bound, out),
         ExprKind::If { cond, then_branch, else_branch } => {
             collect_free_vars(cond, params, bound, out);
             collect_free_in_block(then_branch, params, bound, out);
@@ -336,12 +430,25 @@ fn bind_pattern_names(p: &Pattern, bound: &mut Vec<String>) {
 }
 
 /// A human-readable rendering of a type for diagnostics.
-fn ty_display(ty: &Ty) -> String {
+/// The trait a `dyn Trait` object type stands for (`geo::dyn#Shape` is
+/// `geo::Shape`).
+pub(crate) fn dyn_trait(ty: &Ty) -> Option<String> {
+    let Ty::Named { name, .. } = ty else { return None };
+    let (module, last) = match name.rsplit_once("::") { Some((m, l)) => (Some(m), l), None => (None, name.as_str()) };
+    let t = last.strip_prefix("dyn#")?;
+    Some(match module { Some(m) => format!("{m}::{t}"), None => t.to_string() })
+}
+
+pub(crate) fn ty_display(ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => crate::types::prim_name(*p).to_string(),
         Ty::Named { name, args } => {
             let base = name.rsplit("::").next().unwrap();
-            if args.is_empty() { base.to_string() }
+            if let (Some(assoc), Some(of)) = (base.strip_prefix("proj#"), args.first()) {
+                return format!("{}::{}", ty_display(of), assoc);
+            }
+            let base = match base.strip_prefix("dyn#") { Some(t) => format!("dyn {}", t), None => base.to_string() };
+            if args.is_empty() { base }
             else { format!("{}<{}>", base, args.iter().map(ty_display).collect::<Vec<_>>().join(", ")) }
         }
         Ty::Var(v) => v.clone(),
@@ -357,7 +464,7 @@ fn ty_display(ty: &Ty) -> String {
 /// the runtime array object).
 fn array_elem_ty(ty: &Ty) -> Option<Ty> {
     match ty {
-        Ty::Named { name, args } if name.rsplit("::").next() == Some("Array") && !args.is_empty() => Some(args[0].clone()),
+        Ty::Named { name, args } if name == "Array" && !args.is_empty() => Some(args[0].clone()),
         Ty::Array(elem, _) => Some((**elem).clone()),
         _ => None,
     }
@@ -371,21 +478,6 @@ fn float_intrinsic(name: &str) -> Option<FloatIntrinsic> {
         "ceil" => FloatIntrinsic::Ceil,
         _ => return None,
     })
-}
-
-/// The method-index key for a primitive receiver: `i64`, `f64`, etc. — the
-/// literal name used in `impl Show for i64`.
-fn prim_impl_key(ty: &Ty) -> String {
-    match ty {
-        Ty::Prim(p) => match p {
-            Prim::I8 => "i8", Prim::I16 => "i16", Prim::I32 => "i32", Prim::I64 => "i64",
-            Prim::U8 => "u8", Prim::U16 => "u16", Prim::U32 => "u32", Prim::U64 => "u64",
-            Prim::F32 => "f32", Prim::F64 => "f64",
-            Prim::Bool => "bool", Prim::Char => "char", Prim::Str => "String", Prim::Unit => "()",
-            Prim::RawPtr => "RawPtr",
-        }.to_string(),
-        _ => String::new(),
-    }
 }
 
 fn ty_mangle(t: &Ty) -> String {
@@ -424,6 +516,24 @@ fn repr_is_blittable(repr: &Repr, values: &[ValueLayout]) -> bool {
     }
 }
 
+// A node is retained by each entry, so an address cannot be recycled into an
+// unrelated expression. The key also compares the span: desugaring can reuse
+// a kind at a different source location. Failures are reusable only under the
+// same complete state, just like successful type facts.
+type ProbeLocals = (HashMap<String, Ty>, Vec<HashMap<String, (LocalId, Ty, bool)>>,
+    Vec<Repr>, Vec<Option<String>>, Vec<Ty>, Ty, bool, LetInference, usize,
+    Vec<LocalId>, Vec<bool>, bool);
+struct ProbeEntry {
+    _node: std::sync::Arc<ExprKind>,
+    span: Span,
+    expected: Option<Ty>,
+    locals: ProbeLocals,
+    registry: crate::layout::LayoutProbeState,
+    mono: Mono,
+    count: u32,
+    result: LResult<Ty>,
+}
+
 struct FnLowerer<'a, 'r, 'm> {
     ctx: &'a TyCtx,
     reg: &'r mut LayoutRegistry<'a>,
@@ -448,6 +558,12 @@ struct FnLowerer<'a, 'r, 'm> {
     infer_ret: bool,
     /// Inference for unannotated `let`s; see `LetInference`.
     infer: LetInference,
+    /// Lexical only: reset when checking a lifted closure or another function.
+    unsafe_depth: usize,
+    deferred_locals: Vec<LocalId>,
+    loop_exits: Vec<bool>,
+    type_probe: bool,
+    probe_cache: Rc<std::cell::RefCell<HashMap<usize, Vec<ProbeEntry>>>>,
 }
 
 /// Identifies a `let` for inference: its statement span plus the bound name
@@ -463,8 +579,11 @@ fn span_key(s: Span, name: &str) -> SpanKey { (s.start, s.end, s.source, name.to
 /// (`needs`); a probe attempt binds every open `let` to a placeholder type
 /// (`Ty::Infer` ids) and stops at the first type check that pins one
 /// (`solution`); the next attempt lowers that `let` with the solved type.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq)]
 struct LetInference {
+    /// Run backward argument discovery only after ordinary lowering failed.
+    /// Common calls retain the direct source-order path and its linear work.
+    arguments: bool,
     /// Types solved by earlier probes, keyed by the `let` statement's span.
     solved_lets: HashMap<SpanKey, Ty>,
     /// True during a probe attempt.
@@ -582,6 +701,11 @@ fn lower_fn<'a>(
             ret_ty: ret_ty.clone(),
             infer_ret: false,
             infer: LetInference::default(),
+            unsafe_depth: 0,
+            deferred_locals: vec![],
+            loop_exits: vec![],
+            type_probe: false,
+            probe_cache: Rc::new(std::cell::RefCell::new(HashMap::new())),
         };
         let mut params = Vec::new();
         let mut extern_by_ref = Vec::new();
@@ -639,7 +763,7 @@ fn lower_fn<'a>(
             locals: vec![],
             local_names: vec![],
             body: CoreBlock { stmts: vec![], tail: None },
-            closure_captures: vec![],
+            closure_captures: vec![], is_closure: false,
             is_extern: true,
             span: fn_span,
         });
@@ -649,21 +773,34 @@ fn lower_fn<'a>(
     // `LetInference`). Each discarded attempt's monomorphization and layout
     // registrations are rolled back so they cannot leak placeholder types.
     let mut solved_lets: HashMap<SpanKey, Ty> = HashMap::new();
+    let mut infer_arguments = false;
     loop {
         let snap = (mono.snapshot(), reg.snapshot(), *count);
-        let mut infer = LetInference { solved_lets: solved_lets.clone(), ..LetInference::default() };
+        let mut infer = LetInference { solved_lets: solved_lets.clone(), arguments: infer_arguments, ..LetInference::default() };
         let result = lower_fn_attempt(job, ctx, reg, mono, count, &ret_ty, fn_span, &mut infer);
+        if result.is_err() && infer.needs.is_none() && !infer_arguments {
+            // No constraints were needed on the ordinary path until this
+            // failure. Retry from the original function state; discarded IR,
+            // closure IDs, layouts and spans cannot escape into the real pass.
+            mono.restore(snap.0); reg.restore(snap.1); *count = snap.2;
+            infer_arguments = true;
+            continue;
+        }
         let Some((let_span, name)) = infer.needs.take() else { return result };
         if result.is_ok() { return result; }
         mono.restore(snap.0); reg.restore(snap.1); *count = snap.2;
 
         let snap = (mono.snapshot(), reg.snapshot(), *count);
-        let mut probe = LetInference { solved_lets: solved_lets.clone(), probing: true, ..LetInference::default() };
+        let mut probe = LetInference { solved_lets: solved_lets.clone(), arguments: infer_arguments, probing: true, ..LetInference::default() };
         let _ = lower_fn_attempt(job, ctx, reg, mono, count, &ret_ty, fn_span, &mut probe);
         mono.restore(snap.0); reg.restore(snap.1); *count = snap.2;
         match probe.solution.take() {
             Some((key, ty)) if !solved_lets.contains_key(&key) => { solved_lets.insert(key, ty); }
             _ => {
+                if !infer_arguments {
+                    infer_arguments = true;
+                    continue;
+                }
                 return err(
                     format!("cannot infer the type of `{}`; add a type annotation (`let {}: Type = ...`)", name, name),
                     let_span,
@@ -699,6 +836,11 @@ fn lower_fn_attempt<'a>(
         ret_ty: ret_ty.clone(),
         infer_ret: false,
         infer: std::mem::take(infer),
+        unsafe_depth: 0,
+        deferred_locals: vec![],
+        loop_exits: vec![],
+        type_probe: false,
+        probe_cache: Rc::new(std::cell::RefCell::new(HashMap::new())),
     };
     let result = lower_fn_with(&mut lo, job, &ret_ty, fn_span);
     *infer = std::mem::take(&mut lo.infer);
@@ -727,6 +869,7 @@ fn lower_fn_with(lo: &mut FnLowerer<'_, '_, '_>, job: &Job, ret_ty: &Ty, fn_span
     }
 
     let (body, body_ty) = lo.block_expected(&f.body, Some(&ret_ty))?;
+    lo.check_definite_init(&body, f.body.span)?;
     // Point a body/return type mismatch at the tail expression (or the function
     // body if there's no tail), so the caret lands on the offending value.
     let body_err_span = f.body.tail.as_ref().map(|t| t.span).unwrap_or(f.body.span);
@@ -741,7 +884,7 @@ fn lower_fn_with(lo: &mut FnLowerer<'_, '_, '_>, job: &Job, ret_ty: &Ty, fn_span
         locals: std::mem::take(&mut lo.locals),
         local_names: std::mem::take(&mut lo.local_names),
         body,
-        closure_captures: vec![],
+        closure_captures: vec![], is_closure: false,
         is_extern: false,
         span: fn_span,
     })
@@ -758,10 +901,10 @@ fn ground_type(t: &Type, subst: &HashMap<String, Ty>, ctx: &TyCtx) -> LResult<Ty
 fn apply_subst(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Ty::Named { name, args } => Ty::Named {
-            name: name.clone(),
-            args: args.iter().map(|a| apply_subst(a, subst)).collect(),
-        },
+        Ty::Named { name, args } => {
+            let t = Ty::Named { name: name.clone(), args: args.iter().map(|a| apply_subst(a, subst)).collect() };
+            crate::types::normalize_projection(&t).unwrap_or(t)
+        }
         Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| apply_subst(e, subst)).collect()),
         Ty::Array(e, n) => Ty::Array(Box::new(apply_subst(e, subst)), *n),
         Ty::Fn { params, ret } => Ty::Fn {
@@ -781,6 +924,244 @@ fn conv(e: crate::types::TypeError) -> LowerError {
 }
 
 impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
+    /// Type-only speculative lowering. Every mutable field is restored on
+    /// success or error; exhaustive destructuring makes added state explicit.
+    fn probe_expr_type(&mut self, expression: &Expr, expected: Option<&Ty>) -> LResult<Ty> {
+        // Integer checking is pure and does not need any compiler-state copy.
+        if let ExprKind::Int(magnitude, suffix) = &*expression.kind {
+            return self.integer_literal(*magnitude, *suffix, expected, false, expression.span)
+                .map(|(_, ty)| ty);
+        }
+        let FnLowerer { ctx: _, reg, mono, count, subst, scope, locals, local_names,
+            local_tys, ret_ty, infer_ret, infer, unsafe_depth, deferred_locals, loop_exits,
+            type_probe, probe_cache: _ } = self;
+        let shared = (reg.snapshot(), mono.snapshot(), **count);
+        let saved = (subst.clone(), scope.clone(), locals.clone(), local_names.clone(),
+            local_tys.clone(), ret_ty.clone(), *infer_ret, infer.clone(), *unsafe_depth,
+            deferred_locals.clone(), loop_exits.clone(), *type_probe);
+        let registry = reg.probe_state();
+        let monomorphizer = (**mono).clone();
+        let identity = std::sync::Arc::as_ptr(&expression.kind) as usize;
+        if let Some(entries) = self.probe_cache.borrow().get(&identity) {
+            if let Some(entry) = entries.iter().find(|entry| entry.span == expression.span
+                && entry.expected.as_ref() == expected && entry.locals == saved
+                && entry.registry == registry && entry.mono == monomorphizer
+                && entry.count == shared.2) {
+                return entry.result.clone();
+            }
+        }
+        #[cfg(test)]
+        PROBE_WORK.with(|n| n.set(n.get()+1));
+        // A type-only probe must not turn an error skipped by let discovery
+        // into a fabricated unit-type constraint for another argument.
+        self.type_probe = true;
+        let result = self.expr(expression, expected).map(|(_, ty)| ty);
+        self.reg.restore(shared.0);
+        self.mono.restore(shared.1);
+        *self.count = shared.2;
+        self.probe_cache.borrow_mut().entry(identity).or_default().push(ProbeEntry {
+            _node: expression.kind.clone(), span: expression.span,
+            expected: expected.cloned(), locals: saved.clone(), registry,
+            mono: monomorphizer, count: shared.2, result: result.clone(),
+        });
+        (self.subst, self.scope, self.locals, self.local_names, self.local_tys,
+            self.ret_ty, self.infer_ret, self.infer, self.unsafe_depth,
+            self.deferred_locals, self.loop_exits, self.type_probe) = saved;
+        result
+    }
+
+    /// Learn only ground facts from independent speculative arguments. The
+    /// real pass performs source-order checking and emits all effects.
+    fn infer_argument_types<'e, I>(&mut self, arguments: I, inferred: &mut HashMap<String, Ty>)
+    where I: Iterator<Item = (&'e Expr, &'e Ty)> + Clone {
+        loop {
+            let previous = inferred.clone();
+            for (argument, declared) in arguments.clone() {
+                let expected = apply_subst(declared, inferred);
+                if !has_var(&expected) { continue; }
+                if let Ok(actual) = self.probe_expr_type(argument, compound_hint(&expected)) {
+                    if !has_var(&actual) && !is_never(&actual) {
+                        unify_infer(declared, &actual, inferred);
+                    }
+                }
+            }
+            if previous == *inferred { break; }
+        }
+    }
+
+    /// Enforce both spellings of a generic constraint through one path.
+    fn check_generic_bounds(&self, generics: &Generics, scope: &[String], subst: &HashMap<String, Ty>, required_by: &str, span: Span) -> LResult<()> {
+        let instantiate = |ty: &Type| lower_type(ty, scope, self.ctx)
+            .map(|ty| apply_subst(&ty, subst)).map_err(conv);
+        let check = |ty: &Ty, bound: &TraitRef| -> LResult<()> {
+            let resolved = self.infer.probing.then(|| fill_placeholders(ty, &self.infer.solved));
+            let ty = resolved.as_ref().unwrap_or(ty);
+            let name = bound.path.segments.join("::");
+            let arguments = bound.args.iter().map(&instantiate).map(|argument| argument.map(|ty| {
+                if self.infer.probing { fill_placeholders(&ty, &self.infer.solved) } else { ty }
+            })).collect::<LResult<Vec<_>>>()?;
+            // Probe IR is discarded. Defer only obligations that still depend
+            // on registered let placeholders; the ground retry checks them all.
+            if self.infer.probing && (has_placeholder(ty, &self.infer.placeholders)
+                || arguments.iter().any(|ty| has_placeholder(ty, &self.infer.placeholders))) {
+                return Ok(());
+            }
+            let satisfied = if name == "Sync" && arguments.is_empty() {
+                self.ctx.try_is_sync(ty).map_err(|error| LowerError { msg: error.msg, span })?
+            } else { self.ctx.try_type_implements_trait_args(ty, &name, &arguments).map_err(|error| LowerError { msg: error.msg, span })? };
+            if satisfied {
+                // `Iterator<Item = T>`: the associated type must be `T`.
+                for (assoc, written) in &bound.bindings {
+                    let want = instantiate(written)?;
+                    if has_var(&want) || has_var(ty) { continue; }
+                    let got = self.ctx.associated_type(ty, assoc);
+                    if got.as_ref() != Some(&want) {
+                        return err(format!(
+                            "expected `{}::{}` to be `{}`, found `{}` (required by `{required_by}`)",
+                            ty_display(ty), assoc, ty_display(&want), got.as_ref().map(ty_display).unwrap_or_else(|| "nothing".into())
+                        ), span);
+                    }
+                }
+                return Ok(())
+            }
+            let label = if arguments.is_empty() { name } else {
+                format!("{name}<{}>", arguments.iter().map(ty_display).collect::<Vec<_>>().join(", "))
+            };
+            err(format!("the trait bound `{}: {label}` is not satisfied (required by `{required_by}`)", ty_display(ty)), span)
+        };
+        for parameter in &generics.params {
+            if parameter.bounds.is_empty() { continue; }
+            let ty = subst.get(&parameter.name).ok_or_else(|| LowerError {
+                msg: format!("cannot infer type parameter `{}` for `{required_by}`", parameter.name), span,
+            })?;
+            for bound in &parameter.bounds { check(ty, bound)?; }
+        }
+        for predicate in &generics.where_clauses {
+            let ty = instantiate(&predicate.ty)?;
+            for bound in &predicate.bounds { check(&ty, bound)?; }
+        }
+        Ok(())
+    }
+
+    /// Infer type parameters named only in associated type bindings: with
+    /// `I: Iterator<Item = T>` and `I` known, `T` is `I`'s `Item`.
+    fn infer_from_bindings(&self, generics: &Generics, scope: &[String], subst: &mut HashMap<String, Ty>) -> LResult<()> {
+        let mut bounded: Vec<(Ty, &TraitRef)> = Vec::new();
+        for p in &generics.params {
+            if let Some(t) = subst.get(&p.name) { for b in &p.bounds { bounded.push((t.clone(), b)); } }
+        }
+        for w in &generics.where_clauses {
+            let t = apply_subst(&lower_type(&w.ty, scope, self.ctx).map_err(conv)?, subst);
+            for b in &w.bounds { bounded.push((t.clone(), b)); }
+        }
+        for (ty, bound) in bounded {
+            if has_var(&ty) { continue; }
+            for (assoc, written) in &bound.bindings {
+                let declared = lower_type(written, scope, self.ctx).map_err(conv)?;
+                if let Some(actual) = self.ctx.associated_type(&ty, assoc) {
+                    unify_infer(&declared, &actual, subst);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_alias_bounds(&self, name: &str, actual: &Ty, span: Span) -> LResult<()> {
+        let Some(alias) = self.ctx.aliases.get(name) else { return Ok(()); };
+        if alias.generics.params.iter().all(|p| p.bounds.is_empty()) && alias.generics.where_clauses.is_empty() { return Ok(()); }
+        let inferred = crate::types::type_pattern_bindings(&alias.target, actual).ok_or_else(|| LowerError {
+            msg: format!("alias `{name}` does not match specialization `{}`", ty_display(actual)), span,
+        })?;
+        // All parts of every obligation must be known. In particular, an erased
+        // alias parameter cannot be guessed from its trait bound.
+        let instantiate = |ty: &Type| -> LResult<Ty> {
+            let ty = apply_subst(&lower_type(ty, &alias.params, self.ctx).map_err(conv)?, &inferred);
+            if has_var(&ty) { return err(format!("cannot infer type arguments required by alias `{name}`"), span); }
+            Ok(ty)
+        };
+        for parameter in &alias.generics.params {
+            if parameter.bounds.is_empty() { continue; }
+            if !inferred.get(&parameter.name).is_some_and(|ty| !has_var(ty)) {
+                return err(format!("cannot infer type parameter `{}` required by alias `{name}`", parameter.name), span);
+            }
+            for bound in &parameter.bounds { for argument in &bound.args { instantiate(argument)?; } }
+        }
+        for predicate in &alias.generics.where_clauses {
+            instantiate(&predicate.ty)?;
+            for bound in &predicate.bounds { for argument in &bound.args { instantiate(argument)?; } }
+        }
+        self.check_generic_bounds(&alias.generics, &alias.params, &inferred, name, span)
+    }
+
+    fn integer_literal(
+        &self,
+        magnitude: u64,
+        suffix: crate::lexer::NumSuffix,
+        expected: Option<&Ty>,
+        negative: bool,
+        span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
+        let prim = match expected {
+            Some(Ty::Prim(p)) if is_int_prim(*p) && suffix == crate::lexer::NumSuffix::None => *p,
+            _ => suffix_prim(suffix, false),
+        };
+        let repr = scalar_of(prim).unwrap();
+        let bits = repr.bits();
+        let maximum = if repr.is_signed() {
+            (1u64 << (bits - 1)) - u64::from(!negative)
+        } else if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        if magnitude > maximum {
+            return err(
+                format!(
+                    "integer literal out of range for `{}`",
+                    ty_display(&Ty::Prim(prim))
+                ),
+                span,
+            );
+        }
+        let value = if negative {
+            0u64.wrapping_sub(magnitude)
+        } else {
+            magnitude
+        };
+        Ok((
+            CoreExpr::new(CoreExprKind::ConstInt(value, repr), Repr::Scalar(repr)),
+            Ty::Prim(prim),
+        ))
+    }
+
+    fn check_definite_init(&self, body: &CoreBlock, fallback: Span) -> LResult<()> {
+        crate::definite_init::check(body, &self.deferred_locals).map_err(|(local, span)| {
+            let name = self.local_names[local as usize]
+                .as_deref()
+                .unwrap_or("local");
+            LowerError {
+                msg: format!(
+                    "`{name}` may be uninitialized; assign it on every path before reading it"
+                ),
+                span: span
+                    .checked_sub(1)
+                    .and_then(|id| self.mono.spans.get(id as usize))
+                    .copied()
+                    .unwrap_or(fallback),
+            }
+        })
+    }
+
+    fn require_unsafe(&self, operation: &str, span: Span) -> LResult<()> {
+        if self.unsafe_depth == 0 {
+            return err(
+                format!("{operation} requires an explicit `unsafe {{ ... }}` block"),
+                span,
+            );
+        }
+        Ok(())
+    }
+
     /// Repr of a type, via the shared layout registry.
     fn repr_of(&mut self, ty: &Ty, span: Span) -> LResult<Repr> {
         if is_never(ty) { return Ok(Repr::Unit); }
@@ -939,7 +1320,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// is skipped so later statements can still contribute constraints. The
     /// probe's output is discarded; the real attempt reports every error.
     fn probe_tolerates(&self) -> bool {
-        self.infer.probing && self.infer.solution.is_none()
+        !self.type_probe && self.infer.probing && self.infer.solution.is_none()
     }
 
     /// Lower one statement of a block into `stmts`.
@@ -1027,6 +1408,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                         let dty = ground_type(t, &self.subst.clone(), self.ctx)?;
                         let repr = self.repr_of(&dty, *span)?;
                         let id = self.fresh_local(repr.clone(), dty.clone());
+                        self.deferred_locals.push(id);
                         self.bind_mut(&name, id, dty.clone(), is_mut);
                         // Zero-initialize so the slot is well-defined before the
                         // first assignment (and GC-safe for ref slots → null).
@@ -1075,14 +1457,134 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// Check + lower an expression. `expected` guides literal defaulting.
     fn expr(&mut self, e: &Expr, expected: Option<&Ty>) -> LResult<(CoreExpr, Ty)> {
+        // A value where a trait object is expected becomes that object. Only
+        // expressions that pass the expectation on to their results (blocks,
+        // branches) see it; anything else is lowered as itself and coerced.
+        let passes_on = matches!(&*e.kind, ExprKind::Block(_) | ExprKind::Unsafe(_) | ExprKind::If { .. }
+            | ExprKind::Match { .. } | ExprKind::Loop { .. } | ExprKind::Path(_));
+        let to_dyn = expected.filter(|t| dyn_trait(t).is_some() && !has_var(t));
+        let inner_expected = if to_dyn.is_some() && !passes_on { None } else { expected };
+        let (value, ty) = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.expr_inner(e, inner_expected))?;
+        if let Some(target) = to_dyn {
+            if dyn_trait(&ty).is_none() && !is_never(&ty) && !has_var(&ty) && !has_var(target) {
+                return self.coerce_to_dyn(value, ty, target, e.span);
+            }
+        }
+        Ok((value, ty))
+    }
+
+    /// Build the `dyn Trait` object for `value`: a `dyn#Trait` struct whose
+    /// fields are closures calling each trait method on the value.
+    fn coerce_to_dyn(&mut self, value: CoreExpr, ty: Ty, target: &Ty, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let Ty::Named { name: object, args: trait_args } = target else { unreachable!() };
+        let trait_name = dyn_trait(target).unwrap();
+        if !self.ctx.try_type_implements_trait_args(&ty, &trait_name, trait_args).map_err(conv)? {
+            return err(format!("`{}` does not implement `{}`, so it cannot be used as `{}`", ty_display(&ty), trait_name.rsplit("::").next().unwrap(), ty_display(target)), span);
+        }
+        let Some(def) = self.ctx.structs.get(object).cloned() else { return err(format!("unknown trait object `{}`", ty_display(target)), span) };
+        let StructBody::Named(fields) = &def.body else { unreachable!() };
+        let id = self.fresh_local(value.repr.clone(), ty.clone());
+        self.push_scope();
+        self.bind_mut("dyn#value", id, ty.clone(), true);
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let var = |n: &str| ex(ExprKind::Path(Path::single(n.to_string(), span)));
+        let inits = fields.iter().map(|f| {
+            let TypeKind::Fn(params, _) = &f.ty.kind else { unreachable!() };
+            let names: Vec<String> = (0..params.len()).map(|i| format!("dyn#arg{i}")).collect();
+            let call = ex(ExprKind::MethodCall {
+                recv: var("dyn#value"),
+                method: f.name.clone(),
+                args: names.iter().map(|n| var(n)).collect(),
+                span,
+            });
+            let closure = ex(ExprKind::Closure {
+                params: names.iter().map(|n| ClosureParam { name: n.clone(), ty: None, span }).collect(),
+                ret: None,
+                body: call,
+            });
+            FieldInit { name: f.name.clone(), value: Some(closure), span }
+        }).collect();
+        let lit = ex(ExprKind::StructLit { path: Path { segments: object.split("::").map(str::to_string).collect(), span }, fields: inits, span });
+        let result = self.expr(&lit, Some(target));
+        self.pop_scope();
+        let (object_value, object_ty) = result?;
+        let repr = object_value.repr.clone();
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, value)], tail: Some(object_value) })), repr), object_ty))
+    }
+
+    /// `it.collect()`: build the expected `FromIterator` type from an
+    /// iterator (`Vec`, `String`, `HashMap`, ...), or a `Vec` when nothing
+    /// is expected. Holes (`Vec<_>`) are filled from the iterator's `Item`.
+    fn collect_call(&mut self, recv: &Expr, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let (crecv, rty) = self.expr(recv, None)?;
+        if let Some(entry) = self.lookup_method(&rty, "collect") {
+            return self.method_call_operands(crecv, rty, Some(recv), entry, &[], span);
+        }
+        // A Vec collects its elements (`s.chars().collect::<String>()`).
+        let (crecv, rty) = match (&rty, self.lookup_method(&rty, "iter")) {
+            (Ty::Named { name, .. }, Some(entry)) if name == "Vec" => self.method_call_operands(crecv, rty.clone(), None, entry, &[], span)?,
+            _ => (crecv, rty),
+        };
+        let Some(item) = self.ctx.associated_type(&rty, "Item") else {
+            return err(format!("no method `collect` on `{}` (it is not an iterator)", ty_display(&rty)), span);
+        };
+        let target = match expected {
+            Some(t) if !has_var(t) => t.clone(),
+            Some(Ty::Named { name, args }) => {
+                // Fill the holes from the `FromIterator<Item>` impl of that type.
+                let mut filled = None;
+                for imp in &self.ctx.impls {
+                    let Some(tr) = &imp.trait_ref else { continue };
+                    if tr.path.last() != "FromIterator" || tr.args.len() != 1 { continue; }
+                    let params: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
+                    let self_ty = lower_type(&imp.self_ty, &params, self.ctx).map_err(conv)?;
+                    let Ty::Named { name: n, .. } = &self_ty else { continue };
+                    if n != name { continue; }
+                    let arg = lower_type(&tr.args[0], &params, self.ctx).map_err(conv)?;
+                    let Some(bound) = crate::types::type_pattern_bindings(&arg, &item) else { continue };
+                    let candidate = apply_subst(&self_ty, &bound);
+                    let mut holes = HashMap::new();
+                    unify_infer(&Ty::Named { name: name.clone(), args: args.clone() }, &candidate, &mut holes);
+                    if !has_var(&candidate) { filled = Some(candidate); break; }
+                }
+                filled.ok_or_else(|| LowerError { msg: format!("cannot collect `{}` items into `{}`", ty_display(&item), ty_display(expected.unwrap())), span })?
+            }
+            _ => Ty::Named { name: "Vec".into(), args: vec![item.clone()] },
+        };
+        let Some(base) = crate::types::receiver_base(&target) else {
+            return err(format!("cannot collect into `{}`", ty_display(&target)), span);
+        };
+        let entry = self.lookup_trait_method(&target, "FromIterator", "from_iter")
+            .ok_or_else(|| LowerError { msg: format!("`{}` cannot be built from an iterator (no `FromIterator` impl)", ty_display(&target)), span })?;
+        let id = self.fresh_local(crecv.repr.clone(), rty.clone());
+        self.push_scope();
+        self.bind("collect#iter", id, rty);
+        let arg = Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single("collect#iter".into(), span))), span };
+        let result = self.assoc_call(&base, Some(&target), None, &entry, std::slice::from_ref(&arg), Some(&target), span);
+        self.pop_scope();
+        let (value, ty) = result?;
+        let repr = value.repr.clone();
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, crecv)], tail: Some(value) })), repr), ty))
+    }
+
+    /// Call `method` on a trait object: invoke the object's closure for it.
+    fn dyn_method_call(&mut self, crecv: CoreExpr, recv_ty: Ty, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        let Ty::Named { name, .. } = &recv_ty else { unreachable!() };
+        let has_field = matches!(self.ctx.structs.get(name).map(|d| &d.body), Some(StructBody::Named(fs)) if fs.iter().any(|f| f.name == method));
+        if !has_field {
+            return err(format!("no method `{}` on `{}` (only methods taking `self` without type parameters or `Self` can be called on a trait object)", method, ty_display(&recv_ty)), span);
+        }
+        let (callee, signature) = self.field_read(crecv, &recv_ty, method, span)?;
+        self.invoke_value(callee, signature, args, span)
+    }
+
+    #[inline(never)]
+    fn expr_inner(&mut self, e: &Expr, expected: Option<&Ty>) -> LResult<(CoreExpr, Ty)> {
+        #[cfg(test)]
+        EXPR_WORK.with(|n| n.set(n.get()+1));
         match &*e.kind {
             ExprKind::Int(n, sfx) => {
-                let prim = match expected {
-                    Some(Ty::Prim(p)) if is_int_prim(*p) && *sfx == crate::lexer::NumSuffix::None => *p,
-                    _ => suffix_prim(*sfx, false),
-                };
-                let sr = scalar_of(prim).unwrap();
-                Ok((CoreExpr::new(CoreExprKind::ConstInt(*n, sr), Repr::Scalar(sr)), Ty::Prim(prim)))
+                self.integer_literal(*n, *sfx, expected, false, e.span)
             }
             ExprKind::Float(f, sfx) => {
                 let prim = match expected {
@@ -1090,6 +1592,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     _ => suffix_prim(*sfx, true),
                 };
                 let sr = scalar_of(prim).unwrap();
+                if !f.is_finite() || (prim == Prim::F32 && !(*f as f32).is_finite()) {
+                    return err(format!("floating literal out of range for `{}`", ty_display(&Ty::Prim(prim))), e.span);
+                }
                 Ok((CoreExpr::new(CoreExprKind::ConstFloat(*f, sr), Repr::Scalar(sr)), Ty::Prim(prim)))
             }
             ExprKind::Bool(b) => Ok((CoreExpr::new(CoreExprKind::ConstBool(*b), Repr::Scalar(ScalarRepr::Bool)), Ty::bool())),
@@ -1112,7 +1617,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     } else {
                         self.repr_of(&ty, e.span)?
                     };
-                    Ok((CoreExpr::new(CoreExprKind::Local(id), repr), ty))
+                    let sid = self.mono.intern_span(e.span);
+                    Ok((CoreExpr::new(CoreExprKind::Local(id), repr).at(sid), ty))
                 } else if self.ctx.fns.contains_key(name) {
                     self.function_value(path, expected, e.span)
                 } else if self.ctx.variants.contains_key(name) {
@@ -1132,7 +1638,19 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::Unary(op, inner) => {
+                if *op == UnOp::Neg {
+                    if let ExprKind::Int(n, suffix) = inner.kind.as_ref() {
+                        return self.integer_literal(*n, *suffix, expected, true, e.span);
+                    }
+                }
                 let (ci, ty) = self.expr(inner, expected)?;
+                let valid = match op {
+                    UnOp::Neg => is_numeric(&ty),
+                    UnOp::Not => matches!(ty, Ty::Prim(p) if is_int_prim(p) || p == Prim::Bool),
+                };
+                if !valid {
+                    return err(format!("invalid unary operator for `{}`", ty_display(&ty)), e.span);
+                }
                 let repr = ci.repr.clone();
                 Ok((CoreExpr::new(CoreExprKind::Un(*op, Box::new(ci)), repr), ty))
             }
@@ -1145,7 +1663,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 // here where `expected` is in scope.
                 if let ExprKind::Path(path) = &*callee.kind {
                     let key = path.segments.join("::");
-                    if self.ctx.variants.contains_key(&key) || self.ctx.variants.contains_key(path.last()) {
+                    if !(path.is_single() && self.lookup(path.last()).is_some())
+                        && (self.ctx.variants.contains_key(&key) || self.ctx.variants.contains_key(path.last())) {
                         return self.variant_ctor(path, args, expected, e.span);
                     }
                 }
@@ -1177,6 +1696,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::Block(b) => {
                 let (cb, t) = self.block_expected(b, expected)?;
+                let repr = self.repr_of(&t, e.span)?;
+                Ok((CoreExpr::new(CoreExprKind::Block(Box::new(cb)), repr), t))
+            }
+
+            ExprKind::Unsafe(b) => {
+                self.unsafe_depth += 1;
+                let result = self.block_expected(b, expected);
+                self.unsafe_depth -= 1;
+                let (cb, t) = result?;
                 let repr = self.repr_of(&t, e.span)?;
                 Ok((CoreExpr::new(CoreExprKind::Block(Box::new(cb)), repr), t))
             }
@@ -1213,9 +1741,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::While { cond, body } => {
-                let (cc, ct) = self.expr(cond, Some(&Ty::bool()))?;
-                self.check_assignable(&ct, &Ty::bool(), cond.span)?;
-                let (cb, _) = self.block(body)?;
+                self.loop_exits.push(false);
+                let result = (|| {
+                    let (cc, ct) = self.expr(cond, Some(&Ty::bool()))?;
+                    self.check_assignable(&ct, &Ty::bool(), cond.span)?;
+                    let (cb, _) = self.block(body)?;
+                    Ok((cc, cb))
+                })();
+                self.loop_exits.pop();
+                let (cc, cb) = result?;
                 // while => loop { if !cond { break } body }
                 let break_blk = CoreBlock { stmts: vec![], tail: Some(CoreExpr::new(CoreExprKind::Break(None), Repr::Unit)) };
                 let guard = CoreExpr::new(
@@ -1236,43 +1770,65 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::Loop { body } => {
-                let (cb, _) = self.block(body)?;
-                // A `loop` diverges from the value's standpoint: it runs forever
-                // or exits via `return`/`break`. Type it as never so it can stand
-                // as a function body of any return type (e.g. the `swap` retry
-                // loop). Never is assignable to anything, including unit.
-                Ok((CoreExpr::new(CoreExprKind::Loop(Box::new(cb)), Repr::Unit), never_ty()))
+                self.loop_exits.push(false);
+                let result = self.block(body);
+                let exits = self.loop_exits.pop().unwrap();
+                let (cb, _) = result?;
+                // A loop with a break can fall through and yields unit. Only
+                // a loop without a break has the diverging never type.
+                Ok((CoreExpr::new(CoreExprKind::Loop(Box::new(cb)), Repr::Unit), if exits { Ty::unit() } else { never_ty() }))
             }
 
             ExprKind::For { pat, iter, body } => {
+                // Ranges, Vecs and arrays loop by index; anything else that
+                // implements `Iterator` is driven by `next`.
+                if !matches!(&*iter.kind, ExprKind::Range { .. }) {
+                    let ty = self.probe_expr_type(iter, None)?;
+                    let indexed = array_elem_ty(&ty).is_some() || matches!(&ty, Ty::Named { name, .. } if name == "Vec");
+                    if !indexed && self.ctx.type_implements_trait(&ty, "Iterator") {
+                        let desugared = desugar_for_iterator(pat, iter, body, e.span);
+                        return self.expr(&desugared, None);
+                    }
+                }
                 let desugared = desugar_for(pat, iter, body, e.span)?;
                 self.expr(&desugared, None)
             }
 
-            ExprKind::Break(v) => {
-                let cv = match v {
-                    Some(e) => Some(Box::new(self.expr(e, None)?.0)),
-                    None => None,
-                };
-                Ok((CoreExpr::new(CoreExprKind::Break(cv), Repr::Unit), Ty::unit()))
+            // `lo..hi` / `lo..=hi` as a value is a `Range` iterator.
+            ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } if self.ctx.structs.contains_key("Range") => {
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: e.span };
+                let end = if *inclusive {
+                    ex(ExprKind::Binary(BinOp::Add, hi.clone(), ex(ExprKind::Int(1, crate::lexer::NumSuffix::None))))
+                } else { hi.clone() };
+                let lit = ex(ExprKind::StructLit {
+                    path: Path::single("Range".into(), e.span),
+                    fields: vec![
+                        FieldInit { name: "start".into(), value: Some(lo.clone()), span: e.span },
+                        FieldInit { name: "end".into(), value: Some(end), span: e.span },
+                    ],
+                    span: e.span,
+                });
+                self.expr(&lit, None)
             }
 
-            ExprKind::Continue => Ok((CoreExpr::new(CoreExprKind::Continue, Repr::Unit), Ty::unit())),
+            ExprKind::Break(v) => {
+                let Some(exits) = self.loop_exits.last_mut() else { return err("break outside loop", e.span); };
+                *exits = true;
+                if v.is_some() { return err("break values are not supported; assign a result before breaking", e.span); }
+                Ok((CoreExpr::new(CoreExprKind::Break(None), Repr::Unit), never_ty()))
+            }
+
+            ExprKind::Continue => {
+                if self.loop_exits.is_empty() { return err("continue outside loop", e.span); }
+                Ok((CoreExpr::new(CoreExprKind::Continue, Repr::Unit), never_ty()))
+            }
 
             ExprKind::Assign { target, op, value } => {
-                // `a[i] = v` desugars to `array_set(a, i, v)` (compound forms
-                // expand to `a[i] = a[i] op v`).
                 if let ExprKind::Index { base, index } = &*target.kind {
-                    // (`array_set_op` enforces the mutable-root rule for both this
-                    // desugar and direct `array_set(..)` calls.)
-                    let val_expr = match op {
-                        None => value.clone(),
-                        Some(binop) => Expr {
-                            kind: Box::new(ExprKind::Binary(*binop, target.clone(), value.clone())),
-                            span: e.span,
-                        },
+                    return match op {
+                        None => self.index_set(base, index, value, e.span),
+                        Some(op) => self.compound_index_set(base, index, *op, value, e.span),
                     };
-                    return self.index_set(base, index, &val_expr, e.span);
                 }
                 // `s.field = v` → store into the heap object's field slot.
                 if let ExprKind::Field { base, field } = &*target.kind {
@@ -1297,6 +1853,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 }
                 if let Some(binop) = op {
                     let repr = self.repr_of(&ty, e.span)?;
+                    if matches!(repr, Repr::Scalar(_)) { self.check_scalar_binary(*binop, &ty, e.span)?; }
                     if !matches!(repr, Repr::Scalar(_)) {
                         // `x += v` on a non-scalar uses the operator trait.
                         let load = CoreExpr::new(CoreExprKind::Local(id), repr);
@@ -1319,11 +1876,40 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::Assign { local: id, value: Box::new(final_val) }, Repr::Unit), Ty::unit()))
             }
 
+            // `it.collect::<T>()`.
+            ExprKind::Cast(inner, target) if matches!(&*inner.kind, ExprKind::MethodCall { method, args, .. } if method == "collect" && args.is_empty()) => {
+                let ExprKind::MethodCall { recv, span, .. } = &*inner.kind else { unreachable!() };
+                let want = ground_type(target, &self.subst.clone(), self.ctx)?;
+                self.collect_call(recv, Some(&want), *span)
+            }
             ExprKind::Cast(inner, target) => {
                 let (ci, from_ty) = self.expr(inner, None)?;
                 let to_ty = lower_type(target, &[], self.ctx).map_err(conv)?;
                 let from = ci.repr.clone();
                 let to = self.repr_of(&to_ty, e.span)?;
+                // A representation conversion is not a general type coercion.
+                // In particular, never manufacture an untraced native pointer
+                // from an integer or reinterpret a managed object as a scalar.
+                let valid = match (&from, &to) {
+                    (Repr::Scalar(ScalarRepr::Ptr), _) | (_, Repr::Scalar(ScalarRepr::Ptr)) => false,
+                    (Repr::Scalar(source), Repr::Scalar(ScalarRepr::Bool)) => *source == ScalarRepr::Bool,
+                    (Repr::Scalar(source), Repr::Scalar(ScalarRepr::Char)) => source.is_int(),
+                    (Repr::Scalar(ScalarRepr::Bool | ScalarRepr::Char), Repr::Scalar(target)) => {
+                        !target.is_float()
+                    }
+                    (Repr::Scalar(_), Repr::Scalar(_)) => true,
+                    _ => false,
+                };
+                if !valid {
+                    return err(
+                        format!(
+                            "invalid cast from `{}` to `{}`",
+                            ty_display(&from_ty),
+                            ty_display(&to_ty)
+                        ),
+                        e.span,
+                    );
+                }
                 Ok((
                     CoreExpr::new(CoreExprKind::Cast { value: Box::new(ci), from, to: to.clone() }, to),
                     to_ty,
@@ -1332,11 +1918,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::StructLit { path, fields, .. } => {
                 let key = path.segments.join("::");
-                let is_struct = self.ctx.canon(path.last()).is_some_and(|c| self.ctx.structs.contains_key(&c));
-                if !is_struct && (self.ctx.variants.contains_key(&key) || self.ctx.variants.contains_key(path.last())) {
+                let is_struct = self.ctx.canon(&key).is_some_and(|c| self.ctx.structs.contains_key(&c));
+                if !is_struct && self.ctx.variant_by_path(path).is_some() {
                     self.variant_struct_lit(path, fields, expected, e.span)
                 } else {
-                    self.struct_lit(path, fields, e.span)
+                    self.struct_lit(path, fields, expected, e.span)
                 }
             }
 
@@ -1345,12 +1931,31 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             ExprKind::Index { base, index } => self.index_get(base, index, e.span),
 
             ExprKind::Tuple(elems) => {
+                let wanted = match expected {
+                    Some(Ty::Tuple(types)) => {
+                        if types.len() != elems.len() {
+                            return err(format!("expected a tuple with {} element(s), found {}", types.len(), elems.len()), e.span);
+                        }
+                        Some(types.as_slice())
+                    }
+                    _ => None,
+                };
+                let mut inferred = HashMap::new();
+                if let Some(types) = wanted.filter(|types| types.iter().any(has_var)) {
+                    self.infer_argument_types(elems.iter().zip(types.iter()), &mut inferred);
+                }
                 let mut cfields = Vec::with_capacity(elems.len());
                 let mut tys = Vec::with_capacity(elems.len());
-                for el in elems {
-                    let (ce, t) = self.expr(el, None)?;
+                for (index, el) in elems.iter().enumerate() {
+                    let declared = wanted.map(|types| &types[index]);
+                    let expected = declared.map(|ty| apply_subst(ty, &inferred));
+                    let (ce, ty) = self.expr(el, expected.as_ref().and_then(compound_hint))?;
+                    if let Some(declared) = declared {
+                        unify_infer(declared, &ty, &mut inferred);
+                        self.check_assignable(&ty, &apply_subst(declared, &inferred), el.span)?;
+                    }
                     cfields.push(ce);
-                    tys.push(t);
+                    tys.push(ty);
                 }
                 let ty = Ty::Tuple(tys);
                 let repr = self.repr_of(&ty, e.span)?;
@@ -1358,6 +1963,27 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::MakeValue { value: vid, fields: cfields }, Repr::Value(vid)), ty))
             }
 
+            // `i64::MAX`, `f64::INFINITY`, `f64::consts::PI`, ...
+            ExprKind::Path(path) if primitive_const(&path.segments).is_some() => {
+                let (suffix, value) = primitive_const(&path.segments).unwrap();
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: e.span };
+                let lit = match value {
+                    PrimConst::Int(n) if n < 0 => ex(ExprKind::Binary(
+                        BinOp::Sub,
+                        ex(ExprKind::Unary(UnOp::Neg, ex(ExprKind::Int((n + 1).unsigned_abs() as u64, suffix)))),
+                        ex(ExprKind::Int(1, suffix)),
+                    )),
+                    PrimConst::Int(n) => ex(ExprKind::Int(n as u64, suffix)),
+                    // Non-finite values have no literal: `1.0 / 0.0` and so on.
+                    PrimConst::Float(f) if !f.is_finite() => ex(ExprKind::Binary(
+                        BinOp::Div,
+                        ex(ExprKind::Float(if f.is_nan() { 0.0 } else { f.signum() }, suffix)),
+                        ex(ExprKind::Float(0.0, suffix)),
+                    )),
+                    PrimConst::Float(f) => ex(ExprKind::Float(f, suffix)),
+                };
+                self.expr(&lit, expected)
+            }
             ExprKind::Path(path) if !path.is_single() => {
                 // A qualified path that's a unit enum variant: `Color::Red`,
                 // `Option::None`.
@@ -1370,6 +1996,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::Try(inner) => self.try_op(inner, e.span),
 
+            ExprKind::MethodCall { recv, method, args, span } if method == "collect" && args.is_empty() => {
+                self.collect_call(recv, expected, *span)
+            }
             ExprKind::MethodCall { recv, method, args, span } => {
                 self.method_call(recv, method, args, *span)
             }
@@ -1396,31 +2025,39 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         let i64_repr = Repr::Scalar(ScalarRepr::I64);
         let int = |n: u64| CoreExpr::new(CoreExprKind::ConstInt(n, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
-        // Lower the elements (or the repeated value and its count).
+        // Preserve the container context while inferring its element variables.
+        let mut inferred = HashMap::new();
+        if let (Some(pattern), ArrayLit::Elems(elements)) = (want_elem.as_ref().filter(|ty| has_var(ty)), lit) {
+            self.infer_argument_types(elements.iter().map(|value| (value, pattern)), &mut inferred);
+        }
+        let mut infer_element = |this: &mut Self, value: &Expr, element: &mut Option<Ty>| -> LResult<(CoreExpr, Ty)> {
+            let expected = element.as_ref().map(|ty| apply_subst(ty, &inferred));
+            let (core, actual) = this.expr(value, expected.as_ref().and_then(compound_hint))?;
+            if let Some(pattern) = element.as_ref() {
+                unify_infer(pattern, &actual, &mut inferred);
+                this.check_assignable(&actual, &apply_subst(pattern, &inferred), value.span)?;
+            } else { *element = Some(actual.clone()); }
+            Ok((core, actual))
+        };
         let (elem_ty, values, count): (Ty, Vec<CoreExpr>, CoreExpr) = match lit {
-            ArrayLit::Elems(es) => {
-                let mut elem_ty = want_elem.clone();
+            ArrayLit::Elems(elements) => {
+                let mut element = want_elem.clone();
                 let mut values = Vec::new();
-                for el in es {
-                    let (cv, vt) = self.expr(el, elem_ty.as_ref())?;
-                    match &elem_ty {
-                        Some(t) => self.check_assignable(&vt, &t.clone(), el.span)?,
-                        None => elem_ty = Some(vt),
-                    }
-                    values.push(cv);
-                }
-                let elem_ty = elem_ty.ok_or_else(|| LowerError {
-                    msg: "cannot infer the element type of an empty array literal; annotate its type".into(),
-                    span,
-                })?;
-                (elem_ty, values, int(es.len() as u64))
+                for value in elements { values.push(infer_element(self, value, &mut element)?.0); }
+                let element = element.map(|ty| apply_subst(&ty, &inferred)).filter(|ty| !has_var(ty))
+                    .ok_or_else(|| LowerError { msg: if elements.is_empty() {
+                        "cannot infer the element type of an empty array literal; annotate its type"
+                    } else {
+                        "cannot infer the element type of an unconstrained array literal; annotate its type"
+                    }.into(), span })?;
+                (element, values, int(elements.len() as u64))
             }
             ArrayLit::Repeat(value, count) => {
-                let (cv, vt) = self.expr(value, want_elem.as_ref())?;
-                if let Some(t) = &want_elem { self.check_assignable(&vt, &t.clone(), value.span)?; }
-                let (cc, ct) = self.expr(count, Some(&Ty::i64()))?;
-                self.check_assignable(&ct, &Ty::i64(), count.span)?;
-                (want_elem.unwrap_or(vt), vec![cv], cc)
+                let mut element = want_elem.clone();
+                let (core, actual) = infer_element(self, value, &mut element)?;
+                let (count_core, count_ty) = self.expr(count, Some(&Ty::i64()))?;
+                self.check_assignable(&count_ty, &Ty::i64(), count.span)?;
+                (actual, vec![core], count_core)
             }
         };
         let ty = if dynamic {
@@ -1448,7 +2085,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let local = |id: LocalId, repr: Repr| CoreExpr::new(CoreExprKind::Local(id), repr);
         let set = |index: CoreExpr, value: CoreExpr| CoreStmt::Expr(CoreExpr::new(
             CoreExprKind::ArraySet { array: Box::new(local(arr, Repr::Ref(layout))), index: Box::new(index), value: Box::new(value), elem: elem.clone() },
-            Repr::Scalar(ScalarRepr::I64),
+            Repr::Unit,
         ));
         let mut stmts = Vec::new();
         match lit {
@@ -1488,12 +2125,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// A `Name { field: val, ... }` literal — struct OR an enum struct-variant.
     /// `Enum::Variant { a: x, b }`: a variant with named fields, built like
-    /// the positional `Enum::Variant(x, b)` in declaration order.
+    /// the positional form with independent written-order evaluation.
     fn variant_struct_lit(&mut self, path: &Path, fields: &[FieldInit], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
         let key = path.segments.join("::");
-        let (enum_name, tag) = self.ctx.variants.get(&key)
-            .or_else(|| self.ctx.variants.get(path.last()))
-            .cloned()
+        let (enum_name, tag) = self.ctx.variant_by_path(path)
             .ok_or_else(|| LowerError { msg: format!("unknown variant `{}`", key), span })?;
         let names = self.variant_field_names(&enum_name, tag);
         if names.is_empty() {
@@ -1511,14 +2146,29 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         for n in &names {
             let f = fields.iter().find(|f| &f.name == n)
                 .ok_or_else(|| LowerError { msg: format!("missing field `{}` for variant `{}`", n, path.last()), span })?;
-            args.push(f.value.clone().unwrap_or_else(|| Expr { kind: Box::new(ExprKind::Path(Path::single(n.clone(), f.span))), span: f.span }));
+            args.push(f.value.clone().unwrap_or_else(|| Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(n.clone(), f.span))), span: f.span }));
         }
-        self.variant_ctor(path, &args, expected, span)
+        let order: Vec<_> = fields.iter().map(|f| names.iter().position(|n| n == &f.name).unwrap()).collect();
+        self.variant_ctor_ordered(path, &args, expected, span, Some(&order))
     }
 
-    fn struct_lit(&mut self, path: &Path, fields: &[FieldInit], span: Span) -> LResult<(CoreExpr, Ty)> {
+    fn struct_lit(&mut self, path: &Path, fields: &[FieldInit], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
         let name = path.last();
-        let canon = self.ctx.canon(name).unwrap_or_else(|| name.to_string());
+        let qualified = path.segments.join("::");
+        let canon = self.ctx.canon(&qualified).unwrap_or(qualified);
+        // Constructor binders are independent of the enclosing function's
+        // binders. Normalize an alias template before inferring its arguments.
+        let alias_name = self.ctx.aliases.contains_key(&canon).then(|| canon.clone());
+        let alias_template = self.ctx.aliases.get(&canon).map(|alias| {
+            let renamed = alias.params.iter().enumerate().map(|(i, name)|
+                (name.clone(), Ty::Var(format!("$constructor{i}")))).collect();
+            apply_subst(&alias.target, &renamed)
+        });
+        let canon = match &alias_template {
+            Some(Ty::Named { name, .. }) => name.clone(),
+            Some(_) => return err(format!("`{name}` is not a struct"), span),
+            None => canon,
+        };
         let Some(s) = self.ctx.structs.get(&canon).cloned() else {
             return err(format!("`{}` is not a struct", name), span);
         };
@@ -1526,53 +2176,102 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             return err("struct literal on a non-record struct", span);
         };
         let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
-        // Evaluate fields in declaration order, inferring the struct's type args
-        // from the field values.
-        let mut targ: HashMap<String, Ty> = HashMap::new();
-        let mut cfields = Vec::with_capacity(def_fields.len());
-        let mut field_checks = Vec::new();
-        for df in def_fields {
-            let init = fields.iter().find(|f| f.name == df.name)
-                .ok_or_else(|| LowerError { msg: format!("missing field `{}`", df.name), span })?;
-            let declared = lower_type(&df.ty, &gparams, self.ctx).map_err(conv)?;
-            let val_expr = match &init.value {
-                Some(v) => v.clone(),
-                None => Expr { kind: Box::new(ExprKind::Path(Path::single(df.name.clone(), span))), span },
-            };
-            // Apply the enclosing function's instantiation substitution so a
-            // field type like `Array<T>` (where T is a still-generic param of the
-            // surrounding fn) becomes the concrete `Array<i64>` the field value
-            // (e.g. `array_new(..)`) needs as its expected type.
-            let field_hint = apply_subst(&declared, &self.subst);
-            let (cv, vt) = self.expr(&val_expr, hint(&field_hint))?;
-            unify_infer(&declared, &vt, &mut targ);
-            field_checks.push((declared, vt));
-            cfields.push(cv);
-        }
-        let mut struct_args = Vec::new();
-        for gp in &gparams {
-            match targ.get(gp) {
-                Some(t) => struct_args.push(t.clone()),
-                None => {
-                    let args = gparams.iter().map(|g| targ.get(g).cloned().unwrap_or_else(|| Ty::Var(g.clone()))).collect();
-                    self.infer.unresolved = Some(Ty::Named { name: canon.clone(), args });
-                    return err(format!("cannot infer `{}` for struct `{}`", gp, name), span);
-                }
+        let template = alias_template.unwrap_or_else(|| Ty::Named {
+            name: canon.clone(),
+            args: gparams.iter().enumerate().map(|(i, _)| Ty::Var(format!("$constructor{i}"))).collect(),
+        });
+        let Ty::Named { args: template_args, .. } = &template else { unreachable!() };
+        let field_subst: HashMap<String, Ty> = gparams.iter().cloned().zip(template_args.iter().cloned()).collect();
+        // Validate the field set before evaluating any initializer. Evaluate in
+        // written order into rooted locals; the object layout uses declaration
+        // order independently of that observable evaluation order.
+        let mut seen = std::collections::HashSet::new();
+        for init in fields {
+            if !def_fields.iter().any(|df| df.name == init.name) {
+                return err(format!("unknown field `{}`", init.name), span);
+            }
+            if !seen.insert(init.name.as_str()) {
+                return err(format!("duplicate field `{}`", init.name), span);
             }
         }
-        let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(struct_args.iter().cloned()).collect();
-        for (declared, actual) in &field_checks {
-            self.check_assignable(actual, &apply_subst(declared, &subst), span)?;
+        for df in def_fields {
+            if !seen.contains(df.name.as_str()) {
+                return err(format!("missing field `{}`", df.name), span);
+            }
         }
-        let ty = Ty::Named { name: canon.clone(), args: struct_args };
+        let mut targ: HashMap<String, Ty> = HashMap::new();
+        if let Some(expected) = expected {
+            unify_infer(&template, expected, &mut targ);
+        }
+        // Discover constraints without retaining generated code or changing
+        // source-order evaluation. Failed probes are checked in the real pass.
+        while has_var(&apply_subst(&template, &targ)) {
+            let previous = targ.clone();
+            for init in fields {
+                let field = def_fields.iter().find(|field| field.name == init.name).unwrap();
+                let declared = lower_type(&field.ty, &gparams, self.ctx).map_err(conv)?;
+                let declared = apply_subst(&declared, &field_subst);
+                let expected = apply_subst(&declared, &targ);
+                if !has_var(&expected) { continue; }
+                let shorthand;
+                let value = if let Some(value) = &init.value { value } else {
+                    shorthand = Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(field.name.clone(), span))), span };
+                    &shorthand
+                };
+                if let Ok(actual) = self.probe_expr_type(value, compound_hint(&expected)) {
+                    if !has_var(&actual) && !is_never(&actual) {
+                        unify_infer(&declared, &actual, &mut targ);
+                    }
+                }
+            }
+            if previous == targ { break; }
+        }
+        let mut cfields = vec![None; def_fields.len()];
+        let mut field_stmts = Vec::with_capacity(fields.len());
+        let mut field_checks = Vec::new();
+        for init in fields {
+            let index = def_fields.iter().position(|df| df.name == init.name).unwrap();
+            let df = &def_fields[index];
+            let declared = lower_type(&df.ty, &gparams, self.ctx).map_err(conv)?;
+            let declared = apply_subst(&declared, &field_subst);
+            let val_expr = match &init.value {
+                Some(v) => v.clone(),
+                None => Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(df.name.clone(), span))), span },
+            };
+            let field_hint = apply_subst(&declared, &targ);
+            let (cv, vt) = self.expr(&val_expr, compound_hint(&field_hint))?;
+            unify_infer(&declared, &vt, &mut targ);
+            let local = self.fresh_local(cv.repr.clone(), vt.clone());
+            cfields[index] = Some(CoreExpr::new(CoreExprKind::Local(local), cv.repr.clone()));
+            field_stmts.push(CoreStmt::Let(local, cv));
+            field_checks.push((declared, vt));
+        }
+        let ty = apply_subst(&template, &targ);
+        if has_var(&ty) {
+            self.infer.unresolved = Some(ty);
+            return err(format!("cannot infer type arguments for struct `{name}`"), span);
+        }
+        if let Some(expected) = expected {
+            self.check_assignable(&ty, expected, span)?;
+        }
+        if let Some(alias) = &alias_name { self.check_alias_bounds(alias, &ty, span)?; }
+        for (declared, actual) in &field_checks {
+            self.check_assignable(actual, &apply_subst(declared, &targ), span)?;
+            if matches!(actual, Ty::Prim(Prim::RawPtr)) {
+                self.require_unsafe("constructing a record with a RawPtr field", span)?;
+            }
+        }
         let repr = self.repr_of(&ty, span)?;
+        let cfields = cfields.into_iter().map(Option::unwrap).collect();
         let kind = match repr {
             Repr::Ref(lid) => CoreExprKind::New { layout: lid, fields: cfields },
             Repr::Value(vid) => CoreExprKind::MakeValue { value: vid, fields: cfields },
             _ => return err("struct must be a ref or value type", span),
         };
         let sid = self.mono.intern_span(span);
-        Ok((CoreExpr::new(kind, repr).at(sid), ty))
+        let construction = CoreExpr::new(kind, repr.clone()).at(sid);
+        let block = CoreBlock { stmts: field_stmts, tail: Some(construction) };
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(block)), repr).at(sid), ty))
     }
 
     /// Construct an enum variant. `path` is `Enum::Variant`; `args` are payload
@@ -1585,61 +2284,85 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         expected: Option<&Ty>,
         span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
+        self.variant_ctor_ordered(path, args, expected, span, None)
+    }
+
+    fn variant_ctor_ordered(
+        &mut self, path: &Path, args: &[Expr], expected: Option<&Ty>, span: Span,
+        written_order: Option<&[usize]>,
+    ) -> LResult<(CoreExpr, Ty)> {
         let key = path.segments.join("::");
         let last = path.last();
-        let (enum_name, tag) = self.ctx.variants.get(&key)
-            .or_else(|| self.ctx.variants.get(last))
-            .cloned()
+        let (enum_name, tag) = self.ctx.variant_by_path(path)
             .ok_or_else(|| LowerError { msg: format!("unknown variant `{}`", key), span })?;
         // Builtin Option/Result: enum_name is "Option"/"Result"; handle by name.
         let gparams: Vec<String> = self.ctx.enums.get(&enum_name)
             .map(|e| e.generics.params.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_else(|| builtin_enum_params(&enum_name));
 
+        let alias_name = if path.segments.len() > 1 {
+            let prefix = path.segments[..path.segments.len() - 1].join("::");
+            self.ctx.canon(&prefix).filter(|name| self.ctx.aliases.contains_key(name))
+        } else { None };
+        let template = if let Some(alias) = alias_name.as_ref().and_then(|name| self.ctx.aliases.get(name)) {
+            let renamed = alias.params.iter().enumerate().map(|(i, name)|
+                (name.clone(), Ty::Var(format!("$constructor{i}")))).collect();
+            apply_subst(&alias.target, &renamed)
+        } else {
+            Ty::Named { name: enum_name.clone(), args: gparams.iter().enumerate()
+                .map(|(i, _)| Ty::Var(format!("$constructor{i}"))).collect() }
+        };
+        let Ty::Named { args: template_args, .. } = &template else { unreachable!() };
+        let field_subst: HashMap<String, Ty> = gparams.iter().cloned().zip(template_args.iter().cloned()).collect();
         // Declared payload types (may mention the enum's generic params).
-        let decl_payload = self.variant_decl_payload(&enum_name, tag, &gparams)?;
+        let decl_payload: Vec<Ty> = self.variant_decl_payload(&enum_name, tag, &gparams)?.iter()
+            .map(|ty| apply_subst(ty, &field_subst)).collect();
         if args.len() != decl_payload.len() {
             return err(format!("variant `{}` expects {} args, got {}", last, decl_payload.len(), args.len()), span);
         }
 
         // Infer the enum's type args from (a) the expected type, (b) the payload.
         let mut targ: HashMap<String, Ty> = HashMap::new();
-        if let Some(Ty::Named { name, args: eargs }) = expected {
-            if name == &enum_name || name.rsplit("::").next() == enum_name.rsplit("::").next() {
-                for (gp, a) in gparams.iter().zip(eargs) {
-                    targ.insert(gp.clone(), a.clone());
-                }
-            }
+        if let Some(expected) = expected {
+            unify_infer(&template, expected, &mut targ);
         }
-        let mut cargs = Vec::new();
+        if has_var(&apply_subst(&template, &targ)) {
+            self.infer_argument_types(args.iter().zip(&decl_payload), &mut targ);
+        }
+        let mut cargs = vec![None; args.len()];
         let mut actuals = Vec::new();
-        for (a, decl) in args.iter().zip(&decl_payload) {
+        let mut field_stmts = Vec::new();
+        let positional_order: Vec<_> = (0..args.len()).collect();
+        for &index in written_order.unwrap_or(&positional_order) {
+            let a = &args[index];
+            let decl = &decl_payload[index];
             let payload_hint = apply_subst(decl, &targ);
-            let (ca, at) = self.expr(a, hint(&payload_hint))?;
+            let (ca, at) = self.expr(a, compound_hint(&payload_hint))?;
             unify_infer(decl, &at, &mut targ);
-            actuals.push((decl.clone(), at));
-            cargs.push(ca);
-        }
-        // Resolve the enum's full type args.
-        let mut enum_args = Vec::new();
-        for gp in &gparams {
-            match targ.get(gp) {
-                Some(t) => enum_args.push(t.clone()),
-                None => {
-                    let args = gparams.iter().map(|g| targ.get(g).cloned().unwrap_or_else(|| Ty::Var(g.clone()))).collect();
-                    self.infer.unresolved = Some(Ty::Named { name: enum_name.clone(), args });
-                    return err(format!("cannot infer `{}` for enum `{}`", gp, enum_name), span);
-                }
+            if written_order.is_some() {
+                let local = self.fresh_local(ca.repr.clone(), at.clone());
+                cargs[index] = Some(CoreExpr::new(CoreExprKind::Local(local), ca.repr.clone()));
+                field_stmts.push(CoreStmt::Let(local, ca));
+            } else {
+                cargs[index] = Some(ca);
             }
+            actuals.push((decl.clone(), at));
         }
-        let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(enum_args.iter().cloned()).collect();
+        let cargs = cargs.into_iter().map(Option::unwrap).collect();
+        let ty = apply_subst(&template, &targ);
+        if has_var(&ty) {
+            self.infer.unresolved = Some(ty);
+            return err(format!("cannot infer type arguments for enum `{enum_name}`"), span);
+        }
+        if let Some(expected) = expected {
+            self.check_assignable(&ty, expected, span)?;
+        }
+        if let Some(alias) = &alias_name { self.check_alias_bounds(alias, &ty, span)?; }
         for (decl, actual) in &actuals {
-            self.check_assignable(actual, &apply_subst(decl, &subst), span)?;
+            self.check_assignable(actual, &apply_subst(decl, &targ), span)?;
         }
-
-        let ty = Ty::Named { name: enum_name.clone(), args: enum_args };
         let repr = self.repr_of(&ty, span)?;
-        match repr {
+        let (construction, ty) = match repr {
             // Only the Ref (heap-allocating) variant is an alloc site → intern a
             // span only here, not for the inline MakeValueVariant.
             Repr::Ref(lid) => {
@@ -1650,6 +2373,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::MakeValueVariant { value: vid, tag, fields: cargs }, repr), ty))
             }
             _ => err("enum constructor produced a non-aggregate repr", span),
+        }?;
+        if written_order.is_some() {
+            let repr = construction.repr.clone();
+            let block = CoreBlock { stmts: field_stmts, tail: Some(construction) };
+            Ok((CoreExpr::new(CoreExprKind::Block(Box::new(block)), repr), ty))
+        } else {
+            Ok((construction, ty))
         }
     }
 
@@ -1711,6 +2441,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(struct_args.iter().cloned()).collect();
         let raw_fty = lower_type(&def_fields[idx].ty, &gparams, self.ctx).map_err(conv)?;
         let fty = apply_subst(&raw_fty, &subst);
+        if matches!(fty, Ty::Prim(Prim::RawPtr)) {
+            self.require_unsafe("reading a RawPtr record field", span)?;
+        }
         // The FieldLoc is in the base layout's field_map for reference structs;
         // value structs store fields in declaration order in the LLVM aggregate.
         let loc = match &cbase.repr {
@@ -1749,11 +2482,25 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
         let subst: HashMap<String, Ty> = gparams.iter().cloned().zip(struct_args.iter().cloned()).collect();
         let fty = apply_subst(&lower_type(&def_fields[idx].ty, &gparams, self.ctx).map_err(conv)?, &subst);
+        if matches!(fty, Ty::Prim(Prim::RawPtr)) {
+            self.require_unsafe("writing a RawPtr record field", span)?;
+        }
+        if let Some(binop) = op {
+            if matches!(self.repr_of(&fty, span)?, Repr::Scalar(_)) { self.check_scalar_binary(*binop, &fty, span)?; }
+        }
         let loc = match &cbase.repr {
             Repr::Ref(lid) => self.reg.layouts[*lid as usize].field_map[idx],
             _ => return err("field assignment on non-reference", span),
         };
-        // Compound assign: read the current field first.
+        // A place's base is evaluated once, before reading the old field and
+        // evaluating the RHS. Its typed local remains rooted across calls.
+        let mut stmts = Vec::new();
+        let cbase = if op.is_some() {
+            let id = self.fresh_local(cbase.repr.clone(), bty.clone());
+            let local = CoreExpr::new(CoreExprKind::Local(id), cbase.repr.clone());
+            stmts.push(CoreStmt::Let(id, cbase));
+            local
+        } else { cbase };
         let new_val = match op {
             None => { let (cv, vt) = self.expr(value, Some(&fty))?; self.check_assignable(&vt, &fty, value.span)?; cv }
             Some(binop) => {
@@ -1771,7 +2518,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 }
             }
         };
-        Ok((CoreExpr::new(CoreExprKind::SetField { base: Box::new(cbase), loc, value: Box::new(new_val) }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
+        let store = CoreExpr::new(CoreExprKind::SetField { base: Box::new(cbase), loc, value: Box::new(new_val) }, Repr::Unit);
+        let result = if stmts.is_empty() { store } else {
+            CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts, tail: Some(store) })), Repr::Unit)
+        };
+        Ok((result, Ty::unit()))
     }
 
     fn match_expr(
@@ -1825,10 +2576,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     (u32::MAX, vec![])
                 }
                 PatternKind::Variant { path, payload } => {
-                    let vlast = path.last();
-                    let (tag, ptys) = self.variant_in(&enum_name, vlast, &variants, arm.pattern.span)?;
+                    let (tag, ptys) = self.variant_fields(&sty, path, arm.pattern.span)?;
                     if payload.len() != ptys.len() {
-                        return err(format!("variant `{}` binds {} fields, pattern has {}", vlast, ptys.len(), payload.len()), arm.pattern.span);
+                        return err(format!("variant `{}` binds {} fields, pattern has {}", path.last(), ptys.len(), payload.len()), arm.pattern.span);
                     }
                     let mut binds = Vec::new();
                     for (p, pty) in payload.iter().zip(&ptys) {
@@ -2126,9 +2876,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let Ty::Named { name, .. } = sty else {
                     return err(format!("struct pattern against `{}`", ty_display(sty)), span);
                 };
-                if name.rsplit("::").next() != Some(path.last()) {
-                    return err(format!("pattern for `{}` against a `{}`", path.last(), ty_display(sty)), span);
-                }
+                self.check_constructor_pattern(&path.segments.join("::"), sty, span)?;
                 let def = self.ctx.structs.get(name).cloned()
                     .ok_or_else(|| LowerError { msg: format!("`{}` is not a struct", name), span })?;
                 let StructBody::Named(def_fields) = &def.body else {
@@ -2358,6 +3106,22 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             .unwrap_or_default())
     }
 
+    fn check_constructor_pattern(&self, written: &str, actual: &Ty, span: Span) -> LResult<()> {
+        let canonical = self.ctx.canon(written).ok_or_else(|| LowerError {
+            msg: format!("unknown or ambiguous type `{written}` in pattern"), span,
+        })?;
+        if let Some(alias) = self.ctx.aliases.get(&canonical) {
+            let mut inferred = HashMap::new();
+            unify_infer(&alias.target, actual, &mut inferred);
+            check_assignable(actual, &apply_subst(&alias.target, &inferred), span)?;
+            self.check_alias_bounds(&canonical, actual, span)
+        } else if matches!(actual, Ty::Named { name, .. } if name == &canonical) {
+            Ok(())
+        } else {
+            err(format!("pattern for `{written}` against `{}`", ty_display(actual)), span)
+        }
+    }
+
     /// The tag and payload types of the variant `path` of enum type `sty`.
     fn variant_fields(&mut self, sty: &Ty, path: &Path, span: Span) -> LResult<(u32, Vec<Ty>)> {
         let Ty::Named { name, args } = sty else {
@@ -2365,6 +3129,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
         if !self.ctx.enums.contains_key(name) {
             return err(format!("variant pattern against `{}`, which is not an enum", ty_display(sty)), span);
+        }
+        if path.segments.len() > 1 {
+            self.check_constructor_pattern(&path.segments[..path.segments.len() - 1].join("::"), sty, span)?;
         }
         let variants = self.enum_variants(name, args)?;
         self.variant_in(name, path.last(), &variants, span)
@@ -2413,7 +3180,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// `array_new(len)` — allocate a varlen array. Element type from `expected`.
     fn array_new(&mut self, len: &Expr, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
         let elem_ty = match expected {
-            Some(Ty::Named { name, args }) if name.rsplit("::").next() == Some("Array") && !args.is_empty() => args[0].clone(),
+            Some(Ty::Named { name, args }) if name == "Array" && !args.is_empty() => args[0].clone(),
             _ => return err("`Array::new` requires an expected `Array<T>` type (annotate the let binding)", span),
         };
         let elem = self.repr_of(&elem_ty, span)?;
@@ -2426,7 +3193,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     fn array_len_op(&mut self, arr: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
-        let (ca, _) = self.expr(arr, None)?;
+        let (ca, aty) = self.expr(arr, None)?;
+        if array_elem_ty(&aty).is_none() {
+            return err("array_len on a non-array", span);
+        }
         Ok((CoreExpr::new(CoreExprKind::ArrayLen(Box::new(ca)), Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
     }
 
@@ -2485,7 +3255,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if array_elem_ty(&bty).is_some() {
             return err("range indexing is not supported on `Array`; use a `Vec`", span);
         }
-        let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
         let base_var = ex(ExprKind::Path(Path::single(RANGE_BASE.to_string(), span)));
         let lo = lo.clone().unwrap_or_else(|| ex(ExprKind::Int(0, crate::lexer::NumSuffix::None)));
         let hi = match hi {
@@ -2517,6 +3287,70 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.array_store(ca, aty, idx, val, span)
     }
 
+    /// Capture the location, then the old value, then evaluate the RHS. In
+    /// particular neither an indexer nor its receiver is replayed for the store.
+    fn compound_index_set(&mut self, base: &Expr, idx: &Expr, op: BinOp, rhs: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        self.check_mutable_root(base, "element of", span)?;
+        let (ca, aty) = self.expr(base, None)?;
+        let aid = self.fresh_local(ca.repr.clone(), aty.clone());
+        let array = CoreExpr::new(CoreExprKind::Local(aid), ca.repr.clone());
+        let mut stmts = vec![CoreStmt::Let(aid, ca)];
+        let elem_ty = array_elem_ty(&aty);
+        let getter = if elem_ty.is_none() {
+            Some(self.required_trait_method(&aty, "Index", "index", "indexing", span)?)
+        } else { None };
+        let index_ty = if let Some(entry) = &getter {
+            let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).map_err(conv)?;
+            let mut subst = HashMap::new();
+            unify_infer(&impl_self, &aty, &mut subst);
+            subst.insert("Self".to_string(), aty.clone());
+            let mut params = entry.impl_generics.clone();
+            params.extend(entry.method.generics.params.iter().map(|p| p.name.clone()));
+            params.push("Self".to_string());
+            let param = entry.method.params.first().ok_or_else(|| LowerError {
+                msg: "Index::index must accept an index argument".into(), span,
+            })?;
+            apply_subst(&lower_type(&param.ty, &params, self.ctx).map_err(conv)?, &subst)
+        } else { Ty::i64() };
+        let (ci, it) = self.expr(idx, hint(&index_ty))?;
+        let iid = self.fresh_local(ci.repr.clone(), it.clone());
+        let index = CoreExpr::new(CoreExprKind::Local(iid), ci.repr.clone());
+        stmts.push(CoreStmt::Let(iid, ci));
+        let (old, ty) = if let Some(entry) = getter {
+            self.method_call_operands(array.clone(), aty.clone(), Some(base), entry,
+                &[MethodArg::Lowered(index.clone(), it.clone(), idx.span)], span)?
+        } else {
+            self.check_assignable(&it, &Ty::i64(), idx.span)?;
+            let ty = elem_ty.clone().unwrap();
+            let elem = self.repr_of(&ty, span)?;
+            (CoreExpr::new(CoreExprKind::ArrayGetChecked { array: Box::new(array.clone()), index: Box::new(index.clone()), elem: elem.clone() }, elem), ty)
+        };
+        let oid = self.fresh_local(old.repr.clone(), ty.clone());
+        let current = CoreExpr::new(CoreExprKind::Local(oid), old.repr.clone());
+        stmts.push(CoreStmt::Let(oid, old));
+        let (value, vt) = if matches!(current.repr, Repr::Scalar(_)) {
+            self.check_scalar_binary(op, &ty, span)?;
+            let (right, rt) = self.expr(rhs, Some(&ty))?;
+            self.check_assignable(&rt, &ty, rhs.span)?;
+            let repr = current.repr.clone();
+            (CoreExpr::new(CoreExprKind::Bin(op, Box::new(current), Box::new(right)), repr), ty.clone())
+        } else {
+            self.overloaded_binary(op, current, ty.clone(), base, rhs, span)?
+        };
+        self.check_assignable(&vt, &ty, span)?;
+        let store = if elem_ty.is_some() {
+            let elem = self.repr_of(&ty, span)?;
+            CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(array), index: Box::new(index), value: Box::new(value), elem }, Repr::Unit)
+        } else {
+            let entry = self.required_trait_method(&aty, "IndexSet", "index_set", "indexed assignment", span)?;
+            let (call, ret) = self.method_call_operands(array, aty, Some(base), entry,
+                &[MethodArg::Lowered(index, it, idx.span), MethodArg::Lowered(value, vt, rhs.span)], span)?;
+            self.check_assignable(&ret, &Ty::unit(), span)?;
+            call
+        };
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts, tail: Some(store) })), Repr::Unit), Ty::unit()))
+    }
+
     fn array_set_op(&mut self, arr: &Expr, idx: &Expr, val: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         // Mutating an array element (whether via `a[i] = v` or `array_set(a, ..)`)
         // requires the array's access-path root to be a `mut` binding.
@@ -2532,14 +3366,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.check_assignable(&it, &Ty::i64(), idx.span)?;
         let (cv, vt) = self.expr(val, Some(&elem_ty))?;
         self.check_assignable(&vt, &elem_ty, val.span)?;
-        Ok((CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(ca), index: Box::new(ci), value: Box::new(cv), elem }, Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
+        Ok((CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(ca), index: Box::new(ci), value: Box::new(cv), elem }, Repr::Unit), Ty::unit()))
     }
 
     /// Lower the built-in `String` intrinsics. Each argument must be a `String`.
     fn str_intrinsic(&mut self, name: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
         let str_ty = Ty::Prim(Prim::Str);
         // Lower an argument and require it to be a String.
-        let mut str_arg = |this: &mut Self, e: &Expr| -> LResult<CoreExpr> {
+        let str_arg = |this: &mut Self, e: &Expr| -> LResult<CoreExpr> {
             let (ce, t) = this.expr(e, Some(&str_ty))?;
             this.check_assignable(&t, &str_ty, e.span)?;
             Ok(ce)
@@ -2610,6 +3444,25 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let layout = self.string_layout_id(span)?;
                 Ok((
                     CoreExpr::new(CoreExprKind::ReadFile { layout, path: Box::new(p) }, Repr::Ref(layout)),
+                    str_ty,
+                ))
+            }
+            "fmt_f64" => {
+                if args.len() != 3 { return err("`fmt_f64` takes a float, a precision, and a mode", span); }
+                let (v, vt) = self.expr(&args[0], Some(&Ty::Prim(Prim::F64)))?;
+                self.check_assignable(&vt, &Ty::Prim(Prim::F64), args[0].span)?;
+                let mut ints = Vec::new();
+                for a in &args[1..] {
+                    let (ci, it) = self.expr(a, Some(&Ty::i64()))?;
+                    self.check_assignable(&it, &Ty::i64(), a.span)?;
+                    ints.push(ci);
+                }
+                let layout = self.string_layout_id(span)?;
+                let tid = CoreExpr::new(CoreExprKind::ConstInt(layout as u64, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+                let mode = ints.pop().unwrap();
+                let prec = ints.pop().unwrap();
+                Ok((
+                    CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_fmt_f64", args: vec![tid, v, prec, mode], ret: Repr::Ref(layout) }, Repr::Ref(layout)),
                     str_ty,
                 ))
             }
@@ -2748,6 +3601,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// A zero/null value of the given repr, for deferred-init `let` slots.
     fn zero_value(&self, repr: &Repr) -> CoreExpr {
         match repr {
+            Repr::Scalar(ScalarRepr::Ptr) => CoreExpr::new(CoreExprKind::ConstZero(repr.clone()), repr.clone()),
             Repr::Scalar(s) if s.is_float() => CoreExpr::new(CoreExprKind::ConstFloat(0.0, *s), repr.clone()),
             Repr::Scalar(s) => CoreExpr::new(CoreExprKind::ConstInt(0, *s), repr.clone()),
             Repr::Unit => CoreExpr::new(CoreExprKind::Unit, Repr::Unit),
@@ -2790,7 +3644,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         collect_free_vars(body, &param_names, &mut Vec::new(), &mut free);
         for name in &free {
             if let Some((_, ty)) = self.lookup(name) {
-                if !self.ctx.is_sync(&ty) {
+                let is_sync = self.ctx.try_is_sync(&ty).map_err(|error| LowerError {
+                    msg: error.msg, span: arg.span,
+                })?;
+                if !is_sync {
                     return err(
                         format!(
                             "cannot capture `{}: {}` in a spawned thread — it is not `Sync` \
@@ -2813,9 +3670,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let params: Vec<ClosureParam> = definition.params.iter().map(|param| ClosureParam {
             name: param.name.clone(), ty: if generic { None } else { Some(param.ty.clone()) }, span,
         }).collect();
-        let args = params.iter().map(|param| Expr { kind: Box::new(ExprKind::Path(Path::single(param.name.clone(), span))), span }).collect();
-        let callee = Expr { kind: Box::new(ExprKind::Path(path.clone())), span };
-        let body = Expr { kind: Box::new(ExprKind::Call(callee, args)), span };
+        let args = params.iter().map(|param| Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(param.name.clone(), span))), span }).collect();
+        let callee = Expr { kind: std::sync::Arc::new(ExprKind::Path(path.clone())), span };
+        let body = Expr { kind: std::sync::Arc::new(ExprKind::Call(callee, args)), span };
         self.closure(&params, &if generic { None } else { definition.ret.clone() }, &body, expected, span)
     }
 
@@ -2883,7 +3740,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Lower the lifted function body in a fresh local/scope context that
         // binds the captures (loaded from env) and the params (from args).
         let code_id = self.mono.fresh_closure_id(self.count);
-        let (lifted, ret_ty) = self.lower_lifted(&captures, &cap_reprs, params, &param_tys, body, declared_ret, env_lid, code_id, span)?;
+        // A captured `mut` binding stays mutable inside the closure (a
+        // closure that assigns to it shares it through a `MutCell`).
+        let cap_mut: Vec<bool> = captures.iter().map(|(name, _, _)| self.lookup_mut(name).unwrap_or(false)).collect();
+        let (lifted, ret_ty) = self.lower_lifted(&captures, &cap_mut, &cap_reprs, params, &param_tys, body, declared_ret, env_lid, code_id, span)?;
         self.mono.closures.push((code_id, lifted));
 
         let fn_ty = Ty::Fn { params: param_tys, ret: Box::new(ret_ty) };
@@ -2905,6 +3765,59 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn lower_lifted(
         &mut self,
         captures: &[(String, LocalId, Ty)],
+        cap_mut: &[bool],
+        cap_reprs: &[Repr],
+        params: &[ClosureParam],
+        param_tys: &[Ty],
+        body: &Expr,
+        declared_ret: Option<Ty>,
+        env_lid: LayoutId,
+        code_id: FuncId,
+        span: Span,
+    ) -> LResult<(CoreFn, Ty)> {
+        // Use an independent lexical context even when lowering fails or an
+        // inference probe retries. Unsafe/loop permissions and local slots
+        // must never be inherited from, or overwrite, the enclosing function.
+        let mut lifted = FnLowerer {
+            ctx: self.ctx,
+            reg: self.reg,
+            mono: self.mono,
+            count: self.count,
+            subst: self.subst.clone(),
+            scope: vec![HashMap::new()],
+            locals: vec![],
+            local_names: vec![],
+            local_tys: vec![],
+            ret_ty: declared_ret.clone().unwrap_or_else(Ty::unit),
+            infer_ret: declared_ret.is_none(),
+            infer: std::mem::take(&mut self.infer),
+            unsafe_depth: 0,
+            deferred_locals: vec![],
+            loop_exits: vec![],
+            type_probe: self.type_probe,
+            probe_cache: self.probe_cache.clone(),
+        };
+        let result = lifted.lower_lifted_body(
+            captures,
+            cap_mut,
+            cap_reprs,
+            params,
+            param_tys,
+            body,
+            declared_ret,
+            env_lid,
+            code_id,
+            span,
+        );
+        self.infer = std::mem::take(&mut lifted.infer);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_lifted_body(
+        &mut self,
+        captures: &[(String, LocalId, Ty)],
+        cap_mut: &[bool],
         cap_reprs: &[Repr],
         params: &[ClosureParam],
         param_tys: &[Ty],
@@ -2916,24 +3829,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     ) -> LResult<(CoreFn, Ty)> {
         // The closure literal's span = the lifted function's def location (DWARF).
         let fn_span = self.mono.intern_span(span);
-        // Swap in a fresh body-lowering context. The return type defaults to
-        // the declared one if any (so `return` inside the body checks), else
-        // unit until the body tail tells us otherwise.
-        let saved_scope = std::mem::replace(&mut self.scope, vec![HashMap::new()]);
-        let saved_locals = std::mem::take(&mut self.locals);
-        let saved_local_names = std::mem::take(&mut self.local_names);
-        let saved_local_tys = std::mem::take(&mut self.local_tys);
-        let saved_ret = std::mem::replace(
-            &mut self.ret_ty,
-            declared_ret.clone().unwrap_or_else(Ty::unit),
-        );
-        let saved_infer_ret = std::mem::replace(&mut self.infer_ret, declared_ret.is_none());
-
         // Bind captures first as locals; codegen initializes these from the env.
         let mut cap_locals = Vec::new();
-        for ((name, _, ty), repr) in captures.iter().zip(cap_reprs) {
+        for (((name, _, ty), repr), is_mut) in captures.iter().zip(cap_reprs).zip(cap_mut) {
             let id = self.fresh_local(repr.clone(), ty.clone());
-            self.bind(name, id, ty.clone());
+            self.bind_mut(name, id, ty.clone(), *is_mut);
             cap_locals.push(id);
         }
         // Then params.
@@ -2946,6 +3846,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
 
         let (body_block, body_ty) = self.block_for_closure(body, declared_ret.as_ref())?;
+        self.check_definite_init(&body_block, body.span)?;
         let ret_ty = match &declared_ret {
             Some(t) => {
                 self.check_assignable(&body_ty, t, span)?;
@@ -2960,12 +3861,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.ret_ty = ret_ty.clone();
         let ret_repr = self.repr_of(&ret_ty, span)?;
 
-        let locals = std::mem::replace(&mut self.locals, saved_locals);
-        let local_names = std::mem::replace(&mut self.local_names, saved_local_names);
-        self.scope = saved_scope;
-        self.local_tys = saved_local_tys;
-        self.ret_ty = saved_ret;
-        self.infer_ret = saved_infer_ret;
+        let locals = std::mem::take(&mut self.locals);
+        let local_names = std::mem::take(&mut self.local_names);
 
         let _ = code_id;
         // Compute each capture's ABSOLUTE byte offset within the env (past the
@@ -3010,7 +3907,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             locals,
             local_names,
             body: CoreBlock { stmts: body_block.stmts, tail: body_block.tail },
-            closure_captures,
+            closure_captures, is_closure: true,
             is_extern: false,
             span: fn_span,
         }, ret_ty))
@@ -3029,7 +3926,66 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// Resolve and lower `recv.method(args)` to a concrete monomorphic call,
     /// with `recv` passed as the leading `self` argument.
+    /// `format!` placeholders with a spec expand to `fmt#...` pseudo-methods
+    /// (no source method can contain `#`). Each picks the rendering from the
+    /// receiver's static type, then lowers ordinary source-level expressions.
+    fn format_pseudo_method(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        let (_, ty) = self.expr(recv, None)?;
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let call = |f: &str, args: Vec<Expr>| ex(ExprKind::Call(ex(ExprKind::Path(Path::single(f.to_string(), span))), args));
+        let method_on = |r: Expr, m: &str, args: Vec<Expr>| ex(ExprKind::MethodCall { recv: r, method: m.into(), args, span });
+        let int = |n: i64| ex(ExprKind::Int(n as u64, crate::lexer::NumSuffix::None));
+        let cast = |e: Expr, p: &str| ex(ExprKind::Cast(e, Type { kind: TypeKind::Path(Path::single(p.to_string(), span), vec![]), span }));
+        let is_float = matches!(ty, Ty::Prim(Prim::F32 | Prim::F64));
+        let int_bits = match ty {
+            Ty::Prim(Prim::I8 | Prim::U8) => Some(8),
+            Ty::Prim(Prim::I16 | Prim::U16) => Some(16),
+            Ty::Prim(Prim::I32 | Prim::U32) => Some(32),
+            Ty::Prim(Prim::I64 | Prim::U64) => Some(64),
+            _ => None,
+        };
+        let expr = match method {
+            "fmt#numeric" => ex(ExprKind::Bool(is_float || int_bits.is_some())),
+            "fmt#prec" if is_float => call("fmt_f64", vec![cast(recv.clone(), "f64"), args[0].clone(), int(0)]),
+            "fmt#prec" if ty == Ty::Prim(Prim::Str) => method_on(recv.clone(), "fmt_truncate", vec![args[0].clone()]),
+            "fmt#prec" => method_on(recv.clone(), "to_string", vec![]),
+            "fmt#exp" if is_float || int_bits.is_some() => {
+                let ExprKind::Bool(upper) = &*args[1].kind else { unreachable!() };
+                call("fmt_f64", vec![cast(recv.clone(), "f64"), args[0].clone(), int(if *upper { 3 } else { 2 })])
+            }
+            "fmt#exp" => return err(format!("`{{:e}}` needs a number, not `{}`", ty_display(&ty)), span),
+            "fmt#radix" => {
+                let Some(bits) = int_bits else {
+                    return err(format!("`{{:x}}`, `{{:o}}`, and `{{:b}}` need an integer, not `{}`", ty_display(&ty)), span);
+                };
+                call("fmt_radix", vec![cast(recv.clone(), "i64"), args[0].clone(), args[1].clone(), int(bits)])
+            }
+            "fmt#debug" | "fmt#debug_pretty" => {
+                let pretty = method == "fmt#debug_pretty";
+                match &ty {
+                    _ if is_float => call("fmt_f64", vec![cast(recv.clone(), "f64"), args[0].clone(), int(1)]),
+                    Ty::Prim(Prim::Unit) => ex(ExprKind::Str("()".into())),
+                    Ty::Tuple(elems) => {
+                        let parts = (0..elems.len()).map(|i| {
+                            let field = ex(ExprKind::Field { base: recv.clone(), field: FieldAccess::Tuple(i as u32) });
+                            method_on(field, method, vec![args[0].clone()])
+                        }).collect();
+                        let items = ex(ExprKind::Array(ArrayLit::Elems(parts)));
+                        call("fmt_debug_seq", vec![ex(ExprKind::Str("(".into())), ex(ExprKind::Str(")".into())), items, ex(ExprKind::Bool(pretty)), ex(ExprKind::Bool(elems.len() == 1))])
+                    }
+                    Ty::Array(..) | Ty::Named { .. } if array_elem_ty(&ty).is_some() => call("fmt_debug_array", vec![recv.clone(), ex(ExprKind::Bool(pretty))]),
+                    _ => method_on(recv.clone(), if pretty { "to_debug_string_pretty" } else { "to_debug_string" }, vec![]),
+                }
+            }
+            _ => return err(format!("unknown format operation `{}`", method), span),
+        };
+        self.expr(&expr, None)
+    }
+
     fn method_call(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        if method.starts_with("fmt#") {
+            return self.format_pseudo_method(recv, method, args, span);
+        }
         self.infer.unresolved = None;
         let (crecv, recv_ty) = match self.expr(recv, None) {
             Ok(v) => v,
@@ -3041,11 +3997,28 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.expr(recv, Some(&expected))?
             }
         };
+        // Tuples, arrays and `()` have no impls; their Debug output is built
+        // structurally.
+        if matches!(method, "to_debug_string" | "to_debug_string_pretty") && args.is_empty()
+            && (matches!(recv_ty, Ty::Tuple(_) | Ty::Prim(Prim::Unit)) || array_elem_ty(&recv_ty).is_some())
+        {
+            let pseudo = if method == "to_debug_string" { "fmt#debug" } else { "fmt#debug_pretty" };
+            let none = Expr { kind: std::sync::Arc::new(ExprKind::Unary(UnOp::Neg, Expr { kind: std::sync::Arc::new(ExprKind::Int(1, crate::lexer::NumSuffix::None)), span })), span };
+            return self.format_pseudo_method(recv, pseudo, &[none], span);
+        }
         if let Some(elem_ty) = array_elem_ty(&recv_ty) {
             return self.array_method(crecv, elem_ty, method, args, span);
         }
+        if dyn_trait(&recv_ty).is_some() {
+            return self.dyn_method_call(crecv, recv_ty, method, args, span);
+        }
         let entry = self.lookup_method(&recv_ty, method)
             .ok_or_else(|| LowerError { msg: format!("no method `{}` on `{}`", method, ty_display(&recv_ty)), span })?;
+        if let Some(base) = crate::types::receiver_base(&recv_ty) {
+            if self.ctx.ambiguous_methods.contains(&(base, method.to_string())) {
+                return err(format!("multiple traits define `{}` for `{}`; call it as `Trait::{}(x, ..)`", method, ty_display(&recv_ty), method), span);
+            }
+        }
         self.method_call_lowered(crecv, recv_ty, Some(recv), entry, args, span)
     }
 
@@ -3092,19 +4065,21 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let mut scope_params = entry.impl_generics.clone();
         scope_params.extend(entry.method.generics.params.iter().map(|p| p.name.clone()));
         scope_params.push("Self".to_string());
+        let mut method_binders: HashMap<String, Ty> = entry.method.generics.params.iter().enumerate()
+            .map(|(index, parameter)| (parameter.name.clone(), Ty::Var(format!("$receiver_method{index}")))).collect();
+        method_binders.insert("Self".into(), impl_self.clone());
         let mut subst = HashMap::new();
+        infer_concrete_parts(&impl_self, partial, &mut subst);
         for (a, p) in args.iter().zip(&entry.method.params) {
             let declared = lower_type(&p.ty, &scope_params, self.ctx).map_err(conv)?;
+            let declared = apply_subst(&declared, &method_binders);
             if !has_var(&declared) {
                 continue;
             }
-            let snap = (self.mono.snapshot(), self.reg.snapshot(), *self.count);
-            let lowered = self.expr(a, None);
-            self.mono.restore(snap.0);
-            self.reg.restore(snap.1);
-            *self.count = snap.2;
-            if let Ok((_, actual)) = lowered {
-                unify_infer(&declared, &actual, &mut subst);
+            if let Ok(actual) = self.probe_expr_type(a, None) {
+                if !has_var(&actual) && !is_never(&actual) {
+                    unify_infer(&declared, &actual, &mut subst);
+                }
             }
         }
         let receiver = apply_subst(&impl_self, &subst);
@@ -3113,15 +4088,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// The impl method `method` for a receiver of type `recv_ty`, if any.
     fn lookup_method(&self, recv_ty: &Ty, method: &str) -> Option<crate::types::MethodEntry> {
-        let base = match recv_ty {
-            Ty::Named { name, .. } => name.rsplit("::").next().unwrap().to_string(),
-            Ty::Prim(p) => format!("{:?}", p).to_lowercase(),
-            _ => return None,
-        };
-        // Try the exact base, then the primitive's impl key (`impl i64`,
-        // `impl String`).
+        let base = crate::types::receiver_base(recv_ty)?;
         self.ctx.methods.get(&(base, method.to_string())).cloned()
-            .or_else(|| self.ctx.methods.get(&(prim_impl_key(recv_ty), method.to_string())).cloned())
     }
 
     /// Call the method `method` of `impl trait_name for <recv_ty>` on an
@@ -3138,14 +4106,36 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         args: &[Expr],
         span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
-        let entry = self.lookup_method(&recv_ty, method)
-            .filter(|e| e.trait_name.as_deref() == Some(trait_name))
-            .ok_or_else(|| LowerError {
-                msg: format!("{} is not defined for `{}` (it needs `impl {} for {}`)",
-                    what, ty_display(&recv_ty), trait_name, ty_display(&recv_ty)),
-                span,
-            })?;
+        let entry = self.required_trait_method(&recv_ty, trait_name, method, what, span)?;
         self.method_call_lowered(crecv, recv_ty, recv, entry, args, span)
+    }
+
+    /// The symbol part naming `entry`'s method: its bare name, or
+    /// `Trait::name` when another method of that name on the same receiver
+    /// would otherwise share the symbol.
+    fn method_symbol(&self, recv_ty: &Ty, entry: &crate::types::MethodEntry) -> String {
+        let name = &entry.method.name;
+        let Some(tr) = &entry.trait_name else { return name.clone() };
+        let primary = crate::types::receiver_base(recv_ty)
+            .and_then(|base| self.ctx.methods.get(&(base, name.clone())));
+        match primary {
+            Some(p) if p.trait_name.as_ref() != Some(tr) => format!("{}::{}", tr, name),
+            _ => name.clone(),
+        }
+    }
+
+    /// The method `method` of `impl trait_name for <recv_ty>`, if any.
+    fn lookup_trait_method(&self, recv_ty: &Ty, trait_name: &str, method: &str) -> Option<crate::types::MethodEntry> {
+        let base = crate::types::receiver_base(recv_ty)?;
+        self.ctx.trait_methods.get(&(base, trait_name.to_string(), method.to_string())).cloned()
+    }
+
+    fn required_trait_method(&self, recv_ty: &Ty, trait_name: &str, method: &str, what: &str, span: Span) -> LResult<crate::types::MethodEntry> {
+        self.lookup_trait_method(recv_ty, trait_name, method)
+            .ok_or_else(|| LowerError {
+                msg: format!("{} is not defined for `{}` (it needs `impl {} for {}`)", what, ty_display(recv_ty), trait_name, ty_display(recv_ty)),
+                span,
+            })
     }
 
     /// Lower a call to the impl method `entry` with an already-lowered
@@ -3160,6 +4150,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         entry: crate::types::MethodEntry,
         args: &[Expr],
         span: Span,
+    ) -> LResult<(CoreExpr, Ty)> {
+        let args: Vec<_> = args.iter().map(MethodArg::Source).collect();
+        self.method_call_operands(crecv, recv_ty, recv, entry, &args, span)
+    }
+
+    fn method_call_operands(
+        &mut self, crecv: CoreExpr, recv_ty: Ty, recv: Option<&Expr>,
+        entry: crate::types::MethodEntry, args: &[MethodArg<'_>], span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
         let method = entry.method.name.clone();
         let method = method.as_str();
@@ -3177,6 +4175,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).map_err(conv)?;
         let mut isubst: HashMap<String, Ty> = HashMap::new();
         unify_infer(&impl_self, &recv_ty, &mut isubst);
+        self.check_assignable(&recv_ty, &apply_subst(&impl_self, &isubst), span)?;
         // `Self` resolves to the concrete receiver type.
         isubst.insert("Self".to_string(), recv_ty.clone());
 
@@ -3186,32 +4185,52 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if args.len() != m.params.len() {
             return err(format!("method `{}` expects {} args, got {}", method, m.params.len(), args.len()), span);
         }
+        // Impl and method binders have separate scopes. A method binder
+        // shadows a same-spelled impl binder in its signature and body, while
+        // the impl's applicability conditions still refer to the receiver.
+        let mut signature_subst = isubst.clone();
+        for parameter in &mgparams { signature_subst.remove(parameter); }
+        let mut method_subst = HashMap::new();
+        let mut scope_params = entry.impl_generics.clone();
+        scope_params.extend(mgparams.clone());
+        scope_params.push("Self".into());
         let mut cargs = vec![crecv];
         let mut checks = Vec::new();
         for (a, p) in args.iter().zip(&m.params) {
-            // declared param type may mention impl generics, Self, or method generics.
-            let mut scope_params = entry.impl_generics.clone();
-            scope_params.extend(mgparams.clone());
-            scope_params.push("Self".to_string());
             let declared = lower_type(&p.ty, &scope_params, self.ctx).map_err(conv)?;
-            let pre = apply_subst(&declared, &isubst);
-            let (ca, at) = self.expr(a, hint(&pre))?;
-            unify_infer(&pre, &at, &mut isubst);
-            checks.push((declared.clone(), at, a.span));
+            let declared = apply_subst(&declared, &signature_subst);
+            let pre = apply_subst(&declared, &method_subst);
+            let (ca, at, arg_span) = match a {
+                MethodArg::Source(a) => {
+                    let (ca, at) = self.expr(a, hint(&pre))?;
+                    (ca, at, a.span)
+                }
+                MethodArg::Lowered(ca, at, span) => (ca.clone(), at.clone(), *span),
+            };
+            unify_infer(&declared, &at, &mut method_subst);
+            checks.push((declared, at, arg_span));
             cargs.push(ca);
         }
-        // Re-apply now that all type vars are known, pointing each error at the
-        // argument that caused it.
-        for (declared, actual, arg_span) in &checks {
-            self.check_assignable(actual, &apply_subst(declared, &isubst), *arg_span)?;
+        {
+            let mut known = isubst.clone();
+            known.extend(method_subst.clone());
+            self.infer_from_bindings(&m.generics, &scope_params, &mut known)?;
+            for name in &mgparams {
+                if let Some(t) = known.get(name) { method_subst.entry(name.clone()).or_insert_with(|| t.clone()); }
+            }
         }
+        for (declared, actual, arg_span) in &checks {
+            self.check_assignable(actual, &apply_subst(declared, &method_subst), *arg_span)?;
+        }
+        self.check_generic_bounds(&entry.impl_constraints, &entry.impl_generics, &isubst, method, span)?;
+        let mut subst = isubst;
+        subst.extend(method_subst);
+        self.check_generic_bounds(&m.generics, &scope_params, &subst, method, span)?;
 
-        // Build the full substitution (impl generics + method generics + Self).
-        let subst = isubst.clone();
         // Mangle: <Self-type>::method$<args>.
         let self_mangle = ty_mangle(&recv_ty);
         let extra: Vec<Ty> = mgparams.iter().filter_map(|g| subst.get(g).cloned()).collect();
-        let mangled = mangle(&format!("{}.{}", self_mangle, method), &extra);
+        let mangled = mangle(&format!("{}.{}", self_mangle, self.method_symbol(&recv_ty, &entry)), &extra);
 
         let ret_ty = match &m.ret {
             Some(t) => {
@@ -3236,6 +4255,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn assoc_call(
         &mut self,
         base: &str,
+        alias_target: Option<&Ty>,
+        alias_name: Option<&str>,
         entry: &crate::types::MethodEntry,
         args: &[Expr],
         expected: Option<&Ty>,
@@ -3263,48 +4284,86 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         scope_params.extend(mgparams.clone());
         scope_params.push("Self".to_string());
 
-        // `Self` is the impl's self type with its impl-generics left as vars.
+        // Give receiver binders private semantic identities inside this
+        // inference transaction. Method binders keep their own lexical scope.
+        let impl_binders: HashMap<String, Ty> = entry.impl_generics.iter().enumerate()
+            .map(|(index, name)| (name.clone(), Ty::Var(format!("$associated_impl{index}")))).collect();
         let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).map_err(conv)?;
-        let mut subst: HashMap<String, Ty> = HashMap::new();
-        subst.insert("Self".to_string(), impl_self.clone());
-
-        // Seed inference from the expected return type, if concrete.
-        if let Some(exp) = expected {
-            if let Some(ret) = &m.ret {
-                let ret_decl = lower_type(ret, &scope_params, self.ctx).map_err(conv)?;
-                unify_infer(&ret_decl, exp, &mut subst);
-            }
+        let impl_self = apply_subst(&impl_self, &impl_binders);
+        let mut signature_binders = impl_binders.clone();
+        for name in &mgparams { signature_binders.remove(name); }
+        signature_binders.insert("Self".into(), impl_self.clone());
+        let normalize = |ty: &Type| -> LResult<Ty> {
+            lower_type(ty, &scope_params, self.ctx).map(|ty| apply_subst(&ty, &signature_binders)).map_err(conv)
+        };
+        let declared_params = m.params.iter().map(|p| normalize(&p.ty)).collect::<LResult<Vec<_>>>()?;
+        let declared_return = m.ret.as_ref().map(normalize).transpose()?.unwrap_or_else(Ty::unit);
+        let mut inferred = HashMap::new();
+        if let Some(target) = alias_target {
+            infer_concrete_parts(&impl_self, target, &mut inferred);
         }
-
-        // Lower args, inferring impl/method generics from their concrete types.
+        if let Some(expected) = expected {
+            let declared = apply_subst(&declared_return, &inferred);
+            unify_infer(&declared, expected, &mut inferred);
+        }
         let mut cargs = Vec::new();
         let mut checks = Vec::new();
-        for (a, p) in args.iter().zip(&m.params) {
-            let declared = lower_type(&p.ty, &scope_params, self.ctx).map_err(conv)?;
-            let pre = apply_subst(&declared, &subst);
-            let (ca, at) = self.expr(a, hint(&pre))?;
-            unify_infer(&pre, &at, &mut subst);
-            checks.push((declared, at, a.span));
-            cargs.push(ca);
+        for (arg, declared) in args.iter().zip(&declared_params) {
+            let expected = apply_subst(declared, &inferred);
+            let (value, actual) = self.expr(arg, compound_hint(&expected))?;
+            unify_infer(declared, &actual, &mut inferred);
+            checks.push((declared, actual, arg.span));
+            cargs.push(value);
+        }
+        // `fn from_iter<I: Iterator<Item = T>>(iter: I)`: `T` is `I`'s `Item`.
+        for p in &m.generics.params {
+            let Some(t) = inferred.get(&p.name).cloned().filter(|t| !has_var(t)) else { continue };
+            for b in &p.bounds {
+                for (assoc, written) in &b.bindings {
+                    let declared = normalize(written)?;
+                    if let Some(actual) = self.ctx.associated_type(&t, assoc) {
+                        unify_infer(&declared, &actual, &mut inferred);
+                    }
+                }
+            }
         }
         for (declared, actual, arg_span) in &checks {
-            self.check_assignable(actual, &apply_subst(declared, &subst), *arg_span)?;
+            self.check_assignable(actual, &apply_subst(declared, &inferred), *arg_span)?;
         }
-
-        let ret_ty = match &m.ret {
-            Some(t) => {
-                let raw = lower_type(t, &scope_params, self.ctx).map_err(conv)?;
-                apply_subst(&raw, &subst)
+        // Keep an open result shape available to let/receiver inference. A
+        // later use can specialize it; no job is interned until every receiver
+        // and method binder is ground and its constraints have been checked.
+        let ret_ty = apply_subst(&declared_return, &inferred);
+        let mut impl_subst = HashMap::new();
+        for name in &entry.impl_generics {
+            let actual = apply_subst(&impl_binders[name], &inferred);
+            if has_var(&actual) {
+                if has_var(&ret_ty) { self.infer.unresolved = Some(ret_ty.clone()); }
+                return err(format!("cannot infer impl type parameter `{name}` for `{}`", m.name), span);
             }
-            None => Ty::unit(),
-        };
-
-        // Mangle: <Self-type>::func$<impl-and-method-generic-args>.
-        let self_concrete = apply_subst(&impl_self, &subst);
-        let extra: Vec<Ty> = entry.impl_generics.iter().chain(mgparams.iter())
-            .filter_map(|g| subst.get(g).cloned())
-            .collect();
-        let mangled = mangle(&format!("{}.{}", ty_mangle(&self_concrete), m.name), &extra);
+            impl_subst.insert(name.clone(), actual);
+        }
+        let self_concrete = apply_subst(&impl_self, &inferred);
+        impl_subst.insert("Self".into(), self_concrete.clone());
+        self.check_generic_bounds(&entry.impl_constraints, &entry.impl_generics, &impl_subst, &m.name, span)?;
+        let mut subst = impl_subst.clone();
+        for name in &mgparams {
+            let Some(actual) = inferred.get(name).filter(|ty| !has_var(ty)) else {
+                if has_var(&ret_ty) { self.infer.unresolved = Some(ret_ty.clone()); }
+                return err(format!("cannot infer type parameter `{name}` for `{}`", m.name), span);
+            };
+            subst.insert(name.clone(), actual.clone());
+        }
+        self.check_generic_bounds(&m.generics, &scope_params, &subst, &m.name, span)?;
+        if let Some(target) = alias_target {
+            let mut alias_args = HashMap::new();
+            unify_infer(target, &self_concrete, &mut alias_args);
+            self.check_assignable(&self_concrete, &apply_subst(target, &alias_args), span)?;
+        }
+        if let Some(alias) = alias_name { self.check_alias_bounds(alias, &self_concrete, span)?; }
+        let extra: Vec<Ty> = entry.impl_generics.iter().map(|name| impl_subst[name].clone())
+            .chain(mgparams.iter().map(|name| subst[name].clone())).collect();
+        let mangled = mangle(&format!("{}.{}", ty_mangle(&self_concrete), self.method_symbol(&self_concrete, entry)), &extra);
 
         let job = Job { f: m, subst, mangled, self_ty: None };
         let fid = self.mono.intern(job, self.count);
@@ -3448,6 +4507,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         // Right side expects the left's type for arithmetic/compare.
         let (cr, rt) = self.expr(r, Some(&lt))?;
+        if matches!(cl.repr, Repr::Scalar(_)) { self.check_scalar_binary(op, &lt, span)?; }
         match op {
             Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr => {
                 self.check_assignable(&rt, &lt, span)?;
@@ -3479,6 +4539,24 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 ))
             }
         }
+    }
+
+    fn check_scalar_binary(&self, op: BinOp, ty: &Ty, span: Span) -> LResult<()> {
+        use BinOp::*;
+        let valid = match op {
+            Add | Sub | Mul | Div | Rem => is_numeric(ty),
+            BitAnd | BitOr | BitXor | Shl | Shr => matches!(ty, Ty::Prim(p) if is_int_prim(*p)),
+            Eq | Ne => true,
+            Lt | Le | Gt | Ge => !matches!(ty, Ty::Prim(Prim::RawPtr)),
+            And | Or => *ty == Ty::bool(),
+        };
+        if !valid {
+            return err(
+                format!("invalid binary operator for `{}`", ty_display(ty)),
+                span,
+            );
+        }
+        Ok(())
     }
 
     /// A binary operator on a non-scalar operand desugars to its trait method:
@@ -3524,7 +4602,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// `Some(x)`), whose enum type args may not be pinnable from itself. Such
     /// args are lowered in phase 2 after concrete args pin the type vars.
     /// If `a` is an `as_c_bytes(x)` call, lower it to an `AsCBytes` node (a
-    /// `RawPtr` to a stack copy of `x`'s contents). `x` may be a `String` or a
+    /// `RawPtr` to a scoped native copy of `x`'s contents). `x` may be a `String` or a
     /// scalar `Array<T>`. Returns `Ok(None)` if `a` is not `as_c_bytes`. Errors
     /// if the declared parameter is not `RawPtr` or if `x` is not a String/scalar
     /// array. When the extern parameter is `mut`, the copy is also written BACK
@@ -3598,10 +4676,19 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             return err("a callback argument must be a named function", a.span);
         };
         let name = path.last();
-        let fq = self.ctx.use_aliases.get(name)
-            .filter(|fq| self.ctx.fns.contains_key(*fq))
-            .cloned()
-            .or_else(|| self.ctx.fns.keys().find(|k| k.rsplit("::").next().unwrap() == name).cloned());
+        let fq = if !path.is_single() {
+            let qualified = path.segments.join("::");
+            self.ctx.fns.contains_key(&qualified).then_some(qualified)
+        } else {
+            self.ctx.use_aliases.get(name)
+                .filter(|fq| self.ctx.fns.contains_key(*fq))
+                .cloned()
+                .or_else(|| {
+                    let mut matches = self.ctx.fns.keys().filter(|k| k.rsplit("::").next() == Some(name));
+                    let first = matches.next()?.clone();
+                    matches.next().is_none().then_some(first)
+                })
+        };
         let Some(fq) = fq else {
             return err(format!("unknown function `{}` for callback", name), a.span);
         };
@@ -3629,6 +4716,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             self.check_assignable(fp, cp, a.span)?;
         }
         self.check_assignable(&f_ret, cb_ret, a.span)?;
+        for ty in f_params.iter().chain(std::iter::once(&f_ret)) {
+            if !matches!(self.repr_of(ty, a.span)?, Repr::Scalar(_) | Repr::Unit) {
+                return err("callbacks support only scalar parameters and scalar or unit returns; aggregate callback ABI is not implemented", a.span);
+            }
+        }
         let mangled = mangle(&fq, &[]);
         let job = Job { f, subst: HashMap::new(), mangled, self_ty: None };
         let fid = self.mono.intern(job, self.count);
@@ -3648,52 +4740,159 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.ctx.variants.contains_key(&key) || self.ctx.variants.contains_key(path.last())
     }
 
+    /// Call an evaluated function value. Callee and arguments stay in their
+    /// written order; ANF roots the callee before any argument can allocate.
+    fn call_value(&mut self, callee: &Expr, args: &[Expr], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        // Argument types provide a bidirectional hint for unannotated lambdas
+        // and generic factories. Failed/unknown probes provide no constraint;
+        // an explicitly typed callee can still supply its argument types.
+        let hint_params = args.iter().map(|arg| self.probe_expr_type(arg, None)
+            .ok().filter(|ty| !has_var(ty) && !is_never(ty))).collect::<Option<Vec<_>>>();
+        let hint = hint_params.map(|params| Ty::Fn {
+            params, ret: Box::new(expected.cloned().unwrap_or_else(Ty::unit)),
+        });
+        let (callee, signature) = self.expr(callee, hint.as_ref())?;
+        self.invoke_value(callee, signature, args, span)
+    }
+
+    fn invoke_value(&mut self, callee: CoreExpr, signature: Ty, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        let Ty::Fn { params, ret } = signature else {
+            return err(format!("cannot call a value of type `{}`", ty_display(&signature)), span);
+        };
+        if args.len() != params.len() {
+            return err(format!("closure expects {} args, got {}", params.len(), args.len()), span);
+        }
+        let mut lowered = Vec::with_capacity(args.len());
+        for (arg, parameter) in args.iter().zip(&params) {
+            let (core, actual) = self.expr(arg, Some(parameter))?;
+            self.check_assignable(&actual, parameter, arg.span)?;
+            lowered.push(core);
+        }
+        let repr = self.repr_of(&ret, span)?;
+        Ok((CoreExpr::new(CoreExprKind::CallClosure { callee: Box::new(callee), args: lowered }, repr), *ret))
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
-        // v0 slice: only direct calls to named, non-generic functions.
         let ExprKind::Path(path) = &*callee.kind else {
-            return err("only direct function calls supported in v0 slice", span);
+            return self.call_value(callee, args, expected, span);
         };
         let name = path.last();
-        // Calling a local that holds a closure value (`fn(...) -> _`).
+        // Lexical bindings shadow global functions, even when non-callable.
         if path.is_single() {
-            if let Some((id, Ty::Fn { params: fp, ret: fret })) = self.lookup(name) {
-                if args.len() != fp.len() {
-                    return err(format!("closure expects {} args, got {}", fp.len(), args.len()), span);
-                }
-                let crepr = self.repr_of(&Ty::Fn { params: fp.clone(), ret: fret.clone() }, span)?;
-                let callee = CoreExpr::new(CoreExprKind::Local(id), crepr);
-                let mut cargs = Vec::new();
-                for (a, pt) in args.iter().zip(&fp) {
-                    let (ca, at) = self.expr(a, Some(pt))?;
-                    self.check_assignable(&at, pt, a.span)?;
-                    cargs.push(ca);
-                }
-                let ret_repr = self.repr_of(&fret, span)?;
-                return Ok((
-                    CoreExpr::new(CoreExprKind::CallClosure { callee: Box::new(callee), args: cargs }, ret_repr),
-                    (*fret).clone(),
-                ));
+            if let Some((_, signature)) = self.lookup(name) {
+                let (value, _) = self.expr(callee, None)?;
+                return self.invoke_value(value, signature, args, span);
             }
         }
         // Associated (self-less) function call: `Type::func(args)`. The path's
         // second-to-last segment names the type; look up an impl item of that
         // name with NO `self`. (Methods with `self` go through `method_call`.)
+        // `Box`, `Rc`, and `Arc` are the type they point to (every heap value
+        // is a GC reference): `Box::new(x)` is `x`, and `Rc::clone(x)` shares it.
+        if path.segments.len() == 2 && matches!(path.segments[0].as_str(), "Box" | "Rc" | "Arc")
+            && matches!(name, "new" | "clone") && args.len() == 1
+            && self.ctx.canon(&path.segments[0]).is_none()
+        {
+            return self.expr(&args[0], expected);
+        }
         if path.segments.len() == 2 && path.segments[0] == "Array" && name == "new"
             && !self.ctx.structs.contains_key("Array")
         {
             if args.len() != 1 { return err("`Array::new` takes a length", span); }
             return self.array_new(&args[0], expected, span);
         }
+        // `T::f(args)` on a type parameter: `T`'s own associated function.
+        if path.segments.len() == 2 {
+            if let Some(t) = self.subst.get(&path.segments[0]).cloned() {
+                if let Some(base) = crate::types::receiver_base(&t) {
+                    if let Some(entry) = self.ctx.methods.get(&(base.clone(), name.to_string())).cloned() {
+                        if !entry.method.has_self {
+                            return self.assoc_call(&base, Some(&t), None, &entry, args, expected, span);
+                        }
+                    }
+                }
+            }
+        }
         if path.segments.len() >= 2 {
-            let base = path.segments[path.segments.len() - 2].clone();
+            let written = path.segments[..path.segments.len() - 1].join("::");
+            let canonical = self.ctx.canon(&written).unwrap_or(written);
+            let alias_target = self.ctx.aliases.get(&canonical).map(|alias| alias.target.clone());
+            if name == "new" {
+                if let Some(target) = alias_target.as_ref().filter(|ty| matches!(ty, Ty::Named { name, .. } if name == "Array")) {
+                    if args.len() != 1 { return err(format!("`{}::new` takes a length", path.segments[..path.segments.len() - 1].join("::")), span); }
+                    let mut arguments = HashMap::new();
+                    if let Some(expected) = expected { unify_infer(target, expected, &mut arguments); }
+                    let concrete = apply_subst(target, &arguments);
+                    if has_var(&concrete) {
+                        self.infer.unresolved = Some(concrete);
+                        return err("cannot infer the array alias element type; annotate the binding or constrain a later use", span);
+                    }
+                    if let Some(expected) = expected { self.check_assignable(&concrete, expected, span)?; }
+                    self.check_alias_bounds(&canonical, &concrete, span)?;
+                    return self.array_new(&args[0], Some(&concrete), span);
+                }
+            }
+            let base = alias_target.as_ref().and_then(crate::types::receiver_base).unwrap_or_else(|| canonical.clone());
             if let Some(entry) = self.ctx.methods.get(&(base.clone(), name.to_string())).cloned() {
                 if !entry.method.has_self {
-                    return self.assoc_call(&base, &entry, args, expected, span);
+                    return self.assoc_call(&base, alias_target.as_ref(), alias_target.as_ref().map(|_| canonical.as_str()), &entry, args, expected, span);
+                }
+                // `Type::method(x, args)`: a method called with its receiver
+                // as the first argument.
+                if !args.is_empty() {
+                    let (crecv, recv_ty) = self.expr(&args[0], None)?;
+                    return self.method_call_lowered(crecv, recv_ty, Some(&args[0]), entry, &args[1..], span);
+                }
+            }
+            // `Trait::method(x, args)`: the method of `impl Trait for <x's type>`.
+            let trait_name = self.ctx.traits.keys()
+                .find(|t| **t == canonical || (!canonical.contains("::") && t.rsplit("::").next() == Some(canonical.as_str())))
+                .cloned();
+            if let Some(trait_name) = trait_name {
+                let def = self.ctx.traits[&trait_name].clone();
+                let declared = def.items.iter().any(|item| match item {
+                    TraitItem::Required(sig) => sig.name == name && sig.has_self,
+                    TraitItem::Provided(f) => f.name == name && f.has_self,
+                    TraitItem::AssocType(_) => false,
+                });
+                // `Default::default()`: a function without `self`, taken from
+                // the impl for the expected type.
+                let static_fn = def.items.iter().any(|item| match item {
+                    TraitItem::Required(sig) => sig.name == name && !sig.has_self,
+                    TraitItem::Provided(f) => f.name == name && !f.has_self,
+                    TraitItem::AssocType(_) => false,
+                });
+                if static_fn {
+                    let short = trait_name.rsplit("::").next().unwrap().to_string();
+                    let Some(target) = expected.filter(|t| !has_var(t)).cloned() else {
+                        return err(format!("cannot tell which type's `{}::{}` to call; annotate the expected type", short, name), span);
+                    };
+                    let base = crate::types::receiver_base(&target).ok_or_else(|| LowerError { msg: format!("`{}` does not implement `{}`", ty_display(&target), short), span })?;
+                    let entry = self.lookup_trait_method(&target, &trait_name, name)
+                        .or_else(|| self.lookup_trait_method(&target, &short, name))
+                        .ok_or_else(|| LowerError { msg: format!("`{}` does not implement `{}`", ty_display(&target), short), span })?;
+                    return self.assoc_call(&base, Some(&target), None, &entry, args, expected, span);
+                }
+                if declared && !args.is_empty() {
+                    let (crecv, recv_ty) = self.expr(&args[0], None)?;
+                    if dyn_trait(&recv_ty).is_some() {
+                        return self.dyn_method_call(crecv, recv_ty, name, &args[1..], span);
+                    }
+                    let short = trait_name.rsplit("::").next().unwrap().to_string();
+                    let entry = self.lookup_trait_method(&recv_ty, &trait_name, name)
+                        .or_else(|| self.lookup_trait_method(&recv_ty, &short, name))
+                        .ok_or_else(|| LowerError { msg: format!("`{}` does not implement `{}`", ty_display(&recv_ty), short), span })?;
+                    return self.method_call_lowered(crecv, recv_ty, Some(&args[0]), entry, &args[1..], span);
                 }
             }
         }
         // Array intrinsics — built-in varlen arrays. The element type comes
         // from `expected` (for new) or the array's own type (get/set/len).
+        if native_intrinsic_requires_unsafe(name)
+            && !self.ctx.fns.keys().any(|key| key.rsplit("::").next() == Some(name))
+        {
+            self.require_unsafe(&format!("native primitive `{name}`"), span)?;
+        }
         if !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == name) {
             match name {
                 "array_new" if args.len() == 1 => return self.array_new(&args[0], expected, span),
@@ -3761,7 +4960,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             match name {
                 "print_str" | "print" | "str_len" | "str_eq" | "str_concat"
                 | "str_get" | "str_substring" | "to_string" | "str_to_float" | "str_hash"
-                | "read_file" | "float_bits" | "char_to_str" => {
+                | "read_file" | "float_bits" | "char_to_str" | "fmt_f64" => {
                     return self.str_intrinsic(name, args, span);
                 }
                 "type_id_of" | "type_name_of" | "field_count" | "field_name" | "field_kind"
@@ -3791,7 +4990,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         // `as_c_bytes` is only valid as a DIRECT argument to an extern call (it's
         // intercepted there). Reaching it through the general expression path
-        // means it was used somewhere else — reject it, because the stack copy it
+        // means it was used somewhere else — reject it, because the native copy it
         // produces is only valid for the duration of that one call.
         if name == "as_c_bytes"
             && !self.ctx.fns.keys().any(|k| k.rsplit("::").next().unwrap() == "as_c_bytes")
@@ -3950,6 +5149,22 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 }
             }
         }
+        if matches!(name, "thread_bind_owner" | "atomic_i64_bind_owner" | "chan_bind_owner")
+            && !self.ctx.fns.keys().any(|key| key.rsplit("::").next().unwrap() == name)
+        {
+            if args.len() != 2 { return err(format!("`{name}` takes a handle and managed owner"), span); }
+            let (handle, handle_ty) = self.expr(&args[0], None)?;
+            if !matches!(handle_ty, Ty::Prim(Prim::RawPtr)) {
+                return err(format!("`{name}` handle must be RawPtr"), args[0].span);
+            }
+            let (owner, _) = self.expr(&args[1], None)?;
+            if !matches!(&owner.repr, Repr::Ref(_)) {
+                return err(format!("`{name}` owner must be a managed reference"), args[1].span);
+            }
+            return Ok((CoreExpr::new(CoreExprKind::RuntimeCall {
+                func: match name { "thread_bind_owner" => "ai_thread_bind_owner", "atomic_i64_bind_owner" => "ai_atomic_i64_bind_owner", _ => "ai_chan_bind_owner" }, args: vec![handle, owner], ret: Repr::Unit,
+            }, Repr::Unit), Ty::unit()));
+        }
         // `thread_spawn(closure)` → spawn an OS thread; returns a RawPtr handle.
         // The closure must be a no-arg `fn() -> i64` (M2 restricts results to i64).
         if name == "thread_spawn"
@@ -4074,17 +5289,25 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         // An enum variant constructor (`Option::Some(x)`, `Ok(v)`) is a call
         // syntactically; route it to variant construction.
-        let key = path.segments.join("::");
-        if self.ctx.variants.contains_key(&key) || self.ctx.variants.contains_key(name) {
-            return self.variant_ctor(path, args, None, span);
+        if self.ctx.variant_by_path(path).is_some() {
+            return self.variant_ctor(path, args, expected, span);
         }
         // Resolution order: a `use` alias for this name wins (it disambiguates
         // same-named items across modules); otherwise fall back to the unique
         // last-segment match.
-        let fq = self.ctx.use_aliases.get(name)
-            .filter(|fq| self.ctx.fns.contains_key(*fq))
-            .cloned()
-            .or_else(|| self.ctx.fns.keys().find(|k| k.rsplit("::").next().unwrap() == name).cloned());
+        let fq = if !path.is_single() {
+            let qualified = path.segments.join("::");
+            self.ctx.fns.contains_key(&qualified).then_some(qualified)
+        } else {
+            self.ctx.use_aliases.get(name)
+                .filter(|fq| self.ctx.fns.contains_key(*fq))
+                .cloned()
+                .or_else(|| {
+                    let mut matches = self.ctx.fns.keys().filter(|k| k.rsplit("::").next() == Some(name));
+                    let first = matches.next()?.clone();
+                    matches.next().is_none().then_some(first)
+                })
+        };
         let Some(fq) = fq else {
             let names: Vec<&str> = self.ctx.fns.keys().map(|k| k.rsplit("::").next().unwrap()).collect();
             let hint = closest(name, names.into_iter())
@@ -4095,6 +5318,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let f = self.ctx.fns[&fq].clone();
         if args.len() != f.params.len() {
             return err(format!("`{}` expects {} args, got {}", name, f.params.len(), args.len()), span);
+        }
+
+        if f.is_extern {
+            self.require_unsafe(&format!("foreign call `{name}`"), span)?;
         }
 
         // Lower the argument expressions, learning each one's concrete type.
@@ -4123,6 +5350,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let declared_tys: Vec<Ty> = f.params.iter()
             .map(|p| lower_type(&p.ty, &gparams, self.ctx).map_err(conv))
             .collect::<Result<_, _>>()?;
+        // Collect independent ground constraints before real lowering so a
+        // later argument can type an earlier empty array or generic call.
+        // Speculative lowering rolls back all state; emitted argument effects
+        // still execute once in their written order.
+        if !gparams.is_empty() && self.infer.arguments {
+            self.infer_argument_types(args.iter().zip(&declared_tys), &mut targ);
+        }
         let mut lowered: Vec<Option<(CoreExpr, Ty)>> = (0..args.len()).map(|_| None).collect();
         // Phase 1: lower every argument that is NOT a bare enum-variant
         // constructor. Their concrete types pin type variables. (A variant
@@ -4173,6 +5407,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             slot.0 = declared.clone();
         }
 
+        self.infer_from_bindings(&f.generics, &gparams, &mut targ)?;
         // Resolve the instantiation's concrete type args (in declared order).
         let mut inst_args = Vec::new();
         for gp in &gparams {
@@ -4188,22 +5423,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
         }
 
-        // Check declared trait bounds (`fn f<T: Show>`): the concrete type each
-        // param resolves to must implement every bound trait. This catches
-        // `f(unrelated_value)` at the CALL with a clear bound error instead of a
-        // confusing "no method" error deep inside the (substituted) body.
-        for (gp, conc) in f.generics.params.iter().zip(&inst_args) {
-            for bound in &gp.bounds {
-                let trait_name = bound.path.last();
-                if !(if trait_name == "Sync" { self.ctx.is_sync(conc) } else { self.ctx.type_implements_trait(conc, trait_name) }) {
-                    return err(
-                        format!("the trait bound `{}: {}` is not satisfied (required by `{}`)",
-                            ty_display(conc), trait_name, name),
-                        span,
-                    );
-                }
-            }
-        }
+        self.check_generic_bounds(&f.generics, &gparams, &targ, name, span)?;
 
         // Check each argument against its substituted declared type, pointing the
         // error at the argument's own span.
@@ -4230,6 +5450,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
 /// A `Some(ty)` hint only when the declared type is already concrete (no free
 /// type variables) — otherwise literal defaulting shouldn't be guided by `T`.
+/// Compound literals can infer their variables while retaining array shape.
+fn compound_hint(declared: &Ty) -> Option<&Ty> {
+    match declared {
+        Ty::Tuple(_) | Ty::Array(..) => Some(declared),
+        Ty::Named { name, .. } if name == "Array" => Some(declared),
+        _ => hint(declared),
+    }
+}
+
 fn hint(declared: &Ty) -> Option<&Ty> {
     if let Ty::Fn { params, .. } = declared {
         if params.iter().all(|param| !has_var(param)) { return Some(declared); }
@@ -4237,7 +5466,7 @@ fn hint(declared: &Ty) -> Option<&Ty> {
     if has_var(declared) { None } else { Some(declared) }
 }
 
-fn has_var(t: &Ty) -> bool {
+pub(crate) fn has_var(t: &Ty) -> bool {
     match t {
         Ty::Var(_) => true,
         Ty::Named { args, .. } | Ty::Tuple(args) => args.iter().any(has_var),
@@ -4251,6 +5480,30 @@ fn has_var(t: &Ty) -> bool {
 
 /// Unify a declared type (which may contain `Ty::Var`) against a concrete
 /// actual type, recording type-variable assignments into `out`.
+/// Seed only known parts of an alias receiver. Its free parameters belong to
+/// the alias, so they must never enter the callee's substitution map.
+fn infer_concrete_parts(declared: &Ty, target: &Ty, out: &mut HashMap<String, Ty>) {
+    if !has_var(target) {
+        unify_infer(declared, target, out);
+        return;
+    }
+    match (declared, target) {
+        (Ty::Named { name: left, args: da }, Ty::Named { name: right, args: ta }) if left == right => {
+            for (d, t) in da.iter().zip(ta) { infer_concrete_parts(d, t, out); }
+        }
+        (Ty::Tuple(da), Ty::Tuple(ta)) => {
+            for (d, t) in da.iter().zip(ta) { infer_concrete_parts(d, t, out); }
+        }
+        (Ty::Array(d, dn), Ty::Array(t, tn)) if dn == tn => infer_concrete_parts(d, t, out),
+        (Ty::Fn { params: dp, ret: dr }, Ty::Fn { params: tp, ret: tr })
+        | (Ty::ExternFn { params: dp, ret: dr }, Ty::ExternFn { params: tp, ret: tr }) => {
+            for (d, t) in dp.iter().zip(tp) { infer_concrete_parts(d, t, out); }
+            infer_concrete_parts(dr, tr, out);
+        }
+        _ => {}
+    }
+}
+
 fn unify_infer(declared: &Ty, actual: &Ty, out: &mut HashMap<String, Ty>) {
     match (declared, actual) {
         (Ty::Var(v), _) => { out.entry(v.clone()).or_insert_with(|| actual.clone()); }
@@ -4313,7 +5566,7 @@ const RANGE_BASE: &str = "range#base";
 /// - anything else is a collection with `len()` and indexing (`Vec`, `Array`):
 ///   it is evaluated once and its elements are visited in index order.
 fn desugar_for(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> LResult<Expr> {
-    let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span: sp };
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: sp };
     let var = |name: &str| ex(ExprKind::Path(Path::single(name.to_string(), sp)));
     let int = |n: u64| ex(ExprKind::Int(n, crate::lexer::NumSuffix::None));
     let let_ = |name: &str, is_mut: bool, init: Expr| Stmt::Let {
@@ -4323,10 +5576,7 @@ fn desugar_for(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> LResult<Ex
         span: sp,
     };
     let assign = |name: &str, value: Expr| Stmt::Expr(ex(ExprKind::Assign { target: var(name), op: None, value }));
-    let binding = match &pat.kind {
-        PatternKind::Binding { .. } | PatternKind::Wildcard => pat.clone(),
-        _ => return err("a `for` pattern must be a name or `_`", pat.span),
-    };
+    let binding = pat.clone();
     let bind_item = |value: Expr| Stmt::Let { pattern: binding.clone(), ty: None, init: Some(value), span: sp };
     // The user's body runs as its own block, so its tail value is discarded
     // and its bindings stay local to one iteration.
@@ -4384,6 +5634,77 @@ fn desugar_for(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> LResult<Ex
         ],
     };
     Ok(ex(ExprKind::Block(block(stmts))))
+}
+
+enum PrimConst { Int(i128), Float(f64) }
+
+/// The associated constants of the primitive types (`i64::MAX`,
+/// `u8::MIN`, `f64::EPSILON`, `f64::consts::PI`), with the literal suffix
+/// that gives them their type.
+fn primitive_const(segments: &[String]) -> Option<(crate::lexer::NumSuffix, PrimConst)> {
+    use crate::lexer::NumSuffix as S;
+    let (ty, name) = match segments {
+        [ty, name] => (ty.as_str(), name.as_str()),
+        [ty, consts, name] if consts == "consts" => (ty.as_str(), name.as_str()),
+        _ => return None,
+    };
+    let int = |suffix: S, min: i128, max: i128| -> Option<(S, PrimConst)> {
+        Some((suffix, PrimConst::Int(match name { "MIN" => min, "MAX" => max, "BITS" => return Some((S::U32, PrimConst::Int((max - min + 1).ilog2() as i128))), _ => return None })))
+    };
+    match ty {
+        "i8" => int(S::I8, i8::MIN as i128, i8::MAX as i128),
+        "i16" => int(S::I16, i16::MIN as i128, i16::MAX as i128),
+        "i32" => int(S::I32, i32::MIN as i128, i32::MAX as i128),
+        "i64" => int(S::I64, i64::MIN as i128, i64::MAX as i128),
+        "u8" => int(S::U8, 0, u8::MAX as i128),
+        "u16" => int(S::U16, 0, u16::MAX as i128),
+        "u32" => int(S::U32, 0, u32::MAX as i128),
+        "u64" => int(S::U64, 0, u64::MAX as i128),
+        "f32" | "f64" => {
+            let suffix = if ty == "f32" { S::F32 } else { S::F64 };
+            let wide = ty == "f64";
+            let v = match name {
+                "INFINITY" => f64::INFINITY,
+                "NEG_INFINITY" => f64::NEG_INFINITY,
+                "NAN" => f64::NAN,
+                "MAX" => if wide { f64::MAX } else { f32::MAX as f64 },
+                "MIN" => if wide { f64::MIN } else { f32::MIN as f64 },
+                "MIN_POSITIVE" => if wide { f64::MIN_POSITIVE } else { f32::MIN_POSITIVE as f64 },
+                "EPSILON" => if wide { f64::EPSILON } else { f32::EPSILON as f64 },
+                "PI" => std::f64::consts::PI,
+                "TAU" => std::f64::consts::TAU,
+                "E" => std::f64::consts::E,
+                "SQRT_2" => std::f64::consts::SQRT_2,
+                "LN_2" => std::f64::consts::LN_2,
+                "LN_10" => std::f64::consts::LN_10,
+                "FRAC_PI_2" => std::f64::consts::FRAC_PI_2,
+                _ => return None,
+            };
+            Some((suffix, PrimConst::Float(v)))
+        }
+        _ => None,
+    }
+}
+
+/// `for pat in it { body }` over an iterator:
+/// `{ let mut for#iter = it; loop { match for#iter.next() { Some(pat) => { body } _ => break } } }`.
+fn desugar_for_iterator(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> Expr {
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: sp };
+    let var = || ex(ExprKind::Path(Path::single("for#iter".to_string(), sp)));
+    let next = ex(ExprKind::MethodCall { recv: var(), method: "next".into(), args: vec![], span: sp });
+    let some = Pattern { kind: PatternKind::Variant { path: Path { segments: vec!["Option".into(), "Some".into()], span: sp }, payload: vec![pat.clone()] }, span: sp };
+    let arms = vec![
+        MatchArm { pattern: some, guard: None, body: ex(ExprKind::Block(body.clone())), span: sp },
+        MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span: sp }, guard: None, body: ex(ExprKind::Break(None)), span: sp },
+    ];
+    let lp = ex(ExprKind::Loop { body: Block { stmts: vec![Stmt::Expr(ex(ExprKind::Match { scrutinee: next, arms }))], tail: None, span: sp } });
+    let init = Stmt::Let {
+        pattern: Pattern { kind: PatternKind::Binding { is_mut: true, name: "for#iter".to_string() }, span: sp },
+        ty: None,
+        init: Some(iter.clone()),
+        span: sp,
+    };
+    ex(ExprKind::Block(Block { stmts: vec![init, Stmt::Expr(lp)], tail: None, span: sp }))
 }
 
 fn block_of(e: CoreExpr) -> CoreBlock {
@@ -4471,6 +5792,78 @@ mod tests {
     }
 
     #[test]
+    fn type_probe_cache_respects_context_identity_and_strict_errors() {
+        let module = parse_module(&lex("extern \"C\" fn native() -> i64; fn main()->i64{0}").unwrap()).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let ctx = TyCtx::from_globals(&resolved.globals);
+        let mut reg = LayoutRegistry::new(&ctx);
+        let mut mono = Mono::new();
+        let mut count = 0;
+        let mut lo = FnLowerer {
+            ctx: &ctx, reg: &mut reg, mono: &mut mono, count: &mut count,
+            subst: HashMap::new(), scope: vec![HashMap::new()],
+            locals: vec![], local_names: vec![], local_tys: vec![],
+            ret_ty: Ty::Prim(Prim::I64), infer_ret: false,
+            infer: LetInference::default(), unsafe_depth: 0,
+            deferred_locals: vec![], loop_exits: vec![], type_probe: false,
+            probe_cache: Rc::new(std::cell::RefCell::new(HashMap::new())),
+        };
+        let span = Span::new(0, 1);
+        let expr = |kind| Expr { kind: std::sync::Arc::new(kind), span };
+        let variable = expr(ExprKind::Path(Path::single("x".into(), span)));
+        reset_probe_work();
+        assert!(lo.probe_expr_type(&variable, None).is_err());
+        let misses = probe_work();
+        assert!(lo.probe_expr_type(&variable.clone(), None).is_err());
+        assert_eq!(probe_work(), misses, "identical failed probes should be reused");
+        let id = lo.fresh_local(Repr::Scalar(ScalarRepr::Bool), Ty::Prim(Prim::Bool));
+        lo.bind("x", id, Ty::Prim(Prim::Bool));
+        assert_eq!(lo.probe_expr_type(&variable, None).unwrap(), Ty::Prim(Prim::Bool));
+        lo.push_scope();
+        let shadow = lo.fresh_local(Repr::Scalar(ScalarRepr::I64), Ty::Prim(Prim::I64));
+        lo.bind("x", shadow, Ty::Prim(Prim::I64));
+        assert_eq!(lo.probe_expr_type(&variable, None).unwrap(), Ty::Prim(Prim::I64));
+        lo.pop_scope();
+        assert_eq!(lo.probe_expr_type(&variable, None).unwrap(), Ty::Prim(Prim::Bool));
+
+        let empty = expr(ExprKind::Array(ArrayLit::Elems(vec![])));
+        for element in [Prim::Bool, Prim::I64] {
+            let expected = Ty::Named { name: "Array".into(), args: vec![Ty::Prim(element)] };
+            assert_eq!(lo.probe_expr_type(&empty, Some(&expected)).unwrap(), expected);
+        }
+        let assign = expr(ExprKind::Assign { target: variable.clone(), op: None,
+            value: expr(ExprKind::Bool(true)) });
+        assert!(lo.probe_expr_type(&assign, None).is_err());
+        lo.bind_mut("x", id, Ty::Prim(Prim::Bool), true);
+        assert!(lo.probe_expr_type(&assign, None).is_ok());
+
+        let call = expr(ExprKind::Call(expr(ExprKind::Path(Path::single("native".into(), span))), vec![]));
+        assert!(lo.probe_expr_type(&call, None).unwrap_err().msg.contains("unsafe"));
+        lo.unsafe_depth = 1;
+        assert_eq!(lo.probe_expr_type(&call, None).unwrap(), Ty::Prim(Prim::I64));
+        lo.unsafe_depth = 0;
+        assert!(lo.probe_expr_type(&call, None).is_err());
+        assert_eq!(*lo.count, 0, "probing must restore monomorphization state");
+        assert!(lo.mono.ids.is_empty());
+
+        let mut literal = expr(ExprKind::Bool(true));
+        let original = literal.clone();
+        assert_eq!(lo.probe_expr_type(&literal, None).unwrap(), Ty::Prim(Prim::Bool));
+        *std::sync::Arc::make_mut(&mut literal.kind) = ExprKind::Str("text".into());
+        assert_eq!(lo.probe_expr_type(&literal, None).unwrap(), Ty::Prim(Prim::Str));
+        assert_eq!(lo.probe_expr_type(&original, None).unwrap(), Ty::Prim(Prim::Bool));
+        assert!(lo.reg.layouts.is_empty(), "string layout created by a probe must be rolled back");
+
+        lo.infer.probing = true;
+        let unknown = expr(ExprKind::Path(Path::single("unknown".into(), span)));
+        let block = expr(ExprKind::Block(Block { stmts: vec![Stmt::Expr(unknown)],
+            tail: Some(expr(ExprKind::Bool(true))), span }));
+        assert!(lo.probe_tolerates(), "outer let-discovery still tolerates unrelated errors");
+        assert!(lo.probe_expr_type(&block, None).is_err(), "type-only probing must not skip an error");
+        assert!(lo.probe_tolerates(), "strictness must be restored after a probe");
+    }
+
+    #[test]
     fn lowers_fib() {
         let prog = lower(include_str!("../examples/fib.gcr")).unwrap();
         assert!(prog.entry.is_some());
@@ -4494,9 +5887,9 @@ mod tests {
 
     #[test]
     fn unsigned_literal() {
-        let prog = lower("fn main() -> u32 { let x = 5u32; x + 1 }").unwrap();
-        let main = &prog.funcs[0];
-        assert_eq!(main.ret, Repr::Scalar(ScalarRepr::U32));
+        let prog = lower("fn unsigned() -> u32 { let x = 5u32; x + 1 } fn main() -> i64 { unsigned() as i64 }").unwrap();
+        let unsigned = prog.funcs.iter().find(|f| f.name == "unsigned").unwrap();
+        assert_eq!(unsigned.ret, Repr::Scalar(ScalarRepr::U32));
     }
 
     // ---- Mutability discipline (docs/mutability.md) ----------------------

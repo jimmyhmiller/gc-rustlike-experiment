@@ -505,7 +505,7 @@ mod tests {
             ir.contains("entry.gc.slow") && ir.contains("entry.root"),
             "{ir}"
         );
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 7);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 7);
     }
 
     #[test]
@@ -530,6 +530,6 @@ mod tests {
         let source="fn main() -> i64 { let mut s=0; while s<100 { let mut j=0; while j<3 { j=j+1; } s=s+1; } s }";
         let (program, proof) = analyze(source);
         assert_eq!(proof.bodies.len(), 1);
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 100);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 100);
     }
 }

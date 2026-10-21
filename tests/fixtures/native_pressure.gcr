@@ -1,0 +1,26 @@
+struct Payload { n: i64, text: String }
+fn abandon() -> i64 {
+    let c: Channel<Payload> = Channel::new(32768);
+    match c.send(Payload { n: 17, text: "abandoned" + "λ" }) {
+        Result::Ok(_) => 0, Result::Err(_) => 1
+    }
+}
+fn main() -> i64 {
+    let live: Channel<Payload> = Channel::new(4);
+    match live.send(Payload { n: 42, text: "live" + "λ" }) {
+        Result::Ok(_) => {}, Result::Err(_) => { return 1; }
+    }
+    let mut i = 0;
+    while i < 32 {
+        if abandon() != 0 { return 2; }
+        i = i + 1;
+    }
+    live.close();
+    match live.recv() {
+        Option::Some(value) => {
+            if value.n != 42 || !(value.text == "liveλ") { return 3; }
+        },
+        Option::None => { return 4; }
+    }
+    match live.recv() { Option::Some(_) => 5, Option::None => 0 }
+}

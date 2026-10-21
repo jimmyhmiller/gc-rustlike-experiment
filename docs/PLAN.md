@@ -1,10 +1,31 @@
 # Implementation plan
 
-Updated 2026-10-06. Completed checkpoints are identified below; the remaining
+Updated 2026-10-20. Completed checkpoints are identified below; the remaining
 sections describe proposed work.
 The target semantics are in [concurrency.md](concurrency.md); verified behavior
 and open defects are in [STATUS.md](STATUS.md). Release gates are in
 [PRODUCTION.md](PRODUCTION.md).
+
+The comprehensive language roadmap is [ROADMAP.md](ROADMAP.md). Its item 1
+(language and safety contract) is underway in [SAFETY.md](SAFETY.md); roadmap
+numbering is separate from this earlier concurrency implementation sequence.
+
+## Current delivery and next runtime work
+
+The requested compiler stack handling, lazy backward argument inference and
+callable-expression fixes are implemented on main. Their combined source passes
+complete debug/release workspace checks on macOS ARM64 and Linux x86-64,
+documentation, explicit concurrent JIT and forced detector checks. See
+[GC_READINESS.md](GC_READINESS.md) for exact evidence and counts, and
+[language.md](language.md#callable-expressions-and-argument-inference) for behavior.
+
+The next runtime implementation priority is observable typed worker failure:
+replace native join's scalar-zero fallback, distinguish a successful zero result
+from failure, keep repeated/concurrent observers consistent, and preserve cleanup
+and code/storage lifetime guarantees on every outcome. Then close resource
+cleanup and operating limits, followed by predictable cancellation/shutdown.
+These priorities do not remove the release requirements in
+[ROADMAP.md](ROADMAP.md) and [PRODUCTION.md](PRODUCTION.md). They remain open.
 
 ## 1. Execution ownership and compiler inference — implemented 2026-10-04
 
@@ -184,7 +205,8 @@ passing through a synchronized subset does not certify arbitrary managed races.
    then bounded async request handling; require correctness and numeric memory,
    latency and shutdown budgets before declaring the service gate complete.
 
-AtomicI64 cells now have stable root-execution ownership and are reclaimed after
-children drain. Cells remain retained until that boundary; earlier reclamation
-and bounded long-running resource lifetimes remain work. Never free a native
-atomic based on one alias disappearing.
+Safe AtomicI64 cells now weakly follow a GC reference wrapper and can retire
+after its last alias dies. Unbound raw cells retain root-execution lifetime.
+Native addresses remain stable, and no single-alias free can invalidate another
+alias. Channel ownership, never-joined completions and measured long-running
+resource budgets remain work.

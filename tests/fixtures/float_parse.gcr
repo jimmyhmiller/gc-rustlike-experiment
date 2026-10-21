@@ -1,0 +1,27 @@
+// Large/native and small/leaf parse calls retain f64 bits and live caller roots.
+struct ParseSentinel { number: i64, text: String }
+fn parse(text: String) -> f64 { str_to_float(text) }
+fn main() -> i64 {
+    let mut spaces = " ";
+    for _ in 0..14 { spaces = spaces + spaces; }
+    let text = spaces + "-0.0" + spaces;
+    let number = spaces + "3.25" + spaces;
+    let sentinel = ParseSentinel { number: 42, text: "retained" + "λ" };
+    let worker = Thread::spawn(|| {
+        let mut checksum = 0;
+        for i in 0..128 {
+            let mut a: Array<i64> = Array::new(4096);
+            a[4095] = i; checksum += a[4095];
+        }
+        checksum
+    });
+    for _ in 0..64 {
+        if float_bits(parse(text)) != -9223372036854775808 { return 1; }
+        if parse(number) != 3.25 || parse(" 3.25 ") != 3.25 { return 2; }
+        if sentinel.number != 42 || sentinel.text != "retainedλ" { return 3; }
+        if text.len() != 98308 || number.len() != 98308 { return 4; }
+    }
+    if worker.join() != 8128 { return 5; }
+    print_int(sentinel.number);
+    0
+}

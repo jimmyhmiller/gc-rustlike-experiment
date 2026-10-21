@@ -1,0 +1,28 @@
+// Native scan control. Distinct equal Strings defeat pointer-identity shortcuts.
+// Expected FNV and checksums are checked by the independent benchmark driver.
+fn main() -> i64 {
+    let args = process_args().expect("arguments");
+    if args.len() != 3 { return 2; }
+    let large = args[1] == "large";
+    let mut text = "κλειδί-λ";
+    if large { for _ in 0..13 { text = text + text; } }
+    let other = str_substring(text, 0, text.len());
+    let changed = str_substring(text, 0, text.len()-2) + "μ";
+    let iterations = if large { 1000 } else { 1000000 };
+    let mut checksum = 0;
+    if args[2] == "hash" {
+        for _ in 0..iterations { checksum += str_hash(text) % 1000003; }
+    } else if args[2] == "equal" {
+        for _ in 0..iterations {
+            if !str_eq(text, other) { return 3; }
+            checksum += text.len();
+        }
+    } else {
+        for _ in 0..iterations {
+            if str_eq(text, changed) { return 4; }
+            checksum += changed.len();
+        }
+    }
+    print!("{}", checksum);
+    0
+}

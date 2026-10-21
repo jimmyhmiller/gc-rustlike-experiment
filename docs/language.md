@@ -41,15 +41,28 @@ array slots have no generic default value: initialize each slot with `a[i] = v`
 before reading it. An in-bounds read of an unwritten slot aborts with an
 uninitialized-element diagnostic, including `Array::get` and native string join.
 
+Transparent type aliases name an existing type: `type Counts = Array<i64>;`
+and `type Rows<T> = Vec<T>;`. They preserve the target's identity, representation,
+constructors, methods and pattern forms. Alias definitions resolve names in their
+own module; use aliases do not change that scope. Recursive alias cycles and
+incorrect generic arity are source errors.
+
+Alias type parameters can have trait bounds in their parameter list. Every
+explicit use and inferred construction must satisfy those bounds;
+a generic caller must supply sufficient bounds of its own. Trait names resolve
+lexically: a nearer type declaration or generic binder of the same name cannot
+be skipped to select an outer trait. Qualify the trait path to select it.
+
 Each `impl Trait for T` is checked against the trait: every required method
 must be present, no method may be outside the trait, and each method's
 receiver (`self` or `mut self`), parameters, and return type must match the
 declaration with `Self` and the trait's type parameters substituted. A trait's
 default methods apply to every implementing type that does not override them.
 
-Two methods with the same name on the same type are an error, as is an
-attribute other than `#[value]`. A user item that shadows a prelude type or
-trait also drops the prelude's impls for it.
+Two methods with the same name on the same type are an error unless they
+implement different traits; an inherent method takes precedence over a
+trait's. An unknown attribute is an error. A user item that shadows a prelude
+type or trait also drops the prelude's impls for it.
 
 A `let` without a type annotation can take its type from a later use:
 `let mut v = Vec::new(); v.push(1);` makes `v` a `Vec<i64>`. The first type
@@ -66,10 +79,16 @@ Built-in macros expand in the parser:
 
 - `format!("...", args)` builds a `String`. `{}` takes the next argument, `{N}`
   argument N, and `{name}` a variable in scope; `{{` and `}}` are literal
-  braces. Each value renders with `to_string()`. Arguments are evaluated once,
-  in order. Format specs (`{:?}`, `{:>5}`) are not supported and are an error,
-  as is an argument the string never uses.
-- `println!`, `print!`, `eprintln!`, and `panic!` take the same arguments.
+  braces. Rust's format specs follow a `:`: fill and alignment (`{:>8}`,
+  `{:*^7}`), `+`, `#`, `0`, width, precision (`{:.2}`), and the types `?`,
+  `x`, `X`, `o`, `b`, `e`, `E`; widths and precisions may be `N$`, `name$`,
+  or `.*`. `{}` renders with `to_string()` and `{:?}` (`{:#?}` pretty) with
+  `Debug`; the output matches Rust's. Arguments are evaluated once, in order.
+  An argument the string never uses is an error.
+- `println!`, `print!`, `eprintln!`, and `panic!` take the same arguments and
+  evaluate to `()`. `write!(f, ...)`/`writeln!` append to a `Formatter` (or
+  anything with `write_str`). `todo!`, `unimplemented!`, and `unreachable!`
+  panic.
 - `vec![a, b, c]`, `vec![]`, and `vec![x; n]`. In `vec![x; n]`, `x` is
   evaluated once and every slot holds that same value (for a struct or a
   collection, the same reference).
@@ -89,8 +108,93 @@ on either. In `[x; n]`, every slot holds the same value.
 A method called on a value whose type parameters are still open, such as
 `None.unwrap_or(7)`, takes them from its arguments.
 
-There are no user-defined macros, no trait objects (`dyn Trait`), and no lazy
-iterators: `map`, `filter`, and the other combinators on `Vec` are eager.
+## Rust surface
+
+These follow Rust; differences come from having no references.
+
+- **Formatting.** `Display` and `Debug` take `fn fmt(self, f: Formatter) ->
+  FmtResult` (`fmt::Formatter`/`fmt::Result` also work). A `Formatter` is a GC
+  object, so `f` needs no `&mut`. A `Display` type gets `to_string()`, and
+  `f.debug_struct(..)`, `debug_tuple`, `debug_list`, `debug_map` build Debug
+  output. Debug is implemented for scalars, `String`, `Vec`, `Option`,
+  `Result`, `HashMap`, tuples, and arrays.
+- **Derives.** `#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord,
+  Default, Copy)]` generate impls (`PartialEq`/`Eq` give the `Eq` trait,
+  `PartialOrd`/`Ord` the `Ord` trait; `Copy` changes nothing). `#[allow]`,
+  `#[inline]`, and similar hints are ignored; `#[test]` and `#[cfg(test)]`
+  items are skipped.
+- **Paths.** `use std::...;` imports nothing (the prelude is always in scope);
+  `std::collections::HashMap` and `fmt::Display` name prelude items;
+  `use a::{b, c};` groups work. `Box<T>`, `Rc<T>`, and `Arc<T>` are `T`, and
+  `Box::new(x)` is `x`.
+- **Entry point.** `fn main()` and `fn main() -> Result<(), E>` are accepted
+  (an `Err` prints `Error: {e:?}` and exits 1), as is `fn main() -> i64`.
+- **Trait-qualified calls.** `Trait::method(x, ..)` and `Type::method(x, ..)`
+  call a method with an explicit receiver; two traits may give one type
+  methods of the same name. `Trait::f()` without `self` (`Default::default()`)
+  takes the impl from the expected type, and `T::f()` calls it on a type
+  parameter.
+- **Closures.** `F: Fn(A) -> R` (and `FnMut`, `FnOnce`, in `where` clauses
+  too), `impl Fn(A) -> R`, and `dyn Fn(A) -> R` are the closure type
+  `fn(A) -> R`. An argument's `impl Trait` is an anonymous type parameter.
+  `move` is accepted. A closure that assigns a captured `let mut` variable
+  shares it with the enclosing function, so `let mut n = 0; let mut inc = ||
+  n += 1;` counts.
+- **Trait objects.** `dyn Trait` (usually `Box<dyn Trait>`) holds any value
+  implementing `Trait`; a value converts where a `dyn Trait` is expected.
+  Methods that take `self` without their own type parameters or `Self` in
+  their signature can be called on it, including supertrait methods.
+- **Associated types.** `type Item;` in a trait, `type Item = T;` in an impl,
+  `Self::Item`, `I::Item`, `<T as Trait>::Item`, and bounds such as
+  `I: Iterator<Item = i64>`.
+- **Iterators.** `Iterator` is lazy: `map`, `filter`, `filter_map`,
+  `enumerate`, `zip`, `chain`, `take`, `skip`, `step_by`, `take_while`,
+  `skip_while`, `flat_map`, `peekable`, and `rev` (on ranges and Vec
+  iterators) build adapters; `count`, `sum`, `product`, `fold`, `reduce`,
+  `any`, `all`, `find`, `position`, `max`, `min`, `max_by_key`, `last`,
+  `nth`, `for_each`, and `partition` consume. `collect()` builds a `Vec`,
+  `String`, or `HashMap` from the expected type (`collect::<Vec<_>>()` works),
+  defaulting to a `Vec`. `for` loops drive any iterator, `lo..hi` is a
+  `Range` iterator when used as a value, and `v.iter()` iterates a Vec. Vec's
+  own `map`, `filter`, and `fold` remain eager and return Vecs; `chars()`
+  returns a `Vec<char>`.
+- **Primitive constants and char methods.** `i64::MAX`, `u8::MIN`,
+  `i32::BITS`, `f64::INFINITY`, `f64::NAN`, `f64::EPSILON`,
+  `f64::consts::PI`, and so on; `char` has `is_ascii_digit`, `is_alphabetic`,
+  `is_whitespace`, `to_digit`, `to_ascii_uppercase`, and the other ASCII
+  classifiers (non-ASCII classification is approximate).
+- **Macros.** `macro_rules!` with `expr`, `ident`, `ty`, `tt`, `literal`,
+  `pat`, `path`, `block`, `stmt`, and `item` fragments and `$(..),*`, `+`, `?`
+  repetitions, used as expressions, statements, or items. A macro must be
+  defined before its use. Expansion is not hygienic.
+
+## Callable expressions and argument inference
+
+Any expression with a function type can be called. This includes immediate
+closures, returned closures, parenthesized function-valued fields, array elements,
+and the result of a block or conditional:
+
+```rust
+fn make(offset: i64) -> fn(i64) -> i64 { |n: i64| offset + n }
+fn main() -> i64 {
+    let incremented = (|n| n + 1)(39);
+    make(2)(incremented)
+}
+```
+
+Immediate closure parameters can take their types from the call's arguments;
+annotations remain available when an argument is itself unconstrained. Calls
+check arity, argument types and return types. A local binding shadows a global
+function or variant name; calling a non-function local is a source error.
+
+The callee is evaluated once, then arguments once each from left to right.
+The callee's captured references stay rooted if evaluating an argument collects.
+
+A later concrete argument can constrain an earlier empty array, generic
+constructor or record literal. Ordinary successful lowering runs first;
+backward argument discovery retries only after discarding a failed attempt.
+Generic bounds and nominal identity still apply. Speculative discovery does not
+execute source effects or retain discarded compiler IR.
 
 ## Patterns
 
@@ -100,11 +204,24 @@ tuples, and structs (`Point { x, y }`, `..` for the rest), nested to any
 depth. A pattern's sub-patterns are tested left to right, and a payload is read
 only after its variant tag has matched. `let` requires an irrefutable pattern.
 
+Arms may also use or-patterns (`1 | 2 => ..`, nested as in `(0 | 1, Some(_))`),
+range patterns over integers and chars (`1..=9`, `'a'..='z'`, `10..100`,
+`i64::MIN..=-1`), negative literals, and `name @ 1..=9`; these also work in
+`if let` and `while let`, not in `let`. An or-pattern repeats its arm for each
+alternative, and a range is a guard, so a range does not count toward
+exhaustiveness.
+
 A `match` must be exhaustive. The check covers nested enum variants, `bool`,
 tuples, and structs; integers and strings need a catch-all arm. Guarded arms
 do not count toward coverage.
 
 ## Contracts needing work
+
+Foreign calls, raw native primitives and RawPtr record representation operations
+require lexical `unsafe { ... }` blocks. Typed library APIs contain their own
+unsafe implementations. Deferred bindings require assignment on every reachable
+path before use; their GC storage's zero fill is not an initialized value.
+String ranges require UTF-8 character boundaries. See [SAFETY.md](SAFETY.md).
 
 Read [mutability](mutability.md), [arithmetic](overflow.md), [modules](modules.md),
 [threads](threads.md), and [FFI](ffi.md) for inspected behavior. Low-level runtime
@@ -130,3 +247,32 @@ reference enums are currently omitted from runtime field reflection.
 are GC references or inline value types, passed by value; mutability goes
 through `mut` bindings and `mut self` receivers. Don't add `&` syntax, and don't
 list it as missing.
+
+Program execution starts at a root-level, non-generic `fn main() -> i64` with no
+parameters. The runner supplies process arguments through `process_args()`.
+Named record initializers evaluate in their written order, including shorthand
+fields, and construction preserves those values across later allocation and
+mutation. The compiler rejects duplicate, unknown and missing fields. Field
+storage follows the declaration independently of initializer evaluation order.
+
+Inline value types require finite storage. Direct/indirect inline cycles and
+expanding inline generic cycles are diagnosed. Nested wrappers such as
+`Wrap<Wrap<i64>>` remain valid. Recursion through heap references or arrays is
+supported, including inline array elements containing array references.
+Unqualified type names require a unique declaration or an explicit import;
+qualified names must refer to the written module/declaration path.
+
+Unit fields and parameters have no payload storage. Their expressions still
+evaluate for side effects. Unit arrays retain their logical length and perform
+all normal bounds checks; an in-range optional read yields Some(()). Reflection
+omits unit fields, reads scalar/reference fields with SC ordering and rejects
+inline aggregates passed to field_i64 (field_kind 5).
+
+All assignment expressions yield unit, including local/field/index assignments,
+compound assignments and the array_set primitive. They do not return a dummy
+integer. An assignment can therefore be the tail of a unit-returning function.
+Compound field and indexed assignments evaluate their receiver and index once,
+then read the old value before evaluating the right-hand side. The final store
+uses the captured location even if the right-hand side changes the original
+access path. Custom indexers call Index::index before the right-hand side and
+IndexSet::index_set afterward.

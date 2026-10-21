@@ -1,0 +1,23 @@
+fn make() -> AtomicI64 { AtomicI64::new(42) }
+fn main() -> i64 {
+    let mut original = make();
+    let alias = original;
+    original = AtomicI64::new(-1);
+    if !alias.compare_and_set(42, 43) || alias.compare_and_set(42, 99) { return 1; }
+    alias.store(10);
+    let first = Thread::spawn(|| {
+        let mut i = 0;
+        while i < 100 { alias.fetch_add(1); let pressure = "atomic" + "λ"; i = i + 1; }
+        0
+    });
+    let second = Thread::spawn(|| {
+        let mut i = 0;
+        while i < 100 { alias.fetch_add(1); let pressure = "owner" + "λ"; i = i + 1; }
+        0
+    });
+    let mut i = 0;
+    while i < 100 { let pressure = "moving" + "λ"; i = i + 1; }
+    if first.join() != 0 || second.join() != 0 { return 2; }
+    if alias.load() != 210 || original.load() != -1 { return 3; }
+    0
+}

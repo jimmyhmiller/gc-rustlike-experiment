@@ -1,0 +1,24 @@
+struct OrphanResult { text: String, n: i64 }
+fn launch(done: AtomicI64, n: i64) -> i64 {
+    let ignored = Thread::spawn(|| {
+        let mut i = 0;
+        while i < 4 { let text = "child" + "λ"; i = i + 1; }
+        done.fetch_add(1);
+        OrphanResult { text: "result" + "λ", n: n }
+    });
+    0
+}
+fn main() -> i64 {
+    let done = AtomicI64::new(0);
+    let mut i = 0;
+    while i < 64 {
+        launch(done, i);
+        let text = "parent" + "λ";
+        i = i + 1;
+    }
+    while done.load() != 64 { Thread::sleep(1); }
+    i = 0;
+    while i < 128 { let text = "retirement" + "λ"; i = i + 1; }
+    if done.load() != 64 { return 1; }
+    0
+}

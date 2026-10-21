@@ -25,8 +25,8 @@ struct Block { x: f64, y: f64, w: f64, speed: f64 }
 fn rand_next(s: i64) -> i64 { (s * 1103515245 + 12345) % 2147483648 }
 
 fn main() -> i64 {
-  InitWindow(800, 640, as_c_bytes("gc-rust + raylib — screenshot"));
-  SetTargetFPS(60);
+  (unsafe { InitWindow(800, 640, as_c_bytes("gc-rust + raylib — screenshot")) });
+  (unsafe { SetTargetFPS(60) });
 
   let mut blocks: Vec<Block> = Vec::new();
   let mut rng = 424242;
@@ -56,23 +56,23 @@ fn main() -> i64 {
     }
     blocks = next;
 
-    BeginDrawing();
-    ClearBackground(rgb(18, 18, 28));
+    (unsafe { BeginDrawing() });
+    (unsafe { ClearBackground(rgb(18, 18, 28)) });
     let n2 = blocks.len();
     let mut j = 0;
     while j < n2 {
       let b = blocks[j];
-      DrawRectangle(b.x as i32, b.y as i32, b.w as i32, b.w as i32, rgb(90, 170, 240));
+      (unsafe { DrawRectangle(b.x as i32, b.y as i32, b.w as i32, b.w as i32, rgb(90, 170, 240)) });
       j += 1;
     }
-    DrawCircle(px as i32, 600, 18.0, rgb(245, 205, 80));
-    DrawText(as_c_bytes("Score: " + score.to_string()), 12, 12, 26, rgb(235, 235, 235));
-    DrawText(as_c_bytes("gc-rust + raylib FFI (no shim)"), 12, 44, 20, rgb(150, 150, 160));
-    EndDrawing();
+    (unsafe { DrawCircle(px as i32, 600, 18.0, rgb(245, 205, 80)) });
+    (unsafe { DrawText(as_c_bytes("Score: " + score.to_string()), 12, 12, 26, rgb(235, 235, 235)) });
+    (unsafe { DrawText(as_c_bytes("gc-rust + raylib FFI (no shim)"), 12, 44, 20, rgb(150, 150, 160)) });
+    (unsafe { EndDrawing() });
 
   }
 
-  TakeScreenshot(as_c_bytes("dodge_shot.png"));
-  CloseWindow();
+  (unsafe { TakeScreenshot(as_c_bytes("dodge_shot.png")) });
+  (unsafe { CloseWindow() });
   blocks.len()
 }

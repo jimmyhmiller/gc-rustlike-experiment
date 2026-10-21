@@ -6,9 +6,15 @@ use std::thread::JoinHandle;
 type Panic = Box<dyn Any + Send + 'static>;
 #[derive(Clone, Copy)]
 struct Job {
-    context: usize,
-    invoke: unsafe fn(usize, usize),
+    context: *const (),
+    invoke: unsafe fn(*const (), usize),
 }
+// SAFETY: Only run constructs jobs, borrowing an F: Sync. Helpers invoke
+// through shared references while run retains F and the exclusive dispatch
+// lock. Every helper acknowledges completion before run clears the job or
+// returns/unwinds; no pointer escapes that synchronous borrowed lifetime.
+unsafe impl Send for Job {}
+
 struct State {
     generation: u64,
     job: Option<Job>,
@@ -27,10 +33,15 @@ pub(in crate::gc::heap) struct WorkerPool {
     shared: Arc<Shared>,
     // Serializes dispatch and owns all helpers. Heap collection already holds
     // gc_lock, but this also makes the borrowed-job lifetime invariant local.
-    helpers: Mutex<Vec<JoinHandle<()>>>,
+    helpers: Mutex<allocator_api2::vec::Vec<JoinHandle<()>, crate::runtime::metadata_allocator::MetadataAllocator>>,
 }
 impl WorkerPool {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::default())
+    }
+
+    pub(super) fn with_allocator(allocator: crate::runtime::metadata_allocator::MetadataAllocator) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -44,8 +55,13 @@ impl WorkerPool {
                 ready: Condvar::new(),
                 done: Condvar::new(),
             }),
-            helpers: Mutex::new(Vec::new()),
+            helpers: Mutex::new(allocator_api2::vec::Vec::new_in(allocator)),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn backing_bytes(&self) -> usize {
+        self.helpers.lock().unwrap().capacity() * std::mem::size_of::<JoinHandle<()>>()
     }
 
     /// Run a borrowed job on `count` helpers and on the calling coordinator.
@@ -73,11 +89,11 @@ impl WorkerPool {
                 }
             }
         }
-        unsafe fn invoke<F: Fn(usize) + Sync>(context: usize, id: usize) {
+        unsafe fn invoke<F: Fn(usize) + Sync>(context: *const (), id: usize) {
             // run keeps F alive, holds exclusive dispatch and waits for every
             // participant before clearing this pointer or propagating a panic.
             unsafe {
-                (&*(context as *const F))(id);
+                (&*context.cast::<F>())(id);
             }
         }
         {
@@ -92,7 +108,7 @@ impl WorkerPool {
             state.remaining = count;
             state.failure = None;
             state.job = Some(Job {
-                context: job as *const F as usize,
+                context: (job as *const F).cast(),
                 invoke: invoke::<F>,
             });
             self.shared.ready.notify_all();
@@ -229,5 +245,72 @@ mod tests {
         assert_eq!(alive.load(Ordering::Acquire), 4);
         drop(pool);
         assert_eq!(alive.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod backing_tests {
+    use super::*;
+    use crate::runtime::metadata_allocator::MetadataAllocator;
+
+    #[test]
+    fn collector_worker_handles_remain_charged_through_helper_tls_shutdown() {
+        struct Exit {
+            counter: Arc<crate::runtime::allocation_counter::AllocationCounter>,
+            exited: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for Exit {
+            fn drop(&mut self) {
+                assert!(self.counter.bytes() > 0, "helper backing released before native shutdown");
+                self.exited.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+        thread_local! { static EXIT: std::cell::RefCell<Option<Exit>> = const { std::cell::RefCell::new(None) }; }
+        let counter = Arc::new(Default::default());
+        let exited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = WorkerPool::with_allocator(MetadataAllocator::new(&counter));
+        assert_eq!(counter.bytes(), 0);
+        for count in [3, 1, 5, 2, 0, 5] {
+            pool.run(count, &|id| {
+                if id != 0 {
+                    EXIT.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        if slot.is_none() { *slot = Some(Exit { counter: counter.clone(), exited: exited.clone() }); }
+                    });
+                }
+            });
+            let helpers = pool.helpers.lock().unwrap();
+            assert_eq!(counter.bytes(), helpers.capacity() * std::mem::size_of::<JoinHandle<()>>());
+            assert!(helpers.capacity() >= count);
+        }
+        assert_eq!(exited.load(std::sync::atomic::Ordering::Acquire), 0);
+        drop(pool);
+        assert_eq!(exited.load(std::sync::atomic::Ordering::Acquire), 5);
+        assert_eq!(counter.bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn collector_worker_job_preserves_borrowed_non_send_context() {
+        let pool = WorkerPool::new();
+        let value = Mutex::new(42);
+        // MutexGuard is Sync but not Send: run may share this closure with
+        // helpers, but must never move/drop the captured guard off this thread.
+        let guard = value.lock().unwrap();
+        let visits: [AtomicUsize; 5] = std::array::from_fn(|_| AtomicUsize::new(0));
+        let borrowed = &visits;
+        let job = move |id: usize| {
+            assert_eq!(*guard, 42);
+            borrowed[id].fetch_add(1, Ordering::Relaxed);
+        };
+        for count in [4, 1, 3, 0, 4] { pool.run(count, &job); }
+        assert_eq!(std::array::from_fn::<_, 5, _>(|i| visits[i].load(Ordering::Relaxed)), [5, 4, 3, 3, 2]);
+        drop(job);
+        assert_eq!(*value.lock().unwrap(), 42);
     }
 }

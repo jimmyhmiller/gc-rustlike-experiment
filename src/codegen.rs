@@ -18,10 +18,17 @@ use inkwell::debug_info::{
     DWARFEmissionKind, DWARFSourceLanguage, DebugInfoBuilder,
 };
 use inkwell::module::{FlagBehavior, Module};
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
+use inkwell::types::{AnyType, BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, AtomicOrdering, FloatPredicate, IntPredicate};
 use std::collections::{BTreeSet, HashMap};
+
+#[derive(Clone, Copy)]
+enum ForeignArg<'ctx> {
+    Scalar,
+    Direct(BasicTypeEnum<'ctx>),
+    Indirect { byval: bool },
+}
 
 /// DWARF line-table emission state (debugger P2). Present only for AOT builds
 /// (`gcr build`) — JIT-code DWARF needs the LLDB JIT-registration interface
@@ -98,6 +105,9 @@ pub fn codegen_with_debug<'ctx>(
     prog: &CoreProgram,
     level: DebugLevel,
 ) -> Result<Compiled<'ctx>, CodegenError> {
+    if prog.layouts.len() > u16::MAX as usize + 1 || prog.values.len() > u16::MAX as usize + 1 {
+        return Err(CodegenError("layout/type count exceeds representable ID limit".into()));
+    }
     let mut outlined = if level.is_full() {
         crate::codegen_outline::Outlined {
             program: prog.clone(),
@@ -109,6 +119,12 @@ pub fn codegen_with_debug<'ctx>(
     crate::codegen_tail::eliminate(&mut outlined.program);
     let prog = &outlined.program;
     let module = ctx.create_module("gcr");
+    // Optimizers must use the same aggregate layout as JIT/AOT emission and
+    // the runtime's native buffers. LLVM's empty default layout can place i64
+    // fields at four-byte boundaries before the backend later selects eight.
+    let machine = host_target_machine()?;
+    module.set_triple(&machine.get_triple());
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
     let builder = ctx.create_builder();
     let debug = if level.emits_dwarf() {
         build_debug_cx(ctx, &module, prog, level.is_full())
@@ -146,9 +162,16 @@ pub fn codegen_with_debug<'ctx>(
     };
     cg.declare_runtime_externs();
 
+    // Reserve C symbols before selecting names for managed functions. C names
+    // are ABI identities; managed display names may collide with them.
+    for (i, f) in prog.funcs.iter().enumerate().filter(|(_, f)| f.is_extern) {
+        let fv = cg.declare_fn(i as FuncId, f);
+        cg.funcs.insert(i as FuncId, fv);
+    }
+
     // Declare every function first (so calls can reference forward decls).
     for (i, f) in prog.funcs.iter().enumerate() {
-        let fv = cg.declare_fn(i as FuncId, f);
+        let fv = if f.is_extern { cg.funcs[&(i as FuncId)] } else { cg.declare_fn(i as FuncId, f) };
         if !f.is_extern {
             // Backend-created recursive loops would bypass Core safepoint
             // analysis. Supported self tail calls are lowered before codegen.
@@ -177,7 +200,7 @@ pub fn codegen_with_debug<'ctx>(
     }
 
     let entry = prog.entry.ok_or_else(|| CodegenError("no entry".into()))?;
-    let entry_name = prog.funcs[entry as usize].name.clone();
+    let entry_name = cg.funcs[&entry].get_name().to_str().map_err(|_| CodegenError("entry symbol is not UTF-8".into()))?.to_string();
 
     if std::env::var("GCR_DUMP_IR").is_ok() {
         eprintln!("{}", cg.module.print_to_string().to_string());
@@ -306,14 +329,14 @@ impl<'a, 'ctx> DiTypeBuilder<'a, 'ctx> {
         }
     }
 
-    fn field_ty(&mut self, ft: crate::gc::FieldTy) -> Option<DIType<'ctx>> {
+    fn field_ty(&mut self, ft: &crate::gc::FieldTy) -> Option<DIType<'ctx>> {
         use crate::gc::FieldTy;
         match ft {
-            FieldTy::Scalar(s) => self.scalar(s),
-            FieldTy::Ref(tid) => self.ref_ptr(tid),
+            FieldTy::Scalar(s) => self.scalar(*s),
+            FieldTy::Ref(tid) => self.ref_ptr(*tid),
             // Value-typed fields are not modeled yet (no per-value offsets here);
             // skip the member — siblings keep their explicit offsets.
-            FieldTy::Value(_) => None,
+            FieldTy::Value(_) | FieldTy::ProjectedValue { .. } => None,
         }
     }
 
@@ -354,8 +377,8 @@ impl<'a, 'ctx> DiTypeBuilder<'a, 'ctx> {
             Kind::Struct(fields) => fields
                 .iter()
                 .filter_map(|f| {
-                    let fty = self.field_ty(f.ty)?;
-                    let size_bits = di_field_size_bits(self.prog, f.ty);
+                    let fty = self.field_ty(&f.ty)?;
+                    let size_bits = di_field_size_bits(self.prog, &f.ty);
                     Some(
                         self.di
                             .create_member_type(
@@ -441,14 +464,14 @@ impl<'a, 'ctx> DiTypeBuilder<'a, 'ctx> {
 }
 
 /// Size in bits of a field's value (the storage the member occupies).
-fn di_field_size_bits(prog: &CoreProgram, ft: crate::gc::FieldTy) -> u64 {
+fn di_field_size_bits(prog: &CoreProgram, ft: &crate::gc::FieldTy) -> u64 {
     use crate::gc::FieldTy;
     match ft {
-        FieldTy::Scalar(s) => scalar_kind_di(s).map(|(_, _, b)| b).unwrap_or(64),
+        FieldTy::Scalar(s) => scalar_kind_di(*s).map(|(_, _, b)| b).unwrap_or(64),
         FieldTy::Ref(_) => 64,
-        FieldTy::Value(vid) => prog
+        FieldTy::Value(vid) | FieldTy::ProjectedValue { value_id: vid, .. } => prog
             .values
-            .get(vid as usize)
+            .get(*vid as usize)
             .map(|v| v.size as u64 * 8)
             .unwrap_or(0),
     }
@@ -665,14 +688,134 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
-    /// AAPCS64 classification of a blittable value struct crossing the FFI **by
+    fn uses_sysv_aggregate_abi(&self) -> bool {
+        let triple = self.module.get_triple();
+        let triple = triple.as_str().to_string_lossy();
+        triple.starts_with("x86_64-") && !triple.contains("windows")
+    }
+
+    /// Classify the supported C subset (naturally aligned scalar/nested struct
+    /// fields) into System V AMD64 eightbytes. INTEGER dominates SSE when
+    /// fields share a chunk. Language values contain no x87 or SIMD fields.
+    fn sysv_chunks(&self, vid: ValueId) -> Option<Vec<BasicTypeEnum<'ctx>>> {
+        #[derive(Clone, Copy, Default)]
+        struct Chunk {
+            integer: bool,
+            doubles: bool,
+            floats: u8,
+        }
+        fn walk(values: &[ValueLayout], vid: ValueId, base: u32, chunks: &mut [Chunk; 2]) {
+            let mut offset = base;
+            for field in &values[vid as usize].fields {
+                let (size, align) = value_field_size_align(values, field);
+                offset = (offset + align - 1) & !(align - 1);
+                match field {
+                    Repr::Value(nested) => walk(values, *nested, offset, chunks),
+                    Repr::Scalar(ScalarRepr::F32) => chunks[(offset / 8) as usize].floats += 1,
+                    Repr::Scalar(ScalarRepr::F64) => chunks[(offset / 8) as usize].doubles = true,
+                    Repr::Unit => {}
+                    _ => {
+                        for byte in offset..offset + size {
+                            chunks[(byte / 8) as usize].integer = true;
+                        }
+                    }
+                }
+                offset += size;
+            }
+        }
+        let size = self.prog.values[vid as usize].size;
+        if size > 16 {
+            return None;
+        }
+        let mut chunks = [Chunk::default(); 2];
+        walk(&self.prog.values, vid, 0, &mut chunks);
+        Some(
+            chunks[..size.div_ceil(8) as usize]
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    if chunk.integer || (!chunk.doubles && chunk.floats == 0) {
+                        self.ctx
+                            .custom_width_int_type((size - index as u32 * 8).min(8) * 8)
+                            .into()
+                    } else if chunk.doubles {
+                        self.ctx.f64_type().into()
+                    } else if chunk.floats == 2 {
+                        self.ctx.f32_type().vec_type(2).into()
+                    } else {
+                        self.ctx.f32_type().into()
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// SysV aggregates must fit entirely in the remaining integer/SSE
+    /// registers, or be copied to the stack. A byval argument consumes no GPR.
+    fn foreign_args(&self, function: &CoreFn) -> Vec<ForeignArg<'ctx>> {
+        let sysv = self.uses_sysv_aggregate_abi();
+        let (mut integers, mut vectors) = (0, 0);
+        function
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, repr)| match repr {
+                Repr::Value(vid) => {
+                    if function.extern_by_ref.get(index).copied().unwrap_or(false) {
+                        integers = (integers + 1).min(6);
+                        return ForeignArg::Indirect { byval: false };
+                    }
+                    if sysv {
+                        if let Some(chunks) = self.sysv_chunks(*vid) {
+                            let sse = chunks
+                                .iter()
+                                .filter(|t| t.is_float_type() || t.is_vector_type())
+                                .count();
+                            let gpr = chunks.len() - sse;
+                            if integers + gpr <= 6 && vectors + sse <= 8 {
+                                integers += gpr;
+                                vectors += sse;
+                                return ForeignArg::Direct(self.abi_coerce(*vid, false).unwrap());
+                            }
+                        }
+                        ForeignArg::Indirect { byval: true }
+                    } else {
+                        self.abi_coerce(*vid, false)
+                            .map_or(ForeignArg::Indirect { byval: false }, ForeignArg::Direct)
+                    }
+                }
+                Repr::Scalar(ScalarRepr::F32 | ScalarRepr::F64) => {
+                    vectors = (vectors + 1).min(8);
+                    ForeignArg::Scalar
+                }
+                _ => {
+                    integers = (integers + 1).min(6);
+                    ForeignArg::Scalar
+                }
+            })
+            .collect()
+    }
+
+    fn foreign_byval_attribute(&self, vid: ValueId) -> inkwell::attributes::Attribute {
+        self.ctx.create_type_attribute(
+            inkwell::attributes::Attribute::get_named_enum_kind_id("byval"),
+            self.value_struct_ty(vid).as_any_type_enum(),
+        )
+    }
+
+    /// Target ABI classification of a blittable value struct crossing FFI **by
     /// value** (non-`mut` extern param, or a return). Returns the LLVM type the
     /// struct is COERCED to for the call/return, or `None` when it must go
     /// indirect (> 16 bytes → a pointer to a caller-allocated copy). `is_return`
     /// picks the tighter integer coercion the C ABI uses for small returns
     /// (a 4-byte struct returns as `i32`, but an argument occupies a full `i64`
-    /// register slot). Matches `clang --target=arm64-apple-macos`.
+    /// register slot) on AAPCS64. SysV uses INTEGER/SSE eightbyte coercions.
     fn abi_coerce(&self, vid: ValueId, is_return: bool) -> Option<BasicTypeEnum<'ctx>> {
+        if self.uses_sysv_aggregate_abi() {
+            let chunks = self.sysv_chunks(vid)?;
+            return Some(if chunks.len() == 1 { chunks[0] }
+                else { self.ctx.struct_type(&chunks, false).into() });
+        }
         if let Some((is_f64, n)) = self.value_hfa(vid) {
             let elem = if is_f64 { self.ctx.f64_type() } else { self.ctx.f32_type() };
             return Some(elem.array_type(n).as_basic_type_enum());
@@ -709,7 +852,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     /// Load one mutable managed slot in the language's SC order. Bool has
     /// byte storage even though its SSA representation is i1.
-    fn managed_load(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    fn managed_load_idle(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let storage = if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.ctx.i8_type().as_basic_type_enum()
         } else { self.llvm_ty(repr).ok_or_else(|| CodegenError("invalid managed scalar load".into()))? };
@@ -729,7 +872,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } else { value })
     }
 
-    fn managed_store(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, owner: &CoreExpr) -> Result<(), CodegenError> {
+    fn managed_store_idle(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, owner: &CoreExpr) -> Result<(), CodegenError> {
         let (stored, alignment) = match repr {
             Repr::Scalar(ScalarRepr::Bool) => (
                 self.builder.build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "managed.bool.byte").unwrap().into(), 1,
@@ -743,6 +886,74 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let private = self.private_heap.contains(owner);
         self.set_heap_alias_metadata(instruction, owner)?;
         if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
+        Ok(())
+    }
+
+    /// Select the non-safepointing scoped path while concurrent copying is active.
+    fn managed_access_blocks(&self, fcx: &FnCtx<'ctx>) -> (inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>) {
+        let address = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::COPYING_PHASE as u64);
+        let flag = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), address, "copy.phase.ptr").unwrap().into_pointer_value();
+        let phase = self.builder.build_load(self.ctx.i8_type(), flag, "copy.phase").unwrap();
+        let instruction = phase.as_instruction_value().unwrap();
+        instruction.set_alignment(1).unwrap();
+        instruction.set_atomic_ordering(AtomicOrdering::Monotonic).unwrap();
+        let active = self.builder.build_int_compare(IntPredicate::NE, phase.into_int_value(), self.ctx.i8_type().const_zero(), "copy.active").unwrap();
+        let idle = self.ctx.append_basic_block(fcx.func, "access.idle");
+        let copying = self.ctx.append_basic_block(fcx.func, "access.copying");
+        let merge = self.ctx.append_basic_block(fcx.func, "access.merge");
+        self.builder.build_conditional_branch(active, copying, idle).unwrap();
+        (idle, copying, merge)
+    }
+
+    fn managed_load(&self, fcx: &FnCtx<'ctx>, object: PointerValue<'ctx>, offset: IntValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let width = match repr { Repr::Scalar(s) => s.bits().max(8), Repr::Ref(_) => 64,
+            _ => return Err(CodegenError("aggregate must use a managed snapshot".into())) };
+        let (idle, copying, merge) = self.managed_access_blocks(fcx);
+        self.builder.position_at_end(idle);
+        let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
+        let fast = self.managed_load_idle(addr, repr, name, owner)?;
+        self.builder.build_unconditional_branch(merge).unwrap();
+        self.builder.position_at_end(copying);
+        let function = self.module.get_function(&format!("ai_slot_bits{width}_load")).unwrap();
+        let bits = call_result(self.build_managed_call(fcx, function, &[fcx.thread.into(), object.into(), offset.into()], "slot.scoped").unwrap()).into_int_value();
+        let slow: BasicValueEnum<'ctx> = match repr {
+            Repr::Scalar(ScalarRepr::Bool) => self.builder.build_int_truncate(bits, self.ctx.bool_type(), "slot.bool").unwrap().into(),
+            Repr::Scalar(ScalarRepr::F32 | ScalarRepr::F64) => self.builder.build_bit_cast(bits, self.llvm_ty(repr).unwrap(), "slot.float").unwrap(),
+            Repr::Scalar(ScalarRepr::Ptr) | Repr::Ref(_) => self.builder.build_int_to_ptr(bits, self.ctx.ptr_type(AddressSpace::default()), "slot.pointer").unwrap().into(),
+            _ => bits.into(),
+        };
+        self.builder.build_unconditional_branch(merge).unwrap();
+        self.builder.position_at_end(merge);
+        let phi = self.builder.build_phi(fast.get_type(), name).unwrap();
+        phi.add_incoming(&[(&fast, idle), (&slow, copying)]);
+        Ok(phi.as_basic_value())
+    }
+
+    fn managed_store(&self, fcx: &FnCtx<'ctx>, object: PointerValue<'ctx>, offset: IntValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, traced: bool, owner: &CoreExpr) -> Result<(), CodegenError> {
+        let width = match repr { Repr::Scalar(s) => s.bits().max(8), Repr::Ref(_) => 64,
+            _ => return Err(CodegenError("aggregate must use a managed snapshot".into())) };
+        let (idle, copying, merge) = self.managed_access_blocks(fcx);
+        self.builder.position_at_end(idle);
+        let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
+        self.managed_store_idle(addr, value, repr, owner)?;
+        if traced { self.emit_write_barrier(fcx, object, value); }
+        self.builder.build_unconditional_branch(merge).unwrap();
+        self.builder.position_at_end(copying);
+        if traced {
+            let function = self.module.get_function("ai_slot_ref_store").unwrap();
+            self.build_managed_call(fcx, function, &[fcx.thread.into(), object.into(), offset.into(), value.into()], "").unwrap();
+        } else {
+            let bits: BasicValueEnum<'ctx> = match repr {
+                Repr::Scalar(ScalarRepr::Bool) => self.builder.build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "slot.bool.bits").unwrap().into(),
+                Repr::Scalar(ScalarRepr::F32 | ScalarRepr::F64) => self.builder.build_bit_cast(value, self.ctx.custom_width_int_type(width), "slot.float.bits").unwrap(),
+                Repr::Scalar(ScalarRepr::Ptr) => self.builder.build_ptr_to_int(value.into_pointer_value(), self.ctx.i64_type(), "slot.pointer.bits").unwrap().into(),
+                _ => value,
+            };
+            let function = self.module.get_function(&format!("ai_slot_bits{width}_store")).unwrap();
+            self.build_managed_call(fcx, function, &[fcx.thread.into(), object.into(), offset.into(), bits.into()], "").unwrap();
+        }
+        self.builder.build_unconditional_branch(merge).unwrap();
+        self.builder.position_at_end(merge);
         Ok(())
     }
 
@@ -781,17 +992,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // it. See `docs/ffi.md`.
         if f.is_extern {
             let mut params: Vec<BasicMetadataTypeEnum> = Vec::new();
+            let foreign_args = self.foreign_args(f);
             for (i, p) in f.params.iter().enumerate() {
                 match p {
                     // A `#[repr(C)]` value struct crosses either BY VALUE (the
                     // common case — coerced per the C ABI into register-shaped
                     // types) or BY POINTER (a `mut` out-param, or > 16 bytes which
                     // the ABI passes indirectly). See `docs/ffi.md`.
-                    Repr::Value(vid) => {
-                        let by_ref = f.extern_by_ref.get(i).copied().unwrap_or(false);
-                        match if by_ref { None } else { self.abi_coerce(*vid, false) } {
-                            Some(coerced) => params.push(coerced.into()),
-                            None => params.push(ptr.into()),
+                    Repr::Value(_) => {
+                        match foreign_args[i] {
+                            ForeignArg::Direct(coerced) => params.push(coerced.into()),
+                            _ => params.push(ptr.into()),
                         }
                     }
                     _ => {
@@ -813,16 +1024,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     None => self.ctx.void_type().fn_type(&params, false),
                 },
             };
-            return self.module.add_function(
-                &f.name,
-                fn_ty,
-                Some(inkwell::module::Linkage::External),
+            let function = self.module.add_function(
+                &f.name, fn_ty, Some(inkwell::module::Linkage::External),
             );
+            for (index, abi) in foreign_args.iter().enumerate() {
+                if matches!(abi, ForeignArg::Indirect { byval: true }) {
+                    let Repr::Value(vid) = f.params[index] else { unreachable!() };
+                    function.add_attribute(inkwell::attributes::AttributeLoc::Param(index as u32),
+                        self.foreign_byval_attribute(vid));
+                }
+            }
+            return function;
         }
         // First param is the Thread*. A lifted closure fn takes the env pointer
         // as its second param (before the value params).
         let mut params: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
-        if !f.closure_captures.is_empty() || f.name.starts_with("__closure_") {
+        if f.is_closure {
             params.push(ptr.into());
         }
         for p in &f.params {
@@ -839,11 +1056,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let linkage = if self.closed_world && self.prog.entry != Some(id) {
             Some(inkwell::module::Linkage::Internal)
         } else { None };
-        self.module.add_function(&f.name, fn_ty, linkage)
+        let mut name = f.name.clone();
+        let mut suffix = 0u64;
+        while self.module.get_function(&name).is_some() {
+            name = format!("{}.__managed_{}_{}", f.name, id, suffix);
+            suffix += 1;
+        }
+        self.module.add_function(&name, fn_ty, linkage)
     }
 
     fn is_closure_fn(f: &CoreFn) -> bool {
-        f.name.starts_with("__closure_")
+        f.is_closure
     }
 
     /// Get (or synthesize) a C-ABI trampoline for gc-rust function `fid`, used as
@@ -857,7 +1080,6 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
         let target = self.funcs[&fid];
         let f = &self.prog.funcs[fid as usize];
-        let ptr = self.ctx.ptr_type(AddressSpace::default());
 
         // C signature: the value params (skip Unit), no Thread*.
         let mut c_params: Vec<BasicMetadataTypeEnum> = Vec::new();
@@ -1383,8 +1605,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             thread: func.get_nth_param(0).unwrap().into_pointer_value(),
             loops: Vec::new(),
             loop_headers: Vec::new(),
+            loop_ffi_bases: Vec::new(),
+            ffi_stack_tokens: Vec::new(),
             unlink,
             pending_copy_outs: Vec::new(),
+            pending_ffi_buffers: Vec::new(),
             subprogram,
         };
         if entry_roots_only { self.emit_entry_only_poll(&mut fcx); }
@@ -1496,16 +1721,53 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(ready);
     }
 
+    /// A runtime length guard proves the legacy call cannot do unbounded work.
+    /// Only the versioned polling call can relocate; keep epoch/root reloads on
+    /// that branch. Distinct symbols preserve old callers' noncollecting ABI.
+    fn build_string_scan_call(&self, fcx: &FnCtx<'ctx>, legacy: &str,
+        args: &[inkwell::values::BasicMetadataValueEnum<'ctx>], name: &str) -> BasicValueEnum<'ctx>
+    {
+        let source = args[1].into_pointer_value();
+        let address = self.obj_addr(source, <crate::gc::Full as crate::gc::ObjHeader>::SIZE as u64);
+        let len = self.builder.build_load(self.ctx.i64_type(), address, "scan.length").unwrap().into_int_value();
+        let small = self.builder.build_int_compare(IntPredicate::ULE, len,
+            self.ctx.i64_type().const_int(crate::runtime::STRING_SCAN_LEAF_BYTES as u64, false), "scan.is_small").unwrap();
+        let leaf = self.ctx.append_basic_block(fcx.func, "scan.leaf");
+        let polling = self.ctx.append_basic_block(fcx.func, "scan.polling");
+        let ready = self.ctx.append_basic_block(fcx.func, "scan.ready");
+        self.builder.build_conditional_branch(small, leaf, polling).unwrap();
+        self.builder.position_at_end(leaf);
+        let fast = call_result(self.builder.build_call(self.module.get_function(legacy).unwrap(), args, name).unwrap());
+        self.builder.build_unconditional_branch(ready).unwrap();
+        self.builder.position_at_end(polling);
+        let slow = call_result(self.build_managed_call(fcx, self.module.get_function(&format!("{legacy}_v2")).unwrap(), args, name).unwrap());
+        let polled = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(ready).unwrap();
+        self.builder.position_at_end(ready);
+        let result = self.builder.build_phi(fast.get_type(), name).unwrap();
+        result.add_incoming(&[(&fast, leaf), (&slow, polled)]);
+        result.as_basic_value()
+    }
+
     fn build_managed_call(&self, fcx: &FnCtx<'ctx>, callee: FunctionValue<'ctx>, args: &[inkwell::values::BasicMetadataValueEnum<'ctx>], name: &str)
         -> Result<inkwell::values::CallSiteValue<'ctx>, inkwell::builder::BuilderError>
     {
         let symbol = callee.get_name();
         let symbol = symbol.to_str().unwrap_or("");
-        // These routines neither collect nor park, or deliberately leave the
-        // thread BLOCKED. Never read root slots between ffi_enter and leave.
+        // Returning paths of these routines cannot relocate, or deliberately
+        // leave the thread BLOCKED. Terminal failures may park for diagnostics
+        // but never return to read derived pointers. Never read root slots
+        // between ffi_enter and leave.
         let managed_id = self.funcs.iter().find_map(|(&id, &function)| (function == callee).then_some(id));
-        let no_relocation = if let Some(id) = managed_id { self.nonrelocating[id as usize] } else { symbol.starts_with("llvm.") || matches!(symbol,
+        let no_relocation = if let Some(id) = managed_id { self.nonrelocating[id as usize] } else { symbol.starts_with("llvm.") || crate::codegen_effects::native_atomic_is_nonrelocating(symbol) || matches!(symbol,
+            "ai_ffi_buffer_alloc_v1" | "ai_ffi_buffer_free_v1" | "ai_ffi_buffer_data_v2" |
             "ai_ffi_enter" | "ai_ffi_exit" | "ai_gc_record_alloc" | "ai_gc_write_barrier" |
+            "ai_object_type_id" | "ai_closure_code_ptr" | "ai_managed_try_write" |
+            "ai_slot_bits8_load" | "ai_slot_bits8_store" | "ai_slot_bits16_load" | "ai_slot_bits16_store" |
+            "ai_slot_bits32_load" | "ai_slot_bits32_store" | "ai_slot_bits64_load" | "ai_slot_bits64_store" | "ai_slot_ref_store" |
+            "ai_atom_ref_load" | "ai_atom_ref_cas" |
+            "ai_atom_bits8_load" | "ai_atom_bits8_cas" | "ai_atom_bits16_load" | "ai_atom_bits16_cas" |
+            "ai_atom_bits32_load" | "ai_atom_bits32_cas" | "ai_atom_bits64_load" | "ai_atom_bits64_cas" |
             "ai_str_len" | "ai_str_eq" | "ai_str_get" | "ai_str_hash" | "ai_str_to_float" |
             "ai_bounds_fail" | "ai_uninitialized_array_fail" | "ai_arithmetic_fail" | "ai_panic"
         ) };
@@ -1591,9 +1853,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     fn clear_dead_roots(&self, fcx: &FnCtx<'ctx>, statement: &CoreStmt) {
         let Some(dead) = self.root_liveness.dead(statement) else { return; };
         let ptr = self.ctx.ptr_type(AddressSpace::default());
-        for (local, root) in fcx.root_slots.iter().enumerate() {
-            if dead.contains(&(local as LocalId)) {
-                if let Some(root) = root { self.builder.build_store(*root, ptr.const_null()).unwrap(); }
+        for local in dead {
+            if let Some(root) = fcx.root_slots[*local as usize] {
+                self.builder.build_store(root, ptr.const_null()).unwrap();
             }
         }
         // Indirect value roots retain their original lifetime for now. Clearing
@@ -1609,6 +1871,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             match s {
                 CoreStmt::Let(local, e) => {
                     let v = self.gen_expr(fcx, e)?;
+                    if self.builder.get_insert_block().unwrap().get_terminator().is_some() { return Ok(None); }
                     if let (Some(slot), Some(v)) = (fcx.slots[*local as usize], v) {
                         self.builder.build_store(slot, v).unwrap();
                         if let Some(root) = fcx.root_slots[*local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, v).unwrap(); }
@@ -1672,7 +1935,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if let Repr::Scalar(scalar) = e.repr {
                     if scalar.is_int() {
                         if let Some(value) = self.private_heap.integer(e) {
-                            return Ok(Some(self.scalar_ty(scalar).into_int_type().const_int(value, false).into()));
+                            return Ok(Some(self.scalar_ty(scalar).into_int_type().const_int(value, scalar.is_signed()).into()));
                         }
                     }
                 }
@@ -1735,8 +1998,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::StrEq(a, b) => {
                 let av = self.gen_expr(fcx, a)?.unwrap().into_pointer_value();
                 let bv = self.gen_expr(fcx, b)?.unwrap().into_pointer_value();
-                let f = self.module.get_function("ai_str_eq").unwrap();
-                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), av.into(), bv.into()], "streq").unwrap());
+                let r = self.build_string_scan_call(fcx, "ai_str_eq", &[fcx.thread.into(), av.into(), bv.into()], "streq");
                 // ai_str_eq returns i64 (0/1); narrow to i1 for the bool repr.
                 let iv = r.into_int_value();
                 let b1 = self.builder.build_int_truncate(iv, self.ctx.bool_type(), "streqb").unwrap();
@@ -1812,8 +2074,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             CoreExprKind::StrToFloat(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
-                let f = self.module.get_function("ai_str_to_float").unwrap();
-                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "strtof").unwrap());
+                let r = self.build_string_scan_call(fcx, "ai_str_to_float", &[fcx.thread.into(), sv.into()], "strtof");
                 Ok(Some(r))
             }
             CoreExprKind::FloatBits(f) => {
@@ -1823,18 +2084,28 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             CoreExprKind::StrHash(s) => {
                 let sv = self.gen_expr(fcx, s)?.unwrap().into_pointer_value();
-                let f = self.module.get_function("ai_str_hash").unwrap();
-                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "strhash").unwrap());
+                let r = self.build_string_scan_call(fcx, "ai_str_hash", &[fcx.thread.into(), sv.into()], "strhash");
                 Ok(Some(r))
             }
             CoreExprKind::TypeIdOf(obj) => {
-                // The type_id is a u16 in the object header at offset 8
-                // ([gc_word: u64 @0][type_id: u16 @8]); zero-extend to i64.
+                use crate::gc::{Full, ObjHeader};
                 let ov = self.gen_expr(fcx, obj)?.unwrap().into_pointer_value();
                 let i16t = self.ctx.i16_type();
                 let i64t = self.ctx.i64_type();
-                let addr = self.obj_addr(ov, 8);
-                let mut tid = self.builder.build_load(i16t, addr, "tid").unwrap().into_int_value();
+                let (idle, copying, merge) = self.managed_access_blocks(fcx);
+                self.builder.position_at_end(idle);
+                let addr = self.obj_addr(ov, Full::TYPE_ID_OFFSET as u64);
+                let direct = self.builder.build_load(i16t, addr, "tid").unwrap();
+                self.builder.build_unconditional_branch(merge).unwrap();
+                self.builder.position_at_end(copying);
+                let function = self.module.get_function("ai_object_type_id").unwrap();
+                let resolved = call_result(self.build_managed_call(fcx, function,
+                    &[fcx.thread.into(), ov.into()], "tid.scoped").unwrap());
+                self.builder.build_unconditional_branch(merge).unwrap();
+                self.builder.position_at_end(merge);
+                let physical = self.builder.build_phi(i16t, "tid.physical").unwrap();
+                physical.add_incoming(&[(&direct, idle), (&resolved, copying)]);
+                let mut tid = physical.as_basic_value().into_int_value();
                 // Collector shape IDs may differ between variants of one source
                 // enum; the language exposes its stable nominal LayoutId.
                 if let Repr::Ref(logical) = obj.repr {
@@ -1860,14 +2131,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 Ok(Some(r))
             }
             CoreExprKind::AsCBytes { src, elem, is_string, copy_out } => {
-                // Copy a String/scalar-Array's heap bytes into a dynamically-sized
-                // STACK buffer and yield its pointer. The stack never moves, so
+                // Copy a String/scalar-Array's heap bytes into a scoped
+                // native buffer and yield its pointer. Native storage never moves, so
                 // the pointer is stable for the enclosing extern call with no
                 // pinning. A `copy_out` (mut array) buffer is written back into
                 // the heap object after the call (queued for `gen_call` to drain).
                 // See `docs/ffi.md`.
                 let sv = self.gen_expr(fcx, src)?.unwrap().into_pointer_value();
-                let i8t = self.ctx.i8_type();
                 let i64t = self.ctx.i64_type();
                 let stride = (elem.bits().max(8) / 8) as u64;
 
@@ -1878,8 +2148,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         self.build_managed_call(fcx, lenf, &[fcx.thread.into(), sv.into()], "ascb.len").unwrap()
                     ).into_int_value();
                     let cap = self.builder.build_int_add(len, i64t.const_int(1, false), "ascb.cap").unwrap();
-                    let buf = self.builder.build_array_alloca(i8t, cap, "ascb.buf").unwrap();
-                    let cpf = self.module.get_function("ai_str_copy_to_buf").unwrap();
+                    let alloc = self.module.get_function("ai_ffi_buffer_alloc_v2").unwrap();
+                    let token = call_result(self.build_managed_call(fcx, alloc, &[fcx.thread.into(), cap.into()], "ascb.owner").unwrap()).into_pointer_value();
+                    fcx.pending_ffi_buffers.push(token);
+                    let data = self.module.get_function("ai_ffi_buffer_data_v2").unwrap();
+                    let buf = call_result(self.build_managed_call(fcx, data, &[token.into()], "ascb.buf").unwrap()).into_pointer_value();
+                    // Allocation may park or collect; ANF captured this exact
+                    // source into a rooted local before argument evaluation.
+                    let sv = self.gen_expr(fcx, src)?.unwrap().into_pointer_value();
+                    let cpf = self.module.get_function("ai_str_copy_to_buf_v2").unwrap();
                     self.build_managed_call(fcx, cpf, &[fcx.thread.into(), sv.into(), buf.into()], "").unwrap();
                     return Ok(Some(buf.into()));
                 }
@@ -1894,8 +2171,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 } else {
                     count // Bytes array: count word already holds the byte length.
                 };
-                let buf = self.builder.build_array_alloca(i8t, byte_len, "ascb.buf").unwrap();
-                let cin = self.module.get_function("ai_buf_copy_in").unwrap();
+                let alloc = self.module.get_function("ai_ffi_buffer_alloc_v2").unwrap();
+                let token = call_result(self.build_managed_call(fcx, alloc, &[fcx.thread.into(), byte_len.into()], "ascb.owner").unwrap()).into_pointer_value();
+                fcx.pending_ffi_buffers.push(token);
+                let data = self.module.get_function("ai_ffi_buffer_data_v2").unwrap();
+                let buf = call_result(self.build_managed_call(fcx, data, &[token.into()], "ascb.buf").unwrap()).into_pointer_value();
+                let sv = self.gen_expr(fcx, src)?.unwrap().into_pointer_value();
+                let cin = self.module.get_function("ai_buf_copy_in_v2").unwrap();
                 self.build_managed_call(fcx, cin, &[fcx.thread.into(), sv.into(), buf.into(), byte_len.into(), i64t.const_int(elem.bits() as u64, false).into()], "").unwrap();
                 if *copy_out {
                     // Queue a write-back; gen_call replays it after the extern call.
@@ -1934,6 +2216,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 Ok(Some(v))
             }
             CoreExprKind::CallbackPtr(fid) => {
+                if self.prog.funcs[*fid as usize].is_extern {
+                    // This target already has the C ABI. A managed trampoline
+                    // would incorrectly prepend Thread* to its arguments.
+                    return Ok(Some(self.funcs[fid].as_global_value().as_pointer_value().into()));
+                }
                 // The address of the synthesized C-ABI trampoline for `fid`.
                 let tramp = self.callback_trampoline(*fid);
                 Ok(Some(tramp.as_global_value().as_pointer_value().into()))
@@ -1966,25 +2253,25 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::AtomLoad { atom, elem } => {
                 // Atomic load of the atom's value field (first pointer slot).
                 let a = self.gen_expr(fcx, atom)?.unwrap().into_pointer_value();
-                let slot = self.obj_addr(a, Self::HEADER);
-                // Bool occupies a byte in memory; floating CAS compares bits.
-                let storage = match elem {
-                    Repr::Scalar(ScalarRepr::Bool) => self.ctx.i8_type().into(),
-                    Repr::Scalar(ScalarRepr::F32) => self.ctx.i32_type().into(),
-                    Repr::Scalar(ScalarRepr::F64) => self.ctx.i64_type().into(),
-                    _ => self.llvm_ty(elem).ok_or_else(|| CodegenError("unsupported atom representation".into()))?,
+                if matches!(elem, Repr::Ref(_)) {
+                    let f = self.module.get_function("ai_atom_ref_load").unwrap();
+                    return Ok(Some(call_result(self.build_managed_call(
+                        fcx, f, &[fcx.thread.into(), a.into()], "atom.ref.load",
+                    ).unwrap())));
+                }
+                let Repr::Scalar(scalar) = elem else {
+                    return Err(CodegenError("unsupported atom representation".into()));
                 };
-                let load = self.builder.build_load(storage, slot, "atom.load").unwrap();
-                let inst = load.as_instruction_value().unwrap();
-                // Atomics require natural alignment (8 for our pointer/i64-wide
-                // value fields); the default field alignment (4) is UB for an
-                // atomic load and faults at runtime.
-                inst.set_alignment(8).map_err(|e| CodegenError(e.to_string()))?;
-                inst.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?;
-                let value = match elem {
-                    Repr::Scalar(ScalarRepr::Bool) => self.builder.build_int_truncate(load.into_int_value(), self.ctx.bool_type(), "atom.bool").unwrap().into(),
-                    Repr::Scalar(ScalarRepr::F32 | ScalarRepr::F64) => self.builder.build_bit_cast(load, self.llvm_ty(elem).unwrap(), "atom.float").unwrap(),
-                    _ => load,
+                let width = scalar.bits().max(8);
+                let f = self.module.get_function(&format!("ai_atom_bits{width}_load")).unwrap();
+                let bits = call_result(self.build_managed_call(
+                    fcx, f, &[fcx.thread.into(), a.into()], "atom.bits.load",
+                ).unwrap()).into_int_value();
+                let value = match scalar {
+                    ScalarRepr::Bool => self.builder.build_int_truncate(bits, self.ctx.bool_type(), "atom.bool").unwrap().into(),
+                    ScalarRepr::F32 | ScalarRepr::F64 => self.builder.build_bit_cast(bits, self.llvm_ty(elem).unwrap(), "atom.float").unwrap(),
+                    ScalarRepr::Ptr => self.builder.build_int_to_ptr(bits, self.ctx.ptr_type(AddressSpace::default()), "atom.rawptr").unwrap().into(),
+                    _ => bits.into(),
                 };
                 Ok(Some(value))
             }
@@ -1993,28 +2280,35 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let a = self.gen_expr(fcx, atom)?.unwrap().into_pointer_value();
                 let oldv = self.gen_expr(fcx, old)?.unwrap();
                 let newv = self.gen_expr(fcx, new)?.unwrap();
-                let slot = self.obj_addr(a, Self::HEADER);
+                if matches!(&old.repr, Repr::Ref(_)) {
+                    let f = self.module.get_function("ai_atom_ref_cas").unwrap();
+                    let result = call_result(self.build_managed_call(
+                        fcx, f, &[fcx.thread.into(), a.into(), oldv.into(), newv.into()], "atom.ref.cas",
+                    ).unwrap()).into_int_value();
+                    let ok = self.builder.build_int_compare(
+                        IntPredicate::NE, result, self.ctx.i8_type().const_zero(), "cas.ok",
+                    ).unwrap();
+                    return Ok(Some(ok.into()));
+                }
+                let Repr::Scalar(scalar) = &old.repr else {
+                    return Err(CodegenError("unsupported atom representation".into()));
+                };
+                let width = scalar.bits().max(8);
                 let encode = |v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
-                    match &old.repr {
-                        Repr::Scalar(ScalarRepr::Bool) => self.builder.build_int_z_extend(v.into_int_value(), self.ctx.i8_type(), "atom.bool.bits").unwrap().into(),
-                        Repr::Scalar(s @ (ScalarRepr::F32 | ScalarRepr::F64)) => self.builder.build_bit_cast(v, self.ctx.custom_width_int_type(s.bits()), "atom.float.bits").unwrap(),
+                    match scalar {
+                        ScalarRepr::Bool => self.builder.build_int_z_extend(v.into_int_value(), self.ctx.i8_type(), "atom.bool.bits").unwrap().into(),
+                        ScalarRepr::F32 | ScalarRepr::F64 => self.builder.build_bit_cast(v, self.ctx.custom_width_int_type(width), "atom.float.bits").unwrap(),
+                        ScalarRepr::Ptr => self.builder.build_ptr_to_int(v.into_pointer_value(), self.ctx.i64_type(), "atom.rawptr.bits").unwrap().into(),
                         _ => v,
                     }
                 };
-                let cas = self.builder.build_cmpxchg(
-                    slot, encode(oldv), encode(newv),
-                    AtomicOrdering::SequentiallyConsistent,
-                    AtomicOrdering::SequentiallyConsistent,
+                let f = self.module.get_function(&format!("ai_atom_bits{width}_cas")).unwrap();
+                let result = call_result(self.build_managed_call(
+                    fcx, f, &[fcx.thread.into(), a.into(), encode(oldv).into(), encode(newv).into()], "atom.bits.cas",
+                ).unwrap()).into_int_value();
+                let ok = self.builder.build_int_compare(
+                    IntPredicate::NE, result, self.ctx.i8_type().const_zero(), "cas.ok",
                 ).unwrap();
-                // LLVM gives cmpxchg the operand's natural alignment by default.
-                // Our first object field is 8-aligned, satisfying every supported
-                // scalar/reference operand. Inkwell's alignment setter only
-                // accepts load/store/alloca, so it cannot strengthen this value.
-                // cmpxchg yields { value, i1 success }; element 1 is the success bool.
-                let ok = self.builder.build_extract_value(cas, 1, "cas.ok").unwrap().into_int_value();
-                // Generational write barrier: a successful install may create an
-                // old(atom)→young(new) edge. (No-ops cheaply if non-generational.)
-                self.emit_write_barrier(fcx, a, newv);
                 Ok(Some(ok.into()))
             }
             CoreExprKind::ChanSend { buf, ctrl, value } => {
@@ -2089,6 +2383,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     Some(e) => self.gen_expr(fcx, e)?,
                     None => None,
                 };
+                if self.builder.get_insert_block().unwrap().get_terminator().is_some() { return Ok(None); }
+                let (buffer_base, stack_base) = *fcx.loop_ffi_bases.last()
+                    .ok_or_else(|| CodegenError("break outside loop".into()))?;
+                self.emit_ffi_cleanup(fcx, buffer_base, stack_base);
                 let (cont_bb, phi_in) = *fcx.loops.last()
                     .ok_or_else(|| CodegenError("break outside loop".into()))?;
                 if let (Some(slot), Some(bv)) = (phi_in, bv) {
@@ -2098,6 +2396,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 Ok(None)
             }
             CoreExprKind::Continue => {
+                let (buffer_base, stack_base) = *fcx.loop_ffi_bases.last()
+                    .ok_or_else(|| CodegenError("continue outside loop".into()))?;
+                self.emit_ffi_cleanup(fcx, buffer_base, stack_base);
                 let header_bb = fcx.loop_headers.last()
                     .ok_or_else(|| CodegenError("continue outside loop".into()))?;
                 self.builder.build_unconditional_branch(*header_bb).unwrap();
@@ -2114,14 +2415,25 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::Return(v) => {
                 match v {
                     Some(e) => {
-                        let rv = self.gen_expr(fcx, e)?;
+                        let mut rv = self.gen_expr(fcx, e)?;
+                        if self.builder.get_insert_block().unwrap().get_terminator().is_some() { return Ok(None); }
+                        let may_move = !fcx.pending_ffi_buffers.is_empty();
+                        self.emit_ffi_cleanup(fcx, 0, 0);
+                        let traced = matches!(e.repr, Repr::Ref(_)) || matches!(e.repr, Repr::Value(id) if value_has_ref(&self.prog.values, id));
+                        if may_move && traced {
+                            match e.kind.as_ref() {
+                                CoreExprKind::Local(_) => rv = self.gen_expr(fcx, e)?,
+                                CoreExprKind::ConstZero(_) => {},
+                                _ => return Err(CodegenError("return cleanup requires a rooted ANF value".into())),
+                            }
+                        }
                         self.emit_unlink(fcx);
                         match rv {
                             Some(rv) => { self.builder.build_return(Some(&rv)).unwrap(); }
                             None => { self.builder.build_return(None).unwrap(); }
                         }
                     }
-                    None => { self.emit_unlink(fcx); self.builder.build_return(None).unwrap(); }
+                    None => { self.emit_ffi_cleanup(fcx, 0, 0); self.emit_unlink(fcx); self.builder.build_return(None).unwrap(); }
                 }
                 Ok(None)
             }
@@ -2138,9 +2450,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::Field { base, loc } => self.gen_field(fcx, base, loc),
             CoreExprKind::SetField { base, loc, value } => {
                 let mut obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
+                if matches!(loc, FieldLoc::Unit) {
+                    self.gen_expr(fcx, value)?;
+                    return Ok(None);
+                }
                 let aggregate = matches!(loc, FieldLoc::ValueAt { .. });
-                if aggregate { obj = self.managed_lock(fcx, obj); }
-                let v = self.gen_expr(fcx, value)?.unwrap();
                 let off = match loc {
                     FieldLoc::Ptr { idx } => Self::HEADER + (*idx as u64) * 8,
                     FieldLoc::Raw { offset, .. } | FieldLoc::ValueAt { offset, .. } => {
@@ -2148,13 +2462,58 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         let lay = &self.prog.layouts[lid as usize];
                         Self::HEADER + (lay.ptr_fields as u64) * 8 + *offset as u64
                     }
+                    FieldLoc::Unit => unreachable!("unit fields do not have an address"),
                     FieldLoc::ValueField { .. } => {
                         return Err(CodegenError("value-struct field is immutable".into()));
                     }
                 };
+                let completed = if let FieldLoc::ValueAt { value: vid, .. } = loc {
+                    // ANF value locals already have stable native storage, with
+                    // reference interiors rooted in the caller's frame. The
+                    // nonparking attempt only reads it and cannot relocate it.
+                    let input = if let CoreExprKind::Local(local) = value.kind.as_ref() {
+                        fcx.slots[*local as usize].ok_or_else(|| CodegenError("aggregate RHS has no native local storage".into()))?
+                    } else {
+                        let candidate = self.gen_expr(fcx, value)?.unwrap();
+                        let input = self.entry_alloca(candidate.get_type(), "aggregate.input");
+                        self.builder.build_store(input, candidate).unwrap();
+                        input
+                    };
+                    let name = format!("__aggregate_refs_{vid}");
+                    let mut references = Vec::new();
+                    value_interior_offsets(&self.prog.values, *vid, 0, &mut references);
+                    references.sort_unstable();
+                    references.dedup();
+                    let reference_count = references.len();
+                    let offsets = if let Some(global) = self.module.get_global(&name) { global } else {
+                        let ty = self.ctx.i16_type();
+                        let values: Vec<_> = references.iter().map(|&at| ty.const_int(at as u64, false)).collect();
+                        let initializer = ty.const_array(&values);
+                        let global = self.module.add_global(initializer.get_type(), None, &name);
+                        global.set_initializer(&initializer);
+                        global.set_constant(true);
+                        global.set_linkage(inkwell::module::Linkage::Private);
+                        global
+                    };
+                    let write = self.module.get_function("ai_managed_try_write").unwrap();
+                    let result = call_result(self.build_managed_call(fcx, write, &[
+                        fcx.thread.into(), obj.into(), self.ctx.i64_type().const_int(off, false).into(), input.into(),
+                        self.ctx.i64_type().const_int(self.prog.values[*vid as usize].size as u64, false).into(),
+                        offsets.as_pointer_value().into(), self.ctx.i64_type().const_int(reference_count as u64, false).into(),
+                    ], "aggregate.stored").unwrap()).into_int_value();
+                    let done = self.ctx.append_basic_block(fcx.func, "aggregate.done");
+                    let fallback = self.ctx.append_basic_block(fcx.func, "aggregate.contended");
+                    let success = self.builder.build_int_compare(IntPredicate::NE, result, self.ctx.i8_type().const_zero(), "aggregate.success").unwrap();
+                    self.builder.build_conditional_branch(success, done, fallback).unwrap();
+                    self.builder.position_at_end(fallback);
+                    obj = self.managed_lock(fcx, obj);
+                    Some(done)
+                } else { None };
+                // A contended acquisition can relocate both base and RHS.
+                let v = self.gen_expr(fcx, value)?.unwrap();
                 let addr = self.obj_addr(obj, off);
                 if aggregate { self.builder.build_store(addr, v).unwrap(); }
-                else { self.managed_store(addr, v, &value.repr, base)?; }
+                else { self.managed_store(fcx, obj, self.ctx.i64_type().const_int(off, false), v, &value.repr, matches!(loc, FieldLoc::Ptr { .. }), base)?; }
                 // Generational write barrier. A direct pointer store (FieldLoc::Ptr)
                 // may create an old→young edge. So may a flattened value-with-
                 // references store (FieldLoc::ValueAt): each reference embedded in
@@ -2164,7 +2523,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 // rescan it and could reclaim a still-referenced young object. Mark
                 // for each interior reference of the stored value.
                 match loc {
-                    FieldLoc::Ptr { .. } => self.emit_write_barrier(fcx, obj, v),
+                    FieldLoc::Ptr { .. } => {}, // Complete scalar/reference path owns its barriers.
                     FieldLoc::ValueAt { value, .. } => {
                         // `lay.interior_ptrs` are absolute object offsets of refs
                         // embedded in flattened value fields; those within this
@@ -2196,7 +2555,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     _ => {}
                 }
                 if aggregate { self.managed_unlock(fcx); }
-                Ok(Some(self.ctx.i64_type().const_zero().into()))
+                if let Some(done) = completed {
+                    self.builder.build_unconditional_branch(done).unwrap();
+                    self.builder.position_at_end(done);
+                }
+                Ok(None)
             }
             CoreExprKind::Match { scrutinee, arms } => {
                 self.gen_match(fcx, scrutinee, arms, &e.repr)}
@@ -2244,7 +2607,6 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::MakeClosure { code, env, captures } => self.gen_make_closure(fcx, *code, *env, captures, e.span),
             CoreExprKind::CallClosure { callee, args } => {
                 self.gen_call_closure(fcx, callee, args, &e.repr)}
-            other => Err(CodegenError(format!("codegen unsupported in v0 slice: {:?}", core_disc(other)))),
         }
     }
 
@@ -2300,6 +2662,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             "ai_managed_unlock", self.ctx.void_type().fn_type(&[ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function(
+            "ai_managed_read", self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_managed_try_write", self.ctx.i8_type().fn_type(&[ptr.into(), ptr.into(), i64t.into(), ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // ptr ai_gc_alloc_fixed(ptr thread, i32 type_id, i32 site_id)
         self.module.add_function(
             "ai_gc_alloc_fixed",
@@ -2323,6 +2693,41 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function(
+            "ai_atom_ref_load", ptr.fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_atom_ref_cas",
+            self.ctx.i8_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        for width in [8, 16, 32, 64] {
+            let bits = self.ctx.custom_width_int_type(width);
+            self.module.add_function(
+                &format!("ai_atom_bits{width}_load"), bits.fn_type(&[ptr.into(), ptr.into()], false),
+                Some(inkwell::module::Linkage::External),
+            );
+            self.module.add_function(
+                &format!("ai_atom_bits{width}_cas"),
+                self.ctx.i8_type().fn_type(&[ptr.into(), ptr.into(), bits.into(), bits.into()], false),
+                Some(inkwell::module::Linkage::External),
+            );
+        }
+        for width in [8, 16, 32, 64] {
+            let bits = self.ctx.custom_width_int_type(width);
+            self.module.add_function(
+                &format!("ai_slot_bits{width}_load"), bits.fn_type(&[ptr.into(), ptr.into(), i64t.into()], false),
+                Some(inkwell::module::Linkage::External),
+            );
+            self.module.add_function(
+                &format!("ai_slot_bits{width}_store"), self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t.into(), bits.into()], false),
+                Some(inkwell::module::Linkage::External),
+            );
+        }
+        self.module.add_function("ai_slot_ref_store",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External));
         // void ai_gc_pollcheck_slow(ptr thread)
         self.module.add_function(
             "ai_gc_pollcheck_slow",
@@ -2435,6 +2840,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             i64t.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function(
+            "ai_str_eq_v2",
+            i64t.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // ptr ai_str_concat(ptr thread, i32 type_id, ptr a, ptr b)
         self.module.add_function(
             "ai_str_concat",
@@ -2516,6 +2926,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        // ptr ai_fmt_f64(ptr thread, i64 str_type_id, f64 v, i64 prec, i64 mode)
+        self.module.add_function(
+            "ai_fmt_f64",
+            ptr.fn_type(&[ptr.into(), i64t.into(), self.ctx.f64_type().into(), i64t.into(), i64t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // ptr ai_str_from_float(ptr thread, i32 type_id, f64 v)
         self.module.add_function(
             "ai_str_from_float",
@@ -2528,12 +2944,27 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.ctx.f64_type().fn_type(&[ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function(
+            "ai_str_to_float_v2",
+            self.ctx.f64_type().fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // i64 ai_str_hash(ptr thread, ptr s)
         self.module.add_function(
             "ai_str_hash",
             i64t.fn_type(&[ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function(
+            "ai_str_hash_v2",
+            i64t.fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function("ai_ffi_buffer_alloc_v1", ptr.fn_type(&[i64t.into()], false), Some(inkwell::module::Linkage::External));
+        self.module.add_function("ai_ffi_buffer_free_v1", self.ctx.void_type().fn_type(&[ptr.into(), i64t.into()], false), Some(inkwell::module::Linkage::External));
+        self.module.add_function("ai_ffi_buffer_alloc_v2", ptr.fn_type(&[ptr.into(), i64t.into()], false), Some(inkwell::module::Linkage::External));
+        self.module.add_function("ai_ffi_buffer_data_v2", ptr.fn_type(&[ptr.into()], false), Some(inkwell::module::Linkage::External));
+        self.module.add_function("ai_ffi_buffer_free_v2", self.ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
         // i64 ai_str_copy_to_buf(ptr thread, ptr s, ptr dst)
         self.module.add_function(
             "ai_str_copy_to_buf",
@@ -2552,10 +2983,24 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        for legacy in ["ai_str_copy_to_buf", "ai_buf_copy_in", "ai_buf_copy_out"] {
+            let ty = self.module.get_function(legacy).unwrap().get_type();
+            self.module.add_function(&format!("{legacy}_v2"), ty, Some(inkwell::module::Linkage::External));
+        }
         // Threads. ptr ai_thread_spawn(ptr parent, ptr env, ptr code)
         self.module.add_function(
             "ai_thread_spawn",
             ptr.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_thread_bind_owner",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_atomic_i64_bind_owner",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
         // i64 ai_thread_join(ptr thread, ptr handle)
@@ -2581,6 +3026,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             i64t.fn_type(&[ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        self.module.add_function("ai_object_type_id",
+            self.ctx.i16_type().fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External));
         // ptr ai_closure_code_ptr(ptr thread, ptr env) — recover a closure's code
         // pointer from its env header type_id (correct for any capture count).
         self.module.add_function(
@@ -2591,6 +3039,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         for name in ["ai_chan_waiting_senders", "ai_chan_waiting_receivers"] {
             self.module.add_function(name, i64t.fn_type(&[ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
         }
+        self.module.add_function("ai_chan_bind_owner",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), Some(inkwell::module::Linkage::External));
         // Channels.
         self.module.add_function("ai_chan_new",
             ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i32t.into()], false), Some(inkwell::module::Linkage::External));
@@ -2709,13 +3159,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let base = self.builder.build_load(ptr, base_addr, "tlab.base").unwrap().into_pointer_value();
         let object = unsafe { self.builder.build_in_bounds_gep(self.ctx.i8_type(), base, &[cursor], "tlab.object").unwrap() };
         // Initialize the Full header once, including a known enum tag. A
-        // typed aggregate store preserves native endianness and padding.
-        let header_type = self.ctx.struct_type(&[i64t.into(), self.ctx.i16_type().into(),
-            self.ctx.i16_type().into(), i32t.into()], false);
+        // pair of numeric words preserves the low-16-bit ID and forwarding
+        // marker invariant on both byte orders, matching runtime Full::new.
+        let header_type = self.ctx.struct_type(&[i64t.into(), i64t.into()], false);
         let header = header_type.const_named_struct(&[
             i64t.const_int(header_tag.unwrap_or(0) as u64, false).into(),
-            self.ctx.i16_type().const_int(layout as u64, false).into(),
-            self.ctx.i16_type().const_zero().into(), i32t.const_zero().into(),
+            i64t.const_int(layout as u64, false).into(),
         ]);
         self.builder.build_store(object, header).unwrap().set_alignment(8).unwrap();
         let mut initialized = Full::SIZE as u64;
@@ -2755,7 +3204,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         for (addr, increment) in [(count_addr, 1), (bytes_addr, size)] {
             let old = self.builder.build_load(i64t, addr, "alloc.counter").unwrap().into_int_value();
             let next = self.builder.build_int_add(old, i64t.const_int(increment, false), "alloc.counter_next").unwrap();
-            self.builder.build_store(addr, next).unwrap();
+            // Match the native allocator and profile merges: overflow must
+            // retain a lower bound rather than silently reset a busy site.
+            let over = self.builder.build_int_compare(IntPredicate::UGT, old,
+                i64t.const_int(u64::MAX - increment, false), "alloc.counter_overflow").unwrap();
+            let saturated = self.builder.build_select(over, i64t.const_all_ones(), next,
+                "alloc.counter_saturated").unwrap();
+            self.builder.build_store(addr, saturated).unwrap();
         }
         let count_done = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).unwrap();
@@ -3148,7 +3603,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         match elem {
             Repr::Ref(_) | Repr::Value(_) => (8, true),
             Repr::Scalar(s) => ((s.bits().max(8) / 8) as u64, false),
-            _ => (8, false),
+            Repr::Unit => (1, false),
         }
     }
 
@@ -3168,12 +3623,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// arithmetic) preserves pointer provenance, so LLVM's alias analysis and
     /// strength reduction can optimize loops of array accesses. `idx64` must
     /// already be i64 (see `idx_to_i64`).
-    fn array_elem_addr(&self, arr: PointerValue<'ctx>, idx64: IntValue<'ctx>, stride: u64) -> PointerValue<'ctx> {
-        let i8t = self.ctx.i8_type();
+    fn array_elem_offset(&self, idx64: IntValue<'ctx>, stride: u64) -> IntValue<'ctx> {
         let i64t = self.ctx.i64_type();
         let off = self.builder.build_int_mul(idx64, i64t.const_int(stride, false), "a.off").unwrap();
-        let off = self.builder.build_int_add(off, i64t.const_int(Self::HEADER + 8, false), "a.h").unwrap();
-        unsafe { self.builder.build_in_bounds_gep(i8t, arr, &[off], "a.ep").unwrap() }
+        self.builder.build_int_add(off, i64t.const_int(Self::HEADER + 8, false), "a.h").unwrap()
     }
 
     /// Load an array's logical element count for a bounds check. The count word
@@ -3321,10 +3774,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     fn load_array_element(&mut self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, idx: IntValue<'ctx>, elem: &Repr, array: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let (stride, _) = Self::elem_stride(elem);
-        let addr = self.array_elem_addr(obj, idx, stride);
+        let offset = self.array_elem_offset(idx, stride);
         let ty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
         if matches!(elem, Repr::Value(_) | Repr::Ref(_)) {
-            let pointer = self.managed_load(addr, &Repr::Scalar(ScalarRepr::Ptr), "element.pointer", array)?.into_pointer_value();
+            let pointer = self.managed_load(fcx, obj, offset, &Repr::Scalar(ScalarRepr::Ptr), "element.pointer", array)?.into_pointer_value();
             let empty = self.ctx.append_basic_block(fcx.func, "element.uninitialized");
             let present = self.ctx.append_basic_block(fcx.func, "element.present");
             let is_null = self.builder.build_is_null(pointer, "element.unset").unwrap();
@@ -3337,7 +3790,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             if matches!(elem, Repr::Value(_)) {
                 Ok(self.builder.build_load(ty, self.obj_addr(pointer, Self::HEADER), "element.value").unwrap())
             } else { Ok(pointer.into()) }
-        } else { self.managed_load(addr, elem, "element", array) }
+        } else { self.managed_load(fcx, obj, offset, elem, "element", array) }
     }
 
     /// `array_get(a, i)` yields `Option<T>`: `Some(a[i])` when in bounds, `None`
@@ -3378,8 +3831,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         // In bounds: load the element and wrap it in Some.
         self.builder.position_at_end(some_bb);
-        let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
-        let some = self.build_value_variant(option_vid, OPTION_SOME_TAG, &[(v, elem.clone())]);
+        let values = if matches!(elem, Repr::Unit) { vec![] } else {
+            vec![(self.load_array_element(fcx, obj, idx64, elem, array)?, elem.clone())]
+        };
+        let some = self.build_value_variant(option_vid, OPTION_SOME_TAG, &values);
         let some_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge_bb).unwrap();
 
@@ -3410,6 +3865,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let idx64 = self.idx_to_i64(idx);
         let len = self.known_array_len(obj, array)?;
         self.emit_bounds_check(fcx, idx64, len);
+        if matches!(elem, Repr::Unit) { return Ok(None); }
         let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
         Ok(Some(v))
     }
@@ -3428,6 +3884,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let idx64 = self.idx_to_i64(idx);
         let len = self.known_array_len(obj, array)?;
         self.emit_bounds_check(fcx, idx64, len);
+        if matches!(elem, Repr::Unit) { return Ok(None); }
         let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
         Ok(Some(v))
     }
@@ -3447,21 +3904,25 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let lid = match array.repr { Repr::Ref(lid) => lid, _ => return Err(CodegenError("array destination is not a reference".into())) };
             let boxed = self.prog.layouts[lid as usize].element_box.ok_or_else(|| CodegenError("value array has no element box layout".into()))?;
             self.gen_alloc(fcx, boxed, None, std::slice::from_ref(value), crate::core::SpanId::default())?.unwrap()
+        } else if matches!(elem, Repr::Unit) {
+            self.gen_expr(fcx, value)?;
+            let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
+            let idx64 = self.idx_to_i64(idx);
+            let len = self.known_array_len(obj, array)?;
+            self.emit_bounds_check(fcx, idx64, len);
+            return Ok(None);
         } else { self.gen_expr(fcx, value)?.unwrap() };
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx64 = self.idx_to_i64(idx);
         let len = self.known_array_len(obj, array)?;
         self.emit_bounds_check(fcx, idx64, len);
         let (stride, _) = Self::elem_stride(elem);
-        let addr = self.array_elem_addr(obj, idx64, stride);
+        let offset = self.array_elem_offset(idx64, stride);
         let stored_repr = if matches!(elem, Repr::Value(_)) {
             Repr::Scalar(ScalarRepr::Ptr)
         } else { elem.clone() };
-        self.managed_store(addr, val, &stored_repr, array)?;
-        // Generational write barrier: a long-lived (tenured) array may receive a
-        // young pointer element. `emit_write_barrier` no-ops for scalar elements.
-        self.emit_write_barrier(fcx, obj, val);
-        Ok(Some(self.ctx.i64_type().const_zero().into()))
+        self.managed_store(fcx, obj, offset, val, &stored_repr, matches!(elem, Repr::Ref(_) | Repr::Value(_)), array)?;
+        Ok(None)
     }
 
     /// Build a closure: allocate the env, store the code pointer (the lifted
@@ -3538,13 +3999,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         // A value-struct field is an extractvalue on the inline aggregate.
         if let FieldLoc::ValueField { index } = loc {
-            let agg = self.gen_expr(fcx, base)?.unwrap().into_struct_value();
-            let v = self.builder.build_extract_value(agg, *index, "vfld").unwrap();
+            let value = self.gen_expr(fcx, base)?;
+            let Repr::Value(vid) = base.repr else { return Err(CodegenError("inline field on non-value".into())); };
+            let fields = &self.prog.values[vid as usize].fields;
+            let field = fields.get(*index as usize).ok_or_else(|| CodegenError("inline field index out of bounds".into()))?;
+            if matches!(field, Repr::Unit) { return Ok(None); }
+            let physical = fields[..*index as usize].iter().filter(|r| !matches!(r, Repr::Unit)).count() as u32;
+            let agg = value.unwrap().into_struct_value();
+            let v = self.builder.build_extract_value(agg, physical, "vfld").unwrap();
             return Ok(Some(v));
         }
-        let mut obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
+        if matches!(loc, FieldLoc::Unit) {
+            self.gen_expr(fcx, base)?;
+            return Ok(None);
+        }
+        let obj = self.gen_expr(fcx, base)?.unwrap().into_pointer_value();
         let aggregate = matches!(loc, FieldLoc::ValueAt { .. });
-        if aggregate { obj = self.managed_lock(fcx, obj); }
         let (off, lty): (u64, BasicTypeEnum) = match loc {
             FieldLoc::Ptr { idx } => (
                 Self::HEADER + (*idx as u64) * 8,
@@ -3564,20 +4034,25 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let raw_base = Self::HEADER + (lay.ptr_fields as u64) * 8;
                 (raw_base + *offset as u64, self.value_struct_ty(*value).as_basic_type_enum())
             }
-            FieldLoc::ValueField { .. } => unreachable!(),
+            FieldLoc::Unit | FieldLoc::ValueField { .. } => unreachable!(),
         };
-        let addr = self.obj_addr(obj, off);
         let v = if aggregate {
-            let snapshot = self.builder.build_load(lty, addr, "fld.snapshot").unwrap();
-            self.managed_unlock(fcx);
-            snapshot
+            let snapshot = self.entry_alloca(lty, "fld.snapshot.storage");
+            let FieldLoc::ValueAt { value, .. } = loc else { unreachable!() };
+            let bytes = self.prog.values[*value as usize].size as u64;
+            let read = self.module.get_function("ai_managed_read").unwrap();
+            self.build_managed_call(fcx, read, &[
+                fcx.thread.into(), obj.into(), self.ctx.i64_type().const_int(off, false).into(),
+                snapshot.into(), self.ctx.i64_type().const_int(bytes, false).into(),
+            ], "").unwrap();
+            self.builder.build_load(lty, snapshot, "fld.snapshot").unwrap()
         } else {
             let repr = match loc {
                 FieldLoc::Raw { repr, .. } => Repr::Scalar(*repr),
                 FieldLoc::Ptr { .. } => Repr::Scalar(ScalarRepr::Ptr),
                 _ => unreachable!(),
             };
-            self.managed_load(addr, &repr, "fld", base)?
+            self.managed_load(fcx, obj, self.ctx.i64_type().const_int(off, false), &repr, "fld", base)?
         };
         Ok(Some(v))
     }
@@ -3893,6 +4368,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let rv = self.gen_expr(fcx, r)?.unwrap();
         let b = &self.builder;
 
+        if scalar == ScalarRepr::Ptr {
+            let predicate = match op {
+                BinOp::Eq => IntPredicate::EQ,
+                BinOp::Ne => IntPredicate::NE,
+                _ => return Err(CodegenError("invalid pointer operator".into())),
+            };
+            let left = b.build_ptr_to_int(lv.into_pointer_value(), self.ctx.i64_type(), "ptr.left").unwrap();
+            let right = b.build_ptr_to_int(rv.into_pointer_value(), self.ctx.i64_type(), "ptr.right").unwrap();
+            return Ok(Some(b.build_int_compare(predicate, left, right, "ptr.equal").unwrap().into()));
+        }
         if scalar.is_float() {
             let lf = lv.into_float_value();
             let rf = rv.into_float_value();
@@ -4072,6 +4557,79 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             (Repr::Scalar(a), Repr::Scalar(b)) => (*a, *b),
             _ => return Err(CodegenError("non-scalar cast in v0 slice".into())),
         };
+        if ts == ScalarRepr::Char && fs != ScalarRepr::Char {
+            // Validate the original integer before narrowing: truncation could
+            // turn a negative or oversized input into an apparently valid char.
+            let integer = v.into_int_value();
+            let wide = if fs.bits() < 64 {
+                if fs.is_signed() {
+                    self.builder
+                        .build_int_s_extend(integer, self.ctx.i64_type(), "char.source")
+                        .unwrap()
+                } else {
+                    self.builder
+                        .build_int_z_extend(integer, self.ctx.i64_type(), "char.source")
+                        .unwrap()
+                }
+            } else {
+                integer
+            };
+            let ty = self.ctx.i64_type();
+            let too_large = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::UGT,
+                    wide,
+                    ty.const_int(0x10ffff, false),
+                    "char.range",
+                )
+                .unwrap();
+            let surrogate_low = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::UGE,
+                    wide,
+                    ty.const_int(0xd800, false),
+                    "char.surrogate.low",
+                )
+                .unwrap();
+            let surrogate_high = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::ULE,
+                    wide,
+                    ty.const_int(0xdfff, false),
+                    "char.surrogate.high",
+                )
+                .unwrap();
+            let surrogate = self
+                .builder
+                .build_and(surrogate_low, surrogate_high, "char.surrogate")
+                .unwrap();
+            let invalid = self
+                .builder
+                .build_or(too_large, surrogate, "char.invalid")
+                .unwrap();
+            let fail = self.ctx.append_basic_block(fcx.func, "char.fail");
+            let valid = self.ctx.append_basic_block(fcx.func, "char.valid");
+            self.builder
+                .build_conditional_branch(invalid, fail, valid)
+                .unwrap();
+            self.builder.position_at_end(fail);
+            let abort = self.module.get_function("ai_arithmetic_fail").unwrap();
+            self.build_managed_call(
+                fcx,
+                abort,
+                &[
+                    fcx.thread.into(),
+                    self.ctx.i32_type().const_int(2, false).into(),
+                ],
+                "",
+            )
+            .map_err(|error| CodegenError(error.to_string()))?;
+            self.builder.build_unreachable().unwrap();
+            self.builder.position_at_end(valid);
+        }
         let b = &self.builder;
         let res: BasicValueEnum = match (fs.is_float(), ts.is_float()) {
             (false, false) => {
@@ -4104,22 +4662,63 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let iv = v.into_int_value();
                 let dst = self.scalar_ty(ts).into_float_type();
                 if fs.is_signed() {
-                    b.build_signed_int_to_float(iv, dst, "sitofp").unwrap().into()
+                    b.build_signed_int_to_float(iv, dst, "sitofp")
+                        .unwrap()
+                        .into()
                 } else {
-                    b.build_unsigned_int_to_float(iv, dst, "uitofp").unwrap().into()
+                    b.build_unsigned_int_to_float(iv, dst, "uitofp")
+                        .unwrap()
+                        .into()
                 }
             }
             (true, false) => {
                 let fv = v.into_float_value();
                 let dst = self.scalar_ty(ts).into_int_type();
-                if ts.is_signed() {
-                    b.build_float_to_signed_int(fv, dst, "fptosi").unwrap().into()
+                // Plain fptosi/fptoui produce poison on NaN and out-of-range
+                // input. The saturating intrinsics define all inputs, including
+                // the 64-bit boundaries that cannot be represented exactly in
+                // either source float type.
+                let name = if ts.is_signed() {
+                    "llvm.fptosi.sat"
                 } else {
-                    b.build_float_to_unsigned_int(fv, dst, "fptoui").unwrap().into()
-                }
+                    "llvm.fptoui.sat"
+                };
+                let intrinsic = inkwell::intrinsics::Intrinsic::find(name)
+                    .ok_or_else(|| CodegenError(format!("missing intrinsic {name}")))?;
+                let function = intrinsic
+                    .get_declaration(&self.module, &[dst.into(), fv.get_type().into()])
+                    .ok_or_else(|| CodegenError(format!("cannot declare intrinsic {name}")))?;
+                b.build_call(function, &[fv.into()], "float.cast")
+                    .map_err(|error| CodegenError(error.to_string()))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| CodegenError(format!("intrinsic {name} returned no value")))?
             }
         };
         Ok(Some(res))
+    }
+
+    /// Emit path-local cleanup without consuming compile-time scope entries:
+    /// another branch can still continue evaluating this same foreign call.
+    fn emit_ffi_cleanup(&self, fcx: &FnCtx<'ctx>, buffer_base: usize, stack_base: usize) {
+        let free = self.module.get_function("ai_ffi_buffer_free_v2").unwrap();
+        for &token in fcx.pending_ffi_buffers[buffer_base..].iter().rev() {
+            self.build_managed_call(fcx, free, &[fcx.thread.into(), token.into()], "").unwrap();
+        }
+        for &token in fcx.ffi_stack_tokens[stack_base..].iter().rev() {
+            let intrinsic = inkwell::intrinsics::Intrinsic::find("llvm.stackrestore").unwrap();
+            let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
+            let overloads = if intrinsic.is_overloaded() { &types[..] } else { &[] };
+            let restore = intrinsic.get_declaration(&self.module, overloads).unwrap();
+            self.build_managed_call(fcx, restore, &[token.into()], "").unwrap();
+        }
+    }
+    fn finish_terminated_call(&self, fcx: &mut FnCtx<'ctx>, copies: usize, buffers: usize, stacks: usize) -> bool {
+        if self.builder.get_insert_block().unwrap().get_terminator().is_none() { return false; }
+        fcx.pending_copy_outs.truncate(copies);
+        fcx.pending_ffi_buffers.truncate(buffers);
+        fcx.ffi_stack_tokens.truncate(stacks);
+        true
     }
 
     fn gen_call(
@@ -4131,8 +4730,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let callee = self.funcs[&fid];
         // Foreign `extern "C"` callees take no leading Thread* — they're plain C.
         let is_extern = self.prog.funcs[fid as usize].is_extern;
-        // Dynamic foreign buffers live only through this call and its copy-out.
-        // Restore the stack before returning to a loop that may call again.
+        // ABI coercion temporaries live only through this call and its copy-out.
+        // Restore their stack storage before returning to a calling loop.
+        let stack_base = fcx.ffi_stack_tokens.len();
         let stack_token = if is_extern {
             let intrinsic = inkwell::intrinsics::Intrinsic::find("llvm.stacksave").unwrap();
             let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
@@ -4140,13 +4740,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             let save = intrinsic.get_declaration(&self.module, overloads).unwrap();
             Some(call_result(self.build_managed_call(fcx, save, &[], "ffi.stack").unwrap()))
         } else { None };
+        if let Some(token) = stack_token { fcx.ffi_stack_tokens.push(token); }
         let mut cargs: Vec<inkwell::values::BasicMetadataValueEnum> =
             if is_extern { vec![] } else { vec![fcx.thread.into()] };
         let param_reprs = self.prog.funcs[fid as usize].params.clone();
         let extern_by_ref = self.prog.funcs[fid as usize].extern_by_ref.clone();
+        let foreign_args = if is_extern { self.foreign_args(&self.prog.funcs[fid as usize]) } else { vec![] };
         // Any FFI copy-out buffers queued while evaluating THIS call's arguments
         // are drained after the call; snapshot the queue depth to isolate them.
         let copy_out_base = fcx.pending_copy_outs.len();
+        let buffer_base = fcx.pending_ffi_buffers.len();
 
         // GC-SAFETY: a `Ref` argument backed by a `Local` must be loaded from its
         // root slot AFTER every sibling argument that might allocate — otherwise a
@@ -4164,16 +4767,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             // struct lives on the native stack — never a GC heap object — so its
             // address is stable for the call and needs no pinning. See docs/ffi.md.
             if is_extern {
-                if let Some(Repr::Value(vid)) = param_reprs.get(i) {
+                if let Some(Repr::Value(_)) = param_reprs.get(i) {
                     let by_ref = extern_by_ref.get(i).copied().unwrap_or(false);
-                    let coerce = if by_ref { None } else { self.abi_coerce(*vid, false) };
+                    let coerce = match foreign_args[i] {
+                        ForeignArg::Direct(ty) => Some(ty),
+                        _ => None,
+                    };
                     match coerce {
                         // By value (≤ 16B): materialize the struct, reinterpret it
                         // into the coercion type through a stack slot (the upper
                         // bytes of a partly-filled register slot are don't-care, as
                         // in clang's lowering), and pass the coerced value.
                         Some(coerce_ty) => {
-                            if let Some(v) = self.gen_expr(fcx, a)? {
+                            let value = self.gen_expr(fcx, a)?;
+                            if self.finish_terminated_call(fcx, copy_out_base, buffer_base, stack_base) { return Ok(None); }
+                            if let Some(v) = value {
                                 let slot =
                                     self.entry_alloca(coerce_ty, "ffi.coerce");
                                 self.builder.build_store(slot, v).unwrap();
@@ -4187,13 +4795,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         // (so a `mut` out-param's writes land back in the caller's
                         // variable); a temporary spills to a fresh alloca.
                         None => {
-                            if let CoreExprKind::Local(id) = a.kind.as_ref() {
-                                if let Some(slot) = fcx.slots[*id as usize] {
-                                    cargs.push(slot.into());
-                                    continue;
+                            if by_ref {
+                                if let CoreExprKind::Local(id) = a.kind.as_ref() {
+                                    if let Some(slot) = fcx.slots[*id as usize] {
+                                        cargs.push(slot.into());
+                                        continue;
+                                    }
                                 }
                             }
-                            if let Some(v) = self.gen_expr(fcx, a)? {
+                            let value = self.gen_expr(fcx, a)?;
+                            if self.finish_terminated_call(fcx, copy_out_base, buffer_base, stack_base) { return Ok(None); }
+                            if let Some(v) = value {
                                 let slot =
                                     self.entry_alloca(v.get_type(), "ffi.arg");
                                 self.builder.build_store(slot, v).unwrap();
@@ -4213,7 +4825,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     continue;
                 }
             }
-            if let Some(v) = self.gen_expr(fcx, a)? {
+            let value = self.gen_expr(fcx, a)?;
+            if self.finish_terminated_call(fcx, copy_out_base, buffer_base, stack_base) { return Ok(None); }
+            if let Some(v) = value {
                 cargs.push(v.into());
             }
         }
@@ -4236,13 +4850,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let cs = if is_extern { self.builder.build_call(callee, &cargs, "call").unwrap() }
             else { self.build_managed_call(fcx, callee, &cargs, "call").unwrap() };
         if is_extern {
+            for (index, abi) in foreign_args.iter().enumerate() {
+                if matches!(abi, ForeignArg::Indirect { byval: true }) {
+                    let Repr::Value(vid) = param_reprs[index] else { unreachable!() };
+                    cs.add_attribute(inkwell::attributes::AttributeLoc::Param(index as u32),
+                        self.foreign_byval_attribute(vid));
+                }
+            }
             let leave = self.module.get_function("ai_ffi_leave").unwrap();
             self.build_managed_call(fcx, leave, &[fcx.thread.into()], "").unwrap();
         }
-        // Copy-out: write each `mut` array's stack buffer back into its heap
+        // Copy-out: write each `mut` array's native buffer back into its heap
         // object now that C has filled it (e.g. read(fd, buf, n)).
         if fcx.pending_copy_outs.len() > copy_out_base {
-            let cout = self.module.get_function("ai_buf_copy_out").unwrap();
+            let cout = self.module.get_function("ai_buf_copy_out_v2").unwrap();
             let pending: Vec<_> = fcx.pending_copy_outs.drain(copy_out_base..).collect();
             for (src, buf, byte_len, bits) in pending {
                 // Native callbacks or another mutator may have moved the array.
@@ -4275,13 +4896,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 }
             }
         }
-        if let Some(token) = stack_token {
-            let intrinsic = inkwell::intrinsics::Intrinsic::find("llvm.stackrestore").unwrap();
-            let types = [self.ctx.ptr_type(AddressSpace::default()).into()];
-            let overloads = if intrinsic.is_overloaded() { &types[..] } else { &[] };
-            let restore = intrinsic.get_declaration(&self.module, overloads).unwrap();
-            self.build_managed_call(fcx, restore, &[token.into()], "").unwrap();
-        }
+        self.emit_ffi_cleanup(fcx, buffer_base, stack_base);
+        fcx.pending_ffi_buffers.truncate(buffer_base);
+        fcx.ffi_stack_tokens.truncate(stack_base);
         Ok(ret_val)
     }
 
@@ -4363,6 +4980,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // v0 loops yield unit, so no break-value slot is needed.
         fcx.loops.push((cont_bb, None));
         fcx.loop_headers.push(header_bb);
+        fcx.loop_ffi_bases.push((fcx.pending_ffi_buffers.len(), fcx.ffi_stack_tokens.len()));
 
         self.builder.position_at_end(header_bb);
         // GC safepoint poll at the loop header: atomic acquire, volatile;
@@ -4376,6 +4994,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         fcx.loops.pop();
         fcx.loop_headers.pop();
+        fcx.loop_ffi_bases.pop();
         self.builder.position_at_end(cont_bb);
         Ok(None)
     }
@@ -4474,13 +5093,19 @@ struct FnCtx<'ctx> {
     loops: Vec<(BasicBlock<'ctx>, Option<PointerValue<'ctx>>)>,
     /// Per active loop: the header block (`continue` target).
     loop_headers: Vec<BasicBlock<'ctx>>,
+    /// Native buffer and stack marks at each loop entry.
+    loop_ffi_bases: Vec<(usize, usize)>,
+    /// Active foreign scopes, restored on normal completion or escaping edges.
+    ffi_stack_tokens: Vec<BasicValueEnum<'ctx>>,
     /// `(frame ptr, frame type, &thread.top_frame)` for the GC frame epilogue.
     /// `None` when this function allocated no GC frame (no Ref locals).
     unlink: Option<(PointerValue<'ctx>, inkwell::types::StructType<'ctx>, PointerValue<'ctx>)>,
-    /// FFI copy-out buffers awaiting write-back: `(heap object, stack buffer,
+    /// FFI copy-out buffers awaiting write-back: `(heap object, native buffer,
     /// byte length)`. Filled by an `AsCBytes { copy_out: true }` argument and
     /// drained by `gen_call` AFTER the extern call returns. See `docs/ffi.md`.
     pending_copy_outs: Vec<(CoreExpr, PointerValue<'ctx>, IntValue<'ctx>, u32)>,
+    /// Opaque native ownership tokens for enclosing foreign calls, including nested arguments.
+    pending_ffi_buffers: Vec<PointerValue<'ctx>>,
     /// This function's DWARF `DISubprogram` scope (debugger P2) — `Some` only when
     /// emitting debug info. Debug locations for the function's nodes use it as
     /// their scope (one function = one source, so scope/file stay consistent).
@@ -4520,29 +5145,13 @@ fn float_pred(op: BinOp) -> FloatPredicate {
     use BinOp::*;
     match op {
         Eq => FloatPredicate::OEQ,
-        Ne => FloatPredicate::ONE,
+        // IEEE inequality is true when either operand is NaN (unordered).
+        Ne => FloatPredicate::UNE,
         Lt => FloatPredicate::OLT,
         Le => FloatPredicate::OLE,
         Gt => FloatPredicate::OGT,
         Ge => FloatPredicate::OGE,
         _ => unreachable!(),
-    }
-}
-
-fn core_disc(e: &CoreExprKind) -> &'static str {
-    match e {
-        CoreExprKind::CallClosure { .. } => "call-closure",
-        CoreExprKind::MakeClosure { .. } => "make-closure",
-        CoreExprKind::New { .. } => "new",
-        CoreExprKind::MakeValue { .. } => "make-value",
-        CoreExprKind::MakeVariant { .. } => "make-variant",
-        CoreExprKind::Field { .. } => "field",
-        CoreExprKind::Match { .. } => "match",
-        CoreExprKind::Loop(_) => "loop",
-        CoreExprKind::Break(_) => "break",
-        CoreExprKind::Continue => "continue",
-        CoreExprKind::Assign { .. } => "assign",
-        _ => "expr",
     }
 }
 
@@ -4566,8 +5175,15 @@ fn optimize_module(module: &Module) -> Result<(), CodegenError> {
         CodeModel::Default,
     ).ok_or_else(|| CodegenError("cannot create optimization target machine".into()))?;
     let opts = PassBuilderOptions::create();
-    module.run_passes("default<O3>", &machine, opts)
-        .map_err(|e| CodegenError(format!("LLVM optimization failed: {e}")))
+    // Canonicalize aggregate construction before IPSCCP builds a lattice for
+    // every field of every intermediate insertvalue. Early scalar replacement
+    // and combining retain the full O3 pipeline without quadratic wide-value
+    // state for chains whose fields can already be simplified.
+    // Match the bounded InstCombine settings in LLVM's standard O3 pipeline;
+    // a single early sweep need not itself reach the final optimization fixpoint.
+    module.run_passes("function(sroa,instcombine<max-iterations=1;no-verify-fixpoint>),default<O3>", &machine, opts)
+        .map_err(|e| CodegenError(format!("LLVM optimization failed: {e}")))?;
+    module.verify().map_err(|e| CodegenError(format!("optimized LLVM module verify failed: {e}")))
 }
 
 /// Collector shapes are separate from nominal Core layout IDs. Payload-free
@@ -4623,12 +5239,8 @@ pub fn layouts_to_type_infos(prog: &CoreProgram) -> Vec<crate::gc::TypeInfo> {
                 crate::core::VarLen::Values => ti.with_varlen_values(l.ptr_fields),
                 crate::core::VarLen::Bytes => ti.with_varlen_bytes(l.ptr_fields),
             };
-            // Interior pointers (GC refs inside flattened value fields). Leaked
-            // to `&'static` — the type table lives for the whole program, so this
-            // is a bounded one-time leak, not a per-object cost. Empty stays `&[]`.
             if !l.interior_ptrs.is_empty() {
-                let leaked: &'static [u16] = Box::leak(l.interior_ptrs.clone().into_boxed_slice());
-                ti = ti.with_interior_ptrs(leaked);
+                ti = ti.with_owned_interior_ptrs(l.interior_ptrs.clone());
             }
             ti
         })
@@ -4673,26 +5285,8 @@ fn value_has_ref(values: &[crate::core::ValueLayout], vid: u32) -> bool {
 /// shared across variants (pointers-first layout), so its embedded refs are at
 /// fixed offsets `base, base+8, …` regardless of the active variant.
 fn value_interior_offsets(values: &[crate::core::ValueLayout], vid: u32, base: u16, out: &mut Vec<u16>) {
-    use crate::core::Repr;
-    let vl = &values[vid as usize];
-    if let Some(variants) = &vl.variants {
-        let max_ptrs = crate::core::value_enum_max_ptrs(variants, values);
-        for k in 0..max_ptrs {
-            out.push(base + k * 8);
-        }
-        return;
-    }
-    let mut off = 0u32;
-    for f in &vl.fields {
-        let (sz, align) = value_field_size_align(values, f);
-        off = (off + align - 1) & !(align - 1);
-        match f {
-            Repr::Ref(_) => out.push(base + off as u16),
-            Repr::Value(sub) => value_interior_offsets(values, *sub, base + off as u16, out),
-            _ => {}
-        }
-        off += sz;
-    }
+    crate::layout::visit_value_ref_offsets(values, vid, base as u32, &mut |offset| out.push(offset))
+        .expect("reference offsets must be validated during layout construction");
 }
 
 /// Collect the program's per-layout reflection metadata into a runtime
@@ -4712,47 +5306,194 @@ pub fn layouts_to_type_meta(prog: &CoreProgram) -> Vec<crate::gc::TypeMeta> {
         .collect()
 }
 
-/// Build the runtime [`gc::ValueMeta`] table — reflection metadata for inline
-/// `#[value]` aggregates, indexed by `ValueId`. Value-struct fields get
-/// value-relative byte offsets (mirroring `value_size_align`'s placement) so the
-/// heap-dump renderer can recurse into flattened value fields. Value enums are
-/// emitted as `Opaque` for now (their tag/union offsets aren't decoded yet).
-pub fn layouts_to_value_meta(prog: &CoreProgram) -> Vec<crate::gc::ValueMeta> {
+/// Build reflection views for canonical inline values, including references
+/// hoisted out of nested enum payloads. Reject unrepresentable metadata offsets.
+pub fn layouts_to_value_meta(prog: &CoreProgram) -> Result<Vec<crate::gc::ValueMeta>, CodegenError> {
     use crate::core::Repr;
-    use crate::gc::{FieldMeta, FieldTy, TypeKind, ValueMeta};
-    let align_up = |off: u32, a: u32| -> u32 { (off + a - 1) & !(a - 1) };
-    prog.values
-        .iter()
-        .enumerate()
-        .map(|(vid, vl)| {
-            let kind = if vl.variants.is_some() {
-                TypeKind::Opaque
-            } else {
-                let mut off = 0u32;
+    use crate::gc::{FieldMeta, FieldTy, TypeKind, ValueMeta, VariantMeta};
+    let error = || CodegenError("reflection value layout exceeds representable offset limit".into());
+    let offset = |n: u32| u16::try_from(n).map_err(|_| error());
+    let align_up = |off: u32, alignment: u32| off.checked_add(alignment - 1)
+        .map(|n| n & !(alignment - 1)).ok_or_else(error);
+    prog.values.iter().enumerate().map(|(vid, value)| {
+        let kind = if let Some(variants) = &value.variants {
+            let tag = crate::core::value_enum_max_ptrs(variants, &prog.values) as u32 * 8;
+            let tag_offset = offset(tag)?;
+            let raw_base = tag.checked_add(8).ok_or_else(error)?;
+            let variants = variants.iter().enumerate().map(|(tag, variant)| {
+                let mut pointer = 0u32;
+                let mut raw = 0u32;
                 let mut fields = Vec::new();
-                for (i, r) in vl.fields.iter().enumerate() {
-                    let name = vl.field_names.get(i).cloned().unwrap_or_else(|| i.to_string());
-                    let (sz, align, fty) = match r {
+                for (index, repr) in variant.fields.iter().enumerate() {
+                    let (at, ty) = match repr {
                         Repr::Unit => continue,
-                        Repr::Scalar(s) => {
-                            let b = (s.bits().max(8) / 8).max(1);
-                            (b, b, FieldTy::Scalar(crate::layout::scalar_kind(*s)))
+                        Repr::Ref(id) => {
+                            let at = pointer * 8;
+                            pointer += 1;
+                            (at, FieldTy::Ref(u16::try_from(*id).map_err(|_| error())?))
                         }
-                        Repr::Ref(lid) => (8, 8, FieldTy::Ref(*lid as u16)),
-                        Repr::Value(sub) => {
-                            let v = &prog.values[*sub as usize];
-                            (v.size, v.align, FieldTy::Value(*sub as u16))
+                        Repr::Scalar(scalar) => {
+                            let size = (scalar.bits().max(8) / 8).max(1);
+                            raw = align_up(raw, size)?;
+                            let at = raw_base.checked_add(raw).ok_or_else(error)?;
+                            raw = raw.checked_add(size).ok_or_else(error)?;
+                            (at, FieldTy::Scalar(crate::layout::scalar_kind(*scalar)))
+                        }
+                        Repr::Value(id) => {
+                            let nested = &prog.values[*id as usize];
+                            raw = align_up(raw, nested.align)?;
+                            let at = raw_base.checked_add(raw).ok_or_else(error)?;
+                            raw = raw.checked_add(nested.size).ok_or_else(error)?;
+                            let mut interiors = Vec::new();
+                            value_interior_offsets(&prog.values, *id, 0, &mut interiors);
+                            let value_id = u16::try_from(*id).map_err(|_| error())?;
+                            let ty = if interiors.is_empty() { FieldTy::Value(value_id) } else {
+                                let reference_offsets = interiors.into_iter().map(|child| {
+                                    let source = offset(pointer * 8)?;
+                                    pointer += 1;
+                                    Ok((child, source))
+                                }).collect::<Result<Vec<_>, CodegenError>>()?;
+                                FieldTy::ProjectedValue { value_id, reference_offsets }
+                            };
+                            (at, ty)
                         }
                     };
-                    off = align_up(off, align);
-                    fields.push(FieldMeta { name, offset: off as u16, ty: fty });
-                    off += sz;
+                    fields.push(FieldMeta { name: variant.field_names.get(index).cloned().unwrap_or_else(|| index.to_string()), offset: offset(at)?, ty });
                 }
-                TypeKind::Struct { fields }
-            };
-            ValueMeta { value_id: vid as u16, name: vl.name.clone(), kind }
-        })
-        .collect()
+                Ok(VariantMeta { name: variant.name.clone(), tag: u32::try_from(tag).map_err(|_| error())?, fields })
+            }).collect::<Result<Vec<_>, CodegenError>>()?;
+            TypeKind::Enum { tag_offset, variants }
+        } else {
+            let mut cursor = 0u32;
+            let mut fields = Vec::new();
+            for (index, repr) in value.fields.iter().enumerate() {
+                let (size, alignment) = value_field_size_align(&prog.values, repr);
+                let ty = match repr {
+                    Repr::Unit => continue,
+                    Repr::Scalar(scalar) => FieldTy::Scalar(crate::layout::scalar_kind(*scalar)),
+                    Repr::Ref(id) => FieldTy::Ref(u16::try_from(*id).map_err(|_| error())?),
+                    Repr::Value(id) => FieldTy::Value(u16::try_from(*id).map_err(|_| error())?),
+                };
+                cursor = align_up(cursor, alignment)?;
+                fields.push(FieldMeta { name: value.field_names.get(index).cloned().unwrap_or_else(|| index.to_string()), offset: offset(cursor)?, ty });
+                cursor = cursor.checked_add(size).ok_or_else(error)?;
+            }
+            TypeKind::Struct { fields }
+        };
+        Ok(ValueMeta { value_id: u16::try_from(vid).map_err(|_| error())?, name: value.name.clone(), kind })
+    }).collect()
+}
+
+/// Install the same runtime ABI mappings for every JIT execution context.
+fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::ExecutionEngine<'_>) {
+    use crate::runtime;
+    // Map runtime externs to their Rust implementations.
+    for (name, addr) in [
+        ("ai_gc_alloc_fixed", runtime::ai_gc_alloc_fixed as *const () as usize),
+        ("ai_gc_record_alloc", runtime::ai_gc_record_alloc as *const () as usize),
+        ("ai_gc_alloc_varlen", runtime::ai_gc_alloc_varlen as *const () as usize),
+        ("ai_gc_pollcheck_slow", runtime::ai_gc_pollcheck_slow as *const () as usize),
+        ("ai_ffi_enter", runtime::ai_ffi_enter as *const () as usize),
+        ("ai_ffi_leave", runtime::ai_ffi_leave as *const () as usize),
+        ("ai_current_thread", runtime::ai_current_thread as *const () as usize),
+        ("ai_ffi_reenter", runtime::ai_ffi_reenter as *const () as usize),
+        ("ai_ffi_exit", runtime::ai_ffi_exit as *const () as usize),
+        ("ai_print_int", runtime::ai_print_int as *const () as usize),
+        ("ai_print_float", runtime::ai_print_float as *const () as usize),
+        ("ai_print_str", runtime::ai_print_str as *const () as usize),
+        ("ai_print_str_raw", runtime::ai_print_str_raw as *const () as usize),
+        ("ai_str_len", runtime::ai_str_len as *const () as usize),
+        ("ai_str_eq", runtime::ai_str_eq as *const () as usize),
+        ("ai_str_eq_v2", runtime::ai_str_eq_v2 as *const () as usize),
+        ("ai_str_concat", runtime::ai_str_concat as *const () as usize),
+        ("ai_panic", runtime::ai_panic as *const () as usize),
+        ("ai_str_join", runtime::ai_str_join as *const () as usize),
+        ("ai_host_call", runtime::io::ai_host_call as *const () as usize),
+        ("ai_str_get", runtime::ai_str_get as *const () as usize),
+        ("ai_str_substring", runtime::ai_str_substring as *const () as usize),
+        ("ai_read_file", runtime::ai_read_file as *const () as usize),
+        ("ai_str_from_int", runtime::ai_str_from_int as *const () as usize),
+        ("ai_str_from_float", runtime::ai_str_from_float as *const () as usize),
+        ("ai_fmt_f64", runtime::ai_fmt_f64 as *const () as usize),
+        ("ai_char_to_str", runtime::ai_char_to_str as *const () as usize),
+        ("ai_type_name", runtime::ai_type_name as *const () as usize),
+        ("ai_heap_snapshot", runtime::ai_heap_snapshot as *const () as usize),
+        ("ai_reflect_field_count", runtime::ai_reflect_field_count as *const () as usize),
+        ("ai_reflect_field_kind", runtime::ai_reflect_field_kind as *const () as usize),
+        ("ai_reflect_field_i64", runtime::ai_reflect_field_i64 as *const () as usize),
+        ("ai_reflect_field_name", runtime::ai_reflect_field_name as *const () as usize),
+        ("ai_str_to_float", runtime::ai_str_to_float as *const () as usize),
+        ("ai_str_to_float_v2", runtime::ai_str_to_float_v2 as *const () as usize),
+        ("ai_str_hash", runtime::ai_str_hash as *const () as usize),
+        ("ai_str_hash_v2", runtime::ai_str_hash_v2 as *const () as usize),
+        ("ai_ffi_buffer_alloc_v1", runtime::ai_ffi_buffer_alloc_v1 as *const () as usize),
+        ("ai_ffi_buffer_free_v1", runtime::ai_ffi_buffer_free_v1 as *const () as usize),
+        ("ai_ffi_buffer_alloc_v2", runtime::ai_ffi_buffer_alloc_v2 as *const () as usize),
+        ("ai_ffi_buffer_free_v2", runtime::ai_ffi_buffer_free_v2 as *const () as usize),
+        ("ai_ffi_buffer_data_v2", runtime::ai_ffi_buffer_data_v2 as *const () as usize),
+        ("ai_str_copy_to_buf", runtime::ai_str_copy_to_buf as *const () as usize),
+        ("ai_str_copy_to_buf_v2", runtime::ai_str_copy_to_buf_v2 as *const () as usize),
+        ("ai_managed_lock", runtime::ai_managed_lock as *const () as usize),
+        ("ai_managed_read", runtime::ai_managed_read as *const () as usize),
+        ("ai_managed_try_write", runtime::ai_managed_try_write as *const () as usize),
+        ("ai_managed_unlock", runtime::ai_managed_unlock as *const () as usize),
+        ("ai_buf_copy_in", runtime::ai_buf_copy_in as *const () as usize),
+        ("ai_buf_copy_in_v2", runtime::ai_buf_copy_in_v2 as *const () as usize),
+        ("ai_buf_copy_out", runtime::ai_buf_copy_out as *const () as usize),
+        ("ai_buf_copy_out_v2", runtime::ai_buf_copy_out_v2 as *const () as usize),
+        ("ai_thread_spawn", runtime::ai_thread_spawn as *const () as usize),
+        ("ai_thread_join", runtime::ai_thread_join as *const () as usize),
+        ("ai_thread_bind_owner", runtime::ai_thread_bind_owner as *const () as usize),
+        ("ai_atomic_i64_bind_owner", runtime::ai_atomic_i64_bind_owner as *const () as usize),
+        ("ai_thread_sleep", runtime::ai_thread_sleep as *const () as usize),
+        ("ai_thread_yield", runtime::ai_thread_yield as *const () as usize),
+        ("ai_thread_current_id", runtime::ai_thread_current_id as *const () as usize),
+        ("ai_closure_code_ptr", runtime::ai_closure_code_ptr as *const () as usize),
+        ("ai_object_type_id", runtime::ai_object_type_id as *const () as usize),
+        ("ai_chan_new", runtime::ai_chan_new as *const () as usize),
+        ("ai_chan_bind_owner", runtime::ai_chan_bind_owner as *const () as usize),
+        ("ai_chan_close", runtime::ai_chan_close as *const () as usize),
+        ("ai_chan_waiting_senders", runtime::ai_chan_waiting_senders as *const () as usize),
+        ("ai_chan_waiting_receivers", runtime::ai_chan_waiting_receivers as *const () as usize),
+        ("ai_chan_send", runtime::ai_chan_send as *const () as usize),
+        ("ai_chan_recv", runtime::ai_chan_recv as *const () as usize),
+        ("ai_chan_sender_clone", runtime::ai_chan_sender_clone as *const () as usize),
+        ("ai_chan_sender_drop", runtime::ai_chan_sender_drop as *const () as usize),
+        ("ai_atomic_i64_new", runtime::ai_atomic_i64_new as *const () as usize),
+        ("ai_atomic_i64_load", runtime::ai_atomic_i64_load as *const () as usize),
+        ("ai_atomic_i64_store", runtime::ai_atomic_i64_store as *const () as usize),
+        ("ai_atomic_i64_fetch_add", runtime::ai_atomic_i64_fetch_add as *const () as usize),
+        ("ai_atomic_i64_compare_and_set", runtime::ai_atomic_i64_compare_and_set as *const () as usize),
+        ("ai_gc_write_barrier", runtime::ai_gc_write_barrier as *const () as usize),
+        ("ai_atom_ref_load", runtime::ai_atom_ref_load as *const () as usize),
+        ("ai_atom_ref_cas", runtime::ai_atom_ref_cas as *const () as usize),
+        ("ai_slot_bits8_load", runtime::ai_slot_bits8_load as *const () as usize),
+        ("ai_slot_bits8_store", runtime::ai_slot_bits8_store as *const () as usize),
+        ("ai_slot_bits16_load", runtime::ai_slot_bits16_load as *const () as usize),
+        ("ai_slot_bits16_store", runtime::ai_slot_bits16_store as *const () as usize),
+        ("ai_slot_bits32_load", runtime::ai_slot_bits32_load as *const () as usize),
+        ("ai_slot_bits32_store", runtime::ai_slot_bits32_store as *const () as usize),
+        ("ai_slot_bits64_load", runtime::ai_slot_bits64_load as *const () as usize),
+        ("ai_slot_bits64_store", runtime::ai_slot_bits64_store as *const () as usize),
+        ("ai_slot_ref_store", runtime::ai_slot_ref_store as *const () as usize),
+        ("ai_atom_bits8_load", runtime::ai_atom_bits8_load as *const () as usize),
+        ("ai_atom_bits8_cas", runtime::ai_atom_bits8_cas as *const () as usize),
+        ("ai_atom_bits16_load", runtime::ai_atom_bits16_load as *const () as usize),
+        ("ai_atom_bits16_cas", runtime::ai_atom_bits16_cas as *const () as usize),
+        ("ai_atom_bits32_load", runtime::ai_atom_bits32_load as *const () as usize),
+        ("ai_atom_bits32_cas", runtime::ai_atom_bits32_cas as *const () as usize),
+        ("ai_atom_bits64_load", runtime::ai_atom_bits64_load as *const () as usize),
+        ("ai_atom_bits64_cas", runtime::ai_atom_bits64_cas as *const () as usize),
+        ("ai_bounds_fail", runtime::ai_bounds_fail as *const () as usize),
+        ("ai_uninitialized_array_fail", runtime::ai_uninitialized_array_fail as *const () as usize),
+        ("ai_array_allocation_len", runtime::ai_array_allocation_len as *const () as usize),
+        ("ai_arithmetic_fail", runtime::ai_arithmetic_fail as *const () as usize),
+    ] {
+        if let Some(f) = module.get_function(name) {
+            engine.add_global_mapping(&f, addr);
+        }
+    }
+
 }
 
 /// JIT-compile and run a 0-arg `-> i64` entry with a real GC runtime, returning
@@ -4774,17 +5515,35 @@ pub enum GcRunMode {
     SemiSpace(usize),
 }
 
-pub fn jit_run_i64_gc(prog: &CoreProgram, stress: bool) -> Result<i64, CodegenError> {
-    jit_run_i64_mode(prog, if stress { GcRunMode::Stress } else { GcRunMode::Generational })
+///
+/// # Safety
+/// The program must preserve the compiler's typed Core/GC/ABI invariants. Any
+/// source-level unsafe operations and foreign functions must satisfy their
+/// runtime, pointer and callback-lifetime contracts. Execution invokes native
+/// machine code in this process; manually constructed Core is not validated.
+pub unsafe fn jit_run_i64_gc(prog: &CoreProgram, stress: bool) -> Result<i64, CodegenError> {
+    unsafe { jit_run_i64_mode(prog, if stress { GcRunMode::Stress } else { GcRunMode::Generational }) }
 }
 
 /// JIT-run with an explicit GC heap mode (see [`GcRunMode`]).
-pub fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, CodegenError> {
-    jit_run_i64_with_args(prog, mode, std::env::args_os().collect())
+///
+/// # Safety
+/// The program must preserve the compiler's typed Core/GC/ABI invariants. Any
+/// source-level unsafe operations and foreign functions must satisfy their
+/// runtime, pointer and callback-lifetime contracts. Execution invokes native
+/// machine code in this process; manually constructed Core is not validated.
+pub unsafe fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i64, CodegenError> {
+    unsafe { jit_run_i64_with_args(prog, mode, std::env::args_os().collect()) }
 }
 
 /// Execute with independent argv; children inherit this execution's arguments.
-pub fn jit_run_i64_with_args(
+///
+/// # Safety
+/// The program must preserve the compiler's typed Core/GC/ABI invariants. Any
+/// source-level unsafe operations and foreign functions must satisfy their
+/// runtime, pointer and callback-lifetime contracts. Execution invokes native
+/// machine code in this process; manually constructed Core is not validated.
+pub unsafe fn jit_run_i64_with_args(
     prog: &CoreProgram,
     mode: GcRunMode,
     arguments: Vec<std::ffi::OsString>,
@@ -4801,74 +5560,7 @@ pub fn jit_run_i64_with_args(
         .create_jit_execution_engine(OptimizationLevel::Aggressive)
         .map_err(|e| CodegenError(e.to_string()))?;
 
-    // Map runtime externs to their Rust implementations.
-    for (name, addr) in [
-        ("ai_gc_alloc_fixed", runtime::ai_gc_alloc_fixed as *const () as usize),
-        ("ai_gc_record_alloc", runtime::ai_gc_record_alloc as *const () as usize),
-        ("ai_gc_alloc_varlen", runtime::ai_gc_alloc_varlen as *const () as usize),
-        ("ai_gc_pollcheck_slow", runtime::ai_gc_pollcheck_slow as *const () as usize),
-        ("ai_ffi_enter", runtime::ai_ffi_enter as *const () as usize),
-        ("ai_ffi_leave", runtime::ai_ffi_leave as *const () as usize),
-        ("ai_current_thread", runtime::ai_current_thread as *const () as usize),
-        ("ai_ffi_reenter", runtime::ai_ffi_reenter as *const () as usize),
-        ("ai_ffi_exit", runtime::ai_ffi_exit as *const () as usize),
-        ("ai_print_int", runtime::ai_print_int as *const () as usize),
-        ("ai_print_float", runtime::ai_print_float as *const () as usize),
-        ("ai_print_str", runtime::ai_print_str as *const () as usize),
-        ("ai_print_str_raw", runtime::ai_print_str_raw as *const () as usize),
-        ("ai_str_len", runtime::ai_str_len as *const () as usize),
-        ("ai_str_eq", runtime::ai_str_eq as *const () as usize),
-        ("ai_str_concat", runtime::ai_str_concat as *const () as usize),
-        ("ai_panic", runtime::ai_panic as *const () as usize),
-        ("ai_str_join", runtime::ai_str_join as *const () as usize),
-        ("ai_host_call", runtime::io::ai_host_call as *const () as usize),
-        ("ai_str_get", runtime::ai_str_get as *const () as usize),
-        ("ai_str_substring", runtime::ai_str_substring as *const () as usize),
-        ("ai_str_from_int", runtime::ai_str_from_int as *const () as usize),
-        ("ai_str_from_float", runtime::ai_str_from_float as *const () as usize),
-        ("ai_char_to_str", runtime::ai_char_to_str as *const () as usize),
-        ("ai_type_name", runtime::ai_type_name as *const () as usize),
-        ("ai_heap_snapshot", runtime::ai_heap_snapshot as *const () as usize),
-        ("ai_reflect_field_count", runtime::ai_reflect_field_count as *const () as usize),
-        ("ai_reflect_field_kind", runtime::ai_reflect_field_kind as *const () as usize),
-        ("ai_reflect_field_i64", runtime::ai_reflect_field_i64 as *const () as usize),
-        ("ai_reflect_field_name", runtime::ai_reflect_field_name as *const () as usize),
-        ("ai_str_to_float", runtime::ai_str_to_float as *const () as usize),
-        ("ai_str_hash", runtime::ai_str_hash as *const () as usize),
-        ("ai_str_copy_to_buf", runtime::ai_str_copy_to_buf as *const () as usize),
-        ("ai_managed_lock", runtime::ai_managed_lock as *const () as usize),
-        ("ai_managed_unlock", runtime::ai_managed_unlock as *const () as usize),
-        ("ai_buf_copy_in", runtime::ai_buf_copy_in as *const () as usize),
-        ("ai_buf_copy_out", runtime::ai_buf_copy_out as *const () as usize),
-        ("ai_thread_spawn", runtime::ai_thread_spawn as *const () as usize),
-        ("ai_thread_join", runtime::ai_thread_join as *const () as usize),
-        ("ai_thread_sleep", runtime::ai_thread_sleep as *const () as usize),
-        ("ai_thread_yield", runtime::ai_thread_yield as *const () as usize),
-        ("ai_thread_current_id", runtime::ai_thread_current_id as *const () as usize),
-        ("ai_closure_code_ptr", runtime::ai_closure_code_ptr as *const () as usize),
-        ("ai_chan_new", runtime::ai_chan_new as *const () as usize),
-        ("ai_chan_close", runtime::ai_chan_close as *const () as usize),
-        ("ai_chan_waiting_senders", runtime::ai_chan_waiting_senders as *const () as usize),
-        ("ai_chan_waiting_receivers", runtime::ai_chan_waiting_receivers as *const () as usize),
-        ("ai_chan_send", runtime::ai_chan_send as *const () as usize),
-        ("ai_chan_recv", runtime::ai_chan_recv as *const () as usize),
-        ("ai_chan_sender_clone", runtime::ai_chan_sender_clone as *const () as usize),
-        ("ai_chan_sender_drop", runtime::ai_chan_sender_drop as *const () as usize),
-        ("ai_atomic_i64_new", runtime::ai_atomic_i64_new as *const () as usize),
-        ("ai_atomic_i64_load", runtime::ai_atomic_i64_load as *const () as usize),
-        ("ai_atomic_i64_store", runtime::ai_atomic_i64_store as *const () as usize),
-        ("ai_atomic_i64_fetch_add", runtime::ai_atomic_i64_fetch_add as *const () as usize),
-        ("ai_atomic_i64_compare_and_set", runtime::ai_atomic_i64_compare_and_set as *const () as usize),
-        ("ai_gc_write_barrier", runtime::ai_gc_write_barrier as *const () as usize),
-        ("ai_bounds_fail", runtime::ai_bounds_fail as *const () as usize),
-        ("ai_uninitialized_array_fail", runtime::ai_uninitialized_array_fail as *const () as usize),
-        ("ai_array_allocation_len", runtime::ai_array_allocation_len as *const () as usize),
-        ("ai_arithmetic_fail", runtime::ai_arithmetic_fail as *const () as usize),
-    ] {
-        if let Some(f) = compiled.module.get_function(name) {
-            ee.add_global_mapping(&f, addr);
-        }
-    }
+    map_runtime_symbols(&compiled.module, &ee);
 
     let tis = layouts_to_type_infos(prog);
     // Normal runs use the GENERATIONAL heap: a small nursery (collected cheaply
@@ -4897,10 +5589,14 @@ pub fn jit_run_i64_with_args(
     // Install reflection metadata so heap-exploration tooling and in-language
     // reflection can recover type/field names (the GC type table is nameless).
     rt.heap().set_type_meta(layouts_to_type_meta(prog));
-    rt.heap().set_value_meta(layouts_to_value_meta(prog));
+    rt.heap().set_value_meta(layouts_to_value_meta(prog)?);
     // Install the allocation-site table (Target-1b) so GCR_ALLOC_PROFILE can
     // name each site's (function, type).
     rt.heap().set_alloc_sites(compiled.alloc_sites.clone());
+    if let Some(path) = std::env::var_os("GCR_GC_LOG") {
+        rt.heap().start_gc_log(&path)
+            .map_err(|error| CodegenError(format!("cannot create GC log {:?}: {error}", path)))?;
+    }
 
     let addr = ee
         .get_function_address(&compiled.entry_name)
@@ -4909,8 +5605,7 @@ pub fn jit_run_i64_with_args(
     let f: EntryFn = unsafe { std::mem::transmute(addr) };
     let thread = rt.thread_ptr();
     // Publish the current thread so FFI callback trampolines can recover it.
-    runtime::set_current_thread(thread);
-    let result = unsafe { f(thread) };
+    let result = rt.enter(|thread| unsafe { f(thread) });
     unsafe {
         rt.finish_threads();
     }
@@ -4927,44 +5622,43 @@ pub fn jit_run_i64_with_args(
         // source for `gcr heap` and the heap-explorer widget.
         if let Some(path) = std::env::var_os("GCR_HEAP_DUMP_FILE") {
             if let Err(e) = std::fs::write(&path, &dump) {
-                eprintln!("gc-rust: cannot write heap dump to {:?}: {e}", path);
+                let message = format!("gc-rust: cannot write heap dump to {:?}: {e}\n", path);
+                unsafe { runtime::write_diagnostic(thread, message.as_bytes()); }
             }
         } else {
-            eprint!("{dump}");
+            unsafe { runtime::write_diagnostic(thread, dump.as_bytes()); }
         }
     }
     // Opt-in GC stats (set GCR_GC_STATS=1) — useful to confirm the generational
     // split is working: minor collections should dominate on young-heavy loads.
     if std::env::var("GCR_GC_STATS").is_ok() {
-        eprintln!(
-            "gc-rust: {} minor + {} major collections",
-            rt.heap().minor_collections(),
-            rt.heap().collections(),
-        );
-        // Pause-time + reclaim/promote summary (per kind, p50/p99/max).
-        eprint!("{}", rt.heap().gc_stats_summary());
-    }
-    // Opt-in GC log: GCR_GC_LOG=<path> writes one JSON object per collection.
-    if let Some(path) = std::env::var_os("GCR_GC_LOG") {
-        let _ = std::fs::write(&path, rt.heap().gc_log_jsonl());
+        let summary = format!("gc-rust: {} minor + {} major collections\n{}", rt.heap().minor_collections(), rt.heap().collections(), rt.heap().gc_stats_summary());
+        unsafe { runtime::write_diagnostic(thread, summary.as_bytes()); }
     }
     // Opt-in allocation-site profile (Target-1b): GCR_ALLOC_PROFILE=1 prints the
     // per-site count+bytes table at program end (heap quiescent).
     if std::env::var_os("GCR_ALLOC_PROFILE").is_some() {
-        eprint!("{}", rt.heap().alloc_site_profile_report());
+        let report = rt.heap().alloc_site_profile_report();
+        unsafe { runtime::write_diagnostic(thread, report.as_bytes()); }
     }
     // `gcr bench` metrics sink: GCR_METRICS_FILE=<path> writes the machine-readable
     // per-run metrics (GC cycles/pauses, allocation churn, peak heap) as JSON.
-    if let Some(path) = std::env::var_os("GCR_METRICS_FILE") {
-        let _ = std::fs::write(&path, rt.heap().metrics_json());
-    }
+    let metrics_path = std::env::var_os("GCR_METRICS_FILE");
+    runtime::finish_gc_telemetry(rt.heap(), metrics_path.as_deref().map(std::path::Path::new))
+        .map_err(CodegenError)?;
     Ok(result)
 }
 
 /// JIT-compile and run a 0-arg `-> i64` entry. Uses the GC runtime so heap
 /// programs work; allocation-free programs still run (null-frame fast path).
-pub fn jit_run_i64(prog: &CoreProgram) -> Result<i64, CodegenError> {
-    jit_run_i64_gc(prog, false)
+///
+/// # Safety
+/// The program must preserve the compiler's typed Core/GC/ABI invariants. Any
+/// source-level unsafe operations and foreign functions must satisfy their
+/// runtime, pointer and callback-lifetime contracts. Execution invokes native
+/// machine code in this process; manually constructed Core is not validated.
+pub unsafe fn jit_run_i64(prog: &CoreProgram) -> Result<i64, CodegenError> {
+    unsafe { jit_run_i64_gc(prog, false) }
 }
 
 // =============================================================================
@@ -5113,10 +5807,10 @@ pub fn codegen_aot_object_level(
     let interior: Vec<Vec<u16>> = physical_layouts(prog).layouts.iter().map(|l| l.interior_ptrs.clone()).collect();
     let meta_bytes = crate::gc::reflect::encode(
         &layouts_to_type_meta(prog),
-        &layouts_to_value_meta(prog),
+        &layouts_to_value_meta(prog)?,
         &interior,
         &compiled.alloc_sites,
-    );
+    ).map_err(|error| CodegenError(error.to_string()))?;
     let meta_vals: Vec<_> = meta_bytes
         .iter()
         .map(|b| i8t.const_int(*b as u64, false))
@@ -5138,7 +5832,7 @@ pub fn codegen_aot_object_level(
         false,
     );
     let runtime_main = module.add_function(
-        "gcr_runtime_main_v3",
+        "gcr_runtime_main_v4",
         runtime_main_ty,
         Some(inkwell::module::Linkage::External),
     );
@@ -5238,7 +5932,10 @@ pub fn build_executable_level(
     // pulls libc; we add the rest explicitly. `extra_link_args` (from `gcr build
     // --link-arg …`) is appended for FFI programs — notably the self-hosting
     // compiler, which links libLLVM (`-L<llvm>/lib -lLLVM -Wl,-rpath,…`).
-    let mut linker = std::process::Command::new("cc");
+    // Treat CC as one executable path, preserving non-UTF-8 paths and spaces.
+    // Arguments remain separate process arguments, never shell input.
+    let linker_program = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut linker = std::process::Command::new(&linker_program);
     if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {
         linker.arg("-fsanitize=thread");
     }
@@ -5250,11 +5947,11 @@ pub fn build_executable_level(
         .args(["-lpthread", "-ldl", "-lm"])
         .args(extra_link_args)
         .status()
-        .map_err(|e| CodegenError(format!("failed to invoke linker (cc): {}", e)))?;
+        .map_err(|e| CodegenError(format!("failed to invoke linker ({}): {}", linker_program.to_string_lossy(), e)))?;
     if !status.success() {
         return Err(CodegenError(format!(
-            "linker (cc) failed with status {}",
-            status
+            "linker ({}) failed with status {}",
+            linker_program.to_string_lossy(), status
         )));
     }
 
@@ -5463,7 +6160,7 @@ mod tests {
         let m = parse_module(&lex(src).unwrap()).unwrap();
         let r = resolve_module(m).unwrap();
         let prog = lower_program(&r.globals).unwrap();
-        jit_run_i64(&prog).unwrap()
+        unsafe { jit_run_i64(&prog) }.unwrap()
     }
 
     #[test]
@@ -5641,7 +6338,7 @@ mod tests {
         let m = parse_module(&lex(src).unwrap()).unwrap();
         let r = resolve_module(m).unwrap();
         let prog = lower_program(&r.globals).unwrap();
-        jit_run_i64_gc(&prog, stress).unwrap()
+        unsafe { jit_run_i64_gc(&prog, stress) }.unwrap()
     }
 
     #[test]
@@ -5649,6 +6346,457 @@ mod tests {
         let src = "struct Point { x: i64, y: i64 } \
                    fn main() -> i64 { let p = Point { x: 3, y: 4 }; p.x + p.y }";
         assert_eq!(run_gc(src, false), 7);
+    }
+
+    #[test]
+    fn generated_aggregate_access_survives_active_concurrent_cycles() {
+        if std::env::var_os("GCR_GENERATED_CONCURRENT_CHILD").is_none() {
+            let log = std::env::temp_dir().join(format!(
+                "gcr-generated-concurrent-{}.log",
+                std::process::id()
+            ));
+            let output = std::fs::File::create(&log).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "codegen::tests::generated_aggregate_access_survives_active_concurrent_cycles",
+                    "--nocapture",
+                ])
+                .env("GCR_GENERATED_CONCURRENT_CHILD", "1")
+                .env("GCR_GC_VERIFY", "1")
+                .env("GCRUST_POISON", "1")
+                .stdout(output.try_clone().unwrap())
+                .stderr(output)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!(
+                        "generated concurrent workload stalled: {}",
+                        std::fs::read_to_string(&log).unwrap()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let details = std::fs::read_to_string(&log).unwrap();
+            std::fs::remove_file(log).unwrap();
+            assert!(status.success(), "{details}");
+            for line in details
+                .lines()
+                .filter(|line| line.starts_with("generated concurrent:"))
+            {
+                eprintln!("{line}");
+            }
+            return;
+        }
+        use crate::gc::IdentityPtrPolicy;
+        use crate::runtime::RuntimeContext;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicUsize, Ordering},
+        };
+        static ACTIVE_WRITES: AtomicUsize = AtomicUsize::new(0);
+        static OPERATIONS: AtomicUsize = AtomicUsize::new(0);
+        static OLD_ALIAS_WRITES: AtomicUsize = AtomicUsize::new(0);
+        static YOUNG_EDGE_WRITES: AtomicUsize = AtomicUsize::new(0);
+        static FIRST_YOUNG_MINOR: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static FIRST_WRITER: AtomicUsize = AtomicUsize::new(0);
+        static SECOND_WRITER_SEEN: AtomicBool = AtomicBool::new(false);
+        static SECOND_WRITER: AtomicUsize = AtomicUsize::new(0);
+        static READER_SEEN: AtomicBool = AtomicBool::new(false);
+        static ACTIVE_READER_SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
+        static ACTIVE_READER_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        static FIRST_ACTIVE_WRITER: AtomicUsize = AtomicUsize::new(0);
+        static SECOND_ACTIVE_WRITER_SEEN: AtomicBool = AtomicBool::new(false);
+        static COLLECTIONS_DONE: AtomicBool = AtomicBool::new(false);
+        static COMPLETION_CELL: AtomicPtr<AtomicI64> = AtomicPtr::new(std::ptr::null_mut());
+        unsafe extern "C" fn observe_completion_new(
+            thread: *mut crate::runtime::Thread, value: i64,
+        ) -> *mut AtomicI64 {
+            let cell = unsafe { crate::runtime::ai_atomic_i64_new(thread, value) };
+            assert!(COMPLETION_CELL.compare_exchange(std::ptr::null_mut(), cell,
+                Ordering::AcqRel, Ordering::Acquire).is_ok(), "one completion cell per mode");
+            cell
+        }
+        unsafe extern "C" fn observe_completion_load(
+            thread: *mut crate::runtime::Thread, cell: *const AtomicI64,
+        ) -> i64 {
+            // Signal through the owning RUNNING mutator, never by dereferencing
+            // a borrowed native cell from the collector after its owner exits.
+            if cell == COMPLETION_CELL.load(Ordering::Acquire)
+                && COLLECTIONS_DONE.load(Ordering::Acquire)
+            {
+                unsafe { crate::runtime::ai_atomic_i64_store(thread, cell, 1); }
+            }
+            unsafe { crate::runtime::ai_atomic_i64_load(thread, cell) }
+        }
+        unsafe extern "C" fn observe_write(
+            thread: *mut crate::runtime::Thread,
+            object: *mut u8,
+            offset: usize,
+            source: *const u8,
+            bytes: usize,
+            references: *const u16,
+            count: usize,
+        ) -> u8 {
+            let heap = unsafe { &*(*thread).heap };
+            let active = heap.barriers_active() && !heap.gc_requested();
+            let old_alias = active && unsafe { heap.read_barrier(object) } != object;
+            let young_edge = active
+                && !heap.is_nursery(object)
+                && (0..count).any(|index| unsafe {
+                    let at = references.add(index).read() as usize;
+                    heap.is_nursery(source.add(at).cast::<u64>().read_unaligned() as *const u8)
+                });
+            let result = unsafe {
+                crate::runtime::ai_managed_try_write(
+                    thread, object, offset, source, bytes, references, count,
+                )
+            };
+            // This runtime operation cannot safepoint. Copying cannot finish
+            // while this RUNNING mutator is inside the observed operation.
+            if result == 1 {
+                OPERATIONS.fetch_add(1, Ordering::Release);
+                let address = thread as usize;
+                let first = FIRST_WRITER
+                    .compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire)
+                    .unwrap_or_else(|previous| previous);
+                if first != 0 && first != address {
+                    SECOND_WRITER.store(address, Ordering::Release);
+                    SECOND_WRITER_SEEN.store(true, Ordering::Release);
+                }
+                if active {
+                    ACTIVE_WRITES.fetch_add(1, Ordering::Relaxed);
+                    let first = FIRST_ACTIVE_WRITER
+                        .compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire)
+                        .unwrap_or_else(|previous| previous);
+                    if first != 0 && first != address {
+                        SECOND_ACTIVE_WRITER_SEEN.store(true, Ordering::Release);
+                    }
+                }
+            }
+            if young_edge && result == 1 {
+                let _ = FIRST_YOUNG_MINOR.compare_exchange(
+                    usize::MAX,
+                    heap.minor_collections(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                YOUNG_EDGE_WRITES.fetch_add(1, Ordering::Release);
+            }
+            if old_alias && result == 1 {
+                OLD_ALIAS_WRITES.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
+        unsafe extern "C" fn observe_read(
+            thread: *mut crate::runtime::Thread,
+            object: *mut u8,
+            offset: usize,
+            destination: *mut u8,
+            bytes: usize,
+        ) {
+            let heap = unsafe { &*(*thread).heap };
+            let active = heap.barriers_active() && !heap.gc_requested();
+            let first = FIRST_WRITER.load(Ordering::Acquire);
+            let second = SECOND_WRITER.load(Ordering::Acquire);
+            let reader =
+                first != 0 && second != 0 && thread as usize != first && thread as usize != second;
+            if reader && active {
+                ACTIVE_READER_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe {
+                crate::runtime::ai_managed_read(thread, object, offset, destination, bytes);
+            }
+            OPERATIONS.fetch_add(1, Ordering::Release);
+            if reader {
+                READER_SEEN.store(true, Ordering::Release);
+                // A contended read may park and finish after copying ends.
+                // Count only reads that return while copying remains active.
+                if active && heap.barriers_active() {
+                    ACTIVE_READER_SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // Keep a substantial reference graph alive while fresh aggregates and
+        // scalar slots change. The collector runs independently of allocations.
+        let source = r#"
+            struct Leaf { n: i64 }
+            #[value] struct Pair { left: Leaf, right: Leaf, total: i64 }
+            struct Holder { pair: Pair, scalar: i64 }
+            struct Container { holder: Holder }
+            fn main() -> i64 {
+                let mut live: Array<Leaf> = Array::new(120000);
+                for i in 0..120000 { live[i] = Leaf { n: i }; }
+                let container = Container { holder: Holder {
+                    pair: Pair { left: live[0], right: live[1], total: 1 }, scalar: 0
+                } };
+                // Escape through an atomic owner so this stays an observable
+                // heap-edge load rather than a loop-invariant rooted Holder.
+                let published = Atom::new(container);
+                let done = AtomicI64::new(0);
+                let mut i = 0;
+                // A native atomic load does not park through the copying phase.
+                while i < 100000 || i % 1024 != 0 || done.load() == 0 {
+                    // Reload through a heap edge. Concurrent discovery defers
+                    // healing this edge, so old aliases remain observable.
+                    let container = published.deref();
+                    let mut holder = container.holder;
+                    let left = Leaf { n: i };
+                    let right = Leaf { n: 0 - i };
+                    holder.pair = Pair { left: left, right: right, total: 0 };
+                    holder.scalar = i;
+                    let snapshot = holder.pair;
+                    if snapshot.left.n != i || snapshot.right.n != 0 - i || snapshot.total != 0 { return 81; }
+                    if holder.scalar != i { return 82; }
+                    if live[i % 120000].n != i % 120000 { return 83; }
+                    i = i + 1;
+                }
+                42
+            }
+        "#;
+        for (case, source) in [
+            ("single", source),
+            (
+                "shared",
+                include_str!("../tests/fixtures/concurrent_aggregates.gcr"),
+            ),
+        ] {
+            let shared = case == "shared";
+            let (module, _) = crate::compile::parse_with_prelude(source).unwrap();
+            let resolved = resolve_module(module).unwrap();
+            let program = lower_program(&resolved.globals).unwrap();
+            for (generational, optimized) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let mode = if generational {
+                    "generational"
+                } else {
+                    "semispace"
+                };
+                let context = Context::create();
+                let compiled = codegen(&context, &program).unwrap();
+                if optimized {
+                    optimize_module(&compiled.module).unwrap();
+                }
+                let engine = compiled
+                    .module
+                    .create_jit_execution_engine(OptimizationLevel::None)
+                    .unwrap();
+                map_runtime_symbols(&compiled.module, &engine);
+                ACTIVE_WRITES.store(0, Ordering::Relaxed);
+                OPERATIONS.store(0, Ordering::Relaxed);
+                OLD_ALIAS_WRITES.store(0, Ordering::Relaxed);
+                YOUNG_EDGE_WRITES.store(0, Ordering::Relaxed);
+                FIRST_YOUNG_MINOR.store(usize::MAX, Ordering::Relaxed);
+                COLLECTIONS_DONE.store(false, Ordering::Relaxed);
+                COMPLETION_CELL.store(std::ptr::null_mut(), Ordering::Relaxed);
+                FIRST_WRITER.store(0, Ordering::Relaxed);
+                SECOND_WRITER_SEEN.store(false, Ordering::Relaxed);
+                SECOND_WRITER.store(0, Ordering::Relaxed);
+                READER_SEEN.store(false, Ordering::Relaxed);
+                ACTIVE_READER_SNAPSHOTS.store(0, Ordering::Relaxed);
+                ACTIVE_READER_ATTEMPTS.store(0, Ordering::Relaxed);
+                FIRST_ACTIVE_WRITER.store(0, Ordering::Relaxed);
+                SECOND_ACTIVE_WRITER_SEEN.store(false, Ordering::Relaxed);
+                engine.add_global_mapping(
+                    &compiled.module.get_function("ai_atomic_i64_new").unwrap(),
+                    observe_completion_new as *const () as usize,
+                );
+                engine.add_global_mapping(
+                    &compiled.module.get_function("ai_atomic_i64_load").unwrap(),
+                    observe_completion_load as *const () as usize,
+                );
+                engine.add_global_mapping(
+                    &compiled
+                        .module
+                        .get_function("ai_managed_try_write")
+                        .unwrap(),
+                    observe_write as *const () as usize,
+                );
+                engine.add_global_mapping(
+                    &compiled.module.get_function("ai_managed_read").unwrap(),
+                    observe_read as *const () as usize,
+                );
+                let mut runtime = if generational {
+                    RuntimeContext::new_generational(1 << 20, 32 << 20, layouts_to_type_infos(&program))
+                } else {
+                    RuntimeContext::new(16 << 20, layouts_to_type_infos(&program))
+                };
+                let heap = runtime.heap().clone();
+                let stop = Arc::new(AtomicBool::new(false));
+                let collector_stop = stop.clone();
+                let collector_heap = heap.clone();
+                let collector = std::thread::spawn(move || {
+                    // Avoid counting cycles over an empty heap before generated code
+                    // has started publishing the live graph.
+                    while collector_heap.from_used() < 128 * 1024
+                        || FIRST_WRITER.load(Ordering::Acquire) == 0
+                        || (shared
+                            && (!SECOND_WRITER_SEEN.load(Ordering::Acquire)
+                                || !READER_SEEN.load(Ordering::Acquire)))
+                    {
+                        if collector_stop.load(Ordering::Acquire) {
+                            return 0;
+                        }
+                        std::thread::yield_now();
+                    }
+                    let mut cycles = 0;
+                    let participants_covered = || {
+                        if shared {
+                            SECOND_ACTIVE_WRITER_SEEN.load(Ordering::Acquire)
+                                && ACTIVE_READER_SNAPSHOTS.load(Ordering::Acquire) > 0
+                                && (generational || OLD_ALIAS_WRITES.load(Ordering::Acquire) > 0)
+                        } else {
+                            generational || OLD_ALIAS_WRITES.load(Ordering::Acquire) > 0
+                        }
+                    };
+                    while !collector_stop.load(Ordering::Acquire)
+                        && (cycles < 8
+                            || !participants_covered()
+                            || (generational
+                                && (YOUNG_EDGE_WRITES.load(Ordering::Acquire) == 0
+                                    || collector_heap.minor_collections()
+                                        <= FIRST_YOUNG_MINOR.load(Ordering::Acquire))))
+                    {
+                        // Once major-copy coverage is complete, let normal nursery
+                        // pressure trigger the required later minor without
+                        // flooding the mutators with unrelated major cycles.
+                        if generational
+                            && cycles >= 8
+                            && participants_covered()
+                            && YOUNG_EDGE_WRITES.load(Ordering::Acquire) > 0
+                        {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        unsafe {
+                            collector_heap.concurrent_collect::<IdentityPtrPolicy>();
+                        }
+                        cycles += 1;
+                        if cycles == 1 || cycles % 128 == 0 {
+                            eprintln!(
+                                "generated concurrent progress: case={case} mode={mode} optimized={optimized} cycles={cycles} young_edges={} first_minor={} minors={} old_alias_writes={}",
+                                YOUNG_EDGE_WRITES.load(Ordering::Acquire),
+                                FIRST_YOUNG_MINOR.load(Ordering::Acquire),
+                                collector_heap.minor_collections(),
+                                OLD_ALIAS_WRITES.load(Ordering::Acquire)
+                            );
+                        }
+                        // Give resumed mutators a real opportunity to execute
+                        // between cycles instead of monopolizing their wakeups.
+                        let completed = OPERATIONS.load(Ordering::Acquire);
+                        while OPERATIONS.load(Ordering::Acquire) == completed
+                            && !collector_stop.load(Ordering::Acquire)
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
+                    COLLECTIONS_DONE.store(true, Ordering::Release);
+                    cycles
+                });
+                let address = engine.get_function_address(&compiled.entry_name).unwrap();
+                let entry: unsafe extern "C" fn(*mut crate::runtime::Thread) -> i64 =
+                    unsafe { std::mem::transmute(address) };
+                let result = runtime.enter(|thread| unsafe { entry(thread) });
+                stop.store(true, Ordering::Release);
+                let cycles = collector.join().unwrap();
+                unsafe {
+                    runtime.finish_threads();
+                }
+                assert_eq!(result, 42, "case={case} optimized={optimized}");
+                assert!(
+                    cycles >= 8,
+                    "generated workload did not span eight concurrent cycles"
+                );
+                let active_writes = ACTIVE_WRITES.load(Ordering::Relaxed);
+                assert!(
+                    active_writes > 0,
+                    "no generated replacement completed during copying"
+                );
+                let old_alias_writes = OLD_ALIAS_WRITES.load(Ordering::Relaxed);
+                if !generational {
+                    assert!(
+                        old_alias_writes > 0,
+                        "no generated replacement used a forwarded old alias"
+                    );
+                }
+                let active_reader_snapshots = ACTIVE_READER_SNAPSHOTS.load(Ordering::Relaxed);
+                if shared {
+                    assert!(
+                        active_reader_snapshots > 0,
+                        "dedicated reader did not complete a snapshot during copying; attempts={}",
+                        ACTIVE_READER_ATTEMPTS.load(Ordering::Relaxed)
+                    );
+                    assert!(
+                        SECOND_ACTIVE_WRITER_SEEN.load(Ordering::Acquire),
+                        "two generated writers did not complete writes during copying"
+                    );
+                }
+                let young_edges = YOUNG_EDGE_WRITES.load(Ordering::Acquire);
+                let minors = heap.minor_collections();
+                let first_young_minor = FIRST_YOUNG_MINOR.load(Ordering::Acquire);
+                if generational {
+                    assert!(young_edges > 0, "no active-copy old-to-young replacements");
+                    assert!(
+                        minors > FIRST_YOUNG_MINOR.load(Ordering::Acquire),
+                        "no minor after active-copy young-edge publication"
+                    );
+                }
+                eprintln!(
+                    "generated concurrent: case={case} mode={mode} optimized={optimized} cycles={cycles} active_writes={active_writes} old_alias_writes={old_alias_writes} active_reader_snapshots={active_reader_snapshots} young_edges={young_edges} minors={minors} first_young_minor={first_young_minor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_allocation_counters_saturate_at_unsigned_limits() {
+        use crate::runtime::{self, RuntimeContext};
+        use crate::gc::SiteCounter;
+        let src = "struct Point { x: i64, y: i64 } \
+                   fn mk() -> Point { Point { x: 3, y: 4 } } \
+                   fn main() -> i64 { let p = mk(); p.x + p.y }";
+        let module = parse_module(&lex(src).unwrap()).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let program = lower_program(&resolved.globals).unwrap();
+        for optimized in [false, true] {
+            let ctx = Context::create();
+            let compiled = codegen(&ctx, &program).unwrap();
+            if optimized { optimize_module(&compiled.module).unwrap(); }
+            let engine = compiled.module.create_jit_execution_engine(OptimizationLevel::None).unwrap();
+            // Use the production bindings: generated constructors may invoke
+            // additional access helpers, even when this source only allocates.
+            // Platform dynamic-symbol lookup is not a substitute for mapping.
+            map_runtime_symbols(&compiled.module, &engine);
+            let mut rt = RuntimeContext::new_generational(64 * 1024, 64 * 1024,
+                layouts_to_type_infos(&program));
+            rt.heap().set_alloc_sites(compiled.alloc_sites.clone());
+            let address = engine.get_function_address(&compiled.entry_name).unwrap();
+            let entry: unsafe extern "C" fn(*mut runtime::Thread) -> i64 = unsafe { std::mem::transmute(address) };
+            let thread = rt.thread_ptr();
+            unsafe {
+                assert_eq!(rt.enter(|thread| entry(thread)), 7); // Initialize native site storage and TLAB.
+                let window = &mut *(*thread).tlab_window;
+                assert_eq!(window.counters_len, 1);
+                assert!(window.limit - window.cursor >= 3 * 32);
+                window.counters.write(SiteCounter { count: u64::MAX - 1, bytes: u64::MAX - 32 });
+                for _ in 0..3 {
+                    let before = (*(*thread).tlab_window).cursor;
+                    assert_eq!(rt.enter(|thread| entry(thread)), 7);
+                    let window = &*(*thread).tlab_window;
+                    assert_eq!(window.cursor, before + 32, "must exercise generated fast allocation");
+                    let counter = window.counters.read();
+                    assert_eq!((counter.count, counter.bytes), (u64::MAX, u64::MAX), "optimized={optimized}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -6000,8 +7148,15 @@ mod tests {
 
     #[test]
     fn array_len_works() {
-        let src = "fn main() -> i64 { let a: Array<i64> = array_new(7); array_len(a) }";
-        assert_eq!(run_gc(src, false), 7);
+        for (source, expected) in [
+            ("fn main() -> i64 { let a: Array<i64> = array_new(7); array_len(a) }", 7),
+            ("fn main() -> i64 { let a = [11, 22, 33]; array_len(a) }", 3),
+            ("fn length<T>(a: Array<T>) -> i64 { array_len(a) } fn main() -> i64 { let a: Array<()> = Array::new(7); length(a) }", 7),
+            ("fn main() -> i64 { let a: Array<String> = Array::new(3); array_len(a) }", 3),
+            ("fn array_len(value: i64) -> i64 { value + 1 } fn main() -> i64 { array_len(41) }", 42),
+        ] {
+            assert_eq!(run_gc(source, false), expected, "{source}");
+        }
     }
 
     #[test]

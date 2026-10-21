@@ -10,3 +10,7 @@ path = "src/lib.rs"
 # standalone executables can statically link the GC runtime (the `ai_gc_*` /
 # `ai_print_*` / `gcr_runtime_main` symbols) with no LLVM dependency.
 crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+allocator-api2 = "=0.2.21"
+hashbrown = { version = "=0.16.1", default-features = false, features = ["allocator-api2", "inline-more"] }

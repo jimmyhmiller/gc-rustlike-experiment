@@ -7,7 +7,7 @@ pub(crate) fn eliminate(program: &mut CoreProgram) {
     for (id, function) in program.funcs.iter_mut().enumerate() {
         if function.is_extern
             || !function.closure_captures.is_empty()
-            || function.name.starts_with("__closure_")
+            || function.is_closure
         {
             continue;
         }
@@ -224,6 +224,6 @@ mod tests {
                 CoreExprKind::Loop(_)
             ));
         }
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 74);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 74);
     }
 }

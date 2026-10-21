@@ -71,16 +71,25 @@ pub struct TyCtx {
     pub traits: HashMap<String, Rc<TraitDef>>,
     /// Trait impls, grouped for method lookup.
     pub impls: Vec<Rc<ImplBlock>>,
+    pub(crate) trait_impls: HashMap<String, HashMap<String, Vec<usize>>>,
     /// Variant name → (enum fq-name, index, payload types as written).
     pub variants: HashMap<String, (String, u32)>,
     /// Method index: (receiver base type name, method name) → the impl method.
     /// Used to resolve `recv.method(..)` to a concrete function. Inherent and
     /// trait impls are both indexed here (trait method resolution is by name).
     pub methods: HashMap<(String, String), MethodEntry>,
+    /// Trait methods by (receiver base, trait, method), including inherited
+    /// defaults. `Display::fmt(x, f)` and operator desugaring look here, so
+    /// two traits may define the same method name for one type.
+    pub trait_methods: HashMap<(String, String, String), MethodEntry>,
+    /// (receiver base, method) pairs defined by more than one trait (and no
+    /// inherent impl): a plain `x.m()` call is ambiguous.
+    pub ambiguous_methods: std::collections::HashSet<(String, String)>,
     /// `use` aliases: short name → fully-qualified path. Lets an unqualified call
     /// resolve to the specific item a `use` brought into scope (disambiguating
     /// same-named items across modules).
     pub use_aliases: HashMap<String, String>,
+    pub(crate) aliases: HashMap<String, Rc<crate::type_alias::ResolvedAlias>>,
 }
 
 #[derive(Clone)]
@@ -89,11 +98,52 @@ pub struct MethodEntry {
     pub self_ty: Type,
     /// The impl block's own generic parameter names (`impl<T> ... for Foo<T>`).
     pub impl_generics: Vec<String>,
+    /// Bounds and where predicates that make this impl applicable.
+    pub impl_constraints: crate::ast::Generics,
     /// The trait this method implements (`impl Add for T` → `Some("Add")`),
     /// or `None` for an inherent impl. Operator and indexing desugaring only
     /// accept a method from the matching trait impl.
     pub trait_name: Option<String>,
     pub method: Rc<FnDef>,
+}
+
+/// Match generic binders consistently while preserving nominal identity and
+/// every structural constraint. A repeated binder denotes the same type.
+pub(crate) fn type_pattern_bindings(pattern: &Ty, actual: &Ty) -> Option<HashMap<String, Ty>> {
+    fn matches(pattern: &Ty, actual: &Ty, bindings: &mut HashMap<String, Ty>) -> bool {
+        match (pattern, actual) {
+            (Ty::Var(name), _) => match bindings.get(name) {
+                Some(bound) => bound == actual,
+                None => { bindings.insert(name.clone(), actual.clone()); true }
+            },
+            (Ty::Named { name: pn, args: pa }, Ty::Named { name: an, args: aa }) =>
+                pn == an && pa.len() == aa.len() && pa.iter().zip(aa).all(|(p, a)| matches(p, a, bindings)),
+            (Ty::Tuple(pa), Ty::Tuple(aa)) => pa.len() == aa.len() && pa.iter().zip(aa).all(|(p, a)| matches(p, a, bindings)),
+            (Ty::Array(p, pn), Ty::Array(a, an)) => pn == an && matches(p, a, bindings),
+            (Ty::Fn { params: pp, ret: pr }, Ty::Fn { params: ap, ret: ar })
+            | (Ty::ExternFn { params: pp, ret: pr }, Ty::ExternFn { params: ap, ret: ar }) =>
+                pp.len() == ap.len() && pp.iter().zip(ap).all(|(p, a)| matches(p, a, bindings)) && matches(pr, ar, bindings),
+            _ => pattern == actual,
+        }
+    }
+    let mut bindings = HashMap::new();
+    matches(pattern, actual, &mut bindings).then_some(bindings)
+}
+
+/// The canonical receiver identity used by both duplicate checking and lookup.
+pub(crate) fn receiver_base(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Named { name, .. } => Some(name.clone()),
+        Ty::Prim(p) => Some(prim_name(*p).to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn impl_receiver_base(imp: &crate::ast::ImplBlock, g: &crate::resolve::GlobalTable) -> TResult<String> {
+    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
+    let params = imp.generics.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    let ty = lower_type_with(&imp.self_ty, &params, &env)?;
+    receiver_base(&ty).ok_or_else(|| TypeError { msg: "impl receiver must be a nominal or primitive type".into(), span: imp.self_ty.span })
 }
 
 impl TyCtx {
@@ -108,43 +158,101 @@ impl TyCtx {
                     .or_insert((name.clone(), i as u32));
             }
         }
-        // Build the method index from every impl block.
-        let mut methods = HashMap::new();
-        for imp in &g.impls {
-            let base = type_base_name(&imp.self_ty);
-            let impl_generics: Vec<String> =
-                imp.generics.params.iter().map(|p| p.name.clone()).collect();
+        // Build the method index from every impl block. Inherent methods take
+        // precedence over trait methods of the same name.
+        let mut methods: HashMap<(String, String), MethodEntry> = HashMap::new();
+        let mut trait_methods = HashMap::new();
+        let mut inherent = std::collections::HashSet::new();
+        let mut ambiguous_methods = std::collections::HashSet::new();
+        let mut defaults = std::collections::HashSet::new();
+        let mut add = |methods: &mut HashMap<(String, String), MethodEntry>, base: &str, entry: MethodEntry, is_default: bool| {
+            let key = (base.to_string(), entry.method.name.clone());
+            match &entry.trait_name {
+                None => {
+                    inherent.insert(key.clone());
+                    ambiguous_methods.remove(&key);
+                    methods.insert(key, entry);
+                }
+                Some(tr) => {
+                    let tkey = (base.to_string(), tr.clone(), entry.method.name.clone());
+                    if is_default && trait_methods.contains_key(&tkey) { return; }
+                    trait_methods.insert(tkey, entry.clone());
+                    // An explicitly implemented trait method beats another
+                    // trait's default of the same name (so a type's
+                    // `ToString::to_string` wins over `Display`'s default).
+                    match methods.get(&key) {
+                        None => {
+                            if is_default { defaults.insert(key.clone()); }
+                            methods.insert(key, entry);
+                        }
+                        Some(existing) => {
+                            let explicit_vs_default = is_default != defaults.contains(&key);
+                            if !inherent.contains(&key) && existing.trait_name.as_ref() != Some(tr) && !explicit_vs_default {
+                                ambiguous_methods.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        for imp in g.impls.iter().filter(|imp| imp.trait_ref.is_none()) {
+            let base = impl_receiver_base(imp, g).expect("validated impl receiver");
+            let impl_generics: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
             for m in &imp.items {
-                methods.insert(
-                    (base.clone(), m.name.clone()),
-                    MethodEntry {
-                        self_ty: imp.self_ty.clone(),
-                        impl_generics: impl_generics.clone(),
-                        trait_name: imp.trait_ref.as_ref().map(|t| t.path.last().to_string()),
-                        method: Rc::new(m.clone()),
-                    },
-                );
+                add(&mut methods, &base, MethodEntry {
+                    self_ty: imp.self_ty.clone(),
+                    impl_generics: impl_generics.clone(),
+                    impl_constraints: imp.generics.clone(),
+                    trait_name: None,
+                    method: Rc::new(m.clone()),
+                }, false);
+            }
+        }
+        for imp in g.impls.iter().filter(|imp| imp.trait_ref.is_some()) {
+            let base = impl_receiver_base(imp, g).expect("validated impl receiver");
+            let impl_generics: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
+            let tr = imp.trait_ref.as_ref().unwrap().path.segments.join("::");
+            for m in &imp.items {
+                add(&mut methods, &base, MethodEntry {
+                    self_ty: imp.self_ty.clone(),
+                    impl_generics: impl_generics.clone(),
+                    impl_constraints: imp.generics.clone(),
+                    trait_name: Some(tr.clone()),
+                    method: Rc::new(m.clone()),
+                }, false);
             }
         }
         // A trait's default methods belong to every implementing type that
         // does not define them, after all impl methods (so inherent and
-        // overriding methods take precedence).
+        // overriding methods take precedence). Defaults inherited through a
+        // supertrait chain are not copied: each trait contributes its own.
         for imp in &g.impls {
             let Some(tr) = &imp.trait_ref else { continue };
-            let Some(def) = g.traits.iter().find(|(k, _)| k.rsplit("::").next() == Some(tr.path.last())).map(|(_, d)| d) else { continue };
-            let base = type_base_name(&imp.self_ty);
+            let tname = tr.path.segments.join("::");
+            let Some(def) = g.traits.get(&tname) else { continue };
+            let base = impl_receiver_base(imp, g).expect("validated impl receiver");
             let impl_generics: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
             for item in &def.items {
                 let crate::ast::TraitItem::Provided(f) = item else { continue };
-                methods.entry((base.clone(), f.name.clone())).or_insert_with(|| MethodEntry {
+                add(&mut methods, &base, MethodEntry {
                     self_ty: imp.self_ty.clone(),
                     impl_generics: impl_generics.clone(),
-                    trait_name: Some(tr.path.last().to_string()),
+                    impl_constraints: imp.generics.clone(),
+                    trait_name: Some(tname.clone()),
                     method: Rc::new(f.clone()),
-                });
+                }, true);
+            }
+        }
+        let mut trait_impls: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
+        for (index, imp) in g.impls.iter().enumerate() {
+            if let Some(tr) = &imp.trait_ref {
+                let receiver = impl_receiver_base(imp, g).expect("validated impl receiver");
+                trait_impls.entry(tr.path.segments.join("::")).or_default()
+                    .entry(receiver).or_default().push(index);
             }
         }
         TyCtx {
+            trait_impls,
             structs: g.structs.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             enums: g.enums.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             fns: g.fns.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
@@ -152,163 +260,70 @@ impl TyCtx {
             impls: g.impls.iter().map(|i| Rc::new(i.clone())).collect(),
             variants,
             methods,
+            trait_methods,
+            ambiguous_methods,
             use_aliases: g.use_aliases.clone(),
+            aliases: g.resolved_aliases.clone(),
         }
     }
 
-    /// Is `ty` `Sync` — safe to SHARE across threads? (See `docs/threads.md`.)
-    ///
-    /// Auto-derived structurally, with an `impl Sync for T {}` escape hatch:
-    /// - scalars (`RawPtr` included) — immutable, shareable;
-    /// - the built-in synchronized wrappers `Atom<T>` / `AtomicI64`;
-    /// - an immutable **value** struct/enum (can't be mutated → no race) whose
-    ///   fields are all `Sync`;
-    /// - a **reference** struct/enum whose fields are ALL `Sync` (e.g. a
-    ///   concurrent map built from `Atom`-held buckets);
-    /// - `Array<T>`/`Vec<T>` iff `T` is `Sync`;
-    /// - any type with an explicit `impl Sync for T {}`.
-    /// A plain reference struct with a non-`Sync` field is NOT `Sync` (any holder
-    /// can mutate it → data race when shared).
+    /// Structural sharing includes explicit conditional Sync impls.
     pub fn is_sync(&self, ty: &Ty) -> bool {
-        self.is_sync_rec(ty, &mut Vec::new())
+        self.try_is_sync(ty).unwrap_or(false)
+    }
+    pub fn try_is_sync(&self, ty: &Ty) -> TResult<bool> {
+        crate::trait_solver::prove(self, crate::trait_solver::Goal::Share(ty.clone()))
+    }
+    pub fn type_implements_trait(&self, ty: &Ty, name: &str) -> bool {
+        self.type_implements_trait_args(ty, name, &[])
+    }
+    pub fn type_implements_trait_args(&self, ty: &Ty, name: &str, args: &[Ty]) -> bool {
+        self.try_type_implements_trait_args(ty, name, args).unwrap_or(false)
+    }
+    pub fn try_type_implements_trait_args(&self, ty: &Ty, name: &str, args: &[Ty]) -> TResult<bool> {
+        crate::trait_solver::prove(self, crate::trait_solver::Goal::Trait(ty.clone(), name.into(), args.to_vec()))
     }
 
-    fn is_sync_rec(&self, ty: &Ty, stack: &mut Vec<String>) -> bool {
-        match ty {
-            Ty::Prim(_) => true, // scalars (incl. RawPtr), Str(immutable), Unit
-            Ty::Var(_) | Ty::Infer(_) => true, // checked at the concrete instantiation
-            Ty::Fn { .. } | Ty::ExternFn { .. } => true, // code pointers are immutable
-            Ty::Tuple(es) => es.iter().all(|e| self.is_sync_rec(e, stack)),
-            Ty::Array(e, _) => self.is_sync_rec(e, stack),
-            Ty::Named { name, args } => {
-                let base = name.rsplit("::").next().unwrap();
-                // Built-in synchronized wrappers.
-                if base == "Atom" || base == "AtomicI64" {
-                    return true;
-                }
-                // Explicit author assertion (`impl Sync for T {}`).
-                if self.type_implements_trait(ty, "Sync") {
-                    return true;
-                }
-                // Built-in containers: Sync iff element is Sync.
-                if matches!(base, "Array" | "Vec") {
-                    return args.iter().all(|a| self.is_sync_rec(a, stack));
-                }
-                // Option/Result: Sync iff their payloads are.
-                if matches!(base, "Option" | "Result") {
-                    return args.iter().all(|a| self.is_sync_rec(a, stack));
-                }
-                // Recursion guard for self-referential types.
-                if stack.iter().any(|s| s == name) {
-                    return true;
-                }
-                stack.push(name.clone());
-                let ok = self.struct_or_enum_fields_all_sync(name, args, stack);
-                stack.pop();
-                ok
-            }
-        }
-    }
-
-    /// All fields of a user struct/enum are safe to share. Crucially, a
-    /// **reference** type's field SLOTS are mutable, so each field must be safe
-    /// *under mutation* — a synchronization primitive (`Atom`/`AtomicI64`, or a
-    /// container of Sync), or a deeply-immutable **value** type. A plain scalar /
-    /// `String` / reference field makes the reference type NOT Sync (its slot is
-    /// a racily-mutable shared location). A **value** type is itself immutable
-    /// (rebuild-only), so its fields need only be `is_sync` (read-shareable).
-    fn struct_or_enum_fields_all_sync(&self, base: &str, args: &[Ty], stack: &mut Vec<String>) -> bool {
-        let canon = self.canon(base).unwrap_or_else(|| base.to_string());
-        if let Some(s) = self.structs.get(&canon) {
-            let gp: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
-            let subst: std::collections::HashMap<String, Ty> =
-                gp.iter().cloned().zip(args.iter().cloned()).collect();
-            let field_ok = |ft: &Ty, stack: &mut Vec<String>| {
-                let g = subst_ty(ft, &subst);
-                if s.is_value { self.is_sync_rec(&g, stack) } else { self.field_safe_in_mutable_slot(&g, stack) }
-            };
-            if let crate::ast::StructBody::Named(fields) = &s.body {
-                return fields.iter().all(|f| {
-                    lower_type(&f.ty, &gp, self).map(|ft| field_ok(&ft, stack)).unwrap_or(false)
-                });
-            }
-            return false;
-        }
-        if let Some(e) = self.enums.get(&canon) {
-            let gp: Vec<String> = e.generics.params.iter().map(|p| p.name.clone()).collect();
-            let subst: std::collections::HashMap<String, Ty> =
-                gp.iter().cloned().zip(args.iter().cloned()).collect();
-            let field_ok = |t: &Type, stack: &mut Vec<String>| {
-                lower_type(t, &gp, self).map(|ft| {
-                    let g = subst_ty(&ft, &subst);
-                    if e.is_value { self.is_sync_rec(&g, stack) } else { self.field_safe_in_mutable_slot(&g, stack) }
-                }).unwrap_or(false)
-            };
-            return e.variants.iter().all(|v| match &v.payload {
-                crate::ast::VariantPayload::None => true,
-                crate::ast::VariantPayload::Tuple(tys) => tys.iter().all(|t| field_ok(t, stack)),
-                crate::ast::VariantPayload::Named(fs) => fs.iter().all(|f| field_ok(&f.ty, stack)),
-            });
-        }
-        false
-    }
-
-    /// Is `ty` safe to hold in a MUTABLE, shared slot (a reference type's field)?
-    /// Only a synchronization primitive (`Atom`/`AtomicI64`), a container of such,
-    /// or a deeply-immutable value type qualifies — NOT a plain scalar/String/ref,
-    /// whose slot would be a racily-mutable shared location. See `is_sync`.
-    fn field_safe_in_mutable_slot(&self, ty: &Ty, stack: &mut Vec<String>) -> bool {
-        match ty {
-            Ty::Named { name, args } => {
-                let base = name.rsplit("::").next().unwrap();
-                if base == "Atom" || base == "AtomicI64" { return true; }
-                if self.type_implements_trait(ty, "Sync") { return true; }
-                // A container's slot is mutable, but if its elements are
-                // themselves safe-in-mutable-slot, sharing it is sound for our
-                // purposes (concurrent map built on Atom buckets).
-                if matches!(base, "Array" | "Vec" | "Option" | "Result") {
-                    return args.iter().all(|a| self.field_safe_in_mutable_slot(a, stack));
-                }
-                // A value (immutable) struct/enum field is fine; a reference one
-                // must itself be Sync (all-safe-slots, recursively).
-                if stack.iter().any(|s| s == name) { return true; }
-                stack.push(name.clone());
-                let ok = self.struct_or_enum_fields_all_sync(name, args, stack);
-                stack.pop();
-                ok
-            }
-            // A plain scalar / unit / fn-ptr in a mutable shared slot is a race.
-            _ => false,
-        }
-    }
-
-    /// Does the concrete type `ty` implement the trait named `trait_name`?
-    /// Checks for an `impl <trait_name> for <ty's base>` block (generic or not).
-    pub fn type_implements_trait(&self, ty: &Ty, trait_name: &str) -> bool {
-        let base = match ty {
-            Ty::Named { name, .. } => name.rsplit("::").next().unwrap().to_string(),
-            Ty::Prim(p) => prim_name(*p).to_string(),
-            _ => return false,
+    /// Resolve a variant through its enum's canonical path. A relative enum
+    /// name may expand to its module, but an unknown qualifier is never dropped.
+    pub fn variant_by_path(&self, path: &Path) -> Option<(String, u32)> {
+        let written = path.segments.join("::");
+        if let Some(found) = self.variants.get(&written) { return Some(found.clone()); }
+        if path.segments.len() < 2 { return None; }
+        let enum_path = path.segments[..path.segments.len() - 1].join("::");
+        let canonical = self.canon(&enum_path)?;
+        let canonical = match self.aliases.get(&canonical) {
+            Some(alias) => match &alias.target {
+                Ty::Named { name, .. } => name,
+                _ => return None,
+            },
+            None => &canonical,
         };
-        self.impls.iter().any(|imp| {
-            imp.trait_ref.as_ref().map(|tr| tr.path.last()) == Some(trait_name)
-                && type_base_name(&imp.self_ty) == base
-        })
+        self.variants.get(&format!("{canonical}::{}", path.last())).cloned()
     }
 
     /// Resolve a fully-qualified or unqualified type/enum/struct name to its
     /// canonical fq-name.
     pub fn canon(&self, name: &str) -> Option<String> {
-        if self.structs.contains_key(name) || self.enums.contains_key(name) {
+        if intrinsic_type_arity(name).is_some() { return None; }
+        if self.structs.contains_key(name) || self.enums.contains_key(name) || self.aliases.contains_key(name) {
             return Some(name.to_string());
         }
-        // last-segment match
-        let last = name.rsplit("::").next().unwrap();
-        for k in self.structs.keys().chain(self.enums.keys()) {
-            if k.rsplit("::").next().unwrap() == last {
-                return Some(k.clone());
+        // A qualified path names one declaration; a matching final segment
+        // elsewhere cannot repair an unknown module or qualifier.
+        if name.contains("::") { return None; }
+        if let Some(full) = self.use_aliases.get(name) {
+            if self.structs.contains_key(full) || self.enums.contains_key(full) || self.aliases.contains_key(full) {
+                return Some(full.clone());
             }
         }
+        // The resolver permits an unqualified lookup only when unambiguous.
+        // Hash-map iteration order must never choose the runtime layout.
+        let mut matches = self.structs.keys().chain(self.enums.keys()).chain(self.aliases.keys())
+            .filter(|k| k.rsplit("::").next() == Some(name));
+        let first = matches.next()?;
+        if matches.next().is_none() { return Some(first.clone()); }
+
         None
     }
 }
@@ -343,10 +358,10 @@ pub fn type_base_name(t: &Type) -> String {
 pub(crate) fn subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Ty::Named { name, args } => Ty::Named {
-            name: name.clone(),
-            args: args.iter().map(|a| subst_ty(a, subst)).collect(),
-        },
+        Ty::Named { name, args } => {
+            let t = Ty::Named { name: name.clone(), args: args.iter().map(|a| subst_ty(a, subst)).collect() };
+            normalize_projection(&t).unwrap_or(t)
+        }
         Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst_ty(e, subst)).collect()),
         Ty::Array(e, n) => Ty::Array(Box::new(subst_ty(e, subst)), *n),
         Ty::Fn { params, ret } => Ty::Fn {
@@ -362,54 +377,161 @@ pub(crate) fn subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -
 }
 
 pub fn lower_type(t: &Type, generics: &[String], ctx: &TyCtx) -> TResult<Ty> {
+    lower_type_with(t, generics, ctx)
+}
+
+pub(crate) trait TypeEnvironment {
+    fn canonical(&self, name: &str) -> Option<String>;
+    fn alias(&self, name: &str) -> Option<&crate::type_alias::ResolvedAlias>;
+    fn declared_nominal(&self, name: &str) -> bool;
+}
+impl TypeEnvironment for TyCtx {
+    fn canonical(&self, name: &str) -> Option<String> { self.canon(name) }
+    fn alias(&self, name: &str) -> Option<&crate::type_alias::ResolvedAlias> { self.aliases.get(name).map(Rc::as_ref) }
+    fn declared_nominal(&self, name: &str) -> bool { self.structs.contains_key(name) || self.enums.contains_key(name) }
+}
+
+pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvironment) -> TResult<Ty> {
     match &t.kind {
+        // `Self::Item` / `I::Item`: an associated type of a type parameter,
+        // resolved once the parameter is known (see `normalize_projection`).
+        TypeKind::Path(path, args) if path.segments.len() == 2 && args.is_empty()
+            && (path.segments[0] == "Self" || generics.iter().any(|g| *g == path.segments[0])) =>
+        {
+            Ok(projection(&path.segments[1], Ty::Var(path.segments[0].clone())))
+        }
         TypeKind::Path(path, args) => {
             let name = path.last();
-            if let Some(p) = prim_of(name) {
-                return Ok(Ty::Prim(p));
-            }
-            if generics.iter().any(|g| g == name) {
+            if path.is_single() && generics.iter().any(|g| g == name) {
+                if !args.is_empty() { return Err(TypeError { msg: format!("type parameter `{name}` takes no type arguments"), span: t.span }); }
                 return Ok(Ty::Var(name.to_string()));
             }
-            let targs: Vec<Ty> = args.iter().map(|a| lower_type(a, generics, ctx)).collect::<Result<_, _>>()?;
-            // builtin generic containers stay as Named with their short name.
-            if matches!(name, "Vec" | "Array" | "Option" | "Result") {
-                return Ok(Ty::Named { name: name.to_string(), args: targs });
+            if path.is_single() && name == "_" && args.is_empty() {
+                return Ok(Ty::Var("_".into()));
+            }
+            if let Some(p) = path.is_single().then(|| prim_of(name)).flatten() {
+                if !args.is_empty() { return Err(TypeError { msg: format!("primitive `{name}` takes no type arguments"), span: t.span }); }
+                return Ok(Ty::Prim(p));
+            }
+            let targs: Vec<Ty> = args.iter().map(|a| lower_type_with(a, generics, ctx)).collect::<Result<_, _>>()?;
+            if path.is_single() && name == "Array" {
+                if targs.len() != 1 { return Err(TypeError { msg: format!("type `Array` takes 1 type argument, got {}", targs.len()), span: t.span }); }
+                return Ok(Ty::Named { name: "Array".into(), args: targs });
             }
             let qualified = path.segments.join("::");
-            let canon = ctx.canon(&qualified).unwrap_or(qualified);
+            // Every heap value is already a shared GC reference, so the owning
+            // pointers are the type they point to (unless the program declares
+            // its own type of that name).
+            if path.is_single() && matches!(name, "Box" | "Rc" | "Arc") && targs.len() == 1 && ctx.canonical(&qualified).is_none() {
+                return Ok(targs.into_iter().next().unwrap());
+            }
+            let canon = ctx.canonical(&qualified).unwrap_or(qualified);
+            if let Some(alias) = ctx.alias(&canon) {
+                if targs.len() != alias.params.len() {
+                    return Err(TypeError { msg: format!("type alias `{canon}` takes {} type argument(s), got {}", alias.params.len(), targs.len()), span: t.span });
+                }
+                let subst = alias.params.iter().cloned().zip(targs).collect();
+                return Ok(subst_ty(&alias.target, &subst));
+            }
+            // Bare generic impl namespaces (e.g. impl Thread with static
+            // methods) are distinct from instantiated runtime container types.
+            // The structural fallback has no declaration to check elsewhere.
+            let arity = if ctx.declared_nominal(&canon) { None }
+                else { match canon.as_str() { "Vec" | "Array" | "Option" => Some(1), "Result" => Some(2), _ => None } };
+            if let Some(arity) = arity {
+                if args.len() != arity { return Err(TypeError { msg: format!("type `{canon}` takes {arity} type argument(s), got {}", args.len()), span: t.span }); }
+            }
             Ok(Ty::Named { name: canon, args: targs })
         }
         TypeKind::Tuple(tys) => {
             if tys.is_empty() {
                 Ok(Ty::Prim(Prim::Unit))
             } else {
-                Ok(Ty::Tuple(tys.iter().map(|t| lower_type(t, generics, ctx)).collect::<Result<_, _>>()?))
+                Ok(Ty::Tuple(tys.iter().map(|t| lower_type_with(t, generics, ctx)).collect::<Result<_, _>>()?))
             }
         }
         TypeKind::Array(elem, count) => {
-            let e = lower_type(elem, generics, ctx)?;
+            let e = lower_type_with(elem, generics, ctx)?;
             let n = const_usize(count)?;
             Ok(Ty::Array(Box::new(e), n))
         }
         TypeKind::Fn(params, ret) => {
-            let ps = params.iter().map(|p| lower_type(p, generics, ctx)).collect::<Result<_, _>>()?;
+            let ps = params.iter().map(|p| lower_type_with(p, generics, ctx)).collect::<Result<_, _>>()?;
             let r = match ret {
-                Some(r) => lower_type(r, generics, ctx)?,
+                Some(r) => lower_type_with(r, generics, ctx)?,
                 None => Ty::Prim(Prim::Unit),
             };
             Ok(Ty::Fn { params: ps, ret: Box::new(r) })
         }
         TypeKind::ExternFn(params, ret) => {
-            let ps = params.iter().map(|p| lower_type(p, generics, ctx)).collect::<Result<_, _>>()?;
+            let ps = params.iter().map(|p| lower_type_with(p, generics, ctx)).collect::<Result<_, _>>()?;
             let r = match ret {
-                Some(r) => lower_type(r, generics, ctx)?,
+                Some(r) => lower_type_with(r, generics, ctx)?,
                 None => Ty::Prim(Prim::Unit),
             };
             Ok(Ty::ExternFn { params: ps, ret: Box::new(r) })
         }
         TypeKind::SelfType => Ok(Ty::Var("Self".to_string())),
     }
+}
+
+/// The associated type `name` of `base` (`<base as Trait>::name`), as a
+/// placeholder named type until `base` is known.
+pub(crate) fn projection(name: &str, base: Ty) -> Ty {
+    Ty::Named { name: format!("proj#{}", name), args: vec![base] }
+}
+
+thread_local! {
+    /// The definitions used to resolve projections while a program is being
+    /// checked and lowered. Substitution resolves `proj#Item<Counter>` to the
+    /// `type Item = ..` of Counter's impl as soon as the base is ground.
+    static NORMALIZER: std::cell::Cell<*const TyCtx> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Resolve projections against `ctx` until the guard is dropped.
+pub(crate) struct NormalizerGuard(*const TyCtx);
+impl Drop for NormalizerGuard {
+    fn drop(&mut self) { NORMALIZER.with(|n| n.set(self.0)); }
+}
+pub(crate) fn enter_normalizer(ctx: &TyCtx) -> NormalizerGuard {
+    NormalizerGuard(NORMALIZER.with(|n| n.replace(ctx as *const TyCtx)))
+}
+
+/// If `ty` is a projection on a ground type, the associated type it names.
+pub(crate) fn normalize_projection(ty: &Ty) -> Option<Ty> {
+    let Ty::Named { name, args } = ty else { return None };
+    let assoc = name.strip_prefix("proj#")?;
+    let base = args.first()?;
+    if crate::lower::has_var(base) { return None; }
+    let ptr = NORMALIZER.with(|n| n.get());
+    if ptr.is_null() { return None; }
+    // SAFETY: the guard keeps the pointer valid for the lowering pass that
+    // installed it, which outlives every substitution performed during it.
+    let ctx = unsafe { &*ptr };
+    ctx.associated_type(base, assoc)
+}
+
+impl TyCtx {
+    /// `<base as Trait>::assoc` for the trait impl of `base` defining `assoc`.
+    pub(crate) fn associated_type(&self, base: &Ty, assoc: &str) -> Option<Ty> {
+        for imp in &self.impls {
+            if imp.trait_ref.is_none() { continue; }
+            let Some((_, written)) = imp.assoc_types.iter().find(|(n, _)| n == assoc) else { continue };
+            let params: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
+            let Ok(pattern) = lower_type(&imp.self_ty, &params, self) else { continue };
+            let Some(mut bindings) = type_pattern_bindings(&pattern, base) else { continue };
+            bindings.insert("Self".into(), base.clone());
+            let mut scope = params.clone();
+            scope.push("Self".into());
+            let Ok(raw) = lower_type(written, &scope, self) else { continue };
+            return Some(subst_ty(&raw, &bindings));
+        }
+        None
+    }
+}
+
+pub(crate) fn intrinsic_type_arity(name: &str) -> Option<usize> {
+    if name == "Array" { Some(1) } else { prim_of(name).map(|_| 0) }
 }
 
 fn prim_of(name: &str) -> Option<Prim> {

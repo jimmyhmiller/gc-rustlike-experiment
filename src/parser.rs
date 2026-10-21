@@ -14,10 +14,10 @@ pub struct ParseError {
 }
 
 pub fn parse_module(tokens: &[Token]) -> Result<Module, ParseError> {
-    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0 };
+    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0 };
     let mut items = Vec::new();
     while !p.at(&TokKind::Eof) {
-        items.push(p.item()?);
+        items.extend(p.items()?);
     }
     Ok(Module { items })
 }
@@ -36,6 +36,117 @@ struct Parser {
     /// nested input (e.g. `((((((…))))))`) yields a clean error instead of a
     /// stack overflow. Every recursive-descent compiler needs this.
     depth: u32,
+    /// Items generated alongside the one being parsed (`#[derive]` impls,
+    /// the extra paths of a `use a::{b, c};` group).
+    pending: Vec<Item>,
+    /// While parsing a function's parameters: the anonymous type parameters
+    /// their `impl Trait` types introduce.
+    impl_params: Option<Vec<TypeParam>>,
+    /// `macro_rules!` definitions seen so far (shared with the parsers that
+    /// read their expansions), and the current expansion depth.
+    macros: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<crate::macros::MacroRules>>>>,
+    macro_depth: u32,
+    /// Numbers the bindings that range patterns introduce.
+    pattern_counter: u32,
+}
+
+/// Expansions nested deeper than this are reported (a macro that expands
+/// to itself forever).
+const MAX_MACRO_DEPTH: u32 = 64;
+
+/// The conjunction of a pattern's range guards and the arm's own guard.
+fn conjoin(guards: Vec<Expr>, user: Option<Expr>) -> Option<Expr> {
+    guards.into_iter().chain(user).reduce(|a, b| {
+        let span = a.span;
+        Expr { kind: std::sync::Arc::new(ExprKind::Binary(BinOp::And, a, b)), span }
+    })
+}
+
+/// Map a path into Rust's standard library onto the flat prelude:
+/// `std::collections::HashMap` is `HashMap`, `fmt::Result` is `FmtResult`,
+/// and `std::fmt::Display` (or `fmt::Display`) is `Display`.
+fn std_path(mut segments: Vec<String>) -> Vec<String> {
+    const MODULES: &[&str] = &[
+        "collections", "fmt", "cmp", "ops", "string", "vec", "iter", "hash", "convert", "sync",
+        "thread", "mem", "result", "option", "boxed", "rc", "default", "marker", "clone", "prelude",
+        "v1", "rust_2021", "rust_2024", "hash_map", "borrow",
+    ];
+    if segments.len() > 1 && matches!(segments[0].as_str(), "std" | "core" | "alloc") {
+        segments.remove(0);
+        while segments.len() > 1 && MODULES.contains(&segments[0].as_str()) {
+            let module = segments.remove(0);
+            if module == "fmt" { segments.insert(0, module); break; }
+        }
+    }
+    if segments.len() > 1 && segments[0] == "fmt"
+        && matches!(segments[1].as_str(), "Display" | "Debug" | "Formatter" | "Result" | "Error" | "Write")
+    {
+        segments.remove(0);
+        match segments[0].as_str() {
+            "Result" => segments[0] = "FmtResult".into(),
+            "Error" => segments[0] = "FmtError".into(),
+            _ => {}
+        }
+    }
+    if segments.len() == 2 && segments[0] == "cmp" && segments[1] == "Ordering" {
+        segments.remove(0);
+    }
+    segments
+}
+
+fn is_fn_trait(name: &str) -> bool {
+    matches!(name, "Fn" | "FnMut" | "FnOnce")
+}
+
+/// Remove the type parameters bounded by a closure trait (`F: Fn(A) -> R`,
+/// inline or in a `where` clause), returning each one's closure type.
+fn closure_params(g: &mut Generics) -> Vec<(String, Type)> {
+    let closure = |bounds: &[TraitRef]| bounds.iter()
+        .find(|b| b.path.last() == "Fn" && b.args.len() == 1 && matches!(b.args[0].kind, TypeKind::Fn(..)))
+        .map(|b| b.args[0].clone());
+    let mut out = Vec::new();
+    for p in &g.params {
+        if let Some(t) = closure(&p.bounds) { out.push((p.name.clone(), t)); }
+    }
+    for w in &g.where_clauses {
+        if let TypeKind::Path(path, args) = &w.ty.kind {
+            if path.is_single() && args.is_empty() && g.params.iter().any(|p| p.name == path.last()) {
+                if let Some(t) = closure(&w.bounds) { out.push((path.last().to_string(), t)); }
+            }
+        }
+    }
+    g.params.retain(|p| !out.iter().any(|(n, _)| *n == p.name));
+    g.where_clauses.retain(|w| !matches!(&w.ty.kind, TypeKind::Path(path, _) if path.is_single() && out.iter().any(|(n, _)| n == path.last())));
+    out
+}
+
+/// Replace each named type parameter in `t` by its type.
+fn subst_type(t: &mut Type, map: &[(String, Type)]) {
+    match &mut t.kind {
+        TypeKind::Path(path, args) => {
+            if path.is_single() && args.is_empty() {
+                if let Some((_, r)) = map.iter().find(|(n, _)| n == path.last()) {
+                    *t = r.clone();
+                    return;
+                }
+            }
+            for a in args { subst_type(a, map); }
+        }
+        TypeKind::Tuple(ts) => for a in ts { subst_type(a, map); },
+        TypeKind::Array(e, _) => subst_type(e, map),
+        TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => {
+            for a in ps { subst_type(a, map); }
+            if let Some(r) = r { subst_type(r, map); }
+        }
+        TypeKind::SelfType => {}
+    }
+}
+
+/// A parsed `#[name]` or `#[name(arg, ...)]` attribute.
+struct Attr {
+    name: String,
+    args: Vec<(String, Span)>,
+    span: Span,
 }
 
 /// Maximum expression/block nesting depth before the parser bails with an error.
@@ -110,15 +221,38 @@ impl Parser {
     }
 
     // ---- items -------------------------------------------------------------
-    fn item(&mut self) -> PResult<Item> {
+    /// One source item and anything it generates. A `use` of the standard
+    /// library (`use std::fmt;`) generates nothing: the prelude is flat.
+    fn items(&mut self) -> PResult<Vec<Item>> {
+        let item = self.item()?;
+        let mut out: Vec<Item> = item.into_iter().collect();
+        out.append(&mut self.pending);
+        Ok(out)
+    }
+
+    fn item(&mut self) -> PResult<Option<Item>> {
         let start = self.span();
         let attrs = self.attributes()?;
+        // `macro_rules! name { ... }` and item-position invocations `name!(..);`.
+        if let (TokKind::Ident(name), TokKind::Not) = (self.peek().clone(), self.peek_at(1).clone()) {
+            if name == "macro_rules" {
+                self.macro_rules()?;
+                return Ok(None);
+            }
+            if self.macros.borrow().contains_key(&name) {
+                let items = self.macro_items()?;
+                self.pending.extend(items);
+                return Ok(None);
+            }
+        }
         // `#[value]` selects the inline value-type representation on a struct/enum.
-        let is_value = attrs.iter().any(|(a, _)| a == "value");
+        let is_value = attrs.iter().any(|a| a.name == "value");
+        let skip = attrs.iter().any(|a| a.name == "test" || (a.name == "cfg" && a.args.iter().any(|(n, _)| n == "test")));
+        let derives: Vec<(String, Span)> = attrs.iter().filter(|a| a.name == "derive").flat_map(|a| a.args.clone()).collect();
         let vis = self.eat_kw(Kw::Pub);
         if is_value && !matches!(self.peek(), TokKind::Keyword(Kw::Struct) | TokKind::Keyword(Kw::Enum)) {
-            let (_, span) = attrs.iter().find(|(a, _)| a == "value").unwrap();
-            return Err(ParseError { msg: "`#[value]` applies only to a struct or enum".into(), span: *span });
+            let span = attrs.iter().find(|a| a.name == "value").unwrap().span;
+            return Err(ParseError { msg: "`#[value]` applies only to a struct or enum".into(), span });
         }
         let kind = match self.peek() {
             TokKind::Keyword(Kw::Extern) => ItemKind::Fn(self.extern_fn(vis)?),
@@ -132,16 +266,51 @@ impl Parser {
                 ItemKind::Const(self.const_def(vis)?)
             }
             TokKind::Keyword(Kw::Mod) => ItemKind::Mod(self.mod_def(vis)?),
-            TokKind::Keyword(Kw::Use) => ItemKind::Use(self.use_decl()?),
+            TokKind::Keyword(Kw::Use) => {
+                let mut paths = self.use_decl()?;
+                if paths.is_empty() { return Ok(None); }
+                let first = paths.remove(0);
+                let span = start.to(self.prev_span());
+                self.pending.extend(paths.into_iter().map(|p| Item { kind: ItemKind::Use(p), span }));
+                ItemKind::Use(first)
+            }
             other => return Err(self.error(format!("expected item, found {:?}", other))),
         };
-        Ok(Item { kind, span: start.to(self.prev_span()) })
+        let span = start.to(self.prev_span());
+        if skip {
+            self.pending.clear();
+            return Ok(None);
+        }
+        if !derives.is_empty() {
+            let names: Vec<String> = derives.iter().map(|(n, _)| n.clone()).collect();
+            let sources = crate::derive::derive_impls(&kind, &names)
+                .map_err(|msg| ParseError { msg, span: derives[0].1 })?;
+            for (trait_name, source) in sources {
+                // Generated code reports at the derive name that asked for it.
+                // Each derived trait has its own span, so each generated
+                // method keeps a distinct source identity.
+                let at = derives.iter().find(|(n, _)| n == trait_name || (trait_name == "Eq" && n == "PartialEq") || (trait_name == "Ord" && n == "PartialOrd"))
+                    .map(|(_, s)| *s).unwrap_or(derives[0].1);
+                let mut tokens = crate::lexer::lex_with_source(&source, at.source)
+                    .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
+                for t in &mut tokens { t.span = at; }
+                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0 };
+                while !p.at(&TokKind::Eof) {
+                    let items = p.items().map_err(|e| ParseError { msg: format!("in derived `{}`: {}", trait_name, e.msg), span: at })?;
+                    self.pending.extend(items);
+                }
+            }
+        }
+        Ok(Some(Item { kind, span }))
     }
 
-    /// Parse zero or more leading attributes `#[ name ]`, returning each name
-    /// with its span. `#[value]` is the only attribute; any other name is an
-    /// error rather than being silently ignored.
-    fn attributes(&mut self) -> PResult<Vec<(String, Span)>> {
+    /// Parse zero or more leading attributes `#[ name ]` / `#[name(args)]`.
+    ///
+    /// `#[value]` selects the inline representation; `#[derive(..)]` generates
+    /// impls; `#[test]` and `#[cfg(test)]` items are skipped (there is no test
+    /// harness). Lint and codegen hints (`allow`, `inline`, `must_use`, ...)
+    /// have no effect. Any other attribute is an error.
+    fn attributes(&mut self) -> PResult<Vec<Attr>> {
         let mut attrs = Vec::new();
         while self.at(&TokKind::Hash) {
             let start = self.span();
@@ -149,32 +318,104 @@ impl Parser {
             self.expect(&TokKind::LBracket)?;
             let name_span = self.span();
             let name = self.ident()?;
-            if name != "value" {
-                return Err(ParseError {
-                    msg: format!("unknown attribute `#[{}]` (only `#[value]` is supported)", name),
-                    span: name_span,
-                });
-            }
-            if self.at(&TokKind::LParen) {
-                return Err(self.error("`#[value]` takes no arguments"));
+            let mut args = Vec::new();
+            match name.as_str() {
+                "value" | "test" => {
+                    if self.at(&TokKind::LParen) {
+                        return Err(self.error(format!("`#[{}]` takes no arguments", name)));
+                    }
+                }
+                "cfg" => {
+                    // Only `#[cfg(test)]` is meaningful: the item is skipped.
+                    let s = self.span();
+                    let mut words = Vec::new();
+                    let mut depth = 0i32;
+                    loop {
+                        match self.peek().clone() {
+                            TokKind::Eof => return Err(self.error("unterminated attribute")),
+                            TokKind::RBracket if depth == 0 => break,
+                            TokKind::LParen => depth += 1,
+                            TokKind::RParen => depth -= 1,
+                            TokKind::Ident(w) => words.push(w),
+                            _ => words.push(String::new()),
+                        }
+                        self.bump();
+                    }
+                    if words == ["test"] { args.push(("test".to_string(), s)); }
+                }
+                "derive" => {
+                    self.expect(&TokKind::LParen)?;
+                    while !self.at(&TokKind::RParen) {
+                        let s = self.span();
+                        // `derive(serde::Serialize)` style paths keep their last segment.
+                        let mut n = self.ident()?;
+                        while self.eat(&TokKind::ColonColon) { n = self.ident()?; }
+                        args.push((n, s));
+                        if !self.eat(&TokKind::Comma) { break; }
+                    }
+                    self.expect(&TokKind::RParen)?;
+                }
+                "allow" | "warn" | "deny" | "forbid" | "expect" | "inline" | "cold" | "must_use" | "doc"
+                | "track_caller" | "non_exhaustive" | "rustfmt" | "clippy" | "deprecated" => {
+                    self.skip_attr_args()?;
+                }
+                _ => {
+                    return Err(ParseError {
+                        msg: format!("unknown attribute `#[{}]`", name),
+                        span: name_span,
+                    });
+                }
             }
             self.expect(&TokKind::RBracket)?;
-            attrs.push((name, start.to(self.prev_span())));
+            attrs.push(Attr { name, args, span: start.to(self.prev_span()) });
         }
         Ok(attrs)
+    }
+
+    /// Skip an ignored attribute's arguments up to (not including) its `]`.
+    fn skip_attr_args(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                TokKind::Eof => return Err(self.error("unterminated attribute")),
+                TokKind::RBracket if depth == 0 => return Ok(()),
+                TokKind::LParen | TokKind::LBracket | TokKind::LBrace => depth += 1,
+                TokKind::RParen | TokKind::RBracket | TokKind::RBrace => depth -= 1,
+                _ => {}
+            }
+            self.bump();
+        }
     }
 
     fn fn_def(&mut self, vis: bool) -> PResult<FnDef> {
         let start = self.expect_kw(Kw::Fn)?;
         let name = self.ident()?;
-        let generics = self.generics()?;
-        self.expect(&TokKind::LParen)?;
-        let (params, has_self, self_is_mut) = self.params()?;
-        self.expect(&TokKind::RParen)?;
-        let ret = if self.eat(&TokKind::Arrow) { Some(self.ty()?) } else { None };
-        let generics = self.maybe_where(generics)?;
-        let body = self.block()?;
+        let (generics, params, has_self, self_is_mut, ret) = self.fn_signature()?;
+        let mut body = self.block()?;
+        crate::capture::share_mutated_captures(&mut body);
         Ok(FnDef { vis, name, generics, params, has_self, self_is_mut, ret, body, is_extern: false, span: start.to(self.prev_span()) })
+    }
+
+    /// `<generics>(params) -> ret where ...`. An argument's `impl Trait`
+    /// becomes a type parameter, and a parameter bounded by a closure trait
+    /// (`F: Fn(i64) -> i64`) is replaced by that closure type.
+    fn fn_signature(&mut self) -> PResult<(Generics, Vec<Param>, bool, bool, Option<Type>)> {
+        let mut generics = self.generics()?;
+        self.expect(&TokKind::LParen)?;
+        let outer = self.impl_params.replace(Vec::new());
+        let parsed = self.params();
+        let impl_params = std::mem::replace(&mut self.impl_params, outer).unwrap_or_default();
+        let (mut params, has_self, self_is_mut) = parsed?;
+        generics.params.extend(impl_params);
+        self.expect(&TokKind::RParen)?;
+        let mut ret = if self.eat(&TokKind::Arrow) { Some(self.ty()?) } else { None };
+        let mut generics = self.maybe_where(generics)?;
+        let closures = closure_params(&mut generics);
+        if !closures.is_empty() {
+            for p in &mut params { subst_type(&mut p.ty, &closures); }
+            if let Some(r) = &mut ret { subst_type(r, &closures); }
+        }
+        Ok((generics, params, has_self, self_is_mut, ret))
     }
 
     /// Parse an `extern "C" fn name(params) -> ret;` foreign declaration. The
@@ -352,24 +593,22 @@ impl Parser {
     fn trait_item(&mut self) -> PResult<TraitItem> {
         if self.eat_kw(Kw::Type) {
             let n = self.ident()?;
+            // Bounds on an associated type (`type Item: Display;`) are not checked.
+            if self.eat(&TokKind::Colon) { self.bound_list()?; }
             self.expect(&TokKind::Semi)?;
             return Ok(TraitItem::AssocType(n));
         }
         // A method: parse the signature, then either `;` (required) or a body.
         let start = self.expect_kw(Kw::Fn)?;
         let name = self.ident()?;
-        let generics = self.generics()?;
-        self.expect(&TokKind::LParen)?;
-        let (params, has_self, self_is_mut) = self.params()?;
-        self.expect(&TokKind::RParen)?;
-        let ret = if self.eat(&TokKind::Arrow) { Some(self.ty()?) } else { None };
-        let generics = self.maybe_where(generics)?;
+        let (generics, params, has_self, self_is_mut, ret) = self.fn_signature()?;
         if self.eat(&TokKind::Semi) {
             Ok(TraitItem::Required(FnSig {
                 name, generics, params, has_self, self_is_mut, ret, span: start.to(self.prev_span()),
             }))
         } else {
-            let body = self.block()?;
+            let mut body = self.block()?;
+            crate::capture::share_mutated_captures(&mut body);
             Ok(TraitItem::Provided(FnDef {
                 vis: false, name, generics, params, has_self, self_is_mut, ret, body,
                 is_extern: false,
@@ -394,12 +633,21 @@ impl Parser {
         let generics = self.maybe_where(generics)?;
         self.expect(&TokKind::LBrace)?;
         let mut items = Vec::new();
+        let mut assoc_types = Vec::new();
         while !self.at(&TokKind::RBrace) {
             let vis = self.eat_kw(Kw::Pub);
+            if self.eat_kw(Kw::Type) {
+                let name = self.ident()?;
+                self.expect(&TokKind::Eq)?;
+                let ty = self.ty()?;
+                self.expect(&TokKind::Semi)?;
+                assoc_types.push((name, ty));
+                continue;
+            }
             items.push(self.fn_def(vis)?);
         }
         self.expect(&TokKind::RBrace)?;
-        Ok(ImplBlock { generics, trait_ref, self_ty, items, span: start.to(self.prev_span()) })
+        Ok(ImplBlock { generics, trait_ref, self_ty, items, assoc_types, span: start.to(self.prev_span()) })
     }
 
     fn type_alias(&mut self, vis: bool) -> PResult<TypeAlias> {
@@ -436,25 +684,53 @@ impl Parser {
         self.expect(&TokKind::LBrace)?;
         let mut items = Vec::new();
         while !self.at(&TokKind::RBrace) {
-            items.push(self.item()?);
+            items.extend(self.items()?);
         }
         self.expect(&TokKind::RBrace)?;
         Ok(ModDef { vis, name, items, inline: true, span: start.to(self.prev_span()) })
     }
 
-    fn use_decl(&mut self) -> PResult<UsePath> {
+    /// `use a::b;`, `use a::*;`, and groups `use a::{b, c::d, self};`. Paths
+    /// into the standard library (`std::`, `core::`, `alloc::`) name prelude
+    /// items, which are always in scope, so they produce nothing.
+    fn use_decl(&mut self) -> PResult<Vec<UsePath>> {
         let start = self.expect_kw(Kw::Use)?;
-        let mut segments = vec![self.ident()?];
-        while self.eat(&TokKind::ColonColon) {
+        self.eat(&TokKind::ColonColon);
+        let mut out = Vec::new();
+        self.use_tree(Vec::new(), &mut out)?;
+        self.expect(&TokKind::Semi)?;
+        let span = start.to(self.prev_span());
+        Ok(out.into_iter()
+            .filter(|segments: &Vec<String>| !matches!(segments[0].as_str(), "std" | "core" | "alloc"))
+            .map(|segments| UsePath { segments, span })
+            .collect())
+    }
+
+    fn use_tree(&mut self, prefix: Vec<String>, out: &mut Vec<Vec<String>>) -> PResult<()> {
+        let mut segments = prefix;
+        loop {
+            if self.eat(&TokKind::LBrace) {
+                while !self.at(&TokKind::RBrace) {
+                    self.use_tree(segments.clone(), out)?;
+                    if !self.eat(&TokKind::Comma) { break; }
+                }
+                self.expect(&TokKind::RBrace)?;
+                return Ok(());
+            }
             // A trailing `::*` is a glob import; record it as a `*` segment.
             if self.eat(&TokKind::Star) {
                 segments.push("*".to_string());
                 break;
             }
+            if self.eat_kw(Kw::SelfValue) {
+                // `use a::{self}` names `a` itself.
+                break;
+            }
             segments.push(self.ident()?);
+            if !self.eat(&TokKind::ColonColon) { break; }
         }
-        self.expect(&TokKind::Semi)?;
-        Ok(UsePath { segments, span: start.to(self.prev_span()) })
+        if !segments.is_empty() { out.push(segments); }
+        Ok(())
     }
 
     // ---- generics ----------------------------------------------------------
@@ -503,8 +779,52 @@ impl Parser {
     fn trait_ref(&mut self) -> PResult<TraitRef> {
         let start = self.span();
         let path = self.path()?;
-        let args = self.opt_type_args()?;
-        Ok(TraitRef { path, args, span: start.to(self.prev_span()) })
+        // `Fn(A, B) -> R` (also `FnMut`, `FnOnce`): a closure bound, kept as
+        // a `Fn` trait ref whose one argument is the `fn(A, B) -> R` type.
+        if path.is_single() && is_fn_trait(path.last()) && self.at(&TokKind::LParen) {
+            let sig = self.fn_trait_sig(start)?;
+            return Ok(TraitRef { path: Path::single("Fn".into(), path.span), args: vec![sig], bindings: vec![], span: start.to(self.prev_span()) });
+        }
+        // `<A, B, Item = T>`: type arguments, then associated type bindings.
+        let mut args = Vec::new();
+        let mut bindings = Vec::new();
+        if self.eat(&TokKind::Lt) {
+            while !self.at(&TokKind::Gt) && !self.at(&TokKind::Shr) {
+                if let (TokKind::Ident(name), TokKind::Eq) = (self.peek().clone(), self.peek_at(1).clone()) {
+                    self.bump();
+                    self.bump();
+                    bindings.push((name, self.ty()?));
+                } else {
+                    args.push(self.ty()?);
+                }
+                if !self.eat(&TokKind::Comma) { break; }
+            }
+            self.expect_gt()?;
+        }
+        Ok(TraitRef { path, args, bindings, span: start.to(self.prev_span()) })
+    }
+
+    /// The `(A, B) -> R` after `Fn`, as the type `fn(A, B) -> R`.
+    fn fn_trait_sig(&mut self, start: Span) -> PResult<Type> {
+        self.expect(&TokKind::LParen)?;
+        let mut params = Vec::new();
+        while !self.at(&TokKind::RParen) {
+            params.push(self.ty()?);
+            if !self.eat(&TokKind::Comma) { break; }
+        }
+        self.expect(&TokKind::RParen)?;
+        let ret = if self.eat(&TokKind::Arrow) { Some(Box::new(self.ty()?)) } else { None };
+        Ok(Type { kind: TypeKind::Fn(params, ret), span: start.to(self.prev_span()) })
+    }
+
+    /// `impl A + B` / `dyn A + B` bounds after the keyword.
+    fn bound_list(&mut self) -> PResult<Vec<TraitRef>> {
+        let mut bounds = Vec::new();
+        loop {
+            bounds.push(self.trait_ref()?);
+            if !self.eat(&TokKind::Plus) { break; }
+        }
+        Ok(bounds)
     }
 
     // ---- types -------------------------------------------------------------
@@ -559,9 +879,60 @@ impl Parser {
                 let ret = if self.eat(&TokKind::Arrow) { Some(Box::new(self.ty()?)) } else { None };
                 TypeKind::ExternFn(params, ret)
             }
-            TokKind::Keyword(Kw::SelfType) => {
+            TokKind::Keyword(Kw::SelfType) if !matches!(self.peek_at(1), TokKind::ColonColon) => {
                 self.bump();
                 TypeKind::SelfType
+            }
+            TokKind::Keyword(Kw::SelfType) => TypeKind::Path(self.path()?, vec![]),
+            // `<T as Trait>::Name`: the associated type `Name` of `T`.
+            TokKind::Lt => {
+                self.bump();
+                let base = self.ty()?;
+                self.expect_kw(Kw::As)?;
+                self.trait_ref()?;
+                self.expect_gt()?;
+                self.expect(&TokKind::ColonColon)?;
+                let name = self.ident()?;
+                let first = match &base.kind {
+                    TypeKind::Path(p, a) if p.is_single() && a.is_empty() => p.last().to_string(),
+                    TypeKind::SelfType => "Self".to_string(),
+                    _ => return Err(ParseError { msg: "`<T as Trait>::Name` needs a type parameter or `Self` for `T`".into(), span: start.to(self.prev_span()) }),
+                };
+                TypeKind::Path(Path { segments: vec![first, name], span: start.to(self.prev_span()) }, vec![])
+            }
+            // `impl Fn(A) -> R` and `dyn Fn(A) -> R` are closure types. An
+            // argument's `impl Trait` is an anonymous type parameter.
+            TokKind::Keyword(Kw::Impl) => {
+                self.bump();
+                let bounds = self.bound_list()?;
+                if let Some(f) = bounds.iter().find(|b| b.path.last() == "Fn" && b.args.len() == 1 && matches!(b.args[0].kind, TypeKind::Fn(..))) {
+                    return Ok(f.args[0].clone());
+                }
+                let span = start.to(self.prev_span());
+                let Some(sink) = self.impl_params.as_mut() else {
+                    return Err(ParseError { msg: "`impl Trait` is supported for arguments and `impl Fn(..)` results".into(), span });
+                };
+                let name = format!("impl#{}", sink.len());
+                sink.push(TypeParam { name: name.clone(), bounds, span });
+                TypeKind::Path(Path::single(name, start), vec![])
+            }
+            TokKind::Ident(w) if w == "dyn" && matches!(self.peek_at(1), TokKind::Ident(_)) => {
+                self.bump();
+                let bounds = self.bound_list()?;
+                if let Some(f) = bounds.iter().find(|b| b.path.last() == "Fn" && b.args.len() == 1 && matches!(b.args[0].kind, TypeKind::Fn(..))) {
+                    return Ok(f.args[0].clone());
+                }
+                // `dyn Trait` is the trait's object type, `dyn#Trait` (see
+                // resolve::synthesize_trait_objects). Marker bounds such as
+                // `Send` and `Sync` add nothing: every value may be shared.
+                let mut objects = bounds.into_iter().filter(|b| !matches!(b.path.last(), "Send" | "Sync" | "Unpin"));
+                let (Some(object), None) = (objects.next(), objects.next()) else {
+                    return Err(ParseError { msg: "`dyn` needs exactly one trait (plus `Send`/`Sync`)".into(), span: start.to(self.prev_span()) });
+                };
+                let mut path = object.path;
+                let last = path.segments.pop().unwrap();
+                path.segments.push(format!("dyn#{}", last));
+                TypeKind::Path(path, object.args)
             }
             TokKind::Ident(_) => {
                 let path = self.path()?;
@@ -608,13 +979,22 @@ impl Parser {
     fn path(&mut self) -> PResult<Path> {
         let start = self.span();
         let mut segments = vec![self.path_seg()?];
-        while self.at(&TokKind::ColonColon)
-            && matches!(self.peek_at(1), TokKind::Ident(_) | TokKind::Keyword(Kw::SelfType))
-        {
-            self.bump();
-            segments.push(self.path_seg()?);
+        loop {
+            if self.at(&TokKind::ColonColon)
+                && matches!(self.peek_at(1), TokKind::Ident(_) | TokKind::Keyword(Kw::SelfType))
+            {
+                self.bump();
+                segments.push(self.path_seg()?);
+            } else if self.at(&TokKind::ColonColon) && matches!(self.peek_at(1), TokKind::Lt) {
+                // A turbofish in an expression path (`Vec::<i64>::new()`):
+                // the type arguments are inferred instead.
+                self.bump();
+                self.opt_type_args()?;
+            } else {
+                break;
+            }
         }
-        Ok(Path { segments, span: start.to(self.prev_span()) })
+        Ok(Path { segments: std_path(segments), span: start.to(self.prev_span()) })
     }
     fn path_seg(&mut self) -> PResult<String> {
         match self.peek().clone() {
@@ -653,7 +1033,7 @@ impl Parser {
                 continue;
             }
             if self.is_item_start() {
-                stmts.push(Stmt::Item(self.item()?));
+                stmts.extend(self.items()?.into_iter().map(Stmt::Item));
                 continue;
             }
             // A statement that STARTS with a block-like keyword (`if`/`while`/
@@ -692,7 +1072,7 @@ impl Parser {
     fn is_block_stmt_start(&self) -> bool {
         matches!(
             self.peek(),
-            TokKind::Keyword(Kw::If | Kw::While | Kw::Loop | Kw::Match | Kw::For) | TokKind::LBrace
+            TokKind::Keyword(Kw::If | Kw::While | Kw::Loop | Kw::Match | Kw::For | Kw::Unsafe) | TokKind::LBrace
         )
     }
 
@@ -706,6 +1086,7 @@ impl Parser {
             TokKind::Keyword(Kw::Loop) => self.loop_expr(),
             TokKind::Keyword(Kw::Match) => self.match_expr(),
             TokKind::Keyword(Kw::For) => self.for_expr(),
+            TokKind::Keyword(Kw::Unsafe) => self.unsafe_expr(),
             TokKind::LBrace => self.block_expr(),
             _ => unreachable!("block_like_stmt called on non-block-like start"),
         }
@@ -718,7 +1099,7 @@ impl Parser {
                 Kw::Fn | Kw::Struct | Kw::Enum | Kw::Trait | Kw::Impl
                     | Kw::Type | Kw::Const | Kw::Static | Kw::Mod | Kw::Use
             )
-        )
+        ) || matches!((self.peek(), self.peek_at(1)), (TokKind::Ident(n), TokKind::Not) if n == "macro_rules")
     }
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
@@ -768,7 +1149,7 @@ impl Parser {
             self.bump();
             let hi = if self.starts_expr() { Some(self.expr_bp(3)?) } else { None };
             let span = start.to(self.prev_span());
-            return Ok(Expr { kind: Box::new(ExprKind::Range { lo: None, hi, inclusive }), span });
+            return Ok(Expr { kind: std::sync::Arc::new(ExprKind::Range { lo: None, hi, inclusive }), span });
         }
         let mut lhs = self.unary()?;
 
@@ -779,7 +1160,7 @@ impl Parser {
                 self.bump();
                 let value = self.expr_bp(1)?;
                 let span = start.to(self.prev_span());
-                lhs = Expr { kind: Box::new(ExprKind::Assign { target: lhs, op, value }), span };
+                lhs = Expr { kind: std::sync::Arc::new(ExprKind::Assign { target: lhs, op, value }), span };
                 continue;
             }
             // range
@@ -789,7 +1170,7 @@ impl Parser {
                 let hi = if self.starts_expr() { Some(self.expr_bp(3)?) } else { None };
                 let span = start.to(self.prev_span());
                 lhs = Expr {
-                    kind: Box::new(ExprKind::Range { lo: Some(lhs), hi, inclusive }),
+                    kind: std::sync::Arc::new(ExprKind::Range { lo: Some(lhs), hi, inclusive }),
                     span,
                 };
                 continue;
@@ -800,7 +1181,7 @@ impl Parser {
             self.bump();
             let rhs = self.expr_bp(r_bp)?;
             let span = start.to(self.prev_span());
-            lhs = Expr { kind: Box::new(ExprKind::Binary(op, lhs, rhs)), span };
+            lhs = Expr { kind: std::sync::Arc::new(ExprKind::Binary(op, lhs, rhs)), span };
         }
         Ok(lhs)
     }
@@ -853,7 +1234,7 @@ impl Parser {
             self.bump();
             let e = self.unary()?;
             let span = start.to(self.prev_span());
-            return Ok(Expr { kind: Box::new(ExprKind::Unary(op, e)), span });
+            return Ok(Expr { kind: std::sync::Arc::new(ExprKind::Unary(op, e)), span });
         }
         self.postfix()
     }
@@ -867,39 +1248,58 @@ impl Parser {
                     self.bump();
                     let args = self.call_args()?;
                     let span = start.to(self.prev_span());
-                    e = Expr { kind: Box::new(ExprKind::Call(e, args)), span };
+                    e = Expr { kind: std::sync::Arc::new(ExprKind::Call(e, args)), span };
                 }
                 TokKind::Dot => {
                     self.bump();
                     match self.peek().clone() {
                         TokKind::Ident(name) => {
                             self.bump();
+                            // A turbofish: `.collect::<Vec<_>>()` names the
+                            // result type, which becomes `collect`'s target.
+                            // Other methods infer their type arguments.
+                            let mut turbofish = None;
+                            if self.at(&TokKind::ColonColon) && matches!(self.peek_at(1), TokKind::Lt) {
+                                self.bump();
+                                turbofish = Some(self.opt_type_args()?);
+                            }
                             if self.at(&TokKind::LParen) {
                                 self.bump();
                                 let args = self.call_args()?;
                                 let span = start.to(self.prev_span());
+                                let collect_target = match &turbofish {
+                                    Some(tys) if name == "collect" && tys.len() == 1 => Some(tys[0].clone()),
+                                    _ => None,
+                                };
                                 e = Expr {
-                                    kind: Box::new(ExprKind::MethodCall {
+                                    kind: std::sync::Arc::new(ExprKind::MethodCall {
                                         recv: e, method: name, args, span,
                                     }),
                                     span,
                                 };
+                                if let Some(target) = collect_target {
+                                    e = Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, target)), span };
+                                }
                             } else {
                                 let span = start.to(self.prev_span());
                                 e = Expr {
-                                    kind: Box::new(ExprKind::Field {
+                                    kind: std::sync::Arc::new(ExprKind::Field {
                                         base: e, field: FieldAccess::Named(name),
                                     }),
                                     span,
                                 };
                             }
                         }
-                        TokKind::Int(n, _) => {
+                        TokKind::Int(n, suffix) => {
+                            if suffix != crate::lexer::NumSuffix::None {
+                                return Err(self.error("a tuple field index cannot have a numeric suffix"));
+                            }
+                            let index = u32::try_from(n).map_err(|_| self.error("tuple field index is out of range"))?;
                             self.bump();
                             let span = start.to(self.prev_span());
                             e = Expr {
-                                kind: Box::new(ExprKind::Field {
-                                    base: e, field: FieldAccess::Tuple(n as u32),
+                                kind: std::sync::Arc::new(ExprKind::Field {
+                                    base: e, field: FieldAccess::Tuple(index),
                                 }),
                                 span,
                             };
@@ -912,18 +1312,18 @@ impl Parser {
                     let index = self.delimited_expr()?;
                     self.expect(&TokKind::RBracket)?;
                     let span = start.to(self.prev_span());
-                    e = Expr { kind: Box::new(ExprKind::Index { base: e, index }), span };
+                    e = Expr { kind: std::sync::Arc::new(ExprKind::Index { base: e, index }), span };
                 }
                 TokKind::Question => {
                     self.bump();
                     let span = start.to(self.prev_span());
-                    e = Expr { kind: Box::new(ExprKind::Try(e)), span };
+                    e = Expr { kind: std::sync::Arc::new(ExprKind::Try(e)), span };
                 }
                 TokKind::Keyword(Kw::As) => {
                     self.bump();
                     let t = self.ty()?;
                     let span = start.to(self.prev_span());
-                    e = Expr { kind: Box::new(ExprKind::Cast(e, t)), span };
+                    e = Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, t)), span };
                 }
                 _ => break,
             }
@@ -955,6 +1355,7 @@ impl Parser {
             TokKind::Keyword(Kw::While) => return self.while_expr(),
             TokKind::Keyword(Kw::Loop) => return self.loop_expr(),
             TokKind::Keyword(Kw::For) => return self.for_expr(),
+            TokKind::Keyword(Kw::Unsafe) => return self.unsafe_expr(),
             TokKind::LBrace => return Ok(self.block_expr()?),
             TokKind::Keyword(Kw::Return) => {
                 self.bump();
@@ -968,6 +1369,11 @@ impl Parser {
             }
             TokKind::Keyword(Kw::Continue) => { self.bump(); ExprKind::Continue }
             TokKind::Pipe | TokKind::OrOr => return self.closure(),
+            // `move` closures: captures are always shared GC values or copies.
+            TokKind::Ident(w) if w == "move" && matches!(self.peek_at(1), TokKind::Pipe | TokKind::OrOr) => {
+                self.bump();
+                return self.closure();
+            }
             TokKind::LParen => {
                 self.bump();
                 if self.at(&TokKind::RParen) {
@@ -1008,9 +1414,10 @@ impl Parser {
                     }
                 }
             }
-            TokKind::Ident(_)
+            TokKind::Ident(name)
                 if matches!(self.peek_at(1), TokKind::Not)
-                    && matches!(self.peek_at(2), TokKind::LParen | TokKind::LBracket) =>
+                    && (matches!(self.peek_at(2), TokKind::LParen | TokKind::LBracket)
+                        || (matches!(self.peek_at(2), TokKind::LBrace) && self.macros.borrow().contains_key(name.as_str()))) =>
             {
                 return self.macro_call(start);
             }
@@ -1037,7 +1444,7 @@ impl Parser {
             }
             other => return Err(self.error(format!("expected expression, found {:?}", other))),
         };
-        Ok(Expr { kind: Box::new(kind), span: start.to(self.prev_span()) })
+        Ok(Expr { kind: std::sync::Arc::new(kind), span: start.to(self.prev_span()) })
     }
 
     // ---- built-in macros ----------------------------------------------------
@@ -1047,6 +1454,11 @@ impl Parser {
     fn macro_call(&mut self, start: Span) -> PResult<Expr> {
         let name = self.ident()?;
         self.expect(&TokKind::Not)?;
+        // A user `macro_rules!` macro (which may shadow a built-in one).
+        if self.macros.borrow().contains_key(&name) {
+            let tokens = self.macro_invocation_tokens(&name, start)?;
+            return self.parse_expansion_expr(tokens, start);
+        }
         let close = if self.eat(&TokKind::LParen) {
             TokKind::RParen
         } else {
@@ -1064,21 +1476,165 @@ impl Parser {
                 self.expect(&close)?;
                 let span = start.to(self.prev_span());
                 let call = |f: &str, arg: Expr| Expr {
-                    kind: Box::new(ExprKind::Call(Expr { kind: Box::new(ExprKind::Path(Path::single(f.to_string(), span))), span }, vec![arg])),
+                    kind: std::sync::Arc::new(ExprKind::Call(Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(f.to_string(), span))), span }, vec![arg])),
                     span,
                 };
-                let text = |t: &str| Expr { kind: Box::new(ExprKind::Str(t.to_string())), span };
+                let text = |t: &str| Expr { kind: std::sync::Arc::new(ExprKind::Str(t.to_string())), span };
+                // Like Rust's, the printing macros evaluate to `()`.
+                let unit = |e: Expr| Expr { kind: std::sync::Arc::new(ExprKind::Block(Block { stmts: vec![Stmt::Expr(e)], tail: None, span })), span };
                 Ok(match (name.as_str(), message) {
                     ("format", Some(m)) => m,
-                    ("println", m) => call("println", m.unwrap_or_else(|| text(""))),
-                    ("print", m) => call("print", m.unwrap_or_else(|| text(""))),
-                    ("eprintln", m) => call("stderr_line", m.unwrap_or_else(|| text(""))),
+                    ("println", m) => unit(call("println", m.unwrap_or_else(|| text("")))),
+                    ("print", m) => unit(call("print", m.unwrap_or_else(|| text("")))),
+                    ("eprintln", m) => unit(call("stderr_line", m.unwrap_or_else(|| text("")))),
                     (_, m) => call("panic", m.unwrap_or_else(|| text("explicit panic"))),
                 })
+            }
+            // `write!(f, "...", args)` appends to anything with `write_str`.
+            "write" | "writeln" => {
+                let target = self.delimited_expr()?;
+                let message = if self.eat(&TokKind::Comma) && !self.at(&close) {
+                    Some(self.format_args(&close, &name)?)
+                } else {
+                    None
+                };
+                self.expect(&close)?;
+                let span = start.to(self.prev_span());
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                let text = |t: &str| ex(ExprKind::Str(t.to_string()));
+                let message = match (name.as_str(), message) {
+                    ("writeln", Some(m)) => ex(ExprKind::Binary(BinOp::Add, m, text("\n"))),
+                    ("writeln", None) => text("\n"),
+                    (_, Some(m)) => m,
+                    (_, None) => return Err(ParseError { msg: "`write!` needs a format string".into(), span }),
+                };
+                Ok(ex(ExprKind::MethodCall { recv: target, method: "write_str".into(), args: vec![message], span }))
+            }
+            "unreachable" | "todo" | "unimplemented" => {
+                let message = if self.at(&close) { None } else { Some(self.format_args(&close, &name)?) };
+                self.expect(&close)?;
+                let span = start.to(self.prev_span());
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                let prefix = match name.as_str() {
+                    "unreachable" => "internal error: entered unreachable code",
+                    "todo" => "not yet implemented",
+                    _ => "not implemented",
+                };
+                let text = ex(ExprKind::Str(prefix.to_string()));
+                let message = match message {
+                    Some(m) => ex(ExprKind::Binary(BinOp::Add, ex(ExprKind::Binary(BinOp::Add, text, ex(ExprKind::Str(": ".into())))), m)),
+                    None => text,
+                };
+                Ok(ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".to_string(), span))), vec![message])))
             }
             "assert" | "assert_eq" | "assert_ne" => self.assert_macro(start, &name, &close),
             _ => Err(ParseError { msg: format!("unknown macro `{}!`", name), span: start }),
         }
+    }
+
+    /// `macro_rules! name { (matcher) => { body }; ... }`.
+    fn macro_rules(&mut self) -> PResult<()> {
+        self.bump(); // macro_rules
+        self.expect(&TokKind::Not)?;
+        let name = self.ident()?;
+        let open = self.span();
+        let end = crate::macros::tree_end(&self.toks, self.pos).filter(|_| crate::macros::close_of(self.peek()).is_some())
+            .ok_or_else(|| self.error("expected `{` after `macro_rules! name`"))?;
+        let body: Vec<Token> = self.toks[self.pos + 1..end - 1].to_vec();
+        let brace = matches!(self.peek(), TokKind::LBrace);
+        self.pos = end;
+        if !brace { self.expect(&TokKind::Semi)?; }
+        let mut rules = Vec::new();
+        let mut i = 0;
+        let fail = |(msg, span): (String, Span)| ParseError { msg, span };
+        while i < body.len() {
+            let mend = crate::macros::tree_end(&body, i).filter(|_| crate::macros::close_of(&body[i].kind).is_some())
+                .ok_or_else(|| ParseError { msg: "expected a `(...)` macro pattern".into(), span: body[i].span })?;
+            let matcher = crate::macros::parse_matcher(&body[i + 1..mend - 1]).map_err(fail)?;
+            if body.get(mend).map(|t| &t.kind) != Some(&TokKind::FatArrow) {
+                return Err(ParseError { msg: "expected `=>` after a macro pattern".into(), span: body.get(mend).map(|t| t.span).unwrap_or(open) });
+            }
+            let bstart = mend + 1;
+            let bend = crate::macros::tree_end(&body, bstart).filter(|_| body.get(bstart).is_some_and(|t| crate::macros::close_of(&t.kind).is_some()))
+                .ok_or_else(|| ParseError { msg: "expected a `{...}` macro body".into(), span: body.get(bstart).map(|t| t.span).unwrap_or(open) })?;
+            let trans = crate::macros::parse_transcriber(&body[bstart + 1..bend - 1]).map_err(fail)?;
+            rules.push((matcher, trans));
+            i = bend;
+            if body.get(i).map(|t| &t.kind) == Some(&TokKind::Semi) { i += 1; }
+        }
+        self.macros.borrow_mut().insert(name, std::rc::Rc::new(crate::macros::MacroRules { rules }));
+        Ok(())
+    }
+
+    /// Expand the invocation at the cursor (`name!` then a delimited group,
+    /// the cursor on the group) into tokens.
+    fn macro_invocation_tokens(&mut self, name: &str, at: Span) -> PResult<Vec<Token>> {
+        if self.macro_depth >= MAX_MACRO_DEPTH {
+            return Err(ParseError { msg: format!("macro `{name}!` expands too deeply (limit {MAX_MACRO_DEPTH})"), span: at });
+        }
+        let end = crate::macros::tree_end(&self.toks, self.pos).filter(|_| crate::macros::close_of(self.peek()).is_some())
+            .ok_or_else(|| self.error(format!("expected `(`, `[`, or `{{` after `{name}!`")))?;
+        let input: Vec<Token> = self.toks[self.pos + 1..end - 1].to_vec();
+        self.pos = end;
+        let rules = self.macros.borrow().get(name).cloned().unwrap();
+        let macros = self.macros.clone();
+        let depth = self.macro_depth;
+        let measure = move |kind: &str, toks: &[Token]| -> Option<usize> {
+            let mut all = toks.to_vec();
+            let eof_span = toks.last().map(|t| t.span).unwrap_or(at);
+            all.push(Token { kind: TokKind::Eof, span: eof_span });
+            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0 };
+            let ok = match kind {
+                "expr" => p.delimited_expr().is_ok(),
+                "ty" => p.ty().is_ok(),
+                "pat" | "pat_param" => p.pattern().is_ok(),
+                "path" => p.path().is_ok(),
+                "block" => matches!(p.peek(), TokKind::LBrace) && p.block().is_ok(),
+                "stmt" => p.let_stmt().is_ok() || { p.pos = 0; p.delimited_expr().is_ok() },
+                "item" => p.item().is_ok(),
+                _ => false,
+            };
+            (ok && p.pos > 0).then_some(p.pos.min(toks.len()))
+        };
+        crate::macros::expand(name, &rules, &input, &measure, at).map_err(|(msg, span)| ParseError { msg, span })
+    }
+
+    fn sub_parser(&self, mut tokens: Vec<Token>, at: Span) -> Parser {
+        let eof_span = tokens.last().map(|t| t.span).unwrap_or(at);
+        tokens.push(Token { kind: TokKind::Eof, span: eof_span });
+        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0 }
+    }
+
+    /// An expansion in expression position: its tokens as the body of a block,
+    /// so a macro can expand to statements followed by a value.
+    fn parse_expansion_expr(&mut self, tokens: Vec<Token>, at: Span) -> PResult<Expr> {
+        let mut wrapped = vec![Token { kind: TokKind::LBrace, span: at }];
+        wrapped.extend(tokens);
+        wrapped.push(Token { kind: TokKind::RBrace, span: at });
+        let mut p = self.sub_parser(wrapped, at);
+        let block = p.block()?;
+        if !matches!(p.peek(), TokKind::Eof) {
+            return Err(p.error("unexpected tokens after the macro expansion"));
+        }
+        // A single-expression expansion is that expression.
+        if block.stmts.is_empty() {
+            if let Some(tail) = block.tail.clone() { return Ok(tail); }
+        }
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Block(block)), span: at })
+    }
+
+    /// An invocation in item position: `name!(...);` expanding to items.
+    fn macro_items(&mut self) -> PResult<Vec<Item>> {
+        let start = self.span();
+        let name = self.ident()?;
+        self.expect(&TokKind::Not)?;
+        let brace = matches!(self.peek(), TokKind::LBrace);
+        let tokens = self.macro_invocation_tokens(&name, start)?;
+        if !brace { self.expect(&TokKind::Semi)?; }
+        let mut p = self.sub_parser(tokens, start);
+        let mut items = Vec::new();
+        while !p.at(&TokKind::Eof) { items.extend(p.items()?); }
+        Ok(items)
     }
 
     /// Comma-separated macro arguments up to (not including) `close`.
@@ -1117,7 +1673,7 @@ impl Parser {
         }
         self.expect(close)?;
         let span = start.to(self.prev_span());
-        let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
         let var = |n: &str| ex(ExprKind::Path(Path::single(n.to_string(), span)));
         let let_ = |n: &str, is_mut: bool, init: Expr| Stmt::Let {
             pattern: Pattern { kind: PatternKind::Binding { is_mut, name: n.to_string() }, span },
@@ -1145,11 +1701,9 @@ impl Parser {
                     body: Block { stmts: vec![push(var("vec#value"))], tail: None, span },
                 })),
             ],
-            None => {
-                let mut stmts = vec![let_("vec#items", true, assoc("new", vec![]))];
-                stmts.extend(items.into_iter().map(push));
-                stmts
-            }
+            // `vec![a, b]` is built from an array literal, so an expected
+            // element type (such as a trait object) reaches every element.
+            None => return Ok(assoc("from_array", vec![ex(ExprKind::Array(ArrayLit::Elems(items)))])),
         };
         Ok(ex(ExprKind::Block(Block { stmts, tail: Some(var("vec#items")), span })))
     }
@@ -1165,7 +1719,7 @@ impl Parser {
         let message = if self.eat(&TokKind::Comma) && !self.at(close) { Some(self.format_args(close, name)?) } else { None };
         self.expect(close)?;
         let span = start.to(self.prev_span());
-        let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
         let default = match name {
             "assert" => "assertion failed",
             "assert_eq" => "assertion `left == right` failed",
@@ -1245,13 +1799,22 @@ impl Parser {
         let ret = if self.eat(&TokKind::Arrow) { Some(self.ty()?) } else { None };
         let body = self.expr()?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: Box::new(ExprKind::Closure { params, ret, body }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Closure { params, ret, body }), span })
     }
 
     fn block_expr(&mut self) -> PResult<Expr> {
         let start = self.span();
         let b = self.block()?;
-        Ok(Expr { kind: Box::new(ExprKind::Block(b)), span: start.to(self.prev_span()) })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Block(b)), span: start.to(self.prev_span()) })
+    }
+
+    fn unsafe_expr(&mut self) -> PResult<Expr> {
+        let start = self.expect_kw(Kw::Unsafe)?;
+        let body = self.block()?;
+        Ok(Expr {
+            kind: std::sync::Arc::new(ExprKind::Unsafe(body)),
+            span: start.to(self.prev_span()),
+        })
     }
 
     fn if_expr(&mut self) -> PResult<Expr> {
@@ -1263,7 +1826,7 @@ impl Parser {
         let then_branch = self.block()?;
         let else_branch = self.else_branch()?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: Box::new(ExprKind::If { cond, then_branch, else_branch }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::If { cond, then_branch, else_branch }), span })
     }
 
     fn else_branch(&mut self) -> PResult<Option<Expr>> {
@@ -1276,19 +1839,19 @@ impl Parser {
     /// `if let PAT = EXPR { then } [else ...]` is
     /// `match EXPR { PAT => { then }, _ => else-or-() }`.
     fn if_let(&mut self, start: Span) -> PResult<Expr> {
-        let pattern = self.pattern()?;
+        let alts = self.pattern_alts()?;
         self.expect(&TokKind::Eq)?;
         let scrutinee = self.expr_no_struct()?;
         let then_branch = self.block()?;
         let else_branch = self.else_branch()?;
         let span = start.to(self.prev_span());
         let then_span = then_branch.span;
-        let otherwise = else_branch.unwrap_or(Expr { kind: Box::new(ExprKind::Unit), span });
-        let arms = vec![
-            MatchArm { pattern, guard: None, body: Expr { kind: Box::new(ExprKind::Block(then_branch)), span: then_span }, span },
-            MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: otherwise, span },
-        ];
-        Ok(Expr { kind: Box::new(ExprKind::Match { scrutinee, arms }), span })
+        let otherwise = else_branch.unwrap_or(Expr { kind: std::sync::Arc::new(ExprKind::Unit), span });
+        let then = Expr { kind: std::sync::Arc::new(ExprKind::Block(then_branch)), span: then_span };
+        let mut arms: Vec<MatchArm> = alts.into_iter()
+            .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, None), body: then.clone(), span }).collect();
+        arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: otherwise, span });
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Match { scrutinee, arms }), span })
     }
 
     fn match_expr(&mut self) -> PResult<Expr> {
@@ -1298,16 +1861,19 @@ impl Parser {
         let mut arms = Vec::new();
         while !self.at(&TokKind::RBrace) {
             let astart = self.span();
-            let pattern = self.pattern()?;
+            let alts = self.pattern_alts()?;
             let guard = if self.eat_kw(Kw::If) { Some(self.expr()?) } else { None };
             self.expect(&TokKind::FatArrow)?;
             let body = self.expr()?;
             self.eat(&TokKind::Comma);
-            arms.push(MatchArm { pattern, guard, body, span: astart.to(self.prev_span()) });
+            // Each alternative is its own arm with the same body.
+            for (pattern, guards) in alts {
+                arms.push(MatchArm { pattern, guard: conjoin(guards, guard.clone()), body: body.clone(), span: astart.to(self.prev_span()) });
+            }
         }
         self.expect(&TokKind::RBrace)?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: Box::new(ExprKind::Match { scrutinee, arms }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Match { scrutinee, arms }), span })
     }
 
     fn while_expr(&mut self) -> PResult<Expr> {
@@ -1315,36 +1881,38 @@ impl Parser {
         if self.eat_kw(Kw::Let) {
             // `while let PAT = EXPR { body }` is
             // `loop { match EXPR { PAT => { body }, _ => break } }`.
-            let pattern = self.pattern()?;
+            let alts = self.pattern_alts()?;
             self.expect(&TokKind::Eq)?;
             let scrutinee = self.expr_no_struct()?;
             let body = self.block()?;
             let span = start.to(self.prev_span());
             let body_span = body.span;
-            let arms = vec![
-                MatchArm { pattern, guard: None, body: Expr { kind: Box::new(ExprKind::Block(body)), span: body_span }, span },
+            let body = Expr { kind: std::sync::Arc::new(ExprKind::Block(body)), span: body_span };
+            let mut arms: Vec<MatchArm> = alts.into_iter()
+                .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, None), body: body.clone(), span }).collect();
+            arms.extend([
                 MatchArm {
                     pattern: Pattern { kind: PatternKind::Wildcard, span },
                     guard: None,
-                    body: Expr { kind: Box::new(ExprKind::Break(None)), span },
+                    body: Expr { kind: std::sync::Arc::new(ExprKind::Break(None)), span },
                     span,
                 },
-            ];
-            let matched = Expr { kind: Box::new(ExprKind::Match { scrutinee, arms }), span };
+            ]);
+            let matched = Expr { kind: std::sync::Arc::new(ExprKind::Match { scrutinee, arms }), span };
             let body = Block { stmts: vec![], tail: Some(matched), span };
-            return Ok(Expr { kind: Box::new(ExprKind::Loop { body }), span });
+            return Ok(Expr { kind: std::sync::Arc::new(ExprKind::Loop { body }), span });
         }
         let cond = self.expr_no_struct()?;
         let body = self.block()?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: Box::new(ExprKind::While { cond, body }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::While { cond, body }), span })
     }
 
     fn loop_expr(&mut self) -> PResult<Expr> {
         let start = self.expect_kw(Kw::Loop)?;
         let body = self.block()?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: Box::new(ExprKind::Loop { body }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Loop { body }), span })
     }
 
     fn for_expr(&mut self) -> PResult<Expr> {
@@ -1354,7 +1922,7 @@ impl Parser {
         let iter = self.expr_no_struct()?;
         let body = self.block()?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: Box::new(ExprKind::For { pat, iter, body }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::For { pat, iter, body }), span })
     }
 
     /// Parse an expression but forbid a trailing struct literal at the top
@@ -1375,15 +1943,153 @@ impl Parser {
                 | TokKind::Minus | TokKind::Not | TokKind::Pipe | TokKind::OrOr
                 | TokKind::Keyword(
                     Kw::True | Kw::False | Kw::If | Kw::Match | Kw::While | Kw::Loop
-                        | Kw::For | Kw::Return | Kw::Break | Kw::Continue
+                        | Kw::For | Kw::Return | Kw::Break | Kw::Continue | Kw::Unsafe
                         | Kw::SelfValue | Kw::SelfType
                 )
         )
     }
 
     // ---- patterns ----------------------------------------------------------
+    /// A pattern with no alternatives or ranges (`let`, `for`, parameters).
     fn pattern(&mut self) -> PResult<Pattern> {
         let start = self.span();
+        let mut alts = self.pattern_alts()?;
+        if alts.len() != 1 || !alts[0].1.is_empty() {
+            return Err(ParseError {
+                msg: "or-patterns and range patterns are supported in `match`, `if let`, and `while let`".into(),
+                span: start.to(self.prev_span()),
+            });
+        }
+        Ok(alts.pop().unwrap().0)
+    }
+
+    /// A pattern that may contain `|` alternatives, ranges (`1..=9`,
+    /// `'a'..='z'`), negative literals, and `name @ range`. It expands to one
+    /// plain pattern per alternative, each with the guard conditions its
+    /// ranges need (tested against fresh `pat#N` bindings).
+    fn pattern_alts(&mut self) -> PResult<Vec<(Pattern, Vec<Expr>)>> {
+        self.eat(&TokKind::Pipe);
+        let mut out = self.pattern_one()?;
+        while self.eat(&TokKind::Pipe) {
+            out.extend(self.pattern_one()?);
+        }
+        Ok(out)
+    }
+
+    /// The literal at the cursor as an expression, if it starts one
+    /// (`3`, `-3`, `'a'`).
+    fn literal_pattern_expr(&mut self) -> PResult<Option<Expr>> {
+        let start = self.span();
+        let ex = |kind: ExprKind, span: Span| Expr { kind: std::sync::Arc::new(kind), span };
+        Ok(Some(match self.peek().clone() {
+            TokKind::Minus if matches!(self.peek_at(1), TokKind::Int(..) | TokKind::Float(..)) => {
+                self.bump();
+                let lit = match self.peek().clone() {
+                    TokKind::Int(n, sfx) => ExprKind::Int(n, sfx),
+                    TokKind::Float(f, sfx) => ExprKind::Float(f, sfx),
+                    _ => unreachable!(),
+                };
+                self.bump();
+                let span = start.to(self.prev_span());
+                ex(ExprKind::Unary(UnOp::Neg, ex(lit, span)), span)
+            }
+            TokKind::Int(n, sfx) => { self.bump(); ex(ExprKind::Int(n, sfx), start) }
+            TokKind::Char(c) => { self.bump(); ex(ExprKind::Char(c), start) }
+            // A constant path ending a range: `0..=i64::MAX`.
+            TokKind::Ident(_) if matches!(self.peek_at(1), TokKind::ColonColon) => {
+                let path = self.path()?;
+                ex(ExprKind::Path(path), start.to(self.prev_span()))
+            }
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Range and negative-literal patterns: a fresh binding plus its guard.
+    fn guarded_literal_pattern(&mut self, name: Option<String>) -> PResult<Option<(Pattern, Vec<Expr>)>> {
+        let start = self.span();
+        let save = self.pos;
+        let negative = matches!(self.peek(), TokKind::Minus);
+        let lo = match self.literal_pattern_expr()? {
+            Some(lo) => lo,
+            // A constant path starting a range: `i64::MIN..=-1`.
+            None if matches!(self.peek(), TokKind::Ident(_)) => {
+                let path = self.path()?;
+                if !matches!(self.peek(), TokKind::DotDotEq | TokKind::DotDot) {
+                    self.pos = save;
+                    return Ok(None);
+                }
+                Expr { kind: std::sync::Arc::new(ExprKind::Path(path)), span: start.to(self.prev_span()) }
+            }
+            None => return Ok(None),
+        };
+        let inclusive = self.at(&TokKind::DotDotEq);
+        let is_range = inclusive || self.at(&TokKind::DotDot);
+        if !is_range && !negative && name.is_none() {
+            // An ordinary literal pattern.
+            self.pos = save;
+            return Ok(None);
+        }
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: start };
+        let binding = name.unwrap_or_else(|| {
+            self.pattern_counter += 1;
+            format!("pat#{}", self.pattern_counter)
+        });
+        let var = || ex(ExprKind::Path(Path::single(binding.clone(), start)));
+        let guard = if is_range {
+            self.bump();
+            let hi = self.literal_pattern_expr()?.ok_or_else(|| self.error("expected the end of the range pattern"))?;
+            let upper = if inclusive { BinOp::Le } else { BinOp::Lt };
+            ex(ExprKind::Binary(BinOp::And, ex(ExprKind::Binary(BinOp::Ge, var(), lo)), ex(ExprKind::Binary(upper, var(), hi))))
+        } else {
+            ex(ExprKind::Binary(BinOp::Eq, var(), lo))
+        };
+        let pat = Pattern { kind: PatternKind::Binding { is_mut: false, name: binding }, span: start.to(self.prev_span()) };
+        Ok(Some((pat, vec![guard])))
+    }
+
+    /// Combine the alternatives of each sub-pattern (their cartesian product).
+    fn product(parts: Vec<Vec<(Pattern, Vec<Expr>)>>) -> Vec<(Vec<Pattern>, Vec<Expr>)> {
+        let mut acc: Vec<(Vec<Pattern>, Vec<Expr>)> = vec![(Vec::new(), Vec::new())];
+        for alts in parts {
+            let mut next = Vec::new();
+            for (pats, guards) in &acc {
+                for (p, g) in &alts {
+                    let mut pats = pats.clone();
+                    pats.push(p.clone());
+                    let mut guards = guards.clone();
+                    guards.extend(g.iter().cloned());
+                    next.push((pats, guards));
+                }
+            }
+            acc = next;
+        }
+        acc
+    }
+
+    fn pattern_list(&mut self, close: &TokKind) -> PResult<Vec<Vec<(Pattern, Vec<Expr>)>>> {
+        let mut parts = Vec::new();
+        while !self.at(close) {
+            parts.push(self.pattern_alts()?);
+            if !self.eat(&TokKind::Comma) { break; }
+        }
+        Ok(parts)
+    }
+
+    fn pattern_one(&mut self) -> PResult<Vec<(Pattern, Vec<Expr>)>> {
+        let start = self.span();
+        if let Some(alt) = self.guarded_literal_pattern(None)? {
+            return Ok(vec![alt]);
+        }
+        // `name @ 1..=9`
+        if let (TokKind::Ident(name), TokKind::At) = (self.peek().clone(), self.peek_at(1).clone()) {
+            self.bump();
+            self.bump();
+            return match self.guarded_literal_pattern(Some(name))? {
+                Some(alt) => Ok(vec![alt]),
+                None => Err(self.error("`name @` is supported before a literal or range pattern")),
+            };
+        }
+        let single = |kind: PatternKind, this: &Self| vec![(Pattern { kind, span: start.to(this.prev_span()) }, Vec::new())];
         let kind = match self.peek().clone() {
             TokKind::Ident(name) if name == "_" => { self.bump(); PatternKind::Wildcard }
             TokKind::Keyword(Kw::Mut) => {
@@ -1398,45 +2104,52 @@ impl Parser {
             TokKind::Str(s) => { self.bump(); PatternKind::Literal(LitPattern::Str(s)) }
             TokKind::LParen => {
                 self.bump();
-                let mut pats = Vec::new();
-                while !self.at(&TokKind::RParen) {
-                    pats.push(self.pattern()?);
-                    if !self.eat(&TokKind::Comma) { break; }
-                }
+                let parts = self.pattern_list(&TokKind::RParen)?;
                 self.expect(&TokKind::RParen)?;
-                PatternKind::Tuple(pats)
+                // `(p)` is just `p`.
+                if parts.len() == 1 && !matches!(self.toks[self.pos - 2].kind, TokKind::Comma) {
+                    return Ok(parts.into_iter().next().unwrap());
+                }
+                let span = start.to(self.prev_span());
+                return Ok(Self::product(parts).into_iter()
+                    .map(|(pats, g)| (Pattern { kind: PatternKind::Tuple(pats), span }, g)).collect());
             }
             TokKind::Ident(_) => {
                 let path = self.path()?;
                 if self.at(&TokKind::LParen) {
                     self.bump();
-                    let mut payload = Vec::new();
-                    while !self.at(&TokKind::RParen) {
-                        payload.push(self.pattern()?);
-                        if !self.eat(&TokKind::Comma) { break; }
-                    }
+                    let parts = self.pattern_list(&TokKind::RParen)?;
                     self.expect(&TokKind::RParen)?;
-                    PatternKind::Variant { path, payload }
+                    let span = start.to(self.prev_span());
+                    return Ok(Self::product(parts).into_iter()
+                        .map(|(payload, g)| (Pattern { kind: PatternKind::Variant { path: path.clone(), payload }, span }, g)).collect());
                 } else if self.at(&TokKind::LBrace) {
                     self.bump();
-                    let mut fields = Vec::new();
+                    let mut names = Vec::new();
+                    let mut parts = Vec::new();
                     let mut rest = false;
                     while !self.at(&TokKind::RBrace) {
                         if self.eat(&TokKind::DotDot) { rest = true; break; }
                         let fname = self.ident()?;
                         let fpat = if self.eat(&TokKind::Colon) {
-                            self.pattern()?
+                            self.pattern_alts()?
                         } else {
-                            Pattern {
+                            vec![(Pattern {
                                 kind: PatternKind::Binding { is_mut: false, name: fname.clone() },
                                 span: self.prev_span(),
-                            }
+                            }, Vec::new())]
                         };
-                        fields.push((fname, fpat));
+                        names.push(fname);
+                        parts.push(fpat);
                         if !self.eat(&TokKind::Comma) { break; }
                     }
                     self.expect(&TokKind::RBrace)?;
-                    PatternKind::Struct { path, fields, rest }
+                    let span = start.to(self.prev_span());
+                    return Ok(Self::product(parts).into_iter()
+                        .map(|(pats, g)| (Pattern {
+                            kind: PatternKind::Struct { path: path.clone(), fields: names.iter().cloned().zip(pats).collect(), rest },
+                            span,
+                        }, g)).collect());
                 } else if path.is_single() {
                     // A bare lowercase-ish single ident is a binding; an
                     // upper-case one *could* be a unit variant. Resolution
@@ -1455,7 +2168,7 @@ impl Parser {
             }
             other => return Err(self.error(format!("expected pattern, found {:?}", other))),
         };
-        Ok(Pattern { kind, span: start.to(self.prev_span()) })
+        Ok(single(kind, self))
     }
 
 }
@@ -1464,6 +2177,7 @@ fn expr_is_block_like(e: &Expr) -> bool {
     matches!(
         &*e.kind,
         ExprKind::Block(_)
+            | ExprKind::Unsafe(_)
             | ExprKind::If { .. }
             | ExprKind::Match { .. }
             | ExprKind::While { .. }
@@ -1474,24 +2188,100 @@ fn expr_is_block_like(e: &Expr) -> bool {
 
 fn type_to_trait_ref(t: Type) -> Option<TraitRef> {
     match t.kind {
-        TypeKind::Path(path, args) => Some(TraitRef { path, args, span: t.span }),
+        TypeKind::Path(path, args) => Some(TraitRef { path, args, bindings: vec![], span: t.span }),
         _ => None,
     }
+}
+
+/// A parsed `{...}` format spec: `[[fill]align][+][#][0][width][.prec][type]`.
+#[derive(Default)]
+struct FormatSpec {
+    fill: Option<char>,
+    /// 0 = the type's default, 1 = `<`, 2 = `>`, 3 = `^`.
+    align: i64,
+    plus: bool,
+    alternate: bool,
+    zero: bool,
+    width: Option<FormatCount>,
+    precision: Option<FormatCount>,
+    ty: String,
+}
+
+/// A width or precision: a literal, `N$` (argument N), `name$` (a variable),
+/// or `*` (the next positional argument; precision only).
+enum FormatCount { Lit(u64), Arg(usize), Name(String), Next }
+
+fn parse_format_spec(spec: &str) -> Result<FormatSpec, String> {
+    let bad = || format!("invalid format spec `:{}`", spec);
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let mut out = FormatSpec::default();
+    let align_of = |c: char| match c { '<' => Some(1), '>' => Some(2), '^' => Some(3), _ => None };
+    if chars.len() >= 2 && align_of(chars[1]).is_some() {
+        out.fill = Some(chars[0]);
+        out.align = align_of(chars[1]).unwrap();
+        i = 2;
+    } else if let Some(a) = chars.first().and_then(|c| align_of(*c)) {
+        out.align = a;
+        i = 1;
+    }
+    if chars.get(i) == Some(&'+') { out.plus = true; i += 1; }
+    else if chars.get(i) == Some(&'-') { i += 1; }
+    if chars.get(i) == Some(&'#') { out.alternate = true; i += 1; }
+    // `0` is the zero-pad flag unless it is the argument index of `0$`.
+    if chars.get(i) == Some(&'0') && chars.get(i + 1) != Some(&'$') { out.zero = true; i += 1; }
+    // A count: digits, or an identifier, optionally followed by `$`.
+    let count = |i: &mut usize, allow_star: bool| -> Result<Option<FormatCount>, String> {
+        if allow_star && chars.get(*i) == Some(&'*') { *i += 1; return Ok(Some(FormatCount::Next)); }
+        let start = *i;
+        if chars.get(*i).is_some_and(|c| c.is_ascii_digit()) {
+            while chars.get(*i).is_some_and(|c| c.is_ascii_digit()) { *i += 1; }
+        } else {
+            while chars.get(*i).is_some_and(|c| c.is_alphanumeric() || *c == '_') { *i += 1; }
+        }
+        let word: String = chars[start..*i].iter().collect();
+        if word.is_empty() { return Ok(None); }
+        if chars.get(*i) == Some(&'$') {
+            *i += 1;
+            return Ok(Some(match word.parse::<usize>() { Ok(n) => FormatCount::Arg(n), Err(_) => FormatCount::Name(word) }));
+        }
+        match word.parse::<u64>() {
+            Ok(n) => Ok(Some(FormatCount::Lit(n))),
+            // Not a count: it is the trailing type (`x`, `e`, ...). Rewind.
+            Err(_) => { *i = start; Ok(None) }
+        }
+    };
+    out.width = count(&mut i, false)?;
+    if chars.get(i) == Some(&'.') {
+        i += 1;
+        out.precision = Some(count(&mut i, true)?.ok_or_else(bad)?);
+    }
+    let ty: String = chars[i..].iter().collect();
+    if !matches!(ty.as_str(), "" | "?" | "x" | "X" | "o" | "b" | "e" | "E" | "x?" | "X?") { return Err(bad()); }
+    out.ty = ty;
+    Ok(out)
 }
 
 /// Expand a `format!` string and its arguments into a `String` expression.
 ///
 /// Supports `{}` (the next argument), `{N}` (argument N), `{name}` (a variable
-/// in scope), and the escapes `{{` / `}}`. Each placeholder renders with
-/// `to_string()`. Arguments are evaluated once, in order. Format specs such
-/// as `{:?}` or `{:>5}` are not supported and are an error, as is an argument
-/// the string never uses.
+/// in scope), Rust's format specs after a `:` (fill/alignment, `+`, `#`, `0`,
+/// width, precision, and the `?`, `x`, `X`, `o`, `b`, `e`, `E` types; widths
+/// and precisions may be `N$`, `name$`, or `.*`), and the escapes `{{` / `}}`.
+/// `{}` renders with `to_string()` and `{:?}` with `Debug`. Arguments are
+/// evaluated once, in order. An argument the string never uses is an error.
 fn expand_format(fmt: &str, args: Vec<Expr>, span: Span) -> PResult<Expr> {
     let fail = |msg: String| Err(ParseError { msg, span });
-    let ex = |kind: ExprKind| Expr { kind: Box::new(kind), span };
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
     let arg_name = |i: usize| format!("format#{}", i);
     let var = |n: String| ex(ExprKind::Path(Path::single(n, span)));
-    let to_string = |e: Expr| ex(ExprKind::MethodCall { recv: e, method: "to_string".into(), args: vec![], span });
+    let method = |e: Expr, m: &str, args: Vec<Expr>| ex(ExprKind::MethodCall { recv: e, method: m.into(), args, span });
+    let int = |n: i64| {
+        let lit = ex(ExprKind::Int(n.unsigned_abs(), crate::lexer::NumSuffix::None));
+        if n < 0 { ex(ExprKind::Unary(UnOp::Neg, lit)) } else { lit }
+    };
+    let text = |t: &str| ex(ExprKind::Str(t.to_string()));
+    let boolean = |b: bool| ex(ExprKind::Bool(b));
     let mut pieces: Vec<Expr> = Vec::new();
     let mut literal = String::new();
     let mut used = vec![false; args.len()];
@@ -1503,36 +2293,94 @@ fn expand_format(fmt: &str, args: Vec<Expr>, span: Span) -> PResult<Expr> {
             '}' if chars.peek() == Some(&'}') => { chars.next(); literal.push('}'); }
             '}' => return fail("unmatched `}` in format string (write `}}` for a literal brace)".into()),
             '{' => {
-                let mut spec = String::new();
+                let mut placeholder = String::new();
                 loop {
                     match chars.next() {
                         Some('}') => break,
-                        Some(ch) => spec.push(ch),
+                        Some(ch) => placeholder.push(ch),
                         None => return fail("unterminated `{` in format string (write `{{` for a literal brace)".into()),
                     }
                 }
-                let spec = spec.trim();
-                if spec.contains(':') {
-                    return fail(format!("format spec `{{{}}}` is not supported; only `{{}}`, `{{N}}`, and `{{name}}` are", spec));
-                }
-                let value = if spec.is_empty() || spec.chars().all(|ch| ch.is_ascii_digit()) {
-                    let index = if spec.is_empty() { next += 1; next - 1 } else { spec.parse::<usize>().unwrap() };
+                let (arg, spec) = match placeholder.split_once(':') {
+                    Some((a, s)) => (a.trim().to_string(), Some(s.to_string())),
+                    None => (placeholder.trim().to_string(), None),
+                };
+                let spec = match &spec {
+                    Some(s) => match parse_format_spec(s) { Ok(s) => s, Err(m) => return fail(m) },
+                    None => FormatSpec::default(),
+                };
+                let mut positional = |index: Option<usize>, used: &mut Vec<bool>| -> PResult<Expr> {
+                    let index = index.unwrap_or_else(|| { next += 1; next - 1 });
                     if index >= args.len() {
                         return fail(format!("format string uses argument {} but {} argument(s) were given", index, args.len()));
                     }
                     used[index] = true;
-                    var(arg_name(index))
-                } else if spec.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_')
-                    && spec.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                    Ok(var(arg_name(index)))
+                };
+                // `.*` takes the precision from the next positional argument,
+                // before the value itself.
+                let star_precision = if matches!(spec.precision, Some(FormatCount::Next)) {
+                    Some(positional(None, &mut used)?)
+                } else { None };
+                let value = if arg.is_empty() || arg.chars().all(|ch| ch.is_ascii_digit()) {
+                    positional(if arg.is_empty() { None } else { Some(arg.parse::<usize>().unwrap()) }, &mut used)?
+                } else if arg.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+                    && arg.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
                 {
-                    var(spec.to_string())
+                    var(arg.to_string())
                 } else {
-                    return fail(format!("invalid format placeholder `{{{}}}`", spec));
+                    return fail(format!("invalid format placeholder `{{{}}}`", placeholder));
+                };
+                let count_expr = |c: &Option<FormatCount>, used: &mut Vec<bool>| -> PResult<Option<Expr>> {
+                    Ok(match c {
+                        None => None,
+                        Some(FormatCount::Lit(n)) => Some(int(*n as i64)),
+                        Some(FormatCount::Arg(n)) => {
+                            if *n >= args.len() { return Err(ParseError { msg: format!("format string uses argument {} but {} argument(s) were given", n, args.len()), span }); }
+                            used[*n] = true;
+                            Some(var(arg_name(*n)))
+                        }
+                        Some(FormatCount::Name(name)) => Some(var(name.clone())),
+                        Some(FormatCount::Next) => star_precision.clone(),
+                    })
+                };
+                let width = count_expr(&spec.width, &mut used)?;
+                let precision = count_expr(&spec.precision, &mut used)?;
+                let prec_or_none = || precision.clone().unwrap_or_else(|| int(-1));
+                let (body, prefix) = match spec.ty.as_str() {
+                    "?" | "x?" | "X?" => {
+                        let m = if spec.alternate { "fmt#debug_pretty" } else { "fmt#debug" };
+                        (method(value.clone(), m, vec![prec_or_none()]), "")
+                    }
+                    "x" | "X" | "o" | "b" => {
+                        let (radix, prefix) = match spec.ty.as_str() { "o" => (8, "0o"), "b" => (2, "0b"), _ => (16, "0x") };
+                        (method(value.clone(), "fmt#radix", vec![int(radix), boolean(spec.ty == "X")]), if spec.alternate { prefix } else { "" })
+                    }
+                    "e" | "E" => (method(value.clone(), "fmt#exp", vec![prec_or_none(), boolean(spec.ty == "E")]), ""),
+                    _ => match &precision {
+                        Some(p) => (method(value.clone(), "fmt#prec", vec![p.clone()]), ""),
+                        None => (method(value.clone(), "to_string", vec![]), ""),
+                    },
+                };
+                let piece = if width.is_some() || spec.plus || spec.zero || !prefix.is_empty() {
+                    let call = |f: &str, args: Vec<Expr>| ex(ExprKind::Call(var(f.to_string()), args));
+                    call("fmt_pad", vec![
+                        body,
+                        text(prefix),
+                        text(&spec.fill.unwrap_or(' ').to_string()),
+                        int(spec.align),
+                        width.unwrap_or_else(|| int(0)),
+                        method(value, "fmt#numeric", vec![]),
+                        boolean(spec.plus),
+                        boolean(spec.zero),
+                    ])
+                } else {
+                    body
                 };
                 if !literal.is_empty() {
                     pieces.push(ex(ExprKind::Str(std::mem::take(&mut literal))));
                 }
-                pieces.push(to_string(value));
+                pieces.push(piece);
             }
             _ => literal.push(c),
         }

@@ -92,7 +92,7 @@ pub struct FieldMeta {
 }
 
 /// What a field holds — enough to decode its bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldTy {
     /// A GC pointer to a heap object of the given `type_id`.
     Ref(u16),
@@ -102,6 +102,11 @@ pub enum FieldTy {
     /// the [`ValueMeta`] at the given `value_id`. The renderer recurses into it,
     /// adding this field's offset to the value's own (value-relative) offsets.
     Value(u16),
+    /// A nested value whose raw bytes begin at FieldMeta::offset, but whose
+    /// references were hoisted into the enclosing enum's pointer region.
+    /// Each pair maps a child-relative reference offset to an enclosing-value
+    /// relative reference offset. Mappings compose for nested projected values.
+    ProjectedValue { value_id: u16, reference_offsets: Vec<(u16, u16)> },
 }
 
 /// Reflection metadata for an inline `#[value]` aggregate (a value struct or
@@ -236,22 +241,43 @@ impl ScalarKind {
 //                       Struct/Enum body as above
 //
 //   field_list = u16 count; repeat: str name; u16 offset; field_ty
-//   field_ty   = u8 tag (0=Ref 1=Scalar 2=Value)
+//   field_ty   = u8 tag (0=Ref 1=Scalar 2=Value 3=ProjectedValue)
 //                Ref:    u16 target type_id
 //                Scalar: u8 scalar tag
 //                Value:  u16 value_id
+//                ProjectedValue: u16 value_id; u16 count; count*(u16 child_offset, u16 enclosing_offset)
 
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    assert!(bytes.len() <= u16::MAX as usize, "reflect: name too long");
-    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-    out.extend_from_slice(bytes);
+/// Metadata cannot be represented by the versioned on-disk field widths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeError(pub String);
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for EncodeError {}
+type EncodeResult<T> = Result<T, EncodeError>;
+
+fn put_count16(out: &mut Vec<u8>, count: usize, what: &str) -> EncodeResult<()> {
+    let count = u16::try_from(count).map_err(|_| EncodeError(format!("reflection {what} count {count} exceeds format limit {}", u16::MAX)))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    Ok(())
+}
+fn put_count32(out: &mut Vec<u8>, count: usize, what: &str) -> EncodeResult<()> {
+    let count = u32::try_from(count).map_err(|_| EncodeError(format!("reflection {what} count {count} exceeds format limit {}", u32::MAX)))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    Ok(())
 }
 
-fn put_field(out: &mut Vec<u8>, f: &FieldMeta) {
-    put_str(out, &f.name);
+fn put_str(out: &mut Vec<u8>, s: &str) -> EncodeResult<()> {
+    let bytes = s.as_bytes();
+    put_count16(out, bytes.len(), "name byte")?;
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn put_field(out: &mut Vec<u8>, f: &FieldMeta) -> EncodeResult<()> {
+    put_str(out, &f.name)?;
     out.extend_from_slice(&f.offset.to_le_bytes());
-    match f.ty {
+    match &f.ty {
         FieldTy::Ref(tid) => {
             out.push(0);
             out.extend_from_slice(&tid.to_le_bytes());
@@ -264,37 +290,47 @@ fn put_field(out: &mut Vec<u8>, f: &FieldMeta) {
             out.push(2);
             out.extend_from_slice(&vid.to_le_bytes());
         }
+        FieldTy::ProjectedValue { value_id, reference_offsets } => {
+            out.push(3);
+            out.extend_from_slice(&value_id.to_le_bytes());
+            put_count16(out, reference_offsets.len(), "projected reference")?;
+            for (child, enclosing) in reference_offsets {
+                out.extend_from_slice(&child.to_le_bytes());
+                out.extend_from_slice(&enclosing.to_le_bytes());
+            }
+        }
     }
+    Ok(())
 }
 
 /// Encode one type/value entry body (the `kind` after `id` + `name`).
-fn put_kind(out: &mut Vec<u8>, kind: &TypeKind) {
+fn put_kind(out: &mut Vec<u8>, kind: &TypeKind) -> EncodeResult<()> {
     match kind {
         TypeKind::Struct { fields } => {
             out.push(0);
-            put_field_list(out, fields);
+            put_field_list(out, fields)?;
         }
         TypeKind::Enum { tag_offset, variants } => {
             out.push(1);
             out.extend_from_slice(&tag_offset.to_le_bytes());
-            assert!(variants.len() <= u16::MAX as usize, "reflect: too many variants");
-            out.extend_from_slice(&(variants.len() as u16).to_le_bytes());
+            put_count16(out, variants.len(), "variant")?;
             for v in variants {
-                put_str(out, &v.name);
+                put_str(out, &v.name)?;
                 out.extend_from_slice(&v.tag.to_le_bytes());
-                put_field_list(out, &v.fields);
+                put_field_list(out, &v.fields)?;
             }
         }
         TypeKind::Opaque => out.push(2),
     }
+    Ok(())
 }
 
-fn put_field_list(out: &mut Vec<u8>, fields: &[FieldMeta]) {
-    assert!(fields.len() <= u16::MAX as usize, "reflect: too many fields");
-    out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+fn put_field_list(out: &mut Vec<u8>, fields: &[FieldMeta]) -> EncodeResult<()> {
+    put_count16(out, fields.len(), "field")?;
     for f in fields {
-        put_field(out, f);
+        put_field(out, f)?;
     }
+    Ok(())
 }
 
 /// Encode the type table, value table, per-type interior-pointer offsets, and
@@ -304,40 +340,40 @@ fn put_field_list(out: &mut Vec<u8>, fields: &[FieldMeta]) {
 /// flattened value fields of type `i` (used to set
 /// `gc::TypeInfo::interior_ptrs` for the AOT type table). `alloc_sites[k]`
 /// describes the allocation site whose compile-time id is `k`.
+/// Returns an error if a name or count exceeds the encoded field width.
 pub fn encode(
     types: &[TypeMeta],
     values: &[ValueMeta],
     interior: &[Vec<u16>],
     alloc_sites: &[AllocSite],
-) -> Vec<u8> {
+) -> EncodeResult<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+    put_count32(&mut out, types.len(), "type")?;
     for m in types {
         out.extend_from_slice(&m.type_id.to_le_bytes());
-        put_str(&mut out, &m.name);
-        put_kind(&mut out, &m.kind);
+        put_str(&mut out, &m.name)?;
+        put_kind(&mut out, &m.kind)?;
     }
-    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    put_count32(&mut out, values.len(), "value")?;
     for v in values {
         out.extend_from_slice(&v.value_id.to_le_bytes());
-        put_str(&mut out, &v.name);
-        put_kind(&mut out, &v.kind);
+        put_str(&mut out, &v.name)?;
+        put_kind(&mut out, &v.kind)?;
     }
-    out.extend_from_slice(&(interior.len() as u32).to_le_bytes());
+    put_count32(&mut out, interior.len(), "interior table")?;
     for offs in interior {
-        assert!(offs.len() <= u16::MAX as usize, "reflect: too many interior ptrs");
-        out.extend_from_slice(&(offs.len() as u16).to_le_bytes());
+        put_count16(&mut out, offs.len(), "interior pointer")?;
         for &o in offs {
             out.extend_from_slice(&o.to_le_bytes());
         }
     }
-    out.extend_from_slice(&(alloc_sites.len() as u32).to_le_bytes());
+    put_count32(&mut out, alloc_sites.len(), "allocation site")?;
     for s in alloc_sites {
-        put_str(&mut out, &s.function);
+        put_str(&mut out, &s.function)?;
         out.extend_from_slice(&s.type_id.to_le_bytes());
-        put_str(&mut out, &s.location);
+        put_str(&mut out, &s.location)?;
     }
-    out
+    Ok(out)
 }
 
 struct Reader<'a> {
@@ -377,6 +413,12 @@ impl<'a> Reader<'a> {
             0 => FieldTy::Ref(self.u16()),
             1 => FieldTy::Scalar(ScalarKind::from_tag(self.u8())),
             2 => FieldTy::Value(self.u16()),
+            3 => {
+                let value_id = self.u16();
+                let count = self.u16();
+                let reference_offsets = (0..count).map(|_| (self.u16(), self.u16())).collect();
+                FieldTy::ProjectedValue { value_id, reference_offsets }
+            }
             other => panic!("reflect::decode: invalid FieldTy tag {other}"),
         };
         FieldMeta { name, offset, ty }
@@ -538,7 +580,7 @@ mod tests {
         let values = sample_values();
         let interior = vec![vec![], vec![16u16], vec![16u16, 24u16]];
         let alloc_sites = sample_alloc_sites();
-        let bytes = encode(&types, &values, &interior, &alloc_sites);
+        let bytes = encode(&types, &values, &interior, &alloc_sites).unwrap();
         let (t, v, i, s) = decode(&bytes);
         assert_eq!(types, t);
         assert_eq!(values, v);
@@ -547,11 +589,73 @@ mod tests {
     }
 
     #[test]
+    fn metadata_name_limits_count_bytes_and_report_errors() {
+        let maximum = TypeMeta { type_id: 0, name: "n".repeat(u16::MAX as usize), kind: TypeKind::Opaque };
+        let bytes = encode(std::slice::from_ref(&maximum), &[], &[], &[]).unwrap();
+        assert_eq!(decode(&bytes).0, vec![maximum]);
+        for name in ["n".repeat(65536), "λ".repeat(32768)] {
+            let ty = TypeMeta { type_id: 0, name: name.clone(), kind: TypeKind::Opaque };
+            assert!(encode(&[ty], &[], &[], &[]).unwrap_err().to_string().contains("format limit"));
+            let ty = TypeMeta { type_id: 0, name: "T".into(), kind: TypeKind::Struct {
+                fields: vec![FieldMeta { name: name.clone(), offset: 16, ty: FieldTy::Scalar(ScalarKind::I64) }],
+            }};
+            assert!(encode(&[ty], &[], &[], &[]).is_err());
+            let value = ValueMeta { value_id: 0, name: name.clone(), kind: TypeKind::Opaque };
+            assert!(encode(&[], &[value], &[], &[]).is_err());
+            let site = AllocSite { function: name.clone(), type_id: 0, location: String::new() };
+            assert!(encode(&[], &[], &[], &[site]).is_err());
+            let site = AllocSite { function: "main".into(), type_id: 0, location: name };
+            assert!(encode(&[], &[], &[], &[site]).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_list_limits_report_errors_without_truncating() {
+        let field = FieldMeta { name: "f".into(), offset: 16, ty: FieldTy::Scalar(ScalarKind::I8) };
+        let ty = TypeMeta { type_id: 0, name: "T".into(), kind: TypeKind::Struct { fields: vec![field; 65536] } };
+        assert!(encode(&[ty], &[], &[], &[]).unwrap_err().to_string().contains("field count"));
+        let variant = VariantMeta { name: "V".into(), tag: 0, fields: vec![] };
+        let ty = TypeMeta { type_id: 0, name: "T".into(), kind: TypeKind::Enum { tag_offset: 0, variants: vec![variant; 65536] } };
+        assert!(encode(&[ty], &[], &[], &[]).unwrap_err().to_string().contains("variant count"));
+        assert!(encode(&[], &[], &[vec![16; 65536]], &[]).unwrap_err().to_string().contains("interior pointer count"));
+        if usize::BITS > 32 {
+            assert!(put_count32(&mut vec![], usize::MAX, "table").is_err());
+        }
+    }
+
+    #[test]
     fn empty_table_roundtrips() {
-        let (t, v, i, s) = decode(&encode(&[], &[], &[], &[]));
+        let (t, v, i, s) = decode(&encode(&[], &[], &[], &[]).unwrap());
         assert_eq!(t, Vec::<TypeMeta>::new());
         assert_eq!(v, Vec::<ValueMeta>::new());
         assert_eq!(i, Vec::<Vec<u16>>::new());
         assert_eq!(s, Vec::<AllocSite>::new());
+    }
+}
+
+#[cfg(test)]
+mod projection_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn projected_value_metadata_roundtrips_reference_pairs() {
+        let values = vec![ValueMeta { value_id: 0, name: "Outer".into(), kind: TypeKind::Enum {
+            tag_offset: 16, variants: vec![VariantMeta { name: "Nested".into(), tag: 3, fields: vec![FieldMeta {
+                name: "0".into(), offset: 24,
+                ty: FieldTy::ProjectedValue { value_id: 1, reference_offsets: vec![(0, 8), (16, 0)] },
+            }] }],
+        } }];
+        let encoded = encode(&[], &values, &[], &[]).unwrap();
+        let (_, decoded, _, _) = decode(&encoded);
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn projected_value_metadata_rejects_unrepresentable_reference_count() {
+        let values = vec![ValueMeta { value_id: 0, name: "Outer".into(), kind: TypeKind::Struct { fields: vec![FieldMeta {
+            name: "nested".into(), offset: 0,
+            ty: FieldTy::ProjectedValue { value_id: 0, reference_offsets: vec![(0, 0); 65536] },
+        }] } }];
+        assert!(encode(&[], &values, &[], &[]).unwrap_err().to_string().contains("projected reference count 65536"));
     }
 }

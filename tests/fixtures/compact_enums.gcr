@@ -38,9 +38,9 @@ fn main() -> i64 {
         && type_id_of(pack_empty) == type_id_of(pack) { 1000 } else { -10000 };
     let names = if type_name_of(empty) == "Tree" && type_name_of(pack_empty) == "Pack" { 164 } else { -10000 };
     heap_snapshot();
-    let worker = thread_spawn(|| churn());
+    let worker = (unsafe { thread_spawn(|| churn()) });
     let own = churn();
-    let child = thread_join(worker);
+    let child = (unsafe { thread_join(worker) });
     print_int(own + child + check(held) + check(empty) + value(number)
         + value(flag) + value(none) + unpack(pack) + unpack(pack_empty) + identity + names);
     0

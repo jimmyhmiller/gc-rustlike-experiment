@@ -30,20 +30,20 @@ fn spawn_join_returns_result() {
         }
     "#;
     // fib(28)=317811, fib(30)=832040 -> 1149851
-    assert_eq!(jit_run_i64(&prog_of(src)).unwrap(), 1149851);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(src)) }.unwrap(), 1149851);
 }
 
 #[test]
 fn multi_thread_alloc_correct() {
     let src = include_str!("../examples/threads.gcr");
-    assert_eq!(jit_run_i64(&prog_of(src)).unwrap(), 37492500);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(src)) }.unwrap(), 37492500);
 }
 
 #[test]
 fn multi_thread_alloc_under_stress() {
     // Collect on every allocation across three concurrent mutators.
     let src = include_str!("../examples/threads.gcr");
-    assert_eq!(jit_run_i64_gc(&prog_of(src), true).unwrap(), 37492500);
+    assert_eq!(unsafe { jit_run_i64_gc(&prog_of(src), true) }.unwrap(), 37492500);
 }
 
 // Regression: a thread blocked in `join` must transition to BLOCKED so a GC
@@ -66,14 +66,14 @@ const JOIN_DEADLOCK_SRC: &str = r#"
 
 #[test]
 fn join_does_not_deadlock_when_child_triggers_gc() {
-    assert_eq!(jit_run_i64(&prog_of(JOIN_DEADLOCK_SRC)).unwrap(), 20000);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(JOIN_DEADLOCK_SRC)) }.unwrap(), 20000);
 }
 
 #[test]
 fn join_does_not_deadlock_under_stress() {
     // The strongest form: child collects on every allocation while main blocks
     // in join. Deadlocked before the BLOCKED-state transition fix.
-    assert_eq!(jit_run_i64_gc(&prog_of(JOIN_DEADLOCK_SRC), true).unwrap(), 20000);
+    assert_eq!(unsafe { jit_run_i64_gc(&prog_of(JOIN_DEADLOCK_SRC), true) }.unwrap(), 20000);
 }
 
 // Regression: main holds a live Vec ACROSS join; a GC during the join (from the
@@ -104,7 +104,7 @@ const JOIN_LIVE_ROOTS_SRC: &str = r#"
 #[test]
 fn live_roots_survive_relocation_across_join() {
     // sum(m) = 2*(0..99) = 9900; child = 20000 -> 29900.
-    assert_eq!(jit_run_i64_gc(&prog_of(JOIN_LIVE_ROOTS_SRC), true).unwrap(), 29900);
+    assert_eq!(unsafe { jit_run_i64_gc(&prog_of(JOIN_LIVE_ROOTS_SRC), true) }.unwrap(), 29900);
 }
 
 // Nested/concurrent spawns: drives concurrent env-handoff (globals.add/get/set)
@@ -151,7 +151,7 @@ fn spawn_closure_capturing_value_struct() {
             t.join()
         }
     "#;
-    assert_eq!(jit_run_i64(&prog_of(src)).unwrap(), 42);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(src)) }.unwrap(), 42);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn spawn_closure_capturing_value_struct_under_stress() {
             l + t.join()
         }
     "#;
-    assert_eq!(jit_run_i64_gc(&prog_of(src), true).unwrap(), 8000);
+    assert_eq!(unsafe { jit_run_i64_gc(&prog_of(src), true) }.unwrap(), 8000);
 }
 
 // Generic Thread<T>: a thread can return ANY type, not just i64. The result
@@ -192,7 +192,7 @@ fn thread_returns_vec() {
             s
         }
     "#;
-    assert_eq!(jit_run_i64(&prog_of(src)).unwrap(), 4950);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(src)) }.unwrap(), 4950);
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn thread_returns_vec_under_stress() {
             s
         }
     "#;
-    assert_eq!(jit_run_i64_gc(&prog_of(src), true).unwrap(), 3160);
+    assert_eq!(unsafe { jit_run_i64_gc(&prog_of(src), true) }.unwrap(), 3160);
 }
 
 #[test]
@@ -229,12 +229,12 @@ fn thread_returns_struct() {
             p.a + p.b + t2.join()
         }
     "#;
-    assert_eq!(jit_run_i64(&prog_of(src)).unwrap(), 37);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(src)) }.unwrap(), 37);
 }
 
 #[test]
 fn nested_concurrent_spawns() {
-    assert_eq!(jit_run_i64(&prog_of(NESTED_SRC)).unwrap(), 18000);
+    assert_eq!(unsafe { jit_run_i64(&prog_of(NESTED_SRC)) }.unwrap(), 18000);
 }
 
 // --- AOT: the spawned threads run in a standalone binary too ---

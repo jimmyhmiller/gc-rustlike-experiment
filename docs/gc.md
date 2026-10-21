@@ -9,6 +9,12 @@ promote survivors. Major collection copies tenured objects. A card-table write
 barrier records old-to-young stores, including references inside flattened value
 fields. Objects carry a type ID; TypeInfo describes the traced locations.
 
+When promotion capacity is tight, the read-only survivor preflight uses the
+same dirty-card object enumeration as minor evacuation, plus native channel
+owner edges. It leaves cards intact for evacuation and avoids rescanning the
+entire tenured heap. Direct raw old-to-young writes must mark their cards,
+including initialization of objects allocated directly into tenured space.
+
 Generated functions pass a runtime Thread pointer. Reference locals use shadow-
 stack root slots; value locals containing references use indirect roots. ANF
 normalization evaluates eager operands into locals, including scalar expressions
@@ -66,13 +72,18 @@ the original type-info word in each copy and release-publishes the destination.
 Other workers acquire-load forwarding words. References to BUSY copies become
 retry tasks rather than blocking: waiting while holding other unpublished claims
 could create a cycle between workers. Only owners queue copied objects for scan.
+Objects without traced payload slots need no scan task; native channel-owner
+edges are enrolled independently during claiming, including for opaque owners.
 There are no losing duplicate copies or unused copying-buffer tails. Linear heap
 walks wait until all reservations are initialized; copying does not zero-fill first.
 The same protocol promotes nursery survivors into tenured space during minor GC.
 
-A shared queue transfers batches of up to 32 tasks under one mutex. Workers scan
-batches and reuse task, discovery, claim, layout and destination-address buffers
-within each cycle. They publish pending copies before publishing discovered work. Termination requires both an
+A shared queue transfers batches of up to 128 tasks under one mutex. Workers
+reuse OS-thread task, discovery, layout and destination-address scratch buffers
+across cycles; heap-borrowing claim guards remain job-local. Each active producer
+can retain up to 128 published objects locally, with a 32 KiB copied-work bound,
+and donates excess work or work requested by sleeping helpers. Workers publish
+pending copies before publishing discovered work. Termination requires both an
 empty queue and zero active batches; a worker publishes discoveries before
 retiring its active batch. Idle workers sleep on a condition variable. Root/field
 rewrites use atomic accesses, and destination cards are rebuilt during major
@@ -80,8 +91,10 @@ object scanning. Every participant completes before swapping spaces or resetting
 the nursery. The worker pool dispatches borrowed jobs synchronously and waits for
 all helpers even when a coordinator or helper panics. Helpers do not retain a heap
 reference between jobs, and their handles are joined during heap teardown.
-Collector panics cancel queue waiters, release uncompleted header claims and
-propagate; a failed partially relocated cycle must not resume managed execution.
+Moving-collection panics abort the process at the collection boundary. A failed
+partially relocated cycle has no complete rollback and must not resume managed
+execution. The worker pool's generic borrowed-job panic propagation does not
+make collector failures recoverable.
 
 This is a correctness-oriented parallel backend with measured copy throughput,
 not a completed mutator-scaling effort. Root enumeration, dirty-card indexing,
@@ -207,6 +220,17 @@ require unsafe lifetime management; `DynRootFrame::with_pushed` keeps its guard
 private, rejects duplicate registration, and unlinks on normal return or unwind.
 The managed references placed in slots remain subject to the collector's pointer
 policy and root-enumeration contracts.
+
+`Heap::register_permanent_extra` is unsafe: the source must keep a stable address
+and outlive the heap, and its slots must remain valid, nonoverlapping and quiescent
+through collection. Growth may park and relocate managed objects. Publish frame
+chains and every other live root before calling, then reload derived pointers.
+A pinned temporary source keeps the new roots visible while backing is allocated
+outside collector/registry locks. Collector exclusion transfers publication to
+the permanent registry without enumerating the same slots twice. Old backing is
+freed while callers remain BLOCKED. Spare-capacity publication neither allocates
+nor parks. This internal bridge does not mark later snapshots incomplete as
+external per-call root histories can do.
 
 
 ## Allocation and root fast paths — 2026-10-06
@@ -413,3 +437,217 @@ writes and scalar/reference fields cannot collect or park. Call-effect analysis
 recognizes those operations and inline aggregate
 construction. Mutable aggregate field snapshots and boxed value-array writes
 retain their relocation checks and roots.
+
+### Versioned polling string scans
+
+Large String equality and FNV hashing can service a pending collection in
+`ai_str_eq_v2` / `ai_str_hash_v2`. Inputs are immutable, scratch-rooted before
+polling, and reloaded for each scan chunk. No managed slice survives a poll.
+Hashes preserve the original FNV-1a constants and nonnegative 63-bit result.
+
+The original `ai_str_eq` / `ai_str_hash` symbols remain noncollecting: older
+compiled callers omit root-cache invalidation around them. Changing those
+symbols to collect would silently invalidate the old calling convention.
+Current code generation guards the immutable first input's byte count against
+`STRING_SCAN_LEAF_BYTES` (32 KiB). Small inputs call the original leaf symbols;
+larger inputs call the versioned symbols with relocation-epoch checks and root
+reloads. Equality with unequal lengths remains constant work on the leaf path.
+The versioned symbols make incompatible custom archives fail at link time.
+Thread/AotLayout offsets and the v3 startup record remain unchanged.
+
+This bounds work between scan polls, not total GC pause or OS scheduling time.
+Legacy callers retain their old unbounded scan behavior until recompiled.
+
+## Pointer policies in heap inspection
+
+Embedders using tagged or boxed references must select the same `PtrPolicy` for
+inspection as for collection. `Heap::visit_roots_with_policy::<P>` decodes root
+slots; `dump_heap_text_with_policy::<P>` and `dump_heap_json_with_policy::<P>`
+decode graph edges and reflected references, including inline value fields.
+Inline value enums render their active variant and payload; their metadata tag
+and payload offsets are interpreted relative to the embedded value base.
+Non-pointer values and decoded null pointers are omitted from roots and edges.
+The existing convenience entry points use `IdentityPtrPolicy`.
+
+These remain unsafe inspection APIs: objects and metadata must be initialized,
+and the selected policy must match all traced references. Root visitation requires
+an existing world pause; text/JSON dumping acquires its own pause and must not be
+called while already holding collector exclusion. JSON schema and object IDs are
+unchanged. Use the policy-aware APIs for correct root attribution, reachability
+and retained-size analysis of custom-encoded heaps.
+
+## Telemetry waits and mutator coordination
+
+Public event/summary/metrics readers, trace configuration and trace flushing may
+wait for native locks or I/O. They suspend every RUNNING registration on the
+calling OS thread before waiting, then release the telemetry lock before
+restoring those registrations. Already BLOCKED entries stay blocked. This also
+applies on native unwind; trace sink panics still propagate and poison remains
+observable. JIT embedders must publish current frames before these calls and
+reload derived managed pointers afterward, as at other safepoints.
+
+Collector event recording retains its paused path. Optional trace writes can
+still delay a collection, and embedding sinks must not reenter the heap or
+managed runtime. Parking a flushing caller permits an independent world-pause
+inspection; it does not make a blocked trace sink asynchronous.
+
+## Inline enum reflection metadata
+
+Value enums describe their tag and variant payloads in `ValueMeta`. Nested value
+payloads can store raw bytes in the payload region while their references occupy
+the enclosing enum's leading pointer slots. `FieldTy::ProjectedValue` records
+child-relative/enclosing-relative reference-offset pairs; rendering composes these
+maps while reading scalar/tag bytes from the raw value base. Named variant fields
+retain their source names. Boxed enum payload values use the same representation.
+
+`field_count`, `field_kind` and `field_name` include aggregate enum payload fields
+in source order. Their kind is 5; `field_i64` rejects aggregate storage. Metadata
+builders and reflection emission return errors for unrepresentable offsets/counts.
+The metadata encoding retains existing tags and adds field tag 3 for projected
+values, with a checked u16 mapping count and u16 offset pairs.
+
+Generated native programs require `gcr_runtime_main_v4` so incompatible custom
+archives fail to link. The runtime keeps v3/v2/legacy startup exports for older
+generated programs and their existing metadata. `gc::reflect::encode` and the
+compiler's metadata builders supply the current format.
+
+
+### Native thread-census storage
+
+`native_registry_bytes` includes the allocator-requested backing of the registered
+thread census. Sparse replacement is staged outside the census mutex and checked
+against current membership before installation; state allocations and identities
+stay stable. Old backing remains charged until freed outside registry/coordinator
+locks. Final retirement releases an empty census even while host observers retain
+retired states. Native pressure combines these bytes with the existing registry
+and buffer ledgers.
+
+Registered SATB and allocation-site counter backing is also allocator-accounted.
+Retired state observers keep those bytes charged until their final Arc releases
+the actual allocation, even after Heap drop. SATB queue/iterator handoffs preserve
+the buffer's allocator; bounded collector flushes reuse it. Standalone snapshots
+use standard vectors outside this ledger, while public SATB draining resets its
+configured local reservation. Warm profile writes add no allocation/accounting.
+
+Heap-retired allocation-site totals also retain their allocator charge until
+Heap release, independently of retired state observers. Profile reports copy
+into standalone vectors rather than retaining the heap allocator.
+
+Heap-created global SATB queues charge their deduplication bitmap, chunk-container
+backing and bounded-cycle payload buffers. Public standard-vector inputs transfer
+their backing without copying and become charged at adoption. Already-accounted
+mutator chunks preserve their original allocator without a second charge.
+Drained chunk containers and payload iterators retain allocator ownership until
+physical release. The bitmap remains charged across cycle boundaries until the
+queue drops. Public `drain_all` produces a caller-owned standard snapshot outside
+this ledger and releases the source batch after copying.
+
+This metric excludes ThreadState record/control allocations (including embedded
+scratch roots), temporary census/profile snapshots and other unaccounted collector
+auxiliary storage. Independently constructed standalone queues have no Heap
+ledger. The metric is allocator-requested ownership, not total native RSS.
+
+
+## Optional statemap history — 2026-10-19
+
+Attaching a `StatemapTracer` enables event history. `TraceLimits` bounds committed
+history by event count and custom entity UTF-8 bytes (defaults: 65536 events and
+1 MiB). Oldest events are evicted as needed; an individually oversized entity or
+zero event capacity rejects recording. `stats()` reports retained events, text
+bytes, total attempts, evictions and rejections. Export includes loss counts in
+its title. GC and canonical numeric thread entities require no recording-time
+allocation, including rollover. Custom names retain their original text.
+
+Export uses the tracer creation wall-clock origin and monotonic event offsets,
+escapes JSON names, and takes a bounded snapshot before invoking the writer.
+Concurrent and reentrant recording therefore continues independently of output.
+Each export has its own snapshot allocation; custom strings awaiting publication
+and caller storage are separate from the committed-history limits. These limits
+are not a process RSS quota or a charge to one Heap's metadata ledger. The pinned
+upstream renderer currently mishandles quoted names when producing SVG; our JSON
+preserves those names correctly (see the project pad's upstream renderer issue).
+
+
+## Parallel worker storage and job lifetime — 2026-10-19
+
+Heap-created worker pools charge the requested capacity of their native helper
+handle vector to `native_registry_bytes`. Changing participation can leave idle
+helpers and retained capacity; both belong to the pool until Heap destruction.
+Pool destruction shuts down and joins helpers, including native TLS teardown,
+before releasing handle-vector backing. Shared control allocations, OS resources
+and reusable thread-local scratch have separate lifetimes and remain outside this
+scoped metric.
+
+Synchronous job dispatch preserves the borrowed closure pointer through type
+erasure. Helpers receive shared access to `F: Sync`; the closure need not be Send
+or static. Dispatch holds its exclusive ownership until all participants finish,
+then clears the published job before returning or propagating a panic. This
+pointer-preserving job representation does not change managed-value encoding or
+establish whole-collector strict provenance.
+
+
+## Temporary root-address metadata — 2026-10-19
+
+The native registry metric also includes the collector's temporary root-address
+hash backing, including bucket/control storage. The inline prefix borrows the
+Heap counter and takes no allocator owner. Spill storage acquires independent
+allocator ownership; its consuming iterator keeps backing charged until physical
+release, even after the original borrow ends. This table deduplicates writable
+slot addresses, not their managed values. Caller root storage remains separate.
+
+The charge is transient and is usually gone before parallel dispatch, so an
+end-of-collection sample alone does not describe peak metadata ownership. The
+metric still excludes other collector auxiliary storage, record/control overhead
+and OS-thread scratch caches; it is not total native RSS. These ownership scopes do not change root-source
+quiescence or managed-address lifetime requirements.
+
+
+## Temporary evacuation FIFO metadata — 2026-10-19
+
+Heap collections charge the actual backing of their cycle-local FIFO to the
+native registry ledger. The allocator-aware initialized arena reuses inactive
+Copy task slots, exposes only the logical head/length interval, and retains its
+charge until physical release. Growth accounts both allocations during overlap.
+The normal 4096-root release-client reproduction now observes 65536 bytes during
+dispatch and zero afterward. This extends storage accounting; it does not make
+the ledger a complete process RSS measurement. Initial paired measurements show
+small-collection and single-worker wide-graph regressions under investigation;
+see the current checkpoint in `GC_READINESS.md` for scope and evidence.
+
+
+## Temporary remembered-object metadata — 2026-10-19
+
+Minor collection charges actual remembered-object hash backing to the Heap
+registry allocator. Its exact-sized owning iterator supplies tasks directly to
+FIFO construction, avoiding a separate materialized task vector. The table
+remains charged through enrollment and iterator exhaustion until physical
+release. Empty major/clean-minor paths allocate neither a table nor an allocator
+owner. Managed object addresses remain valid under the same scoped pause.
+
+The 4096-parent normal fixture reports actual table requests of 73744 bytes on
+Linux and 73736 on macOS; accounting uses allocator requests rather than an
+assumed cross-platform layout. Removing the vector saves one 65536-byte request
+in the Linux fixture, while retaining the table longer increases its measured
+peak live requested storage by 8208 bytes. Isolated dirty-minor timing improves;
+fresh applied-source gates are described in `GC_READINESS.md`. Initialized-range
+and thread snapshots, other controls and OS-thread scratch remain separately
+scoped; this metric is not complete process RSS.
+
+
+## Initialized allocation-region snapshots — 2026-10-19
+
+Heap-owned collector/inspection walks and remembered-card enumeration use a
+snapshot of initialized regions that excludes active and retired TLAB tails.
+Up to three regions are inline; larger snapshots borrow the Heap accounting
+allocator and use one backing buffer. Sorted holes are converted to initialized
+prefixes in place; small coalesced results release temporary backing immediately.
+Standalone arena walking retains its global-allocator entry point. Actual backing
+is charged through physical release, including while visitors run. No buffer
+registry lock is held across a visitor callback; nested metadata inspection is
+covered by native tests.
+
+Walkers require stopped mutators or exclusive arena/heap access with valid,
+stable allocation extents. Visitors must not collect or invalidate visited
+objects. The backing ledger still excludes thread census snapshots, persistent
+object-index storage, TLAB controls and other separately scoped owners. Current
+validation and measured sparse/dense tradeoffs are in `GC_READINESS.md`.

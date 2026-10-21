@@ -1,0 +1,241 @@
+fn cast_f32_i8(x: f32) -> i8 { x as i8 }
+fn check_f32_i8(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_i8(nan) == (0 as i8) &&
+    cast_f32_i8(inf) == (127 as i8) &&
+    cast_f32_i8(zero - inf) == ((0 - 127 - 1) as i8) &&
+    cast_f32_i8(128.0 as f32) == (127 as i8) &&
+    cast_f32_i8((0.0 - 128.0) as f32) == ((0 - 127 - 1) as i8) &&
+    cast_f32_i8(12.75 as f32) == (12 as i8) &&
+    cast_f32_i8((0.0 - 12.75) as f32) == ((0 - 12) as i8) &&
+    cast_f32_i8(zero) == (0 as i8) &&
+    cast_f32_i8(zero * ((0.0 - 1.0) as f32)) == (0 as i8)
+}
+
+fn cast_f32_i16(x: f32) -> i16 { x as i16 }
+fn check_f32_i16(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_i16(nan) == (0 as i16) &&
+    cast_f32_i16(inf) == (32767 as i16) &&
+    cast_f32_i16(zero - inf) == ((0 - 32767 - 1) as i16) &&
+    cast_f32_i16(32768.0 as f32) == (32767 as i16) &&
+    cast_f32_i16((0.0 - 32768.0) as f32) == ((0 - 32767 - 1) as i16) &&
+    cast_f32_i16(12.75 as f32) == (12 as i16) &&
+    cast_f32_i16((0.0 - 12.75) as f32) == ((0 - 12) as i16) &&
+    cast_f32_i16(zero) == (0 as i16) &&
+    cast_f32_i16(zero * ((0.0 - 1.0) as f32)) == (0 as i16)
+}
+
+fn cast_f32_i32(x: f32) -> i32 { x as i32 }
+fn check_f32_i32(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_i32(nan) == (0 as i32) &&
+    cast_f32_i32(inf) == (2147483647 as i32) &&
+    cast_f32_i32(zero - inf) == ((0 - 2147483647 - 1) as i32) &&
+    cast_f32_i32(2147483648.0 as f32) == (2147483647 as i32) &&
+    cast_f32_i32((0.0 - 2147483648.0) as f32) == ((0 - 2147483647 - 1) as i32) &&
+    cast_f32_i32(12.75 as f32) == (12 as i32) &&
+    cast_f32_i32((0.0 - 12.75) as f32) == ((0 - 12) as i32) &&
+    cast_f32_i32(zero) == (0 as i32) &&
+    cast_f32_i32(zero * ((0.0 - 1.0) as f32)) == (0 as i32)
+}
+
+fn cast_f32_i64(x: f32) -> i64 { x as i64 }
+fn check_f32_i64(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_i64(nan) == (0 as i64) &&
+    cast_f32_i64(inf) == (9223372036854775807 as i64) &&
+    cast_f32_i64(zero - inf) == ((0 - 9223372036854775807 - 1) as i64) &&
+    cast_f32_i64(9223372036854775808.0 as f32) == (9223372036854775807 as i64) &&
+    cast_f32_i64((0.0 - 9223372036854775808.0) as f32) == ((0 - 9223372036854775807 - 1) as i64) &&
+    cast_f32_i64(12.75 as f32) == (12 as i64) &&
+    cast_f32_i64((0.0 - 12.75) as f32) == ((0 - 12) as i64) &&
+    cast_f32_i64(zero) == (0 as i64) &&
+    cast_f32_i64(zero * ((0.0 - 1.0) as f32)) == (0 as i64)
+}
+
+fn cast_f32_u8(x: f32) -> u8 { x as u8 }
+fn check_f32_u8(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_u8(nan) == (0 as u8) &&
+    cast_f32_u8(inf) == ((0 - 1) as u8) &&
+    cast_f32_u8(zero - inf) == (0 as u8) &&
+    cast_f32_u8(256.0 as f32) == ((0 - 1) as u8) &&
+    cast_f32_u8((0.0 - 256.0) as f32) == (0 as u8) &&
+    cast_f32_u8(12.75 as f32) == (12 as u8) &&
+    cast_f32_u8((0.0 - 12.75) as f32) == (0 as u8) &&
+    cast_f32_u8(zero) == (0 as u8) &&
+    cast_f32_u8(zero * ((0.0 - 1.0) as f32)) == (0 as u8)
+}
+
+fn cast_f32_u16(x: f32) -> u16 { x as u16 }
+fn check_f32_u16(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_u16(nan) == (0 as u16) &&
+    cast_f32_u16(inf) == ((0 - 1) as u16) &&
+    cast_f32_u16(zero - inf) == (0 as u16) &&
+    cast_f32_u16(65536.0 as f32) == ((0 - 1) as u16) &&
+    cast_f32_u16((0.0 - 65536.0) as f32) == (0 as u16) &&
+    cast_f32_u16(12.75 as f32) == (12 as u16) &&
+    cast_f32_u16((0.0 - 12.75) as f32) == (0 as u16) &&
+    cast_f32_u16(zero) == (0 as u16) &&
+    cast_f32_u16(zero * ((0.0 - 1.0) as f32)) == (0 as u16)
+}
+
+fn cast_f32_u32(x: f32) -> u32 { x as u32 }
+fn check_f32_u32(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_u32(nan) == (0 as u32) &&
+    cast_f32_u32(inf) == ((0 - 1) as u32) &&
+    cast_f32_u32(zero - inf) == (0 as u32) &&
+    cast_f32_u32(4294967296.0 as f32) == ((0 - 1) as u32) &&
+    cast_f32_u32((0.0 - 4294967296.0) as f32) == (0 as u32) &&
+    cast_f32_u32(12.75 as f32) == (12 as u32) &&
+    cast_f32_u32((0.0 - 12.75) as f32) == (0 as u32) &&
+    cast_f32_u32(zero) == (0 as u32) &&
+    cast_f32_u32(zero * ((0.0 - 1.0) as f32)) == (0 as u32)
+}
+
+fn cast_f32_u64(x: f32) -> u64 { x as u64 }
+fn check_f32_u64(zero: f32) -> bool {
+    let inf = (1.0 as f32) / zero;
+    let nan = zero / zero;
+    cast_f32_u64(nan) == (0 as u64) &&
+    cast_f32_u64(inf) == ((0 - 1) as u64) &&
+    cast_f32_u64(zero - inf) == (0 as u64) &&
+    cast_f32_u64(18446744073709551616.0 as f32) == ((0 - 1) as u64) &&
+    cast_f32_u64((0.0 - 18446744073709551616.0) as f32) == (0 as u64) &&
+    cast_f32_u64(12.75 as f32) == (12 as u64) &&
+    cast_f32_u64((0.0 - 12.75) as f32) == (0 as u64) &&
+    cast_f32_u64(zero) == (0 as u64) &&
+    cast_f32_u64(zero * ((0.0 - 1.0) as f32)) == (0 as u64)
+}
+
+fn cast_f64_i8(x: f64) -> i8 { x as i8 }
+fn check_f64_i8(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_i8(nan) == (0 as i8) &&
+    cast_f64_i8(inf) == (127 as i8) &&
+    cast_f64_i8(zero - inf) == ((0 - 127 - 1) as i8) &&
+    cast_f64_i8(128.0 as f64) == (127 as i8) &&
+    cast_f64_i8((0.0 - 128.0) as f64) == ((0 - 127 - 1) as i8) &&
+    cast_f64_i8(12.75 as f64) == (12 as i8) &&
+    cast_f64_i8((0.0 - 12.75) as f64) == ((0 - 12) as i8) &&
+    cast_f64_i8(zero) == (0 as i8) &&
+    cast_f64_i8(zero * (0.0 - 1.0)) == (0 as i8)
+}
+
+fn cast_f64_i16(x: f64) -> i16 { x as i16 }
+fn check_f64_i16(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_i16(nan) == (0 as i16) &&
+    cast_f64_i16(inf) == (32767 as i16) &&
+    cast_f64_i16(zero - inf) == ((0 - 32767 - 1) as i16) &&
+    cast_f64_i16(32768.0 as f64) == (32767 as i16) &&
+    cast_f64_i16((0.0 - 32768.0) as f64) == ((0 - 32767 - 1) as i16) &&
+    cast_f64_i16(12.75 as f64) == (12 as i16) &&
+    cast_f64_i16((0.0 - 12.75) as f64) == ((0 - 12) as i16) &&
+    cast_f64_i16(zero) == (0 as i16) &&
+    cast_f64_i16(zero * (0.0 - 1.0)) == (0 as i16)
+}
+
+fn cast_f64_i32(x: f64) -> i32 { x as i32 }
+fn check_f64_i32(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_i32(nan) == (0 as i32) &&
+    cast_f64_i32(inf) == (2147483647 as i32) &&
+    cast_f64_i32(zero - inf) == ((0 - 2147483647 - 1) as i32) &&
+    cast_f64_i32(2147483648.0 as f64) == (2147483647 as i32) &&
+    cast_f64_i32((0.0 - 2147483648.0) as f64) == ((0 - 2147483647 - 1) as i32) &&
+    cast_f64_i32(12.75 as f64) == (12 as i32) &&
+    cast_f64_i32((0.0 - 12.75) as f64) == ((0 - 12) as i32) &&
+    cast_f64_i32(zero) == (0 as i32) &&
+    cast_f64_i32(zero * (0.0 - 1.0)) == (0 as i32)
+}
+
+fn cast_f64_i64(x: f64) -> i64 { x as i64 }
+fn check_f64_i64(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_i64(nan) == (0 as i64) &&
+    cast_f64_i64(inf) == (9223372036854775807 as i64) &&
+    cast_f64_i64(zero - inf) == ((0 - 9223372036854775807 - 1) as i64) &&
+    cast_f64_i64(9223372036854775808.0 as f64) == (9223372036854775807 as i64) &&
+    cast_f64_i64((0.0 - 9223372036854775808.0) as f64) == ((0 - 9223372036854775807 - 1) as i64) &&
+    cast_f64_i64(12.75 as f64) == (12 as i64) &&
+    cast_f64_i64((0.0 - 12.75) as f64) == ((0 - 12) as i64) &&
+    cast_f64_i64(zero) == (0 as i64) &&
+    cast_f64_i64(zero * (0.0 - 1.0)) == (0 as i64)
+}
+
+fn cast_f64_u8(x: f64) -> u8 { x as u8 }
+fn check_f64_u8(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_u8(nan) == (0 as u8) &&
+    cast_f64_u8(inf) == ((0 - 1) as u8) &&
+    cast_f64_u8(zero - inf) == (0 as u8) &&
+    cast_f64_u8(256.0 as f64) == ((0 - 1) as u8) &&
+    cast_f64_u8((0.0 - 256.0) as f64) == (0 as u8) &&
+    cast_f64_u8(12.75 as f64) == (12 as u8) &&
+    cast_f64_u8((0.0 - 12.75) as f64) == (0 as u8) &&
+    cast_f64_u8(zero) == (0 as u8) &&
+    cast_f64_u8(zero * (0.0 - 1.0)) == (0 as u8)
+}
+
+fn cast_f64_u16(x: f64) -> u16 { x as u16 }
+fn check_f64_u16(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_u16(nan) == (0 as u16) &&
+    cast_f64_u16(inf) == ((0 - 1) as u16) &&
+    cast_f64_u16(zero - inf) == (0 as u16) &&
+    cast_f64_u16(65536.0 as f64) == ((0 - 1) as u16) &&
+    cast_f64_u16((0.0 - 65536.0) as f64) == (0 as u16) &&
+    cast_f64_u16(12.75 as f64) == (12 as u16) &&
+    cast_f64_u16((0.0 - 12.75) as f64) == (0 as u16) &&
+    cast_f64_u16(zero) == (0 as u16) &&
+    cast_f64_u16(zero * (0.0 - 1.0)) == (0 as u16)
+}
+
+fn cast_f64_u32(x: f64) -> u32 { x as u32 }
+fn check_f64_u32(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_u32(nan) == (0 as u32) &&
+    cast_f64_u32(inf) == ((0 - 1) as u32) &&
+    cast_f64_u32(zero - inf) == (0 as u32) &&
+    cast_f64_u32(4294967296.0 as f64) == ((0 - 1) as u32) &&
+    cast_f64_u32((0.0 - 4294967296.0) as f64) == (0 as u32) &&
+    cast_f64_u32(12.75 as f64) == (12 as u32) &&
+    cast_f64_u32((0.0 - 12.75) as f64) == (0 as u32) &&
+    cast_f64_u32(zero) == (0 as u32) &&
+    cast_f64_u32(zero * (0.0 - 1.0)) == (0 as u32)
+}
+
+fn cast_f64_u64(x: f64) -> u64 { x as u64 }
+fn check_f64_u64(zero: f64) -> bool {
+    let inf = (1.0 as f64) / zero;
+    let nan = zero / zero;
+    cast_f64_u64(nan) == (0 as u64) &&
+    cast_f64_u64(inf) == ((0 - 1) as u64) &&
+    cast_f64_u64(zero - inf) == (0 as u64) &&
+    cast_f64_u64(18446744073709551616.0 as f64) == ((0 - 1) as u64) &&
+    cast_f64_u64((0.0 - 18446744073709551616.0) as f64) == (0 as u64) &&
+    cast_f64_u64(12.75 as f64) == (12 as u64) &&
+    cast_f64_u64((0.0 - 12.75) as f64) == (0 as u64) &&
+    cast_f64_u64(zero) == (0 as u64) &&
+    cast_f64_u64(zero * (0.0 - 1.0)) == (0 as u64)
+}
+
+fn main() -> i64 { if check_f32_i8(0.0 as f32) && check_f32_i16(0.0 as f32) && check_f32_i32(0.0 as f32) && check_f32_i64(0.0 as f32) && check_f32_u8(0.0 as f32) && check_f32_u16(0.0 as f32) && check_f32_u32(0.0 as f32) && check_f32_u64(0.0 as f32) && check_f64_i8(0.0 as f64) && check_f64_i16(0.0 as f64) && check_f64_i32(0.0 as f64) && check_f64_i64(0.0 as f64) && check_f64_u8(0.0 as f64) && check_f64_u16(0.0 as f64) && check_f64_u32(0.0 as f64) && check_f64_u64(0.0 as f64) { 42 } else { 1 } }

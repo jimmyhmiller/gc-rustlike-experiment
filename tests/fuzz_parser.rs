@@ -43,9 +43,21 @@ fn try_parse(src: &str) -> Result<(), String> {
     let handle = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-            // Lex may error (fine); only parse a successful lex.
-            if let Ok(toks) = lex(&src) {
-                let _ = parse_module(&toks);
+            // Exercise the diagnostic path too: reporting malformed source
+            // must be just as robust as rejecting it.
+            match lex(&src) {
+                Ok(toks) => {
+                    if let Err(error) = parse_module(&toks) {
+                        gcrust::diag::render("fuzz.gcr", &src, error.span, &error.msg);
+                    }
+                }
+                Err(error) => {
+                    let start = error.span.start as usize;
+                    let end = error.span.end as usize;
+                    assert!(start <= end && end <= src.len());
+                    assert!(src.is_char_boundary(start) && src.is_char_boundary(end));
+                    gcrust::diag::render("fuzz.gcr", &src, error.span, &error.msg);
+                }
             }
         })
         .expect("spawn fuzz worker");
@@ -68,6 +80,7 @@ fn gen_random_chars(rng: &mut Rng, len: usize) -> String {
         '(', ')', '{', '}', '[', ']', '<', '>', ':', ';', ',', '.',
         '+', '-', '*', '/', '%', '=', '!', '&', '|', '"', '\'', '_',
         ':', ':', // bias toward `::`
+        'é', '界', '🦀', '\\', '\0', // scalar boundaries and malformed escapes
     ];
     (0..len).map(|_| *rng.pick(CHARS)).collect()
 }

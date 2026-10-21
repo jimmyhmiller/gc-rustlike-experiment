@@ -160,6 +160,29 @@ publish frames before parking and reload relocated references on resumption.
 Task frames must remain rooted even when no worker is executing them. Retiring
 a thread/task unregisters roots only after its result and failure are published.
 
+Inline aggregate field reads copy one coherent value while holding both the
+aggregate stripe and canonical object access. An uncontended read can complete
+while concurrent copying continues; it need not wait for the whole phase.
+Contended reads publish roots and may wait for relocation before retrying.
+Blocked waiters wait for stripe availability without taking ownership. After
+resuming RUNNING they reload the rooted receiver and try its current stripe;
+a lost race retries. Release notifies every waiter because relocation can send
+the next acquisition to another stripe, leaving no later release on the old one.
+No aggregate stripe is held across a blocked-to-running transition.
+Aggregate replacements first try a non-safepointing transaction: retain the
+aggregate stripe and canonical access, log overwritten references, copy untraced
+bytes and atomically store traced words, mark canonical nursery cards, then
+linearize before releasing canonical access. A failed try changes neither the
+payload nor the SC order; generated code uses the rooted lock fallback and
+reloads the RHS after relocation. The try-write source can be the existing ANF
+value-local storage: it is stable on the native stack, reference interiors are
+rooted in the caller frame, and the nonparking operation neither retains nor
+relocates it. Constants still receive temporary storage. This avoids copying a
+rooted local into an additional untraced staging buffer. Reads also linearize under canonical access,
+so old/new aliases remain ordered even if their aggregate stripes differ.
+No safepoint occurs while canonical access is held. This integration does not
+establish arbitrary generated-program concurrent-collector conformance.
+
 ## Implementation ledger
 
 | Area | Observed today | Required before version 1 conformance |

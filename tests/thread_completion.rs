@@ -24,11 +24,20 @@ fn main() -> i64 {
     // Reference results retain identity on every observation.
     p.n = 81;
     if alias.join().n != 81 { return 2; }
-    let scalar = thread_spawn(|| 17);
-    if thread_join(scalar) != 17 || thread_join(scalar) != 17 { return 3; }
+    let scalar = (unsafe { thread_spawn(|| 17) });
+    if (unsafe { thread_join(scalar) }) != 17 || (unsafe { thread_join(scalar) }) != 17 { return 3; }
+    let mut replaced = Thread::spawn(|| 41);
+    if replaced.join() != 41 { return 4; }
+    let replacement_alias = replaced;
+    replaced.result = ThreadResult { v: Option::Some(99) };
+    i = 0;
+    while i < 100 { let text = "pressure" + "λ"; i = i + text.len() / 10; }
+    if replacement_alias.join() != 99 { return 5; }
     0
 }
 "#;
+
+const ATOMIC_OWNERS: &str = include_str!("fixtures/atomic_ownership.gcr");
 
 const CONCURRENT: &str = r#"
 #[value] enum Outcome { Text(String), Number(i64) }
@@ -102,6 +111,9 @@ fn main() -> i64 {
 fn source(name: &str) -> &'static str {
     match name {
         "repeat" => REPEAT,
+        "atomic_owners" => ATOMIC_OWNERS,
+        "channel_owners" => include_str!("fixtures/channel_ownership.gcr"),
+        "orphan_threads" => include_str!("fixtures/orphan_threads.gcr"),
         "concurrent" => CONCURRENT,
         "abandoned" => ABANDONED,
         "inference" => INFERENCE,
@@ -117,7 +129,7 @@ fn jit_worker() {
     let (module, _) = parse_with_prelude(source(&name)).unwrap();
     let resolved = resolve_module(module).unwrap();
     let program = lower_program(&resolved.globals).unwrap();
-    assert_eq!(jit_run_i64_gc(&program, true).unwrap(), 0);
+    assert_eq!(unsafe { jit_run_i64_gc(&program, true) }.unwrap(), 0);
 }
 
 fn verify(name: &str) {
@@ -204,4 +216,123 @@ fn inferred_returns_reject_incompatible_types() {
         let error = lower_program(&resolved.globals).unwrap_err();
         assert!(error.msg.contains("expected"), "{}", error.msg);
     }
+}
+
+#[test]
+fn safe_thread_spawns_establish_managed_completion_ownership() {
+    for (source, binds) in [
+        (REPEAT, true),
+        ("fn main() -> i64 { let handle = unsafe { thread_spawn(|| 42) }; unsafe { thread_join(handle) } }", false),
+    ] {
+        let (module, _) = parse_with_prelude(source).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let program = lower_program(&resolved.globals).unwrap();
+        // Inspect the typed owner as well as the emitted call. A replaceable
+        // ThreadResult field cannot anchor the lifetime of the native handle.
+        fn check_owners(node: &serde_json::Value, program: &gcrust::core::CoreProgram) {
+            if let Some(call) = node.get("RuntimeCall") {
+                if call["func"] == "ai_thread_bind_owner" {
+                    let layout = call["args"][1]["repr"]["Ref"].as_u64().unwrap() as usize;
+                    let name = &program.layouts[layout].name;
+                    assert!(name.starts_with("Thread<"), "unstable completion owner: {name}");
+                }
+            }
+            match node {
+                serde_json::Value::Object(fields) => {
+                    for child in fields.values() { check_owners(child, program); }
+                }
+                serde_json::Value::Array(children) => {
+                    for child in children { check_owners(child, program); }
+                }
+                _ => {}
+            }
+        }
+        check_owners(&serde_json::to_value(&program).unwrap(), &program);
+        for optimized in [false, true] {
+            let ir = gcrust::codegen::emit_llvm_ir(&program, optimized).unwrap();
+            assert_eq!(ir.contains("call void @ai_thread_bind_owner("), binds,
+                "safe wrappers must bind; legacy raw spawn must preserve execution ownership");
+        }
+    }
+}
+
+#[test]
+fn atomic_aliases_survive_moving_gc_and_concurrent_updates() {
+    verify("atomic_owners");
+}
+
+#[test]
+fn safe_atomics_bind_their_stable_wrapper_identity() {
+    fn visit(node: &serde_json::Value, program: &gcrust::core::CoreProgram, count: &mut usize) {
+        if let Some(call) = node.get("RuntimeCall") {
+            if call["func"] == "ai_atomic_i64_bind_owner" {
+                let layout = call["args"][1]["repr"]["Ref"].as_u64().unwrap() as usize;
+                assert_eq!(program.layouts[layout].name, "AtomicI64");
+                *count += 1;
+            }
+        }
+        match node {
+            serde_json::Value::Object(fields) => { for child in fields.values() { visit(child, program, count); } }
+            serde_json::Value::Array(children) => { for child in children { visit(child, program, count); } }
+            _ => {}
+        }
+    }
+    for (source, bound) in [
+        (ATOMIC_OWNERS, true),
+        ("fn main() -> i64 { let cell = unsafe { atomic_i64_new(42) }; unsafe { atomic_i64_load(cell) } }", false),
+    ] {
+        let (module, _) = parse_with_prelude(source).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let program = lower_program(&resolved.globals).unwrap();
+        let mut count = 0;
+        visit(&serde_json::to_value(&program).unwrap(), &program, &mut count);
+        assert_eq!(count > 0, bound);
+        for optimized in [false, true] {
+            let ir = gcrust::codegen::emit_llvm_ir(&program, optimized).unwrap();
+            assert_eq!(ir.contains("call void @ai_atomic_i64_bind_owner("), bound);
+        }
+    }
+}
+
+#[test]
+fn channel_cycles_aliases_and_blocked_operations_survive_gc() {
+    verify("channel_owners");
+}
+
+#[test]
+fn safe_channels_bind_the_wrapper_and_raw_queues_remain_unbound() {
+    fn visit(node: &serde_json::Value, program: &gcrust::core::CoreProgram, count: &mut usize) {
+        if let Some(call) = node.get("RuntimeCall") {
+            if call["func"] == "ai_chan_bind_owner" {
+                let layout = call["args"][1]["repr"]["Ref"].as_u64().unwrap() as usize;
+                assert!(program.layouts[layout].name.starts_with("Channel<"));
+                *count += 1;
+            }
+        }
+        match node {
+            serde_json::Value::Object(fields) => { for child in fields.values() { visit(child, program, count); } }
+            serde_json::Value::Array(children) => { for child in children { visit(child, program, count); } }
+            _ => {}
+        }
+    }
+    for (source, binds) in [
+        (include_str!("fixtures/channel_ownership.gcr"), true),
+        ("struct Message { n: i64 } fn main() -> i64 { let witness: Array<Message> = Array::new(0); let ctrl = unsafe { chan_new(1, witness) }; unsafe { chan_close(ctrl); } 0 }", false),
+    ] {
+        let (module, _) = parse_with_prelude(source).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let program = lower_program(&resolved.globals).unwrap();
+        let mut count = 0;
+        visit(&serde_json::to_value(&program).unwrap(), &program, &mut count);
+        assert_eq!(count > 0, binds);
+        for optimized in [false, true] {
+            let ir = gcrust::codegen::emit_llvm_ir(&program, optimized).unwrap();
+            assert_eq!(ir.contains("call void @ai_chan_bind_owner("), binds);
+        }
+    }
+}
+
+#[test]
+fn unobserved_thread_results_and_native_retirement_survive_gc() {
+    verify("orphan_threads");
 }

@@ -1,8 +1,8 @@
 //! Statemap trace instrumentation for GC safepoint visualization.
 //!
 //! Emits [statemap](https://github.com/bcantrill/statemap)-compatible
-//! trace data capturing thread states and GC phases. Enable with the
-//! `statemap` feature flag.
+//! trace data capturing thread states and GC phases. Tracing is opt-in by
+//! attaching a tracer to a heap.
 //!
 //! Usage:
 //! ```rust,ignore
@@ -12,9 +12,10 @@
 //! // Then: statemap gc_trace.out > gc_trace.svg
 //! ```
 
+use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime};
 
 // ─── States ──────────────────────────────────────────────────────
 
@@ -83,79 +84,226 @@ const ALL_STATES: [TraceState; 8] = [
     TraceState::GcResuming,
 ];
 
-// ─── Event record ────────────────────────────────────────────────
-
+/// Retention budgets apply to committed history. Each export owns an additional
+/// bounded snapshot; caller-owned input strings and concurrent calls are separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceLimits {
+    pub max_events: usize,
+    pub max_entity_bytes: usize,
+}
+impl Default for TraceLimits {
+    fn default() -> Self {
+        Self {
+            max_events: 64 * 1024,
+            max_entity_bytes: 1024 * 1024,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceStats {
+    pub retained: usize,
+    pub entity_bytes: usize,
+    pub total_recorded: u64,
+    pub evicted: u64,
+    pub rejected: u64,
+}
+#[derive(Clone)]
+enum Entity {
+    Gc,
+    Thread(usize),
+    Custom(Arc<str>),
+}
+impl Entity {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Custom(name) => name.len(),
+            _ => 0,
+        }
+    }
+}
 #[derive(Clone)]
 struct TraceEvent {
-    entity: String,
+    entity: Entity,
     time_ns: u64,
     state: TraceState,
 }
-
-// ─── Tracer ──────────────────────────────────────────────────────
-
-/// Accumulates statemap trace events and writes them out.
-///
-/// Thread-safe: all mutation goes through a `Mutex<Vec<TraceEvent>>`.
-/// The lock is held only briefly per event (one push).
-pub struct StatemapTracer {
-    epoch: Instant,
-    events: Mutex<Vec<TraceEvent>>,
+struct History {
+    events: VecDeque<TraceEvent>,
+    entity_bytes: usize,
+    total_recorded: u64,
+    evicted: u64,
+    rejected: u64,
 }
-
-impl StatemapTracer {
-    /// Create a new tracer. The epoch is set to `Instant::now()`.
-    pub fn new() -> Self {
-        StatemapTracer {
-            epoch: Instant::now(),
-            events: Mutex::new(Vec::with_capacity(64 * 1024)),
+impl History {
+    fn stats(&self) -> TraceStats {
+        TraceStats {
+            retained: self.events.len(),
+            entity_bytes: self.entity_bytes,
+            total_recorded: self.total_recorded,
+            evicted: self.evicted,
+            rejected: self.rejected,
         }
     }
+}
 
-    /// Record a state transition.
+/// Thread-safe recent trace history with explicit retention and loss statistics.
+/// GC/thread recording allocates no event names. Export performs writer calls
+/// after releasing the history mutex; custom-name disposal also runs outside it.
+pub struct StatemapTracer {
+    epoch: Instant,
+    wall_epoch: SystemTime,
+    limits: TraceLimits,
+    history: Mutex<History>,
+}
+impl Default for StatemapTracer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl StatemapTracer {
+    pub fn new() -> Self {
+        Self::with_limits(TraceLimits::default())
+    }
+    pub fn with_limits(limits: TraceLimits) -> Self {
+        let wall_epoch = SystemTime::now();
+        let epoch = Instant::now();
+        let history = Mutex::new(History {
+            events: VecDeque::with_capacity(limits.max_events),
+            entity_bytes: 0,
+            total_recorded: 0,
+            evicted: 0,
+            rejected: 0,
+        });
+        // Some native mutex backends allocate on first use. Prepare before a
+        // tracer can be attached to a running heap or collector.
+        drop(history.lock().unwrap());
+        Self {
+            epoch,
+            wall_epoch,
+            limits,
+            history,
+        }
+    }
+    fn reject(&self) {
+        let mut history = self.history.lock().unwrap();
+        history.total_recorded = history.total_recorded.saturating_add(1);
+        history.rejected = history.rejected.saturating_add(1);
+    }
     pub fn record(&self, entity: &str, state: TraceState) {
-        let elapsed = self.epoch.elapsed();
-        let time_ns = elapsed.as_nanos() as u64;
-        let event = TraceEvent {
-            entity: entity.to_string(),
-            time_ns,
-            state,
-        };
-        self.events.lock().unwrap().push(event);
+        if entity == "gc" {
+            self.record_gc(state);
+            return;
+        }
+        if let Some(digits) = entity.strip_prefix("thread") {
+            if !digits.is_empty()
+                && (digits == "0" || !digits.starts_with('0'))
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                if let Ok(id) = digits.parse() {
+                    self.record_thread(id, state);
+                    return;
+                }
+            }
+        }
+        if self.limits.max_events == 0 || entity.len() > self.limits.max_entity_bytes {
+            self.reject();
+            return;
+        }
+        // Allocation runs outside the mutex. Retention budgets do not include
+        // concurrent callers' unpublished names or caller-owned input strings.
+        self.push(Entity::Custom(Arc::from(entity)), state);
     }
-
-    /// Record a state transition for a thread by ID.
     pub fn record_thread(&self, thread_id: usize, state: TraceState) {
-        let entity = format!("thread{}", thread_id);
-        self.record(&entity, state);
+        self.push(Entity::Thread(thread_id), state);
     }
-
-    /// Record a GC state transition.
     pub fn record_gc(&self, state: TraceState) {
-        self.record("gc", state);
+        self.push(Entity::Gc, state);
     }
-
-    /// Write the statemap data to a file.
+    fn push(&self, entity: Entity, state: TraceState) {
+        if self.limits.max_events == 0 {
+            self.reject();
+            return;
+        }
+        let bytes = entity.bytes();
+        loop {
+            let mut history = self.history.lock().unwrap();
+            if history.events.len() < self.limits.max_events
+                && bytes <= self.limits.max_entity_bytes - history.entity_bytes
+            {
+                // Timestamp at commit gives ordered records, including across
+                // concurrent recorders. Equal timestamps retain commit order.
+                let time_ns = self
+                    .epoch
+                    .elapsed()
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                history.events.push_back(TraceEvent {
+                    entity,
+                    time_ns,
+                    state,
+                });
+                history.entity_bytes += bytes;
+                history.total_recorded = history.total_recorded.saturating_add(1);
+                return;
+            }
+            let removed = history
+                .events
+                .pop_front()
+                .expect("retention budget must permit one event");
+            history.entity_bytes -= removed.entity.bytes();
+            history.evicted = history.evicted.saturating_add(1);
+            drop(history);
+            drop(removed);
+        }
+    }
+    pub fn stats(&self) -> TraceStats {
+        self.history.lock().unwrap().stats()
+    }
+    /// Number of events currently retained, rather than lifetime attempts.
+    pub fn len(&self) -> usize {
+        self.stats().retained
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     pub fn write_to_file(&self, path: &str) -> std::io::Result<()> {
-        let mut f = std::fs::File::create(path)?;
-        self.write_to(&mut f)
+        self.write_to(&mut std::fs::File::create(path)?)
     }
-
-    /// Write the statemap data to any writer.
     pub fn write_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
-        // Metadata
-        let now = std::time::SystemTime::now()
+        // Reserve outside the mutex. Cloning bounded events only increments
+        // custom-name Arc counts, with no per-name allocation under the lock.
+        let mut events = Vec::with_capacity(self.limits.max_events);
+        let stats = {
+            let history = self.history.lock().unwrap();
+            events.extend(history.events.iter().cloned());
+            history.stats()
+        };
+        let start = self
+            .wall_epoch
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let secs = now.as_secs();
-        let nanos = now.subsec_nanos();
-
-        write!(w, "{{")?;
-        write!(w, "\"title\":\"dynalloc GC trace\",")?;
-        write!(w, "\"start\":[{},{}],", secs, nanos)?;
-        write!(w, "\"states\":{{")?;
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trace origin predates Unix epoch",
+                )
+            })?;
+        write!(w, "{{\"title\":\"dynalloc GC trace")?;
+        if stats.evicted != 0 || stats.rejected != 0 {
+            write!(
+                w,
+                " ({} retained; {} earlier events evicted; {} events rejected)",
+                stats.retained, stats.evicted, stats.rejected
+            )?;
+        }
+        write!(
+            w,
+            "\",\"start\":[{},{}],\"states\":{{",
+            start.as_secs(),
+            start.subsec_nanos()
+        )?;
         for (i, state) in ALL_STATES.iter().enumerate() {
-            if i > 0 {
+            if i != 0 {
                 write!(w, ",")?;
             }
             write!(
@@ -166,28 +314,51 @@ impl StatemapTracer {
                 state.color()
             )?;
         }
-        write!(w, "}}")?;
-        writeln!(w, "}}")?;
-
-        // Data records — time must be a string per statemap format.
-        // Sort by time since events come from multiple threads.
-        let mut events = self.events.lock().unwrap().clone();
-        events.sort_by_key(|e| e.time_ns);
-        for event in events.iter() {
-            writeln!(
-                w,
-                "{{\"time\":\"{}\",\"entity\":\"{}\",\"state\":{}}}",
-                event.time_ns,
-                event.entity,
-                event.state.value()
-            )?;
+        writeln!(w, "}}}}")?;
+        for event in events {
+            write!(w, "{{\"time\":\"{}\",\"entity\":", event.time_ns)?;
+            match &event.entity {
+                Entity::Gc => w.write_all(b"\"gc\"")?,
+                Entity::Thread(id) => write!(w, "\"thread{}\"", id)?,
+                Entity::Custom(name) => write_json_string(w, name)?,
+            }
+            writeln!(w, ",\"state\":{}}}", event.state.value())?;
         }
-
         Ok(())
     }
-
-    /// Number of events recorded so far.
-    pub fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
-    }
 }
+fn write_json_string<W: Write>(writer: &mut W, value: &str) -> std::io::Result<()> {
+    writer.write_all(b"\"")?;
+    let mut start = 0;
+    let bytes = value.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'"' || byte == b'\\' || byte < 0x20 {
+            writer.write_all(&bytes[start..index])?;
+            match byte {
+                b'"' => writer.write_all(b"\\\"")?,
+                b'\\' => writer.write_all(b"\\\\")?,
+                b'\n' => writer.write_all(b"\\n")?,
+                b'\r' => writer.write_all(b"\\r")?,
+                b'\t' => writer.write_all(b"\\t")?,
+                _ => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    writer.write_all(&[
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[(byte >> 4) as usize],
+                        HEX[(byte & 15) as usize],
+                    ])?;
+                }
+            }
+            start = index + 1;
+        }
+    }
+    writer.write_all(&bytes[start..])?;
+    writer.write_all(b"\"")
+}
+
+#[cfg(test)]
+#[path = "statemap_tests.rs"]
+mod tests;

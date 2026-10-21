@@ -16,7 +16,7 @@ fn run(src: &str) -> i64 {
     let prog = lower_program(&resolved.globals).expect("lower");
     // `true` = collect on every allocation, so the new generic heap shapes
     // (HashMap key/val arrays, etc.) are traced under stress.
-    jit_run_i64_gc(&prog, true).expect("run")
+    unsafe { jit_run_i64_gc(&prog, true) }.expect("run")
 }
 
 #[test]

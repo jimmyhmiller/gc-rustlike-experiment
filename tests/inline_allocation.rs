@@ -141,3 +141,99 @@ fn collecting_foreign_callback_refreshes_caller_roots_and_copy_out() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn emitted_inline_headers_keep_numeric_words_on_both_byte_orders() {
+    use gcrust::{
+        codegen::codegen, compile::parse_with_prelude, lower::lower_program,
+        resolve::resolve_module,
+    };
+    use inkwell::{
+        context::Context,
+        targets::TargetData,
+        values::{InstructionOpcode, StructValue},
+    };
+    let source = "struct First { n: i64 } struct Second { first: First, n: i64 } fn make() -> Second { Second { first: First { n: 17 }, n: 25 } } fn main() -> i64 { let b = make(); b.first.n + b.n }";
+    let (module, _) = parse_with_prelude(source).unwrap();
+    let resolved = resolve_module(module).unwrap();
+    let program = lower_program(&resolved.globals).unwrap();
+    let context = Context::create();
+    let compiled = codegen(&context, &program).unwrap();
+    let little = TargetData::create("e-p:64:64-i64:64-n8:16:32:64-S128");
+    let big = TargetData::create("E-p:64:64-i64:64-n32:64-S128");
+    // Serialize actual emitted constants using LLVM's independent field layout,
+    // accepting any integer-field decomposition that preserves the word ABI.
+    fn bytes(value: StructValue<'_>, layout: &TargetData, big: bool) -> Vec<u8> {
+        let ty = value.get_type();
+        let mut bytes = vec![0; layout.get_store_size(&ty) as usize];
+        for index in 0..value.count_fields() {
+            let field = value.get_field_at_index(index).unwrap().into_int_value();
+            let number = field.get_zero_extended_constant().unwrap();
+            let size = layout.get_store_size(&field.get_type()) as usize;
+            let offset = layout.offset_of_element(&ty, index).unwrap() as usize;
+            let encoded = if big {
+                number.to_be_bytes()
+            } else {
+                number.to_le_bytes()
+            };
+            let encoded = if big {
+                &encoded[8 - size..]
+            } else {
+                &encoded[..size]
+            };
+            bytes[offset..offset + size].copy_from_slice(encoded);
+        }
+        bytes
+    }
+    let mut found = 0;
+    let mut nonzero_id = false;
+    for function in compiled.module.get_functions() {
+        for block in function.get_basic_blocks() {
+            for instruction in block.get_instructions() {
+                if instruction.get_opcode() != InstructionOpcode::Store {
+                    continue;
+                }
+                let destination = instruction
+                    .get_operand(1)
+                    .unwrap()
+                    .value()
+                    .unwrap()
+                    .into_pointer_value();
+                if !destination
+                    .get_name()
+                    .to_bytes()
+                    .starts_with(b"tlab.object")
+                {
+                    continue;
+                }
+                let Some(inkwell::values::BasicValueEnum::StructValue(header)) =
+                    instruction.get_operand(0).unwrap().value()
+                else {
+                    continue;
+                };
+                let le = bytes(header, &little, false);
+                let be = bytes(header, &big, true);
+                assert_eq!(le.len(), 16);
+                assert_eq!(be.len(), 16);
+                for offset in [0, 8] {
+                    let expected = u64::from_le_bytes(le[offset..offset + 8].try_into().unwrap());
+                    let actual = u64::from_be_bytes(be[offset..offset + 8].try_into().unwrap());
+                    assert_eq!(
+                        actual, expected,
+                        "header word {offset} changes meaning with byte order"
+                    );
+                    assert_eq!(actual & gcrust::gc::FORWARDING_BIT, 0);
+                    if offset == 8 {
+                        assert!(actual <= u16::MAX as u64);
+                        nonzero_id |= actual != 0;
+                    }
+                }
+                found += 1;
+            }
+        }
+    }
+    assert!(
+        found >= 2 && nonzero_id,
+        "fixture did not emit distinct heap headers"
+    );
+}

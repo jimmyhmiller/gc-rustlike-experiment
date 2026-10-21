@@ -97,6 +97,7 @@ fn gc_log_records_accurate_per_collection_events() {
     for l in &lines {
         assert!(l.contains("\"kind\":\"minor\""), "binary_trees is young-heavy");
         assert!(field(l, "pause_ns") > 0, "non-zero pause recorded");
+        assert_eq!(field(l, "elapsed_ns"), field(l, "pause_ns"), "STW event timing: {l}");
         let before = field(l, "before_bytes");
         let after = field(l, "after_bytes");
         let reclaimed = field(l, "reclaimed_bytes");

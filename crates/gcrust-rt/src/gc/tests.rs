@@ -639,7 +639,7 @@ fn bump_heap_walk() {
 
     let mut visited: Vec<(*mut u8, u16)> = Vec::new();
     unsafe {
-        bump.walk(&[INFO_A, INFO_B, INFO_C], &mut |ptr, info| {
+        bump.walk(&[INFO_A.clone(), INFO_B.clone(), INFO_C.clone()], &mut |ptr, info| {
             visited.push((ptr, info.type_id));
         });
     }
@@ -670,7 +670,7 @@ fn bump_heap_walk_varlen() {
 
     let mut visited: Vec<(*mut u8, u16)> = Vec::new();
     unsafe {
-        bump.walk(&[INFO_FIX, INFO_VEC, INFO_STR], &mut |ptr, info| {
+        bump.walk(&[INFO_FIX.clone(), INFO_VEC.clone(), INFO_STR.clone()], &mut |ptr, info| {
             visited.push((ptr, info.type_id));
         });
     }
@@ -783,7 +783,7 @@ fn semi_space_collect_preserves_live_object() {
         .with_type_id(0)
         .with_fields(0);
 
-    let type_table = vec![INFO_LEAF];
+    let type_table = vec![INFO_LEAF.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let obj = gc.alloc_obj::<Compact>(&INFO_LEAF, 0);
@@ -804,7 +804,7 @@ fn semi_space_dead_objects_reclaimed() {
         .with_type_id(0)
         .with_fields(0);
 
-    let type_table = vec![INFO];
+    let type_table = vec![INFO.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
 
@@ -832,7 +832,7 @@ fn semi_space_pointer_fixup() {
         .with_type_id(0)
         .with_fields(2);
 
-    let type_table = vec![PAIR];
+    let type_table = vec![PAIR.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let child = gc.alloc_obj::<Compact>(&PAIR, 0);
@@ -876,7 +876,7 @@ fn semi_space_adversarial_int_payload_in_raw_region_not_relocated() {
         .with_type_id(0)
         .with_fields(1)
         .with_raw_bytes(8);
-    let type_table = vec![MIXED];
+    let type_table = vec![MIXED.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
 
@@ -926,7 +926,7 @@ fn semi_space_traced_slot_relocated_regardless_of_value_negative_control() {
     static TWO: TypeInfo = TypeInfo::for_header(Compact::SIZE)
         .with_type_id(0)
         .with_fields(2);
-    let type_table = vec![TWO];
+    let type_table = vec![TWO.clone()];
     let mut gc = SemiSpace::new::<Compact>(4096);
     let referee = gc.alloc_obj::<Compact>(&TWO, 0);
     let holder = gc.alloc_obj::<Compact>(&TWO, 0);
@@ -947,18 +947,23 @@ fn semi_space_traced_slot_relocated_regardless_of_value_negative_control() {
 /// indistinguishable from a no-op. Here we deliberately simulate the failure the
 /// precise-layout invariant forbids — a traced slot pointing at bits whose
 /// header `type_id` is out of range (what a leaked scalar, or a corrupted
-/// reference, looks like) — and assert the collector PANICS loudly rather than
+/// reference, looks like) — and assert the collector emits its panic diagnostic and aborts rather than
 /// following garbage or silently skipping. Armed unconditionally in debug; the
 /// same panic occurs in release under `GCR_GC_VERIFY=1` (gated off here because
 /// release-default would instead fault with a generic bounds-check message).
 #[test]
-#[should_panic(expected = "precise-layout violation")]
 #[cfg_attr(not(debug_assertions), ignore = "detector armed via GCR_GC_VERIFY in release")]
 fn semi_space_detector_panics_on_bad_header_in_traced_slot() {
+    if !super::failure::tests::is_child() {
+        super::failure::tests::expect_abort(
+            "gc::tests::semi_space_detector_panics_on_bad_header_in_traced_slot",
+            "detector", 1, "precise-layout violation");
+        return;
+    }
     static ONE: TypeInfo = TypeInfo::for_header(Compact::SIZE)
         .with_type_id(0)
         .with_fields(1);
-    let type_table = vec![ONE]; // table len 1 → only type_id 0 is valid
+    let type_table = vec![ONE.clone()]; // table len 1 → only type_id 0 is valid
     let mut gc = SemiSpace::new::<Compact>(4096);
 
     // A from-space object whose header we corrupt to an out-of-range type_id —
@@ -971,7 +976,7 @@ fn semi_space_detector_panics_on_bad_header_in_traced_slot() {
 
     let root = SingleRoot(Cell::new(holder as u64));
     // Following the traced slot, copy_or_forward reads the out-of-range type_id
-    // and the armed detector panics — NOT a silent `return old`.
+    // and the armed detector panics inside the fatal boundary, never returning.
     unsafe { gc.collect::<IdentityPtrPolicy>(&type_table, &mut [&root]) };
 }
 
@@ -981,7 +986,7 @@ fn semi_space_chain() {
         .with_type_id(0)
         .with_fields(1);
 
-    let type_table = vec![NODE];
+    let type_table = vec![NODE.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let d = gc.alloc_obj::<Compact>(&NODE, 0);
@@ -1019,7 +1024,7 @@ fn semi_space_cycle() {
         .with_type_id(0)
         .with_fields(1);
 
-    let type_table = vec![NODE];
+    let type_table = vec![NODE.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let b = gc.alloc_obj::<Compact>(&NODE, 0);
@@ -1048,7 +1053,7 @@ fn semi_space_multiple_collections() {
         .with_type_id(0)
         .with_fields(0);
 
-    let type_table = vec![INFO];
+    let type_table = vec![INFO.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let obj = gc.alloc_obj::<Compact>(&INFO, 0);
@@ -1074,7 +1079,7 @@ fn semi_space_varlen_values() {
         .with_type_id(1)
         .with_fields(0);
 
-    let type_table = vec![VEC, LEAF];
+    let type_table = vec![VEC.clone(), LEAF.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
 
@@ -1118,7 +1123,7 @@ fn semi_space_with_frame_chain() {
         .with_type_id(0)
         .with_fields(2);
 
-    let type_table = vec![PAIR];
+    let type_table = vec![PAIR.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let child = gc.alloc_obj::<Compact>(&PAIR, 0);
@@ -1156,7 +1161,7 @@ fn semi_space_with_root_set() {
         .with_type_id(0)
         .with_fields(0);
 
-    let type_table = vec![INFO];
+    let type_table = vec![INFO.clone()];
 
     let mut gc = SemiSpace::new::<Compact>(4096);
     let g1 = gc.alloc_obj::<Compact>(&INFO, 0);
@@ -1181,13 +1186,12 @@ fn semi_space_traces_and_relocates_interior_pointer() {
     // embedded in a flattened value field), not a leading value slot. It is only
     // reachable to the collector via `interior_ptrs`.
     static INTERIOR: [u16; 1] = [Compact::SIZE as u16 + 8];
-    static HOLDER: TypeInfo = TypeInfo::for_header(Compact::SIZE)
+    static HOLDER: TypeInfo = TypeInfo::for_header_with_interior_ptrs(Compact::SIZE, &INTERIOR)
         .with_type_id(0)
-        .with_raw_bytes(16)
-        .with_interior_ptrs(&INTERIOR);
+        .with_raw_bytes(16);
     static LEAF: TypeInfo = TypeInfo::for_header(Compact::SIZE).with_type_id(1);
 
-    let type_table = vec![HOLDER, LEAF];
+    let type_table = vec![HOLDER.clone(), LEAF.clone()];
     let mut gc = SemiSpace::new::<Compact>(4096);
 
     let child = gc.alloc_obj::<Compact>(&LEAF, 0);
@@ -1283,7 +1287,7 @@ fn heap_basic_alloc_and_collect() {
         .with_type_id(0)
         .with_fields(0);
 
-    let heap = Heap::new::<Compact>(4096, vec![INFO]);
+    let heap = Heap::new::<Compact>(4096, vec![INFO.clone()]);
 
     let obj = unsafe { heap.alloc_obj::<Compact>(&INFO, 0) };
     assert!(!obj.is_null());
@@ -1302,7 +1306,7 @@ fn heap_dead_objects_reclaimed() {
         .with_type_id(0)
         .with_fields(0);
 
-    let heap = Heap::new::<Compact>(4096, vec![INFO]);
+    let heap = Heap::new::<Compact>(4096, vec![INFO.clone()]);
 
     let kept = unsafe { heap.alloc_obj::<Compact>(&INFO, 0) };
     for _ in 0..5 {
@@ -1328,7 +1332,7 @@ fn mutator_thread_basic_alloc() {
         .with_type_id(0)
         .with_fields(0);
 
-    let heap = Arc::new(Heap::new::<Compact>(4096, vec![INFO]));
+    let heap = Arc::new(Heap::new::<Compact>(4096, vec![INFO.clone()]));
     let mt: MutatorThread<IdentityPtrPolicy> = MutatorThread::register(heap.clone());
 
     let obj = unsafe { mt.alloc_obj::<Compact>(&INFO, 0) };
@@ -1342,7 +1346,7 @@ fn alloc_site_profile_merges_threads_and_salvages_retired() {
     static INFO0: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_fields(1);
     static INFO1: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(1).with_fields(2);
 
-    let heap = Heap::new::<Full>(64 * 1024, vec![INFO0, INFO1]);
+    let heap = Heap::new::<Full>(64 * 1024, vec![INFO0.clone(), INFO1.clone()]);
     heap.set_type_meta(vec![
         TypeMeta { type_id: 0, name: "Point".into(), kind: TypeKind::Opaque },
         TypeMeta { type_id: 1, name: "Pair".into(), kind: TypeKind::Opaque },
@@ -1408,12 +1412,55 @@ fn alloc_site_profile_merges_threads_and_salvages_retired() {
 }
 
 #[test]
+fn alloc_site_profile_saturates_updates_live_retired_and_report_totals() {
+    use crate::gc::thread::SiteCounter;
+    let heap = Heap::new::<Full>(64 * 1024, vec![]);
+    let states: Vec<_> = (0..3).map(|_| heap.register_thread().0).collect();
+    for state in &states {
+        unsafe {
+            state.record_alloc(1, 0); // Initialize both sites and their ABI window.
+            let window = heap.configure_inline_tlab(state);
+            assert_eq!((*window).counters_len, 2);
+            for index in 0..2 {
+                (*window).counters.add(index).write(SiteCounter {
+                    count: u64::MAX - 1, bytes: u64::MAX - 8,
+                });
+            }
+        }
+    }
+    unsafe {
+        states[0].record_alloc(0, 8); // Exact limit.
+        let counters = states[0].alloc_site_counters();
+        assert_eq!((counters[0].count, counters[0].bytes), (u64::MAX, u64::MAX));
+        states[0].record_alloc(0, 1); // Stay at the limit.
+        let counters = states[0].alloc_site_counters();
+        assert_eq!((counters[0].count, counters[0].bytes), (u64::MAX, u64::MAX));
+    }
+    for retired_count in 0..=3 {
+        let profile = heap.alloc_site_profile();
+        assert_eq!(profile.len(), 2);
+        for site in &profile {
+            assert_eq!((site.count, site.bytes), (u64::MAX, u64::MAX));
+        }
+        let metrics = heap.metrics_json();
+        for key in ["alloc_objects", "alloc_bytes"] {
+            assert!(metrics.contains(&format!("\"{key}\":{}", u64::MAX)), "{metrics}");
+        }
+        let report = heap.alloc_site_profile_report();
+        assert!(report.contains(&format!("{}  {}  (total over 2 sites)", u64::MAX, u64::MAX)), "{report}");
+        if retired_count < 3 {
+            unsafe { heap.safe_deregister_thread(&states[retired_count]); }
+        }
+    }
+}
+
+#[test]
 fn alloc_site_profile_real_threads_join_then_profile() {
     use crate::gc::reflect::AllocSite;
     use std::sync::Arc;
 
     static INFO: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_fields(0);
-    let heap = Arc::new(Heap::new::<Full>(64 * 1024, vec![INFO]));
+    let heap = Arc::new(Heap::new::<Full>(64 * 1024, vec![INFO.clone()]));
     heap.set_alloc_sites(vec![AllocSite { function: "worker".into(), type_id: 0, location: String::new() }]);
 
     let n_threads = 4u64;
@@ -1463,7 +1510,7 @@ fn alloc_site_profile_dump_concurrent_with_live_worker_no_hang() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static INFO: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_fields(0);
-    let heap = Arc::new(Heap::new::<Full>(64 * 1024, vec![INFO]));
+    let heap = Arc::new(Heap::new::<Full>(64 * 1024, vec![INFO.clone()]));
     heap.set_alloc_sites(vec![AllocSite { function: "worker".into(), type_id: 0, location: String::new() }]);
 
     let n_allocs = 5000u64;
@@ -1530,7 +1577,7 @@ fn alloc_site_profile_dump_concurrent_resize_stress_asan() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static INFO: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_fields(0);
-    let heap = Arc::new(Heap::new::<Full>(64 * 1024, vec![INFO]));
+    let heap = Arc::new(Heap::new::<Full>(64 * 1024, vec![INFO.clone()]));
 
     let n_allocs = 2000u64;
     let bytes_each = 16u64;
@@ -1581,7 +1628,7 @@ fn alloc_site_profile_unlabelled_sites_not_dropped() {
     // Counters with no matching site-table entry (e.g. table not installed) are
     // surfaced under a synthetic label, never silently dropped.
     static INFO: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_fields(0);
-    let heap = Heap::new::<Full>(4096, vec![INFO]);
+    let heap = Heap::new::<Full>(4096, vec![INFO.clone()]);
     let (ts, _) = heap.register_thread();
     unsafe {
         ts.record_alloc(7, 16);
@@ -1601,14 +1648,15 @@ fn visit_roots_reports_real_roots_only() {
     // the in-degree-0 proxy. A rooted object is visited; an unrooted (orphan)
     // object is not — even though both are live in the heap.
     static INFO: TypeInfo = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_fields(0);
-    let heap = Heap::new::<Full>(4096, vec![INFO]);
+    let root = SingleRoot(Cell::new(0));
+    let heap = Heap::new::<Full>(4096, vec![INFO.clone()]);
 
     let rooted = unsafe { heap.alloc_obj::<Full>(&INFO, 0) };
     let orphan = unsafe { heap.alloc_obj::<Full>(&INFO, 0) };
     assert!(!rooted.is_null() && !orphan.is_null());
 
     // Root only `rooted` via a permanent extra.
-    let root = SingleRoot(Cell::new(rooted as u64));
+    root.0.set(rooted as u64);
     unsafe { heap.register_permanent_extra(&root as *const dyn RootSource) };
 
     let mut seen: Vec<*mut u8> = Vec::new();
@@ -1707,8 +1755,8 @@ fn read_barrier_follows_forwarding() {
     let mut to_word: u64 = 0x0000_0000_0000_0007;
     let to_ptr = &mut to_word as *mut u64 as *mut u8;
 
-    // Source whose header word is forwarding (bit 0 set).
-    let mut from_word: u64 = (to_ptr as u64) | 1;
+    // Use the collector's actual marker; odd type IDs are not forwarding.
+    let mut from_word: u64 = (to_ptr as u64) | crate::gc::semi_space::FORWARDING_BIT;
     let from_ptr = &mut from_word as *mut u64 as *mut u8;
 
     let r = unsafe { read_barrier(from_ptr, 0) };
@@ -1748,7 +1796,7 @@ fn major_collection_preserves_old_to_young_edges_for_next_minor() {
             let child_info = TypeInfo::for_header(Full::SIZE)
                 .with_type_id(1)
                 .with_raw_bytes(8);
-            let heap = Heap::new_generational::<Full>(4096, 4096, vec![parent_info, child_info]);
+            let heap = Heap::new_generational::<Full>(4096, 4096, vec![parent_info.clone(), child_info.clone()]);
             let (thread, _) = heap.register_thread();
             let parent = unsafe { heap.alloc_obj::<Full>(&parent_info, length) };
             let child = unsafe { heap.alloc_nursery_obj::<Full>(&child_info, 0) };
@@ -1758,7 +1806,7 @@ fn major_collection_preserves_old_to_young_edges_for_next_minor() {
                 (child.add(16) as *mut u64).write(42);
             }
             heap.mark_card_dirty(parent);
-            let root = heap.globals.add(parent as u64);
+            let root = unsafe { heap.globals.add(parent as u64) };
             unsafe {
                 if mutator_driven {
                     heap.mutator_triggered_gc::<IdentityPtrPolicy>(&thread);
@@ -1788,8 +1836,8 @@ fn local_buffers_survive_major_and_are_invalidated_by_minor_and_space_flip() {
     let info = TypeInfo::for_header(Full::SIZE).with_fields(1);
     for generational in [false, true] {
         let heap = std::sync::Arc::new(if generational {
-            Heap::new_generational::<Full>(128 * 1024, 512 * 1024, vec![info])
-        } else { Heap::new::<Full>(512 * 1024, vec![info]) });
+            Heap::new_generational::<Full>(128 * 1024, 512 * 1024, vec![info.clone()])
+        } else { Heap::new::<Full>(512 * 1024, vec![info.clone()]) });
         let mt = MutatorThread::<IdentityPtrPolicy>::register(heap.clone());
         let frame = RootFrame::<1>::new();
         let _guard = unsafe { mt.frame_chain().push(&frame) };
@@ -1832,12 +1880,13 @@ fn mutator_tlab_allocation_throughput() {
     for local in [false, true] {
         let mut samples = Vec::new();
         for _ in 0..5 {
-            let heap = std::sync::Arc::new(Heap::new::<Full>(64 * 1024 * 1024, vec![info]));
+            let heap = std::sync::Arc::new(Heap::new::<Full>(64 * 1024 * 1024, vec![info.clone()]));
             let start = std::sync::Barrier::new(workers + 1);
             let elapsed = std::thread::scope(|scope| {
                 let tasks: Vec<_> = (0..workers).map(|_| {
                     let heap = &heap;
                     let start = &start;
+                    let info = &info;
                     scope.spawn(move || {
                         let mt = MutatorThread::<IdentityPtrPolicy>::register(heap.clone());
                         start.wait();
@@ -1857,8 +1906,9 @@ fn mutator_tlab_allocation_throughput() {
             assert_eq!(objects, workers * count);
             samples.push(elapsed);
         }
+        let raw_samples = samples.clone();
         samples.sort_unstable();
-        eprintln!("allocation benchmark: workers={workers} tlab={local} objects={} median_ns={}", workers * count, samples[2]);
+        eprintln!("allocation benchmark: workers={workers} tlab={local} objects={} median_ns={} raw_ns={raw_samples:?}", workers * count, samples[2]);
     }
 }
 
@@ -1866,7 +1916,7 @@ fn mutator_tlab_allocation_throughput() {
 fn dirty_card_starts_with_a_spanning_object_before_a_later_object() {
     let array = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_varlen_values(0);
     let leaf = TypeInfo::for_header(Full::SIZE).with_type_id(1).with_raw_bytes(8);
-    let heap = Heap::new_generational::<Full>(4096, 4096, vec![array, leaf]);
+    let heap = Heap::new_generational::<Full>(4096, 4096, vec![array.clone(), leaf.clone()]);
     let (thread, _) = heap.register_thread();
     let parent = unsafe { heap.alloc_obj::<Full>(&array, 81) };
     let trailing = unsafe { heap.alloc_obj::<Full>(&leaf, 0) };
@@ -1875,7 +1925,7 @@ fn dirty_card_starts_with_a_spanning_object_before_a_later_object() {
     assert_eq!((slot as usize - parent as usize) / 512, (trailing as usize - parent as usize) / 512);
     unsafe { slot.cast::<u64>().write(young as u64); }
     heap.mark_card_dirty(slot);
-    heap.globals.add(parent as u64);
+    unsafe { heap.globals.add(parent as u64) };
     unsafe { heap.mutator_triggered_minor_gc::<IdentityPtrPolicy>(&thread); }
     let moved = unsafe { slot.cast::<*mut u8>().read() };
     assert!(heap.is_tenured(moved), "dirty card skipped the object spanning its leading boundary");
@@ -1969,22 +2019,22 @@ fn heap_rejects_unregistered_or_incompatible_layouts_without_reserving_space() {
         .with_raw_bytes(8);
     for generational in [false, true] {
         let heap = if generational {
-            Heap::new_generational::<Full>(4096, 4096, vec![info])
+            Heap::new_generational::<Full>(4096, 4096, vec![info.clone()])
         } else {
-            Heap::new::<Full>(4096, vec![info])
+            Heap::new::<Full>(4096, vec![info.clone()])
         };
         let kept = unsafe { heap.alloc_obj::<Full>(&info, 0) };
         assert!(!kept.is_null());
-        let index = heap.globals.add(kept as u64);
+        let index = unsafe { heap.globals.add(kept as u64) };
         let before = (heap.from_used(), heap.nursery_used());
         let malformed = [
-            info.with_type_id(1),
-            info.with_raw_bytes(16),
+            info.clone().with_type_id(1),
+            info.clone().with_raw_bytes(16),
             TypeInfo {
                 header_size: Compact::SIZE as u16,
-                ..info
+                ..info.clone()
             },
-            info.with_interior_ptrs(&[0]),
+            info.clone().with_interior_ptrs(&[0]),
         ];
         // No other mutators/collectors exist. Rejecting a descriptor must not
         // reserve an object whose header or scanning extent could corrupt GC.
@@ -2011,10 +2061,10 @@ fn heap_rejects_unregistered_or_incompatible_layouts_without_reserving_space() {
 #[test]
 fn invalid_mutator_layouts_do_not_trigger_stress_gc_or_publish_tlab_ranges() {
     let info = TypeInfo::for_header(Full::SIZE).with_raw_bytes(8);
-    let heap = std::sync::Arc::new(Heap::new_generational::<Full>(4096, 4096, vec![info]));
+    let heap = std::sync::Arc::new(Heap::new_generational::<Full>(4096, 4096, vec![info.clone()]));
     heap.set_gc_every_alloc(true);
     let mt = MutatorThread::<IdentityPtrPolicy>::register(heap.clone());
-    let bad = info.with_raw_bytes(16);
+    let bad = info.clone().with_raw_bytes(16);
     unsafe {
         assert!(mt.alloc(&bad, 0).is_null());
         assert!(mt.alloc_obj::<Full>(&bad, 0).is_null());
@@ -2033,10 +2083,10 @@ fn type_registration_requires_exclusive_ownership_and_validates_layouts() {
     let info = TypeInfo::for_header(Full::SIZE)
         .with_raw_bytes(8)
         .with_type_id(99);
-    let id = heap.dynamic_add_type(info);
+    let id = heap.dynamic_add_type(info.clone());
     assert_eq!(id, 0);
     assert_eq!(heap.type_info_by_id(id).type_id, id);
-    let registered = *heap.type_info_by_id(id);
+    let registered = heap.type_info_by_id(id).clone();
     assert!(!unsafe { heap.alloc_obj::<Full>(&registered, 0) }.is_null());
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2051,7 +2101,7 @@ fn type_registration_requires_exclusive_ownership_and_validates_layouts() {
 #[test]
 fn legacy_collection_preserves_mixed_alignment_graphs() {
     let normal = TypeInfo::for_header(Compact::SIZE).with_fields(1);
-    let aligned = normal.with_type_id(1).with_align_log2(6);
+    let aligned = normal.clone().with_type_id(1).with_align_log2(6);
     let mut gc = SemiSpace::new::<Compact>(4096);
     let first = gc.alloc_obj::<Compact>(&normal, 0);
     let second = gc.alloc_obj::<Compact>(&aligned, 0);
@@ -2067,7 +2117,7 @@ fn legacy_collection_preserves_mixed_alignment_graphs() {
     for _ in 0..4 {
         // Single-threaded collector, complete cyclic graph rooted in one slot.
         unsafe {
-            gc.collect::<IdentityPtrPolicy>(&[normal, aligned], &mut [&root]);
+            gc.collect::<IdentityPtrPolicy>(&[normal.clone(), aligned.clone()], &mut [&root]);
         }
         let first = root.0.get() as *mut u8;
         let second = unsafe { *(first.add(8) as *const u64) } as *mut u8;
@@ -2079,7 +2129,7 @@ fn legacy_collection_preserves_mixed_alignment_graphs() {
         let mut visited = Vec::new();
         unsafe {
             gc.from_space()
-                .walk(&[normal, aligned], &mut |obj, _| visited.push(obj));
+                .walk(&[normal.clone(), aligned.clone()], &mut |obj, _| visited.push(obj));
         }
         assert_eq!(visited, [first, second, third, fourth]);
     }
@@ -2090,7 +2140,7 @@ fn legacy_full_header_forwarding_uses_reserved_first_word() {
     let info = TypeInfo::for_header(Full::SIZE)
         .with_type_id(1)
         .with_fields(1);
-    let table = [info.with_type_id(0), info];
+    let table = [info.clone().with_type_id(0), info.clone()];
     let mut gc = SemiSpace::new::<Full>(4096);
     let obj = gc.alloc_obj::<Full>(&info, 0);
     unsafe {
@@ -2118,11 +2168,11 @@ fn dynamic_root_callback_unlinks_on_unwind_and_rejects_duplicate_registration() 
     let frame = DynRootFrame::new(2);
     frame.set(0, 11);
     frame.slot(1).set(22);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         frame.with_pushed(&chain, |frame| {
             assert_eq!(chain.depth(), 1);
             let mut slots = Vec::new();
-            unsafe {
+            {
                 chain.scan_roots(&mut |slot| {
                     slots.push(*slot);
                     *slot += 1;
@@ -2137,14 +2187,14 @@ fn dynamic_root_callback_unlinks_on_unwind_and_rejects_duplicate_registration() 
     assert!(result.is_err());
     assert_eq!(chain.depth(), 0);
     assert_eq!(other_chain.depth(), 0);
-    frame.with_pushed(&chain, |_| assert_eq!(chain.depth(), 1));
+    unsafe { frame.with_pushed(&chain, |_| assert_eq!(chain.depth(), 1)); }
     assert_eq!(chain.depth(), 0);
 }
 
 #[test]
 fn type_registration_rejects_exhausted_id_space_without_wrapping() {
     let info = TypeInfo::for_header(Full::SIZE);
-    let table = (0..=u16::MAX).map(|id| info.with_type_id(id)).collect();
+    let table = (0..=u16::MAX).map(|id| info.clone().with_type_id(id)).collect();
     let mut heap = Heap::new::<Full>(4096, table);
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| heap.dynamic_add_type(info)))
@@ -2159,11 +2209,11 @@ fn type_registration_rejects_exhausted_id_space_without_wrapping() {
 fn remembered_edges_survive_clean_pauses_then_late_dirty_cards_after_major() {
     let parent_info = TypeInfo::for_header(Full::SIZE).with_type_id(0).with_varlen_values(0);
     let child_info = TypeInfo::for_header(Full::SIZE).with_type_id(1).with_raw_bytes(8);
-    let heap = Heap::new_generational::<Full>(4096, 4096, vec![parent_info, child_info]);
+    let heap = Heap::new_generational::<Full>(4096, 4096, vec![parent_info.clone(), child_info.clone()]);
     let (thread, _) = heap.register_thread();
     let parent = unsafe { heap.alloc_obj::<Full>(&parent_info, 81) };
     assert!(!parent.is_null());
-    let root = heap.globals.add(parent as u64);
+    let root = unsafe { heap.globals.add(parent as u64) };
     for phase in 0..2 {
         if phase == 1 {
             unsafe { heap.mutator_triggered_gc::<IdentityPtrPolicy>(&thread); }

@@ -70,6 +70,8 @@ fn generated_accesses_are_atomic_or_proven_private_and_snapshots_cannot_collect(
         assert!(ir.contains("load atomic i8") && ir.contains("store atomic i8"));
         assert!(ir.contains("load atomic double") && ir.contains("store atomic double"));
         assert!(check_snapshot_paths(&ir) > 0, "missing aggregate regions");
+        assert!(ir.lines().any(|line| line.contains("call i8 @ai_managed_try_write(")), "missing nonparking aggregate attempt: {ir}");
+        assert!(ir.contains("aggregate.contended"), "missing rooted contention fallback: {ir}");
         for line in ir.lines() {
             if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot")
             {
@@ -97,6 +99,19 @@ fn generated_accesses_are_atomic_or_proven_private_and_snapshots_cannot_collect(
 // Follow control flow rather than textual block order. LLVM may lay a poll
 // block between acquisition and release in the printed IR without putting it
 // on any path that holds the snapshot stripe.
+fn llvm_label(text: &str) -> &str {
+    if let Some(rest) = text.strip_prefix('"') {
+        // LLVM quoted identifiers encode embedded quotes as hexadecimal
+        // escapes, so the next literal quote terminates the identifier.
+        let end = rest.find('"').expect("unterminated LLVM label");
+        &text[..end + 2]
+    } else {
+        let end = text.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '-')))
+            .unwrap_or(text.len());
+        &text[..end]
+    }
+}
+
 fn check_snapshot_paths(ir: &str) -> usize {
     use std::collections::{HashMap, HashSet};
     let mut functions = Vec::new();
@@ -119,9 +134,8 @@ fn check_snapshot_paths(ir: &str) -> usize {
         let mut entry = None;
         let mut label = "";
         for line in lines {
-            if !line.starts_with(' ')
-                && let Some((name, _)) = line.split_once(':')
-            {
+            let name = llvm_label(line);
+            if !name.is_empty() && line[name.len()..].starts_with(':') {
                 label = name;
                 entry.get_or_insert(name);
                 blocks.entry(name).or_default();
@@ -160,11 +174,9 @@ fn check_snapshot_paths(ir: &str) -> usize {
             }
             for line in lines {
                 for target in line.split("label %").skip(1) {
-                    let name: String = target
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-                        .collect();
-                    pending.push((name, held));
+                    let name = llvm_label(target);
+                    assert!(!name.is_empty(), "missing LLVM branch target: {line}");
+                    pending.push((name.to_owned(), held));
                 }
             }
         }
@@ -177,6 +189,96 @@ fn check_snapshot_paths(ir: &str) -> usize {
 fn snapshot_path_check_accepts_reordered_blocks_and_rejects_collecting_paths() {
     let good = "define void @test() {\nentry:\n  call ptr @ai_managed_lock(ptr %t, ptr %o)\n  br label %release\nunrelated:\n  call void @ai_gc_pollcheck_slow(ptr %t)\n  ret void\nrelease:\n  call void @ai_managed_unlock(ptr %t)\n  ret void\n}\n";
     assert_eq!(check_snapshot_paths(good), 1);
+    let quoted = good.replace("release", "\"Atom.RefCounter.new$RefCounter:exit-i\"");
+    assert_eq!(check_snapshot_paths(&quoted), 1);
     let bad = good.replace("br label %release", "br label %unrelated");
     assert!(std::panic::catch_unwind(|| check_snapshot_paths(&bad)).is_err());
+}
+
+#[test]
+fn scalar_and_reference_slots_keep_phase_checked_scoped_fallbacks() {
+    use gcrust::compile::parse_with_prelude;
+    use gcrust::lower::lower_program;
+    use gcrust::resolve::resolve_module;
+    let (module, _) = parse_with_prelude(r#"
+        struct Item { byte: i8, word: i16, wide: i32, number: i64, text: String }
+        fn main() -> i64 {
+            let mut item = Item { byte: 1 as i8, word: 2 as i16, wide: 3 as i32, number: 4, text: "a" };
+            item.byte = item.byte + 1 as i8;
+            item.word = item.word + 1 as i16;
+            item.wide = item.wide + 1 as i32;
+            item.number = item.number + 1;
+            item.text = "b";
+            let mut refs: Array<Item> = Array::new(1);
+            refs[0] = item;
+            let mut bytes: Array<i8> = Array::new(1);
+            bytes[0] = refs[0].byte;
+            bytes[0] as i64
+        }
+    "#).unwrap();
+    let resolved = resolve_module(module).unwrap();
+    let program = lower_program(&resolved.globals).unwrap();
+    // Unoptimized emission retains both paths even for closed-world private
+    // objects. Optimization may fold accesses when their results are known.
+    let ir = gcrust::codegen::emit_llvm_ir(&program, false).unwrap();
+    assert!(ir.contains("load atomic i8") && ir.contains("copy.phase"), "{ir}");
+    for width in [8, 16, 32, 64] {
+        for operation in ["load", "store"] {
+            let symbol = format!("@ai_slot_bits{width}_{operation}(");
+            assert!(ir.lines().any(|line| line.contains("call ") && line.contains(&symbol)), "{ir}");
+        }
+    }
+    assert!(ir.lines().any(|line| line.contains("call void @ai_slot_ref_store(")), "{ir}");
+    assert!(ir.lines().any(|line| line.contains(" = load ") && line.contains("!alias.scope")), "private idle path lost its provenance: {ir}");
+}
+
+#[test]
+fn native_aggregate_snapshot_uses_target_layout_before_optimization() {
+    use gcrust::{compile::parse_with_prelude, lower::lower_program, resolve::resolve_module};
+    let (module, _) = parse_with_prelude(r#"
+        struct Leaf { n: i64 }
+        #[value] struct Mixed { tag: i32, wide: i64, leaf: Leaf }
+        struct Holder { mixed: Mixed }
+        fn main() -> i64 {
+            let holder = Holder { mixed: Mixed { tag: 7 as i32, wide: 123456789, leaf: Leaf { n: 42 } } };
+            let observed = holder.mixed;
+            if observed.tag != 7 as i32 || observed.wide != 123456789 || observed.leaf.n != 42 { 81 } else { 0 }
+        }
+    "#).unwrap();
+    let program = lower_program(&resolve_module(module).unwrap().globals).unwrap();
+    for stress in [false, true] {
+        assert_eq!(unsafe { gcrust::codegen::jit_run_i64_gc(&program, stress) }.unwrap(), 0);
+    }
+    for optimize in [false, true] {
+        let ir = gcrust::codegen::emit_llvm_ir(&program, optimize).unwrap();
+        assert!(ir.contains("target datalayout =") && ir.contains("target triple ="), "{ir}");
+        assert!(ir.lines().any(|line| line.contains("call void @ai_managed_read(")), "{ir}");
+    }
+}
+
+#[test]
+fn aggregate_write_reuses_rooted_value_local_storage() {
+    use gcrust::{compile::parse_with_prelude, lower::lower_program, resolve::resolve_module};
+    let (module, _) = parse_with_prelude(r#"
+        struct Leaf { n: i64 }
+        #[value] struct Pair { left: Leaf, right: Leaf }
+        struct Holder { pair: Pair }
+        fn replace(mut holder: Holder, pair: Pair) { holder.pair = pair; }
+        fn main() -> i64 {
+            let holder = Holder { pair: Pair { left: Leaf { n: 1 }, right: Leaf { n: 2 } } };
+            replace(holder, Pair { left: Leaf { n: 42 }, right: Leaf { n: 43 } });
+            if holder.pair.left.n == 42 && holder.pair.right.n == 43 { 0 } else { 81 }
+        }
+    "#).unwrap();
+    let program = lower_program(&resolve_module(module).unwrap().globals).unwrap();
+    let ir = gcrust::codegen::emit_llvm_ir(&program, false).unwrap();
+    let function = ir.split("define ").find(|body| body.lines().next()
+        .is_some_and(|line| line.contains("@replace(") || line.contains("@\"replace\"("))).unwrap();
+    let body = function.split("\n}").next().unwrap();
+    assert!(body.contains("call i8 @ai_managed_try_write("), "{body}");
+    assert!(body.contains("call ptr @ai_managed_lock("), "{body}");
+    assert!(!body.contains("aggregate.input"), "rooted RHS was duplicated: {body}");
+    for stress in [false, true] {
+        assert_eq!(unsafe { gcrust::codegen::jit_run_i64_gc(&program, stress) }.unwrap(), 0);
+    }
 }

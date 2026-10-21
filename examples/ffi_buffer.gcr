@@ -1,5 +1,5 @@
 // FFI Phase C follow-up: pass ARRAY contents to C, including copy-OUT (C fills a
-// buffer in place). `as_c_bytes(arr)` copies the array's bytes to a stack buffer
+// buffer in place). `as_c_bytes(arr)` copies the array's bytes to a native buffer
 // for the call; when the extern parameter is `mut`, the buffer is copied BACK
 // into the array afterward — the read(2)/memset pattern. See docs/ffi.md.
 
@@ -13,7 +13,7 @@ extern "C" fn memcmp(a: RawPtr, b: RawPtr, n: i64) -> i32;
 fn main() -> i64 {
     // Copy-out: ask C to fill 5 bytes with 0x07.
     let mut buf: Array<u8> = Array::new(5);
-    memset(as_c_bytes(buf), 7, 5);
+    (unsafe { memset(as_c_bytes(buf), 7, 5) });
     // The write-back means buf now holds [7,7,7,7,7].
     let sum = (buf[0] as i64) + (buf[4] as i64); // 7 + 7 = 14
 
@@ -22,7 +22,7 @@ fn main() -> i64 {
     a[0] = 1; a[1] = 2; a[2] = 3;
     let mut b: Array<u8> = Array::new(3);
     b[0] = 1; b[1] = 2; b[2] = 3;
-    let eq = memcmp(as_c_bytes(a), as_c_bytes(b), 3); // 0 when equal
+    let eq = (unsafe { memcmp(as_c_bytes(a), as_c_bytes(b), 3) }); // 0 when equal
 
     sum + (eq as i64) // 14 + 0 = 14
 }

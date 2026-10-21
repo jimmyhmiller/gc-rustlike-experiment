@@ -44,11 +44,26 @@ fn opaque_meta(name: &str) -> TypeMeta {
     TypeMeta { type_id: 0, name: name.to_string(), kind: TypeKind::Opaque }
 }
 
+#[derive(Clone, PartialEq)]
+enum PendingRef {
+    Struct(LayoutId, String, crate::ast::StructDef, Vec<Ty>),
+    Enum(LayoutId, String, crate::ast::EnumDef, Vec<Ty>),
+    Array(LayoutId, Ty, Option<u64>),
+    BuiltinEnum(LayoutId, String, String, Vec<Ty>),
+    Vec(LayoutId, Ty),
+}
+
 pub struct LayoutRegistry<'a> {
     ctx: &'a TyCtx,
     /// Interning: a canonical key for a `Ty` → its assigned id.
     ref_ids: HashMap<String, LayoutId>,
+    nominal_ref_ids: HashMap<Ty, LayoutId>,
     value_ids: HashMap<String, ValueId>,
+    nominal_value_ids: HashMap<Ty, ValueId>,
+    pending_refs: Vec<PendingRef>,
+    building_values: Vec<Ty>,
+    repr_depth: usize,
+    flushing_refs: bool,
     pub layouts: Vec<Layout>,
     pub values: Vec<ValueLayout>,
 }
@@ -58,24 +73,48 @@ pub struct LayoutError(pub String);
 type R<T> = Result<T, LayoutError>;
 
 /// The registry's contents at a point in time; see [`LayoutRegistry::snapshot`].
+#[derive(Clone, PartialEq)]
 pub struct LayoutSnapshot {
     ref_ids: HashMap<String, LayoutId>,
+    nominal_ref_ids: HashMap<Ty, LayoutId>,
     value_ids: HashMap<String, ValueId>,
+    nominal_value_ids: HashMap<Ty, ValueId>,
+    pending_refs: Vec<PendingRef>,
+    building_values: Vec<Ty>,
+    repr_depth: usize,
+    flushing_refs: bool,
     layouts: usize,
     values: usize,
 }
 
+/// Complete registry state used only to identify an exact type-probe context.
+#[derive(PartialEq)]
+pub(crate) struct LayoutProbeState {
+    snapshot: LayoutSnapshot,
+    layouts: Vec<Layout>,
+    values: Vec<ValueLayout>,
+}
+
 impl<'a> LayoutRegistry<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        LayoutRegistry { ctx, ref_ids: HashMap::new(), value_ids: HashMap::new(), layouts: vec![], values: vec![] }
+        LayoutRegistry { ctx, ref_ids: HashMap::new(), nominal_ref_ids: HashMap::new(), value_ids: HashMap::new(), nominal_value_ids: HashMap::new(), pending_refs: vec![], building_values: vec![], repr_depth: 0, flushing_refs: false, layouts: vec![], values: vec![] }
     }
 
     /// Record the registry so a discarded lowering attempt can be undone.
-    /// Layouts are only ever appended, so lengths plus the intern maps suffice.
+    /// Completed layouts are append-only. A repr transaction completes its new
+    /// placeholders before returning; snapshots also preserve deferred work.
+    pub(crate) fn probe_state(&self) -> LayoutProbeState {
+        LayoutProbeState { snapshot: self.snapshot(), layouts: self.layouts.clone(), values: self.values.clone() }
+    }
+
     pub fn snapshot(&self) -> LayoutSnapshot {
         LayoutSnapshot {
             ref_ids: self.ref_ids.clone(),
+            nominal_ref_ids: self.nominal_ref_ids.clone(),
             value_ids: self.value_ids.clone(),
+            nominal_value_ids: self.nominal_value_ids.clone(),
+            pending_refs: self.pending_refs.clone(), building_values: self.building_values.clone(),
+            repr_depth: self.repr_depth, flushing_refs: self.flushing_refs,
             layouts: self.layouts.len(),
             values: self.values.len(),
         }
@@ -84,13 +123,45 @@ impl<'a> LayoutRegistry<'a> {
     /// Drop everything registered since `snap`.
     pub fn restore(&mut self, snap: LayoutSnapshot) {
         self.ref_ids = snap.ref_ids;
+        self.nominal_ref_ids = snap.nominal_ref_ids;
         self.value_ids = snap.value_ids;
+        self.nominal_value_ids = snap.nominal_value_ids;
+        self.pending_refs = snap.pending_refs; self.building_values = snap.building_values;
+        self.repr_depth = snap.repr_depth; self.flushing_refs = snap.flushing_refs;
         self.layouts.truncate(snap.layouts);
         self.values.truncate(snap.values);
     }
 
     /// The [`Repr`] of a ground type, registering any needed layouts.
     pub fn repr(&mut self, ty: &Ty) -> R<Repr> {
+        if matches!(ty, Ty::Prim(p) if *p != Prim::Str) {
+            return self.repr_inner(ty);
+        }
+        if self.pending_refs.is_empty() && self.building_values.is_empty() {
+            if let Some(id) = self.nominal_ref_ids.get(ty) { return Ok(Repr::Ref(*id)); }
+            if let Some(id) = self.nominal_value_ids.get(ty) { return Ok(Repr::Value(*id)); }
+        }
+        // Failed construction must not leave reusable placeholder descriptors.
+        // Nested repr calls share the outer transaction and worklist.
+        let checkpoint = (self.repr_depth == 0 && !self.flushing_refs).then(|| self.snapshot());
+        self.repr_depth += 1;
+        let result = self.repr_inner(ty);
+        self.repr_depth -= 1;
+        let result = result.and_then(|repr| {
+            if self.repr_depth == 0 && !self.flushing_refs { self.finish_pending_refs()?; }
+            // Headers and reflection field targets encode IDs in sixteen bits.
+            if self.layouts.len() > u16::MAX as usize + 1 || self.values.len() > u16::MAX as usize + 1 {
+                return Err(LayoutError("layout/type count exceeds representable ID limit".into()));
+            }
+            Ok(repr)
+        });
+        if result.is_err() {
+            if let Some(checkpoint) = checkpoint { self.restore(checkpoint); }
+        }
+        result
+    }
+
+    fn repr_inner(&mut self, ty: &Ty) -> R<Repr> {
         match ty {
             Ty::Prim(Prim::Unit) => Ok(Repr::Unit),
             Ty::Prim(Prim::Str) => {
@@ -101,13 +172,12 @@ impl<'a> LayoutRegistry<'a> {
             Ty::Named { name, args } => self.named_repr(name, args),
             Ty::Array(elem, n) => {
                 // Fixed array → a reference object holding `n` inline elements.
-                let er = self.repr(elem)?;
-                Ok(Repr::Ref(self.array_layout(&er, *n)?))
+                Ok(Repr::Ref(self.typed_array(ty.clone(), elem, Some(*n))?))
             }
             Ty::Tuple(elems) => {
                 // Tuples are value aggregates.
                 let reprs: Vec<Repr> = elems.iter().map(|e| self.repr(e)).collect::<R<_>>()?;
-                Ok(Repr::Value(self.tuple_value(&reprs)))
+                Ok(Repr::Value(self.tuple_value(&reprs)?))
             }
             Ty::Fn { .. } => {
                 // A closure value is a reference to its environment object; the
@@ -125,12 +195,27 @@ impl<'a> LayoutRegistry<'a> {
         // Builtin generic containers.
         match name {
             "Array" => {
-                let er = self.repr(&args[0])?;
-                return Ok(Repr::Ref(self.array_for(&er)?));
+                let Some(elem) = args.first().filter(|_| args.len() == 1) else {
+                    return Err(LayoutError("Array requires one element type".into()));
+                };
+                return Ok(Repr::Ref(self.typed_array(Ty::Named { name: name.into(), args: args.to_vec() }, elem, None)?));
             }
             "Vec" => {
-                let er = self.repr(&args[0])?;
-                return Ok(Repr::Ref(self.vec_layout(&er)));
+                if let Some(s) = self.ctx.structs.get(name).cloned() {
+                    return if s.is_value {
+                        Ok(Repr::Value(self.value_struct(name, &s, args)?))
+                    } else { Ok(Repr::Ref(self.ref_struct(name, &s, args)?)) };
+                }
+                let Some(elem) = args.first().filter(|_| args.len() == 1) else {
+                    return Err(LayoutError("Vec requires one element type".into()));
+                };
+                let nominal = Ty::Named { name: name.into(), args: args.to_vec() };
+                if let Some(id) = self.nominal_ref_ids.get(&nominal) { return Ok(Repr::Ref(*id)); }
+                let id = self.layouts.len() as LayoutId;
+                self.layouts.push(placeholder_layout("<pending-vec>"));
+                self.nominal_ref_ids.insert(nominal, id);
+                self.pending_refs.push(PendingRef::Vec(id, elem.clone()));
+                return Ok(Repr::Ref(id));
             }
             "Option" | "Result" => {
                 // Built-in enums. Honour a `#[value]` declaration (the prelude
@@ -141,6 +226,7 @@ impl<'a> LayoutRegistry<'a> {
                     if e.is_value {
                         return Ok(Repr::Value(self.value_enum(name, &e, args)?));
                     }
+                    return Ok(Repr::Ref(self.ref_enum(name, &e, args)?));
                 }
                 return Ok(Repr::Ref(self.builtin_enum_layout(name, args)?));
             }
@@ -165,6 +251,47 @@ impl<'a> LayoutRegistry<'a> {
         }
     }
 
+    fn finish_pending_refs(&mut self) -> R<()> {
+        self.flushing_refs = true;
+        let result = (|| {
+            while let Some(pending) = self.pending_refs.pop() {
+                match pending {
+                    PendingRef::Struct(id, key, definition, args) => { self.finish_ref_struct(id, key, &definition, &args)?; }
+                    PendingRef::Enum(id, key, definition, args) => { self.finish_ref_enum(id, key, &definition, &args)?; }
+                    PendingRef::BuiltinEnum(id, key, name, args) => { self.finish_builtin_enum_layout(id, key, &name, &args)?; }
+                    PendingRef::Vec(id, elem) => {
+                        let repr = self.repr(&elem)?;
+                        self.layouts[id as usize] = Self::vec_layout(&repr);
+                    }
+                    PendingRef::Array(id, elem, count) => {
+                        let repr = self.repr(&elem)?;
+                        let key = match count {
+                            Some(n) => format!("[{};{}]", repr_key(&repr), n),
+                            None => format!("Array<{}>", repr_key(&repr)),
+                        };
+                        self.fill_array(id, &repr, key)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.flushing_refs = false;
+        result
+    }
+
+    fn begin_inline_value(&mut self, nominal: &Ty) -> R<()> {
+        let Ty::Named { name, .. } = nominal else { unreachable!() };
+        for active in &self.building_values {
+            if let Ty::Named { name: active_name, .. } = active {
+                if active_name == name && !strict_type_subterm(nominal, active) {
+                    return Err(LayoutError(format!("recursive inline value type `{name}` has no finite representation")));
+                }
+            }
+        }
+        self.building_values.push(nominal.clone());
+        Ok(())
+    }
+
     // ---- key construction (monomorphic interning) -------------------------
     fn key(name: &str, args: &[Ty]) -> String {
         if args.is_empty() {
@@ -178,13 +305,19 @@ impl<'a> LayoutRegistry<'a> {
     // ---- reference structs -------------------------------------------------
     fn ref_struct(&mut self, name: &str, s: &crate::ast::StructDef, args: &[Ty]) -> R<LayoutId> {
         let key = Self::key(name, args);
-        if let Some(id) = self.ref_ids.get(&key) {
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_ref_ids.get(&nominal) {
             return Ok(*id);
         }
         // Reserve id up-front for recursive types.
         let id = self.layouts.len() as LayoutId;
-        self.ref_ids.insert(key.clone(), id);
+        self.nominal_ref_ids.insert(nominal, id);
         self.layouts.push(placeholder_layout(&key));
+        self.pending_refs.push(PendingRef::Struct(id, key, s.clone(), args.to_vec()));
+        Ok(id)
+    }
+
+    fn finish_ref_struct(&mut self, id: LayoutId, key: String, s: &crate::ast::StructDef, args: &[Ty]) -> R<LayoutId> {
 
         let field_tys = struct_field_tys(s, args, self.ctx)?;
         let field_names = struct_field_names(s);
@@ -195,12 +328,18 @@ impl<'a> LayoutRegistry<'a> {
 
     fn ref_enum(&mut self, name: &str, e: &crate::ast::EnumDef, args: &[Ty]) -> R<LayoutId> {
         let key = Self::key(name, args);
-        if let Some(id) = self.ref_ids.get(&key) {
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_ref_ids.get(&nominal) {
             return Ok(*id);
         }
         let id = self.layouts.len() as LayoutId;
-        self.ref_ids.insert(key.clone(), id);
+        self.nominal_ref_ids.insert(nominal, id);
         self.layouts.push(placeholder_layout(&key));
+        self.pending_refs.push(PendingRef::Enum(id, key, e.clone(), args.to_vec()));
+        Ok(id)
+    }
+
+    fn finish_ref_enum(&mut self, id: LayoutId, key: String, e: &crate::ast::EnumDef, args: &[Ty]) -> R<LayoutId> {
 
         // A reference enum is one heap object: [header with u32 tag][union of
         // variant payloads]. We give it the max over variants of (ptr_fields, raw_bytes)
@@ -254,12 +393,19 @@ impl<'a> LayoutRegistry<'a> {
     fn builtin_enum_layout(&mut self, name: &str, args: &[Ty]) -> R<LayoutId> {
         // Option<T> = { None, Some(T) }; Result<T,E> = { Ok(T), Err(E) }.
         let key = Self::key(name, args);
-        if let Some(id) = self.ref_ids.get(&key) {
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_ref_ids.get(&nominal) {
             return Ok(*id);
         }
         let id = self.layouts.len() as LayoutId;
-        self.ref_ids.insert(key.clone(), id);
+        self.nominal_ref_ids.insert(nominal, id);
         self.layouts.push(placeholder_layout(&key));
+        self.pending_refs.push(PendingRef::BuiltinEnum(id, key, name.to_string(), args.to_vec()));
+        Ok(id)
+    }
+
+    fn finish_builtin_enum_layout(&mut self, id: LayoutId, key: String, name: &str, args: &[Ty]) -> R<LayoutId> {
+
 
         let variants: Vec<Vec<Ty>> = match name {
             "Option" => vec![vec![], vec![args[0].clone()]],
@@ -310,76 +456,93 @@ impl<'a> LayoutRegistry<'a> {
     // ---- value aggregates --------------------------------------------------
     fn value_struct(&mut self, name: &str, s: &crate::ast::StructDef, args: &[Ty]) -> R<ValueId> {
         let key = Self::key(name, args);
-        if let Some(id) = self.value_ids.get(&key) {
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_value_ids.get(&nominal) {
             return Ok(*id);
         }
-        let field_tys = struct_field_tys(s, args, self.ctx)?;
-        let fields: Vec<Repr> = field_tys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
-        let (size, align) = value_size_align(&fields, &self.values);
-        let field_names = struct_field_names(s);
-        let id = self.values.len() as ValueId;
-        self.values.push(ValueLayout { name: key.clone(), variants: None, fields, field_names, size, align });
-        self.value_ids.insert(key, id);
-        Ok(id)
+        self.begin_inline_value(&nominal)?;
+        let result = (|| {
+            let field_tys = struct_field_tys(s, args, self.ctx)?;
+            let fields: Vec<Repr> = field_tys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
+            let (size, align) = value_size_align(&fields, &self.values)?;
+            let field_names = struct_field_names(s);
+            let id = self.values.len() as ValueId;
+            self.values.push(ValueLayout { name: key.clone(), variants: None, fields, field_names, size, align });
+            self.nominal_value_ids.insert(nominal, id);
+            Ok(id)
+        })();
+        self.building_values.pop();
+        result
     }
 
     fn value_enum(&mut self, name: &str, e: &crate::ast::EnumDef, args: &[Ty]) -> R<ValueId> {
         let key = Self::key(name, args);
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_value_ids.get(&nominal) {
+            return Ok(*id);
+        }
+        self.begin_inline_value(&nominal)?;
+        let result = (|| {
+            let mut variants = Vec::new();
+            for v in &e.variants {
+                let ptys = variant_payload_tys(v, &e.generics, args, self.ctx)?;
+                let fields: Vec<Repr> = ptys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
+                variants.push(ValueVariant { name: v.name.clone(), fields, field_names: variant_field_names(v) });
+            }
+            // Pointers-first layout (mirrors reference enums): `max_ptrs` leading GC
+            // slots shared across variants, then the u32 tag, then the raw region
+            // (scalar + value payloads with references split into the leading slots). Embedded refs land at fixed offsets
+            // (`0, 8, …`) regardless of the active variant, so the GC can trace them
+            // with a static interior-pointer list. `max_ptrs == 0` degenerates to the
+            // compact `{ tag, padding, raw }` form. Raw payloads are 8-aligned.
+            let max_ptrs = checked_value_enum_max_ptrs(&variants, &self.values)
+                .ok_or_else(layout_limit_error)? as u32;
+            // Every canonical reference offset is stored in a u16 GC descriptor.
+            // Reject shapes that cannot describe their final leading slot before
+            // codegen can overflow its offset arithmetic (including bare locals).
+            if max_ptrs != 0 { layout_offset((max_ptrs - 1) * 8)?; }
+            let mut max_raw = 0u32;
+            let mut align = 8;
+            for vv in &variants {
+                let mut raw = 0u32;
+                for f in &vv.fields {
+                    match f {
+                        Repr::Ref(_) | Repr::Unit => {}
+                        Repr::Scalar(s) => {
+                            let b = (s.bits().max(8) / 8).max(1);
+                            raw = checked_align_up(raw, b)?.checked_add(b).ok_or_else(layout_limit_error)?;
+                            align = align.max(b);
+                        }
+                        Repr::Value(vid) => {
+                            let v = &self.values[*vid as usize];
+                            raw = checked_align_up(raw, v.align)?.checked_add(v.size).ok_or_else(layout_limit_error)?;
+                            align = align.max(v.align);
+                        }
+                    }
+                }
+                max_raw = max_raw.max(raw);
+            }
+            let size = checked_align_up(max_ptrs.checked_mul(8).and_then(|n| n.checked_add(8)).and_then(|n| n.checked_add(max_raw)).ok_or_else(layout_limit_error)?, align)?;
+            let id = self.values.len() as ValueId;
+            self.values.push(ValueLayout { name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
+            self.nominal_value_ids.insert(nominal, id);
+            Ok(id)
+        })();
+        self.building_values.pop();
+        result
+    }
+
+    fn tuple_value(&mut self, reprs: &[Repr]) -> R<ValueId> {
+        let key = format!("({})", reprs.iter().map(repr_key).collect::<Vec<_>>().join(","));
         if let Some(id) = self.value_ids.get(&key) {
             return Ok(*id);
         }
-        let mut variants = Vec::new();
-        for v in &e.variants {
-            let ptys = variant_payload_tys(v, &e.generics, args, self.ctx)?;
-            let fields: Vec<Repr> = ptys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
-            variants.push(ValueVariant { name: v.name.clone(), fields });
-        }
-        // Pointers-first layout (mirrors reference enums): `max_ptrs` leading GC
-        // slots shared across variants, then the u32 tag, then the raw region
-        // (scalar + value payloads with references split into the leading slots). Embedded refs land at fixed offsets
-        // (`0, 8, …`) regardless of the active variant, so the GC can trace them
-        // with a static interior-pointer list. `max_ptrs == 0` degenerates to the
-        // compact `{ tag, padding, raw }` form. Raw payloads are 8-aligned.
-        let max_ptrs = value_enum_max_ptrs(&variants, &self.values) as u32;
-        let mut max_raw = 0u32;
-        let mut align = 8;
-        for vv in &variants {
-            let mut raw = 0u32;
-            for f in &vv.fields {
-                match f {
-                    Repr::Ref(_) | Repr::Unit => {}
-                    Repr::Scalar(s) => {
-                        let b = (s.bits().max(8) / 8).max(1);
-                        raw = align_up(raw, b) + b;
-                        align = align.max(b);
-                    }
-                    Repr::Value(vid) => {
-                        let v = &self.values[*vid as usize];
-                        raw = align_up(raw, v.align) + v.size;
-                        align = align.max(v.align);
-                    }
-                }
-            }
-            max_raw = max_raw.max(raw);
-        }
-        let size = align_up(max_ptrs * 8 + 8 + max_raw, align);
-        let id = self.values.len() as ValueId;
-        self.values.push(ValueLayout { name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
-        self.value_ids.insert(key, id);
-        Ok(id)
-    }
-
-    fn tuple_value(&mut self, reprs: &[Repr]) -> ValueId {
-        let key = format!("({})", reprs.iter().map(repr_key).collect::<Vec<_>>().join(","));
-        if let Some(id) = self.value_ids.get(&key) {
-            return *id;
-        }
-        let (size, align) = value_size_align(reprs, &self.values);
+        let (size, align) = value_size_align(reprs, &self.values)?;
         let field_names: Vec<String> = (0..reprs.len()).map(|i| i.to_string()).collect();
         let id = self.values.len() as ValueId;
         self.values.push(ValueLayout { name: key.clone(), variants: None, fields: reprs.to_vec(), field_names, size, align });
         self.value_ids.insert(key, id);
-        id
+        Ok(id)
     }
 
     // ---- built-in reference layouts ---------------------------------------
@@ -391,12 +554,12 @@ impl<'a> LayoutRegistry<'a> {
             meta: opaque_meta("String"),
         })
     }
-    fn vec_layout(&mut self, elem: &Repr) -> LayoutId {
+    fn vec_layout(elem: &Repr) -> Layout {
         // A Vec is a small header object {len, cap, ptr-to-backing}; for v0 we
         // model it as a reference with a pointer to a varlen backing array.
         let key = format!("Vec<{}>", repr_key(elem));
-        let traced = matches!(elem, Repr::Ref(_));
-        self.intern_ref(&key, Layout {
+        let traced = matches!(elem, Repr::Ref(_) | Repr::Value(_));
+        Layout {
             ptr_fields: 1, // backing array pointer
             raw_bytes: 16, // len + cap
             varlen: VarLen::None,
@@ -409,14 +572,38 @@ impl<'a> LayoutRegistry<'a> {
             elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
             meta: opaque_meta(&key),
-        })
+        }
     }
+    fn typed_array(&mut self, nominal: Ty, elem: &Ty, count: Option<u64>) -> R<LayoutId> {
+        if let Some(id) = self.nominal_ref_ids.get(&nominal) { return Ok(*id); }
+        let id = self.layouts.len() as LayoutId;
+        self.layouts.push(placeholder_layout("<pending-array>"));
+        self.nominal_ref_ids.insert(nominal, id);
+        self.pending_refs.push(PendingRef::Array(id, elem.clone(), count));
+        Ok(id)
+    }
+
     /// A varlen array layout for the given element repr. Pointer elements use a
     /// traced `Values` tail; scalar elements use an untraced `Bytes` tail whose
     /// element stride is the scalar's byte size. Value elements use traced boxes.
     pub fn array_for(&mut self, elem: &Repr) -> R<LayoutId> {
         let key = format!("Array<{}>", repr_key(elem));
         if let Some(id) = self.ref_ids.get(&key) { return Ok(*id); }
+        let checkpoint = self.snapshot();
+        let result = (|| {
+            let id = self.layouts.len() as LayoutId;
+            self.layouts.push(placeholder_layout(&key));
+            self.fill_array(id, elem, key)?;
+            if self.layouts.len() > u16::MAX as usize + 1 {
+                return Err(LayoutError("layout/type count exceeds representable ID limit".into()));
+            }
+            Ok(id)
+        })();
+        if result.is_err() { self.restore(checkpoint); }
+        result
+    }
+
+    fn fill_array(&mut self, id: LayoutId, elem: &Repr, key: String) -> R<()> {
         let element_box = if let Repr::Value(vid) = elem {
             let name = format!("<array-element:{}>", self.values[*vid as usize].name);
             let size = self.values[*vid as usize].size;
@@ -424,7 +611,7 @@ impl<'a> LayoutRegistry<'a> {
             let raw_bytes = u16::try_from(size).map_err(|_| LayoutError("array value element exceeds layout size limit".into()))?;
             let mut interior_ptrs = Vec::new();
             self.value_ref_offsets(*vid, HEADER, &mut interior_ptrs)?;
-            Some(self.intern_ref(&name, Layout {
+            Some(self.intern_ref(&format!("<array-element-id:{vid}>"), Layout {
                 ptr_fields: 0, raw_bytes, varlen: VarLen::None,
                 field_map: vec![FieldLoc::ValueAt { offset: 0, value: *vid }],
                 name: name.clone(), elem_stride: 0, element_box: None,
@@ -432,26 +619,17 @@ impl<'a> LayoutRegistry<'a> {
             }))
         } else { None };
         let traced = matches!(elem, Repr::Ref(_) | Repr::Value(_));
-        let stride = match elem { Repr::Scalar(s) => (s.bits().max(8) / 8) as u16, _ => 8 };
-        let id = self.layouts.len() as LayoutId;
-        self.layouts.push(Layout {
+        let stride = match elem { Repr::Unit => 1, Repr::Scalar(s) => (s.bits().max(8) / 8) as u16, _ => 8 };
+        self.layouts[id as usize] = Layout {
             ptr_fields: 0, raw_bytes: 0,
             varlen: if traced { VarLen::Values } else { VarLen::Bytes },
             field_map: vec![], name: key.clone(), elem_stride: stride,
             element_box, interior_ptrs: vec![], meta: opaque_meta(&key),
-        });
+        };
         self.ref_ids.insert(key, id);
-        Ok(id)
+        Ok(())
     }
 
-    fn array_layout(&mut self, elem: &Repr, n: u64) -> R<LayoutId> {
-        let key = format!("[{};{}]", repr_key(elem), n);
-        let dynamic = self.array_for(elem)?;
-        let mut layout = self.layouts[dynamic as usize].clone();
-        layout.name = key.clone();
-        layout.meta = opaque_meta(&key);
-        Ok(self.intern_ref(&key, layout))
-    }
     fn closure_placeholder(&mut self) -> LayoutId {
         // Filled per-closure during closure lowering; a generic env placeholder.
         self.intern_ref("<closure-env>", placeholder_layout("<closure-env>"))
@@ -462,18 +640,20 @@ impl<'a> LayoutRegistry<'a> {
     /// returned layout's `field_map` is empty (codegen addresses by section
     /// offset using `capture_kinds`). `key` makes distinct closures distinct.
     pub fn closure_env(&mut self, key: &str, captures: &[Repr]) -> R<LayoutId> {
-        let ptr_fields = captures.iter().filter(|repr| matches!(repr, Repr::Ref(_))).count() as u16;
+        let ptr_fields = u16::try_from(captures.iter().filter(|repr| matches!(repr, Repr::Ref(_))).count()).map_err(|_| layout_limit_error())?;
+        let pointer_end = HEADER as u32 + ptr_fields as u32 * 8;
+        layout_offset(pointer_end)?;
         let mut raw_bytes = 8u32;
         let mut interior_ptrs = Vec::new();
         for capture in captures {
             match capture {
                 Repr::Scalar(s) => {
                     let size = s.bits().max(8) / 8;
-                    raw_bytes = align_up(raw_bytes, size) + size;
+                    raw_bytes = checked_align_up(raw_bytes, size)?.checked_add(size).ok_or_else(layout_limit_error)?;
                 }
                 Repr::Value(id) => {
-                    raw_bytes = align_up(raw_bytes, 8);
-                    if HEADER as u32 + ptr_fields as u32 * 8 + raw_bytes + self.values[*id as usize].size > u16::MAX as u32 { return Err(LayoutError("closure capture exceeds pointer-offset limit".into())); }
+                    raw_bytes = checked_align_up(raw_bytes, 8)?;
+                    if pointer_end.checked_add(raw_bytes).and_then(|n| n.checked_add(self.values[*id as usize].size)).ok_or_else(layout_limit_error)? > u16::MAX as u32 { return Err(LayoutError("closure capture exceeds pointer-offset limit".into())); }
                     let base = u16::try_from(HEADER as u32 + ptr_fields as u32 * 8 + raw_bytes).map_err(|_| LayoutError("closure capture exceeds layout size limit".into()))?;
                     self.value_ref_offsets(*id, base, &mut interior_ptrs)?;
                     raw_bytes += self.values[*id as usize].size;
@@ -481,7 +661,8 @@ impl<'a> LayoutRegistry<'a> {
                 _ => {}
             }
         }
-        let raw_bytes = u16::try_from(align_up(raw_bytes, 8)).map_err(|_| LayoutError("closure captures exceed layout size limit".into()))?;
+        layout_offset(pointer_end.checked_add(checked_align_up(raw_bytes, 8)?).ok_or_else(layout_limit_error)?)?;
+        let raw_bytes = u16::try_from(checked_align_up(raw_bytes, 8)?).map_err(|_| LayoutError("closure captures exceed layout size limit".into()))?;
         let id = self.layouts.len() as LayoutId;
         self.layouts.push(Layout { ptr_fields, raw_bytes, varlen: VarLen::None,
             field_map: vec![], name: key.to_string(), elem_stride: 0, element_box: None,
@@ -508,7 +689,7 @@ impl<'a> LayoutRegistry<'a> {
                 Repr::Ref(_) => ptrs += 1,
                 Repr::Scalar(s) => {
                     let size = s.bits().max(8) / 8;
-                    raw = align_up(raw, size) + size;
+                    raw = checked_align_up(raw, size)?.checked_add(size).ok_or_else(layout_limit_error)?;
                 }
                 Repr::Value(id) => {
                     let value = &self.values[id as usize];
@@ -516,12 +697,12 @@ impl<'a> LayoutRegistry<'a> {
                     // slots as value enums, including nested value references.
                     let mut offsets = Vec::new();
                     self.value_ref_offsets(id, 0, &mut offsets)?;
-                    ptrs += offsets.len() as u32;
-                    raw = align_up(raw, 8) + value.size;
+                    ptrs = ptrs.checked_add(u32::try_from(offsets.len()).map_err(|_| layout_limit_error())?).ok_or_else(layout_limit_error)?;
+                    raw = checked_align_up(raw, 8)?.checked_add(value.size).ok_or_else(layout_limit_error)?;
                 }
                 Repr::Unit => {}
             }
-            if HEADER as u32 + ptrs * 8 + align_up(raw, 8) > u16::MAX as u32 {
+            if ptrs.checked_mul(8).and_then(|n| n.checked_add(HEADER as u32)).and_then(|n| n.checked_add(checked_align_up(raw, 8).ok()?)).ok_or_else(layout_limit_error)? > u16::MAX as u32 {
                 return Err(LayoutError("enum payload exceeds layout size limit".into()));
             }
         }
@@ -531,16 +712,16 @@ impl<'a> LayoutRegistry<'a> {
     fn build_ref_layout(&mut self, name: &str, field_names: &[String], field_tys: &[Ty]) -> R<Layout> {
         // Pointer fields first (traced), then raw scalar/value bytes.
         let mut ptr_idx = 0u16;
-        let mut raw_off = 0u16;
+        let mut raw_off = 0u32;
         let mut field_map = Vec::with_capacity(field_tys.len());
         // First pass: place pointers.
         let reprs: Vec<Repr> = field_tys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
         for r in &reprs {
             if let Repr::Ref(_) = r {
                 field_map.push(FieldLoc::Ptr { idx: ptr_idx });
-                ptr_idx += 1;
+                ptr_idx = ptr_idx.checked_add(1).ok_or_else(layout_limit_error)?;
             } else {
-                field_map.push(FieldLoc::Raw { offset: 0, repr: ScalarRepr::I64 }); // patched below
+                field_map.push(FieldLoc::Unit); // non-unit raw/value fields patched below
             }
         }
         // Second pass: place raw fields, patching the placeholders.
@@ -548,20 +729,22 @@ impl<'a> LayoutRegistry<'a> {
             match r {
                 Repr::Ref(_) | Repr::Unit => {}
                 Repr::Scalar(s) => {
-                    let sz = (s.bits().max(8) / 8) as u16;
-                    raw_off = align_up(raw_off as u32, sz as u32) as u16;
-                    field_map[i] = FieldLoc::Raw { offset: raw_off, repr: *s };
-                    raw_off += sz;
+                    let sz = s.bits().max(8) / 8;
+                    raw_off = checked_align_up(raw_off, sz)?;
+                    field_map[i] = FieldLoc::Raw { offset: layout_offset(raw_off)?, repr: *s };
+                    raw_off = raw_off.checked_add(sz).ok_or_else(layout_limit_error)?;
+                    layout_offset(raw_off)?;
                 }
                 Repr::Value(vid) => {
                     // A flattened value aggregate lives inline in the raw region.
                     // References embedded in it are recorded as `interior_ptrs`
-                    // below so the GC traces them; value enums carrying refs are
-                    // still rejected there (their union offsets are tag-dependent).
-                    let sz = self.values[*vid as usize].size as u16;
-                    raw_off = align_up(raw_off as u32, 8) as u16;
-                    field_map[i] = FieldLoc::ValueAt { offset: raw_off, value: *vid };
-                    raw_off += sz;
+                    // below so the GC traces them. Value enums use shared
+                    // leading reference slots, independent of the active tag.
+                    let sz = self.values[*vid as usize].size;
+                    raw_off = checked_align_up(raw_off, 8)?;
+                    field_map[i] = FieldLoc::ValueAt { offset: layout_offset(raw_off)?, value: *vid };
+                    raw_off = raw_off.checked_add(sz).ok_or_else(layout_limit_error)?;
+                    layout_offset(raw_off)?;
                 }
             }
         }
@@ -574,17 +757,17 @@ impl<'a> LayoutRegistry<'a> {
             match (r, &field_map[i]) {
                 (Repr::Ref(lid), FieldLoc::Ptr { idx }) => meta_fields.push(FieldMeta {
                     name: fname,
-                    offset: HEADER + idx * 8,
+                    offset: layout_offset(HEADER as u32 + *idx as u32 * 8)?,
                     ty: FieldTy::Ref(*lid as u16),
                 }),
                 (Repr::Scalar(s), FieldLoc::Raw { offset, .. }) => meta_fields.push(FieldMeta {
                     name: fname,
-                    offset: HEADER + ptr_total * 8 + offset,
+                    offset: layout_offset(HEADER as u32 + ptr_total as u32 * 8 + *offset as u32)?,
                     ty: FieldTy::Scalar(scalar_kind(*s)),
                 }),
                 (Repr::Value(vid), FieldLoc::ValueAt { offset, .. }) => meta_fields.push(FieldMeta {
                     name: fname,
-                    offset: HEADER + ptr_total * 8 + offset,
+                    offset: layout_offset(HEADER as u32 + ptr_total as u32 * 8 + *offset as u32)?,
                     ty: FieldTy::Value(*vid as u16),
                 }),
                 // Unit fields are zero-size (no storage); skip.
@@ -601,13 +784,13 @@ impl<'a> LayoutRegistry<'a> {
         let mut interior_ptrs = Vec::new();
         for (i, r) in reprs.iter().enumerate() {
             if let (Repr::Value(vid), FieldLoc::ValueAt { offset, .. }) = (r, &field_map[i]) {
-                let base = HEADER + ptr_total * 8 + offset;
+                let base = layout_offset(HEADER as u32 + ptr_total as u32 * 8 + *offset as u32)?;
                 self.value_ref_offsets(*vid, base, &mut interior_ptrs)?;
             }
         }
         Ok(Layout {
             ptr_fields: ptr_idx,
-            raw_bytes: align_up(raw_off as u32, 8) as u16,
+            raw_bytes: layout_offset(checked_align_up(raw_off, 8)?)?,
             varlen: VarLen::None,
             field_map,
             name: name.to_string(),
@@ -625,36 +808,7 @@ impl<'a> LayoutRegistry<'a> {
     /// Value enums split direct and nested references into shared leading slots,
     /// so their offsets remain independent of the active variant.
     fn value_ref_offsets(&self, vid: ValueId, base: u16, out: &mut Vec<u16>) -> R<()> {
-        let vl = &self.values[vid as usize];
-        if let Some(variants) = &vl.variants {
-            let max_ptrs = crate::core::value_enum_max_ptrs(variants, &self.values);
-            for k in 0..max_ptrs {
-                out.push(base + k * 8);
-            }
-            return Ok(());
-        }
-        let mut off = 0u32;
-        for f in &vl.fields {
-            let (sz, align) = match f {
-                Repr::Unit => (0u32, 1u32),
-                Repr::Scalar(s) => {
-                    let b = (s.bits().max(8) / 8).max(1);
-                    (b, b)
-                }
-                Repr::Ref(_) => (8, 8),
-                Repr::Value(sub) => {
-                    (self.values[*sub as usize].size, self.values[*sub as usize].align)
-                }
-            };
-            off = align_up(off, align);
-            match f {
-                Repr::Ref(_) => out.push(base + off as u16),
-                Repr::Value(sub) => self.value_ref_offsets(*sub, base + off as u16, out)?,
-                _ => {}
-            }
-            off += sz;
-        }
-        Ok(())
+        visit_value_ref_offsets(&self.values, vid, base as u32, &mut |offset| out.push(offset))
     }
 
 
@@ -663,9 +817,9 @@ impl<'a> LayoutRegistry<'a> {
     /// fill the shared pointer region (slots `0..`) in declaration order; scalar
     /// payloads fill the raw region after the pointer slots (at `HEADER +
     /// max_ptrs*8`). Offsets are absolute (header included). Value payloads
-    /// advance both cursors but remain omitted from reflection: their nested
-    /// references live separately in leading slots, which a contiguous ValueMeta
-    /// cannot describe. Unit payloads have no storage and are also omitted.
+    /// advance both cursors. Projected-value metadata describes their nested
+    /// references in the leading slots while retaining the raw payload base.
+    /// Unit payloads have no storage and are omitted.
     fn enum_variant_fields(
         &self,
         reprs: &[Repr],
@@ -692,11 +846,20 @@ impl<'a> LayoutRegistry<'a> {
                 }
                 Repr::Value(id) => {
                     raw_cursor = align_up(raw_cursor as u32, 8) as u16;
+                    let offset = raw_cursor;
                     raw_cursor += self.values[*id as usize].size as u16;
                     let mut offsets = Vec::new();
                     // Already validated when the payload layout was built.
                     self.value_ref_offsets(*id, 0, &mut offsets).expect("validated value layout");
-                    ptr_slot += offsets.len() as u16;
+                    let ty = if offsets.is_empty() { FieldTy::Value(*id as u16) } else {
+                        let reference_offsets = offsets.into_iter().map(|child| {
+                            let enclosing = HEADER + ptr_slot * 8;
+                            ptr_slot += 1;
+                            (child, enclosing)
+                        }).collect();
+                        FieldTy::ProjectedValue { value_id: *id as u16, reference_offsets }
+                    };
+                    out.push(FieldMeta { name: fname, offset, ty });
                 }
                 Repr::Unit => {}
             }
@@ -777,7 +940,61 @@ fn scalar_of(p: Prim) -> Option<ScalarRepr> {
     })
 }
 
-fn value_size_align(fields: &[Repr], values: &[ValueLayout]) -> (u32, u32) {
+// Re-entering an inline generic declaration is finite only when it consumes
+// an already-present type argument (e.g. Wrap<Wrap<i64>> -> Wrap<i64>).
+// Expanding cycles such as Bad<T> -> Bad<(T,T)> cannot have finite storage.
+fn strict_type_subterm(needle: &Ty, parent: &Ty) -> bool {
+    let children: Vec<&Ty> = match parent {
+        Ty::Named { args, .. } | Ty::Tuple(args) => args.iter().collect(),
+        Ty::Array(elem, _) => vec![elem.as_ref()],
+        Ty::Fn { params, ret } | Ty::ExternFn { params, ret } => params.iter().chain(std::iter::once(ret.as_ref())).collect(),
+        _ => vec![],
+    };
+    children.into_iter().any(|child| child == needle || strict_type_subterm(needle, child))
+}
+
+// Share reference-offset composition between layout validation and descriptor
+// construction. Visiting avoids allocating a temporary descriptor just to check
+// whether a nested aggregate can represent every interior root.
+pub(crate) fn visit_value_ref_offsets(
+    values: &[ValueLayout],
+    vid: ValueId,
+    base: u32,
+    visit: &mut impl FnMut(u16),
+) -> R<()> {
+    let vl = &values[vid as usize];
+    if let Some(variants) = &vl.variants {
+        let max_ptrs = crate::core::value_enum_max_ptrs(variants, values);
+        for k in 0..max_ptrs {
+            visit(layout_offset(base.checked_add(k as u32 * 8).ok_or_else(layout_limit_error)?)?);
+        }
+        return Ok(());
+    }
+    let mut off = 0u32;
+    for f in &vl.fields {
+        let (sz, align) = match f {
+            Repr::Unit => (0u32, 1u32),
+            Repr::Scalar(s) => {
+                let b = (s.bits().max(8) / 8).max(1);
+                (b, b)
+            }
+            Repr::Ref(_) => (8, 8),
+            Repr::Value(sub) => {
+                (values[*sub as usize].size, values[*sub as usize].align)
+            }
+        };
+        off = checked_align_up(off, align)?;
+        match f {
+            Repr::Ref(_) => visit(layout_offset(base.checked_add(off).ok_or_else(layout_limit_error)?)?),
+            Repr::Value(sub) => visit_value_ref_offsets(values, *sub, base.checked_add(off).ok_or_else(layout_limit_error)?, visit)?,
+            _ => {}
+        }
+        off = off.checked_add(sz).ok_or_else(layout_limit_error)?;
+    }
+    Ok(())
+}
+
+fn value_size_align(fields: &[Repr], values: &[ValueLayout]) -> R<(u32, u32)> {
     let mut off = 0u32;
     let mut align = 1u32;
     for f in fields {
@@ -787,10 +1004,26 @@ fn value_size_align(fields: &[Repr], values: &[ValueLayout]) -> (u32, u32) {
             Repr::Ref(_) => (8, 8),
             Repr::Value(vid) => (values[*vid as usize].size, values[*vid as usize].align),
         };
-        off = align_up(off, a) + sz;
+        off = checked_align_up(off, a)?;
+        if !matches!(f, Repr::Unit) { layout_offset(off)?; }
+        if let Repr::Value(vid) = f {
+            visit_value_ref_offsets(values, *vid, off, &mut |_| {})?;
+        }
+        off = off.checked_add(sz).ok_or_else(layout_limit_error)?;
         align = align.max(a);
     }
-    (align_up(off, align.max(1)), align.max(1))
+    Ok((checked_align_up(off, align.max(1))?, align.max(1)))
+}
+
+fn layout_limit_error() -> LayoutError {
+    LayoutError("layout exceeds representable offset or size limit".into())
+}
+fn layout_offset(offset: u32) -> R<u16> {
+    u16::try_from(offset).map_err(|_| layout_limit_error())
+}
+fn checked_align_up(size: u32, alignment: u32) -> R<u32> {
+    if alignment == 0 { return Ok(size); }
+    size.checked_add(alignment - 1).map(|n| n & !(alignment - 1)).ok_or_else(layout_limit_error)
 }
 
 fn align_up(n: u32, a: u32) -> u32 {
@@ -799,7 +1032,7 @@ fn align_up(n: u32, a: u32) -> u32 {
 
 fn ty_key(t: &Ty) -> String {
     match t {
-        Ty::Prim(p) => format!("{:?}", p),
+        Ty::Prim(p) => crate::types::prim_name(*p).to_string(),
         Ty::Named { name, args } => if args.is_empty() { name.clone() } else {
             format!("{}<{}>", name, args.iter().map(ty_key).collect::<Vec<_>>().join(","))
         },
@@ -832,6 +1065,39 @@ mod tests {
         let m = parse_module(&lex(src).unwrap()).unwrap();
         let r = resolve_module(m).unwrap();
         TyCtx::from_globals(&r.globals)
+    }
+
+    #[test]
+    fn composed_scalar_offsets_do_not_consume_reference_descriptor_range() {
+        let value = |name: &str, fields, size| ValueLayout {
+            name: name.into(), variants: None, fields, field_names: vec![], size, align: 8,
+        };
+        let values = [
+            value("Leaf", vec![Repr::Scalar(ScalarRepr::I64)], 8),
+            value("Big", vec![Repr::Scalar(ScalarRepr::I64); 8191], 65528),
+            value("Inner", vec![Repr::Value(1), Repr::Value(0)], 65536),
+        ];
+        assert_eq!(value_size_align(&[Repr::Scalar(ScalarRepr::I64), Repr::Value(2)], &values).unwrap(), (65544, 8));
+    }
+
+    #[test]
+    fn nested_reference_offsets_preserve_boundary_and_reject_overflow() {
+        let nested = ValueLayout {
+            name: "Nested".into(),
+            variants: Some(vec![ValueVariant {
+                name: "All".into(),
+                fields: vec![Repr::Ref(0); 8191],
+                field_names: vec![],
+            }]),
+            fields: vec![],
+            field_names: vec![],
+            size: 65536,
+            align: 8,
+        };
+        let values = [nested];
+        assert!(value_size_align(&[Repr::Scalar(ScalarRepr::I64), Repr::Value(0)], &values).is_ok());
+        let error = value_size_align(&[Repr::Scalar(ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64), Repr::Value(0)], &values).unwrap_err();
+        assert!(error.0.contains("layout exceeds representable offset or size limit"));
     }
 
     #[test]

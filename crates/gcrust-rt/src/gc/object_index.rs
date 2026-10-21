@@ -3,20 +3,37 @@
 //! Initialized arena ranges only grow until reset. An earlier range boundary is
 //! an object boundary, so subtracting the previous initialized ranges lets us
 //! walk new objects, including prefixes filled into previously unused TLAB tails.
+use crate::runtime::metadata_allocator::MetadataAllocator;
+use allocator_api2::vec::Vec as NativeVec;
 use std::ops::Range;
 
 use super::alloc::AtomicBumpAllocator;
 use super::field::{read_type_id, read_varlen_count};
 use super::type_info::{TypeInfo, VarLenKind};
 
-#[derive(Default)]
 pub(super) struct ObjectStartIndex {
     epoch: Option<usize>,
-    ranges: Vec<Range<usize>>,
-    starts: Vec<usize>,
+    ranges: NativeVec<Range<usize>, MetadataAllocator>,
+    starts: NativeVec<usize, MetadataAllocator>,
+}
+
+#[cfg(test)]
+impl Default for ObjectStartIndex {
+    fn default() -> Self {
+        Self::with_allocator(MetadataAllocator::default())
+    }
 }
 
 impl ObjectStartIndex {
+    /// Both reusable buffers retain their accounting owner until physical release.
+    pub(super) fn with_allocator(allocator: MetadataAllocator) -> Self {
+        Self {
+            epoch: None,
+            ranges: NativeVec::new_in(allocator.clone()),
+            starts: NativeVec::new_in(allocator),
+        }
+    }
+
     /// The allocator must be stopped, all reservations initialized, and the
     /// type table must describe its objects. Keep this index bound to one arena.
     pub(super) unsafe fn update(
@@ -186,5 +203,79 @@ mod tests {
             init_header::<Full>(obj, 0);
         }
         verify(&mut index, &space, &types);
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use crate::runtime::{allocation_counter::AllocationCounter, allocation_probe};
+    use std::sync::Arc;
+
+    #[test]
+    fn collector_object_index_empty_owned_buffers_allocate_nothing() {
+        let counter = Arc::<AllocationCounter>::default();
+        allocation_probe::start();
+        let index = ObjectStartIndex::with_allocator(MetadataAllocator::new(&counter));
+        assert_eq!(counter.bytes(), 0);
+        assert_eq!(Arc::strong_count(&counter), 3);
+        assert_eq!(index.get(0), None);
+        drop(index);
+        assert_eq!(Arc::strong_count(&counter), 1);
+        assert_eq!(allocation_probe::finish_bytes(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn collector_object_index_retains_actual_backing_charge_across_warm_reuse() {
+        let counter = Arc::<AllocationCounter>::default();
+        let mut index = ObjectStartIndex::with_allocator(MetadataAllocator::new(&counter));
+        // Exercise both independently grown buffer layouts, without allocating
+        // managed arena storage or relying on a standard Vec's private layout.
+        allocation_probe::start();
+        index.ranges.extend((0..9).map(|i| i * 32..i * 32 + 16));
+        index.starts.resize(257, usize::MAX);
+        index.starts[256] = 42;
+        let cold = allocation_probe::finish_bytes();
+        assert!(cold.0 >= 2);
+        assert_eq!(counter.bytes(), cold.2 - cold.3);
+        assert!(
+            counter.bytes()
+                >= 9 * std::mem::size_of::<Range<usize>>() + 257 * std::mem::size_of::<usize>()
+        );
+        let retained = counter.bytes();
+        assert_eq!(index.get(256), Some(42));
+        allocation_probe::start();
+        index.ranges.clear();
+        index.starts.clear();
+        assert_eq!(index.get(256), None);
+        index.ranges.push(0..16);
+        index.starts.resize(3, usize::MAX);
+        index.starts[1] = 16;
+        assert_eq!(index.get(1), Some(16));
+        assert_eq!(counter.bytes(), retained);
+        assert_eq!(allocation_probe::finish_bytes(), (0, 0, 0, 0));
+        drop(index);
+        assert_eq!(counter.bytes(), 0);
+        assert_eq!(Arc::strong_count(&counter), 1);
+    }
+
+    #[test]
+    fn collector_object_index_owns_counter_after_constructor_scope_ends() {
+        let (index, observer) = {
+            let counter = Arc::<AllocationCounter>::default();
+            let mut index = ObjectStartIndex::with_allocator(MetadataAllocator::new(&counter));
+            index.ranges.push(0..512);
+            index.starts.resize(64, 0);
+            let observer = Arc::downgrade(&counter);
+            (index, observer)
+        };
+        {
+            let counter = observer.upgrade().expect("index owns accounting state");
+            assert!(counter.bytes() >= 64 * std::mem::size_of::<usize>());
+            assert_eq!(Arc::strong_count(&counter), 3);
+            assert_eq!(index.get(63), Some(0));
+        }
+        drop(index);
+        assert!(observer.upgrade().is_none());
     }
 }

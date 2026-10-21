@@ -299,6 +299,13 @@ struct Vec<T> { data: Array<T>, len: i64, cap: i64 }
 impl<T> Vec<T> {
     fn new() -> Vec<T> { Vec { data: Array::new(4), len: 0, cap: 4 } }
 
+    // A Vec that takes over `a` as its storage (`vec![a, b, c]`).
+    fn from_array(a: Array<T>) -> Vec<T> {
+        let n = a.len();
+        if n == 0 { return Vec::new(); }
+        Vec { data: a, len: n, cap: n }
+    }
+
     fn with_capacity(cap: i64) -> Vec<T> {
         if cap < 0 { panic("Vec::with_capacity: negative capacity"); }
         let c = cap.max(1);
@@ -1038,25 +1045,29 @@ struct ThreadResult<T> { v: Option<T> }
 // Sharing the cell between child (one write, before finishing) and parent (one
 // reads, after join) is safe because `thread_join` orders them — assert Sync
 // (the auto-deriver can't see the join provides the ordering).
-impl Sync for ThreadResult {}
+impl<T> Sync for ThreadResult<T> {}
 
 struct Thread<T> { handle: RawPtr, result: ThreadResult<T> }
 
-// Completion records are root-execution-owned. Concurrent joins synchronize
-// before reading the cell; the child is its only writer and writes once.
-impl Sync for Thread {}
+// Completion records follow the Thread object itself after native join.
+// Concurrent joins synchronize before reading it; the child writes once.
+impl<T> Sync for Thread<T> {}
 
 impl Thread {
     fn spawn<T>(f: fn() -> T) -> Thread<T> {
         let cell: ThreadResult<T> = ThreadResult { v: Option::None };
         // The child computes `f()` and stores it into the shared cell (a plain
         // field write), then returns 0 (the runtime's i64 channel is unused).
-        let handle = thread_spawn(|| {
+        let handle = (unsafe { thread_spawn(|| {
             let mut c = cell;
             c.v = Option::Some(f());
             0
-        });
-        Thread { handle: handle, result: cell }
+        }) });
+        // Bind to the wrapper identity: its result field can be replaced safely.
+        // Metadata remains until native join and collection of every wrapper alias.
+        let thread = unsafe { Thread { handle: handle, result: cell } };
+        unsafe { thread_bind_owner(handle, thread); }
+        thread
     }
     fn sleep(ms: i64) { let _u = thread_sleep(ms); }
     fn yield_now() { let _u = thread_yield(); }
@@ -1065,7 +1076,7 @@ impl Thread {
 
 impl<T> Thread<T> {
     fn join(self) -> T {
-        let _h = thread_join(self.handle);   // wait for the OS thread (happens-before)
+        let _h = (unsafe { thread_join(self.handle) });   // wait for the OS thread (happens-before)
         // The child has stored its result before finishing, so this reads `Some`.
         // The `None` arm is unreachable; the loop satisfies the return type.
         let mut r = self.result;
@@ -1080,19 +1091,24 @@ impl<T> Thread<T> {
 
 // ---- AtomicI64 — a lock-free shared integer (see docs/threads.md) ----------
 // The cell lives off the GC heap (stable address), so concurrent CAS/fetch_add
-// are safe. The root execution owns cells until all children drain at shutdown.
+// are safe. Native cells weakly follow the managed wrapper identity.
 // Shareable across threads.
-#[value]
 struct AtomicI64 { cell: RawPtr }
 
 impl AtomicI64 {
-    fn new(v: i64) -> AtomicI64 { AtomicI64 { cell: atomic_i64_new(v) } }
+    // Only this constructor supplies a live atomic cell to this representation.
+    fn new(v: i64) -> AtomicI64 {
+        let cell = unsafe { atomic_i64_new(v) };
+        let wrapper = unsafe { AtomicI64 { cell: cell } };
+        unsafe { atomic_i64_bind_owner(cell, wrapper); }
+        wrapper
+    }
 }
 impl AtomicI64 {
-    fn load(self) -> i64 { atomic_i64_load(self.cell) }
-    fn store(self, v: i64) -> i64 { atomic_i64_store(self.cell, v) }
-    fn fetch_add(self, delta: i64) -> i64 { atomic_i64_fetch_add(self.cell, delta) }
-    fn compare_and_set(self, expected: i64, new: i64) -> bool { atomic_i64_cas(self.cell, expected, new) == 1 }
+    fn load(self) -> i64 { (unsafe { atomic_i64_load(self.cell) }) }
+    fn store(self, v: i64) -> i64 { (unsafe { atomic_i64_store(self.cell, v) }) }
+    fn fetch_add(self, delta: i64) -> i64 { (unsafe { atomic_i64_fetch_add(self.cell, delta) }) }
+    fn compare_and_set(self, expected: i64, new: i64) -> bool { (unsafe { atomic_i64_cas(self.cell, expected, new) }) == 1 }
 }
 
 // ---- Atom<T> — a Clojure-style atom (see docs/threads.md) ------------------
@@ -1110,18 +1126,18 @@ impl<T> Atom<T> {
 
 impl<T> Atom<T> {
     // @atom — the current value (atomic load).
-    fn deref(self) -> T { atom_load(self) }
+    fn deref(self) -> T { (unsafe { atom_load(self) }) }
 
     // compare-and-set! — install `new` iff the current value is `old`.
-    fn compare_and_set(self, old: T, new: T) -> bool { atom_cas(self, old, new) }
+    fn compare_and_set(self, old: T, new: T) -> bool { (unsafe { atom_cas(self, old, new) }) }
 
     // swap! — apply the pure function `f` to the current value and install the
     // result, retrying the whole function if another thread swapped in between.
     fn swap(self, f: fn(T) -> T) -> T {
         loop {
-            let old = atom_load(self);
+            let old = (unsafe { atom_load(self) });
             let new = f(old);
-            if atom_cas(self, old, new) {
+            if (unsafe { atom_cas(self, old, new) }) {
                 return new;
             }
         }
@@ -1130,8 +1146,8 @@ impl<T> Atom<T> {
     // reset! — set a new value unconditionally (retry the CAS until it sticks).
     fn reset(self, v: T) -> T {
         loop {
-            let old = atom_load(self);
-            if atom_cas(self, old, v) {
+            let old = (unsafe { atom_load(self) });
+            if (unsafe { atom_cas(self, old, v) }) {
                 return v;
             }
         }
@@ -1147,15 +1163,21 @@ struct Channel<T> { buf: Array<ChannelMessage<T>>, ctrl: RawPtr }
 impl<T> Channel<T> {
     fn new(cap: i64) -> Channel<T> {
         let b: Array<ChannelMessage<T>> = Array::new(0);
-        Channel { buf: b, ctrl: chan_new(cap, b) }
+        // The control record and witness have the same message type.
+        let ctrl = unsafe { chan_new(cap, b) };
+        let channel = unsafe { Channel { buf: b, ctrl: ctrl } };
+        unsafe { chan_bind_owner(ctrl, channel); }
+        channel
     }
     fn send(self, v: T) -> Result<(), T> {
         let message = ChannelMessage { value: v };
-        if chan_send(self.buf, self.ctrl, message) == 0 { Result::Ok(()) }
+        let status = unsafe { chan_send(self.buf, self.ctrl, message) };
+        if status == 0 { Result::Ok(()) }
         else { Result::Err(v) }
     }
     fn recv(self) -> Option<T> {
-        match chan_recv(self.buf, self.ctrl) {
+        let result = unsafe { chan_recv(self.buf, self.ctrl) };
+        match result {
             Option::Some(message) => Option::Some(message.value),
             Option::None => Option::None
         }
@@ -1164,8 +1186,917 @@ impl<T> Channel<T> {
     fn recv_value(self) -> T {
         match self.recv() { Option::Some(value) => value, Option::None => panic("receive on closed drained channel") }
     }
-    fn close(self) -> i64 { chan_close(self.ctrl); 0 }
-    fn waiting_senders(self) -> i64 { chan_waiting_senders(self.ctrl) }
-    fn waiting_receivers(self) -> i64 { chan_waiting_receivers(self.ctrl) }
+    fn close(self) -> i64 { (unsafe { chan_close(self.ctrl) }); 0 }
+    fn waiting_senders(self) -> i64 { let n = unsafe { chan_waiting_senders(self.ctrl) }; n }
+    fn waiting_receivers(self) -> i64 { let n = unsafe { chan_waiting_receivers(self.ctrl) }; n }
 }
-impl Sync for Channel {}
+impl<T> Sync for Channel<T> {}
+
+// ---- Formatting ---------------------------------------------------------------
+// `format!("{}", x)` renders `x.to_string()`; a type implementing `Display`
+// gets `to_string` from it. `{:?}` renders through `Debug`. Both traits write
+// into a `Formatter`, as in Rust: `write!(f, "...", args)` appends to it.
+// A `Formatter` is a GC object, so `f: Formatter` (no `&mut`) is enough.
+
+struct FmtError {}
+type FmtResult = Result<(), FmtError>;
+
+struct Formatter { parts: Vec<String>, alt: bool }
+
+impl Formatter {
+    fn new() -> Formatter { Formatter { parts: Vec::new(), alt: false } }
+    fn new_alternate() -> Formatter { Formatter { parts: Vec::new(), alt: true } }
+    fn write_str(self, s: String) -> FmtResult {
+        let mut f = self;
+        f.parts.push(s);
+        Result::Ok(())
+    }
+    fn write_char(self, c: char) -> FmtResult { self.write_str(c.to_string()) }
+    // `{:#?}`: pretty-printed Debug output was requested.
+    fn alternate(self) -> bool { self.alt }
+    fn finish_string(self) -> String { self.parts.join("") }
+
+    fn debug_struct(self, name: String) -> DebugStruct {
+        self.write_str(name);
+        DebugStruct { b: DebugInner::new(self, " { ", " }", " {\n", "}", "") }
+    }
+    fn debug_tuple(self, name: String) -> DebugTuple {
+        self.write_str(name);
+        DebugTuple { b: DebugInner::new(self, "(", ")", "(\n", ")", "") }
+    }
+    fn debug_list(self) -> DebugList { DebugList { b: DebugInner::new(self, "[", "]", "[\n", "]", "[]") } }
+    fn debug_set(self) -> DebugSet { DebugSet { b: DebugInner::new(self, "{", "}", "{\n", "}", "{}") } }
+    fn debug_map(self) -> DebugMap { DebugMap { b: DebugInner::new(self, "{", "}", "{\n", "}", "{}") } }
+}
+
+trait Display {
+    fn fmt(self, f: Formatter) -> FmtResult;
+    fn to_string(self) -> String {
+        let f = Formatter::new();
+        Display::fmt(self, f);
+        f.finish_string()
+    }
+}
+
+trait Debug {
+    fn fmt(self, f: Formatter) -> FmtResult;
+    fn to_debug_string(self) -> String {
+        let f = Formatter::new();
+        Debug::fmt(self, f);
+        f.finish_string()
+    }
+    fn to_debug_string_pretty(self) -> String {
+        let f = Formatter::new_alternate();
+        Debug::fmt(self, f);
+        f.finish_string()
+    }
+}
+
+// The shared state of the `debug_*` builders: the open/close text for one-line
+// and pretty (`{:#?}`) output.
+struct DebugInner { f: Formatter, open: String, close: String, open_pretty: String, close_pretty: String, empty: String, has_fields: bool }
+
+impl DebugInner {
+    fn new(f: Formatter, open: String, close: String, open_pretty: String, close_pretty: String, empty: String) -> DebugInner {
+        DebugInner { f, open, close, open_pretty, close_pretty, empty, has_fields: false }
+    }
+    fn render<T: Debug>(self, value: T) -> String {
+        if self.f.alt { value.to_debug_string_pretty() } else { value.to_debug_string() }
+    }
+    fn entry(self, text: String) {
+        let mut b = self;
+        if b.f.alt {
+            if !b.has_fields { b.f.write_str(b.open_pretty); }
+            b.f.write_str("    " + fmt_indent(text) + ",\n");
+        } else {
+            b.f.write_str(if b.has_fields { ", " } else { b.open });
+            b.f.write_str(text);
+        }
+        b.has_fields = true;
+    }
+    fn finish(self) -> FmtResult {
+        if !self.has_fields { self.f.write_str(self.empty) }
+        else if self.f.alt { self.f.write_str(self.close_pretty) }
+        else { self.f.write_str(self.close) }
+    }
+}
+
+struct DebugStruct { b: DebugInner }
+impl DebugStruct {
+    fn field<T: Debug>(self, name: String, value: T) -> DebugStruct {
+        self.b.entry(name + ": " + self.b.render(value));
+        self
+    }
+    fn finish(self) -> FmtResult { self.b.finish() }
+    fn finish_non_exhaustive(self) -> FmtResult {
+        self.b.entry("..");
+        self.b.finish()
+    }
+}
+
+struct DebugTuple { b: DebugInner }
+impl DebugTuple {
+    fn field<T: Debug>(self, value: T) -> DebugTuple {
+        self.b.entry(self.b.render(value));
+        self
+    }
+    fn finish(self) -> FmtResult { self.b.finish() }
+}
+
+struct DebugList { b: DebugInner }
+impl DebugList {
+    fn entry<T: Debug>(self, value: T) -> DebugList {
+        self.b.entry(self.b.render(value));
+        self
+    }
+    fn entries<T: Debug>(self, values: Vec<T>) -> DebugList {
+        for v in values { self.b.entry(self.b.render(v)); }
+        self
+    }
+    fn finish(self) -> FmtResult { self.b.finish() }
+}
+
+struct DebugSet { b: DebugInner }
+impl DebugSet {
+    fn entry<T: Debug>(self, value: T) -> DebugSet {
+        self.b.entry(self.b.render(value));
+        self
+    }
+    fn entries<T: Debug>(self, values: Vec<T>) -> DebugSet {
+        for v in values { self.b.entry(self.b.render(v)); }
+        self
+    }
+    fn finish(self) -> FmtResult { self.b.finish() }
+}
+
+struct DebugMap { b: DebugInner }
+impl DebugMap {
+    fn entry<K: Debug, V: Debug>(self, key: K, value: V) -> DebugMap {
+        self.b.entry(self.b.render(key) + ": " + self.b.render(value));
+        self
+    }
+    fn finish(self) -> FmtResult { self.b.finish() }
+}
+
+// Indent every line after the first (nested pretty output).
+fn fmt_indent(s: String) -> String { s.replace("\n", "\n    ") }
+
+// The number of chars (not bytes) in `s`.
+fn fmt_char_len(s: String) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    let len = str_len(s);
+    while i < len {
+        if (str_get(s, i) & 192) != 128 { n += 1; }
+        i += 1;
+    }
+    n
+}
+
+// Apply a format spec's sign, `#` prefix, zero padding, fill, and alignment.
+// `align` is 0 (the default: right for numbers, left otherwise), 1 `<`,
+// 2 `>`, or 3 `^`.
+fn fmt_pad(body: String, prefix: String, fill: String, align: i64, width: i64, numeric: bool, plus: bool, zero: bool) -> String {
+    let mut sign = "";
+    let mut digits = body;
+    if numeric && digits.starts_with("-") {
+        sign = "-";
+        digits = digits[1..];
+    } else if numeric && plus {
+        sign = "+";
+    }
+    let head = sign + prefix;
+    let len = fmt_char_len(head) + fmt_char_len(digits);
+    if len >= width { return head + digits; }
+    let pad = width - len;
+    if zero && numeric { return head + "0".repeat(pad) + digits; }
+    let s = head + digits;
+    let a = if align == 0 { if numeric { 2 } else { 1 } } else { align };
+    if a == 1 { s + fill.repeat(pad) }
+    else if a == 2 { fill.repeat(pad) + s }
+    else { fill.repeat(pad / 2) + s + fill.repeat(pad - pad / 2) }
+}
+
+// `v` in base `radix`, as an unsigned `bits`-wide integer (so a negative
+// i32 prints its two's complement, like Rust).
+fn fmt_radix(v: i64, radix: i64, upper: bool, bits: i64) -> String {
+    let mut u = v as u64;
+    if bits < 64 { u = u & ((1u64 << (bits as u64)) - 1u64); }
+    if u == 0u64 { return "0"; }
+    let r = radix as u64;
+    let digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" };
+    let mut out: Vec<String> = Vec::new();
+    while u > 0u64 {
+        let d = (u % r) as i64;
+        out.push(digits[d..d + 1]);
+        u = u / r;
+    }
+    out.reverse();
+    out.join("")
+}
+
+fn fmt_debug_list(open: String, close: String, parts: Vec<String>, pretty: bool, single_comma: bool) -> String {
+    if parts.len() == 0 { return open + close; }
+    if pretty {
+        let mut s = open + "\n";
+        for p in parts { s = s + "    " + fmt_indent(p) + ",\n"; }
+        return s + close;
+    }
+    let mut s = open + parts.join(", ");
+    if single_comma && parts.len() == 1 { s = s + ","; }
+    s + close
+}
+
+// Debug output for a tuple whose elements are already rendered.
+fn fmt_debug_seq(open: String, close: String, items: Array<String>, pretty: bool, single_comma: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for it in items { parts.push(it); }
+    fmt_debug_list(open, close, parts, pretty, single_comma)
+}
+
+// Debug output for an array.
+fn fmt_debug_array<A>(a: A, pretty: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for x in a { parts.push(if pretty { x.to_debug_string_pretty() } else { x.to_debug_string() }); }
+    fmt_debug_list("[", "]", parts, pretty, false)
+}
+
+// `s` with Rust's Debug escapes, without the quotes.
+fn fmt_escape(s: String, quote: char) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for c in s.chars() {
+        if c == '\n' { out.push("\\n"); }
+        else if c == '\t' { out.push("\\t"); }
+        else if c == '\r' { out.push("\\r"); }
+        else if c == '\0' { out.push("\\0"); }
+        else if c == '\\' { out.push("\\\\"); }
+        else if c == quote { out.push("\\" + c.to_string()); }
+        else if (c as i64) < 32 || (c as i64) == 127 { out.push("\\u{" + fmt_radix(c as i64, 16, false, 64) + "}"); }
+        else { out.push(c.to_string()); }
+    }
+    out.join("")
+}
+
+impl String {
+    // The first `n` chars (`{:.N}` on a string).
+    fn fmt_truncate(self, n: i64) -> String {
+        let cs = self.chars();
+        if cs.len() <= n { self } else { String::from_chars(cs[..n]) }
+    }
+}
+
+impl Display for i8 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for i16 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for i32 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for i64 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for u8 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for u16 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for u32 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for u64 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for f32 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for f64 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Display for bool { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(self.to_string()) } }
+impl Display for char { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(self.to_string()) } }
+impl Display for String { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(self) } }
+
+impl Debug for i8 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for i16 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for i32 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for i64 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for u8 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for u16 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for u32 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for u64 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(to_string(self)) } }
+impl Debug for f32 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(fmt_f64(self as f64, 0 - 1, 1)) } }
+impl Debug for f64 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(fmt_f64(self, 0 - 1, 1)) } }
+impl Debug for bool { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(self.to_string()) } }
+impl Debug for char { fn fmt(self, f: Formatter) -> FmtResult { f.write_str("'" + fmt_escape(self.to_string(), '\'') + "'") } }
+impl Debug for String { fn fmt(self, f: Formatter) -> FmtResult { f.write_str("\"" + fmt_escape(self, '"') + "\"") } }
+impl Debug for Ordering {
+    fn fmt(self, f: Formatter) -> FmtResult {
+        f.write_str(match self { Ordering::Less => "Less", Ordering::Equal => "Equal", Ordering::Greater => "Greater" })
+    }
+}
+
+impl<T: Debug> Debug for Vec<T> {
+    fn fmt(self, f: Formatter) -> FmtResult { f.debug_list().entries(self).finish() }
+}
+impl<T: Debug> Debug for Option<T> {
+    fn fmt(self, f: Formatter) -> FmtResult {
+        match self {
+            Option::Some(v) => f.debug_tuple("Some").field(v).finish(),
+            Option::None => f.write_str("None"),
+        }
+    }
+}
+impl<T: Debug, E: Debug> Debug for Result<T, E> {
+    fn fmt(self, f: Formatter) -> FmtResult {
+        match self {
+            Result::Ok(v) => f.debug_tuple("Ok").field(v).finish(),
+            Result::Err(e) => f.debug_tuple("Err").field(e).finish(),
+        }
+    }
+}
+impl<K: Eq + Hash + Debug, V: Debug> Debug for HashMap<K, V> {
+    fn fmt(self, f: Formatter) -> FmtResult {
+        let m = f.debug_map();
+        let ks = self.keys();
+        let vs = self.values();
+        let mut i = 0;
+        while i < ks.len() {
+            m.entry(ks[i], vs[i]);
+            i += 1;
+        }
+        m.finish()
+    }
+}
+impl Debug for FmtError { fn fmt(self, f: Formatter) -> FmtResult { f.write_str("Error") } }
+
+// ---- Default -------------------------------------------------------------------
+
+trait Default { fn default() -> Self; }
+impl Default for i8 { fn default() -> i8 { 0 } }
+impl Default for i16 { fn default() -> i16 { 0 } }
+impl Default for i32 { fn default() -> i32 { 0 } }
+impl Default for i64 { fn default() -> i64 { 0 } }
+impl Default for u8 { fn default() -> u8 { 0 } }
+impl Default for u16 { fn default() -> u16 { 0 } }
+impl Default for u32 { fn default() -> u32 { 0 } }
+impl Default for u64 { fn default() -> u64 { 0 } }
+impl Default for f32 { fn default() -> f32 { 0.0 } }
+impl Default for f64 { fn default() -> f64 { 0.0 } }
+impl Default for bool { fn default() -> bool { false } }
+impl Default for char { fn default() -> char { '\0' } }
+impl Default for String { fn default() -> String { "" } }
+impl<T> Default for Vec<T> { fn default() -> Vec<T> { Vec::new() } }
+impl<T> Default for Option<T> { fn default() -> Option<T> { Option::None } }
+impl<K: Eq + Hash, V> Default for HashMap<K, V> { fn default() -> HashMap<K, V> { HashMap::new() } }
+
+// ---- Clone for scalars and strings ----------------------------------------------
+// Copying a scalar or an immutable String is cloning it.
+
+impl Clone for i8 { fn clone(self) -> i8 { self } }
+impl Clone for i16 { fn clone(self) -> i16 { self } }
+impl Clone for i32 { fn clone(self) -> i32 { self } }
+impl Clone for i64 { fn clone(self) -> i64 { self } }
+impl Clone for u8 { fn clone(self) -> u8 { self } }
+impl Clone for u16 { fn clone(self) -> u16 { self } }
+impl Clone for u32 { fn clone(self) -> u32 { self } }
+impl Clone for u64 { fn clone(self) -> u64 { self } }
+impl Clone for f32 { fn clone(self) -> f32 { self } }
+impl Clone for f64 { fn clone(self) -> f64 { self } }
+impl Clone for bool { fn clone(self) -> bool { self } }
+impl Clone for char { fn clone(self) -> char { self } }
+impl Clone for String { fn clone(self) -> String { self } }
+impl<T: Clone> Clone for Option<T> {
+    fn clone(self) -> Option<T> {
+        match self { Option::Some(v) => Option::Some(v.clone()), Option::None => Option::None }
+    }
+}
+impl<T: Clone, E: Clone> Clone for Result<T, E> {
+    fn clone(self) -> Result<T, E> {
+        match self { Result::Ok(v) => Result::Ok(v.clone()), Result::Err(e) => Result::Err(e.clone()) }
+    }
+}
+
+// The shared storage of a `let mut` variable that a closure assigns to (see
+// src/capture.rs): the variable and its closures all use `cell.v`.
+struct MutCell<T> { v: T }
+
+// ---- Iterators ------------------------------------------------------------------
+// Lazy, as in Rust: adapters (`map`, `filter`, `zip`, ...) build iterator
+// structs and do no work until a consumer (`collect`, `sum`, `count`, a `for`
+// loop, ...) calls `next`. An iterator is a GC object, so `let mut it =
+// v.iter(); it.next()` advances it in place. Consumers take `self`, so they
+// work on temporaries: `v.iter().map(f).count()`.
+
+trait Iterator {
+    type Item;
+    fn next(mut self) -> Option<Self::Item>;
+
+    fn map<B>(self, f: fn(Self::Item) -> B) -> Map<Self, Self::Item, B> { Map { iter: self, f: f } }
+    fn filter(self, p: fn(Self::Item) -> bool) -> Filter<Self, Self::Item> { Filter { iter: self, p: p } }
+    fn filter_map<B>(self, f: fn(Self::Item) -> Option<B>) -> FilterMap<Self, Self::Item, B> { FilterMap { iter: self, f: f } }
+    fn enumerate(self) -> Enumerate<Self> { Enumerate { iter: self, i: 0 } }
+    fn take(self, n: i64) -> Take<Self> { Take { iter: self, n: n } }
+    fn skip(self, n: i64) -> Skip<Self> { Skip { iter: self, n: n } }
+    fn step_by(self, step: i64) -> StepBy<Self> {
+        if step <= 0 { panic("Iterator::step_by: step must be positive"); }
+        StepBy { iter: self, step: step, first: true }
+    }
+    fn zip<J: Iterator>(self, other: J) -> Zip<Self, J> { Zip { a: self, b: other } }
+    fn chain<J: Iterator<Item = Self::Item>>(self, other: J) -> Chain<Self, J> { Chain { a: self, b: other, first: true } }
+    fn take_while(self, p: fn(Self::Item) -> bool) -> TakeWhile<Self, Self::Item> { TakeWhile { iter: self, p: p, done: false } }
+    fn skip_while(self, p: fn(Self::Item) -> bool) -> SkipWhile<Self, Self::Item> { SkipWhile { iter: self, p: p, started: false } }
+    fn flat_map<J: Iterator>(self, f: fn(Self::Item) -> J) -> FlatMap<Self, Self::Item, J> {
+        FlatMap { iter: self, f: f, current: Option::None }
+    }
+    fn inspect(self, f: fn(Self::Item)) -> Inspect<Self, Self::Item> { Inspect { iter: self, f: f } }
+    fn peekable(self) -> Peekable<Self, Self::Item> { Peekable { iter: self, peeked: Option::None } }
+    // Values are already copies or shared references: these adapt nothing.
+    fn cloned(self) -> Self { self }
+    fn copied(self) -> Self { self }
+    fn by_ref(self) -> Self { self }
+    fn into_iter(self) -> Self { self }
+
+    fn count(self) -> i64 {
+        let mut it = self;
+        let mut n = 0;
+        while let Option::Some(_) = it.next() { n += 1; }
+        n
+    }
+    fn last(self) -> Option<Self::Item> {
+        let mut it = self;
+        let mut last = Option::None;
+        while let Option::Some(x) = it.next() { last = Option::Some(x); }
+        last
+    }
+    fn nth(self, n: i64) -> Option<Self::Item> {
+        let mut it = self;
+        let mut i = 0;
+        while let Option::Some(x) = it.next() {
+            if i == n { return Option::Some(x); }
+            i += 1;
+        }
+        Option::None
+    }
+    fn fold<B>(self, init: B, f: fn(B, Self::Item) -> B) -> B {
+        let mut it = self;
+        let mut acc = init;
+        while let Option::Some(x) = it.next() { acc = f(acc, x); }
+        acc
+    }
+    fn reduce(self, f: fn(Self::Item, Self::Item) -> Self::Item) -> Option<Self::Item> {
+        let mut it = self;
+        match it.next() {
+            Option::None => Option::None,
+            Option::Some(first) => {
+                let mut acc = first;
+                while let Option::Some(x) = it.next() { acc = f(acc, x); }
+                Option::Some(acc)
+            }
+        }
+    }
+    fn for_each(self, f: fn(Self::Item)) {
+        let mut it = self;
+        while let Option::Some(x) = it.next() { f(x); }
+    }
+    fn any(self, p: fn(Self::Item) -> bool) -> bool {
+        let mut it = self;
+        while let Option::Some(x) = it.next() { if p(x) { return true; } }
+        false
+    }
+    fn all(self, p: fn(Self::Item) -> bool) -> bool {
+        let mut it = self;
+        while let Option::Some(x) = it.next() { if !p(x) { return false; } }
+        true
+    }
+    fn find(self, p: fn(Self::Item) -> bool) -> Option<Self::Item> {
+        let mut it = self;
+        while let Option::Some(x) = it.next() { if p(x) { return Option::Some(x); } }
+        Option::None
+    }
+    fn find_map<B>(self, f: fn(Self::Item) -> Option<B>) -> Option<B> {
+        let mut it = self;
+        while let Option::Some(x) = it.next() {
+            match f(x) { Option::Some(y) => { return Option::Some(y); }, Option::None => {} }
+        }
+        Option::None
+    }
+    fn position(self, p: fn(Self::Item) -> bool) -> Option<i64> {
+        let mut it = self;
+        let mut i = 0;
+        while let Option::Some(x) = it.next() {
+            if p(x) { return Option::Some(i); }
+            i += 1;
+        }
+        Option::None
+    }
+    fn max(self) -> Option<Self::Item> where Self::Item: Ord {
+        let mut it = self;
+        let mut best = it.next();
+        while let Option::Some(x) = it.next() {
+            match best { Option::Some(b) => { if x.cmp(b) != Ordering::Less { best = Option::Some(x); } }, Option::None => {} }
+        }
+        best
+    }
+    fn min(self) -> Option<Self::Item> where Self::Item: Ord {
+        let mut it = self;
+        let mut best = it.next();
+        while let Option::Some(x) = it.next() {
+            match best { Option::Some(b) => { if x.cmp(b) == Ordering::Less { best = Option::Some(x); } }, Option::None => {} }
+        }
+        best
+    }
+    fn max_by_key<K: Ord>(self, f: fn(Self::Item) -> K) -> Option<Self::Item> {
+        let mut it = self;
+        let mut best = Option::None;
+        let mut best_key = Option::None;
+        while let Option::Some(x) = it.next() {
+            let k = f(x);
+            let better = match best_key { Option::Some(bk) => k.cmp(bk) != Ordering::Less, Option::None => true };
+            if better { best = Option::Some(x); best_key = Option::Some(k); }
+        }
+        best
+    }
+    fn min_by_key<K: Ord>(self, f: fn(Self::Item) -> K) -> Option<Self::Item> {
+        let mut it = self;
+        let mut best = Option::None;
+        let mut best_key = Option::None;
+        while let Option::Some(x) = it.next() {
+            let k = f(x);
+            let better = match best_key { Option::Some(bk) => k.cmp(bk) == Ordering::Less, Option::None => true };
+            if better { best = Option::Some(x); best_key = Option::Some(k); }
+        }
+        best
+    }
+    fn max_by(self, f: fn(Self::Item, Self::Item) -> Ordering) -> Option<Self::Item> {
+        let mut it = self;
+        let mut best = it.next();
+        while let Option::Some(x) = it.next() {
+            match best { Option::Some(b) => { if f(x, b) != Ordering::Less { best = Option::Some(x); } }, Option::None => {} }
+        }
+        best
+    }
+    fn min_by(self, f: fn(Self::Item, Self::Item) -> Ordering) -> Option<Self::Item> {
+        let mut it = self;
+        let mut best = it.next();
+        while let Option::Some(x) = it.next() {
+            match best { Option::Some(b) => { if f(x, b) == Ordering::Less { best = Option::Some(x); } }, Option::None => {} }
+        }
+        best
+    }
+    fn sum(self) -> Self::Item where Self::Item: Sum {
+        let mut it = self;
+        let mut acc: Self::Item = Sum::zero();
+        while let Option::Some(x) = it.next() { acc = acc + x; }
+        acc
+    }
+    fn product(self) -> Self::Item where Self::Item: Sum {
+        let mut it = self;
+        let mut acc: Self::Item = Sum::one();
+        while let Option::Some(x) = it.next() { acc = acc * x; }
+        acc
+    }
+    // The items in a Vec. `collect()` builds whatever `FromIterator` type is
+    // expected (`Vec`, `String`, `HashMap`, ...), defaulting to a Vec.
+    fn collect_vec(self) -> Vec<Self::Item> {
+        let mut it = self;
+        let mut v: Vec<Self::Item> = Vec::new();
+        while let Option::Some(x) = it.next() { v.push(x); }
+        v
+    }
+    fn partition(self, p: fn(Self::Item) -> bool) -> (Vec<Self::Item>, Vec<Self::Item>) {
+        let mut it = self;
+        let mut yes: Vec<Self::Item> = Vec::new();
+        let mut no: Vec<Self::Item> = Vec::new();
+        while let Option::Some(x) = it.next() { if p(x) { yes.push(x); } else { no.push(x); } }
+        (yes, no)
+    }
+}
+
+// The additive and multiplicative identities, for `Iterator::sum`/`product`.
+trait Sum { fn zero() -> Self; fn one() -> Self; }
+impl Sum for i8 { fn zero() -> i8 { 0 } fn one() -> i8 { 1 } }
+impl Sum for i16 { fn zero() -> i16 { 0 } fn one() -> i16 { 1 } }
+impl Sum for i32 { fn zero() -> i32 { 0 } fn one() -> i32 { 1 } }
+impl Sum for i64 { fn zero() -> i64 { 0 } fn one() -> i64 { 1 } }
+impl Sum for u8 { fn zero() -> u8 { 0 } fn one() -> u8 { 1 } }
+impl Sum for u16 { fn zero() -> u16 { 0 } fn one() -> u16 { 1 } }
+impl Sum for u32 { fn zero() -> u32 { 0 } fn one() -> u32 { 1 } }
+impl Sum for u64 { fn zero() -> u64 { 0 } fn one() -> u64 { 1 } }
+impl Sum for f32 { fn zero() -> f32 { 0.0 } fn one() -> f32 { 1.0 } }
+impl Sum for f64 { fn zero() -> f64 { 0.0 } fn one() -> f64 { 1.0 } }
+
+// Types `collect()` can build.
+trait FromIterator<A> { fn from_iter<I: Iterator<Item = A>>(iter: I) -> Self; }
+impl<T> FromIterator<T> for Vec<T> {
+    fn from_iter<I: Iterator<Item = T>>(iter: I) -> Vec<T> { iter.collect_vec() }
+}
+impl FromIterator<char> for String {
+    fn from_iter<I: Iterator<Item = char>>(iter: I) -> String { String::from_chars(iter.collect_vec()) }
+}
+impl<K: Eq + Hash, V> FromIterator<(K, V)> for HashMap<K, V> {
+    fn from_iter<I: Iterator<Item = (K, V)>>(iter: I) -> HashMap<K, V> {
+        let mut it = iter;
+        let mut m: HashMap<K, V> = HashMap::new();
+        while let Option::Some(kv) = it.next() { m.insert(kv.0, kv.1); }
+        m
+    }
+}
+
+// `lo..hi` used as a value; `lo..=hi` ends one later.
+struct Range { start: i64, end: i64 }
+impl Iterator for Range {
+    type Item = i64;
+    fn next(mut self) -> Option<i64> {
+        if self.start < self.end {
+            let x = self.start;
+            self.start = x + 1;
+            Option::Some(x)
+        } else { Option::None }
+    }
+}
+impl Range {
+    fn rev(self) -> RangeRev { RangeRev { start: self.start, end: self.end } }
+    fn len(self) -> i64 { if self.end > self.start { self.end - self.start } else { 0 } }
+    fn contains(self, x: i64) -> bool { x >= self.start && x < self.end }
+    fn is_empty(self) -> bool { self.start >= self.end }
+}
+struct RangeRev { start: i64, end: i64 }
+impl Iterator for RangeRev {
+    type Item = i64;
+    fn next(mut self) -> Option<i64> {
+        if self.start < self.end {
+            self.end = self.end - 1;
+            Option::Some(self.end)
+        } else { Option::None }
+    }
+}
+
+// `v.iter()` / `v.into_iter()`: a Vec's elements, front to back.
+struct VecIter<T> { v: Vec<T>, i: i64, end: i64 }
+impl<T> Iterator for VecIter<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
+        if self.i < self.end {
+            let x = self.v[self.i];
+            self.i = self.i + 1;
+            Option::Some(x)
+        } else { Option::None }
+    }
+}
+impl<T> VecIter<T> {
+    fn rev(self) -> VecIterRev<T> { VecIterRev { v: self.v, i: self.i, end: self.end } }
+    fn len(self) -> i64 { self.end - self.i }
+}
+struct VecIterRev<T> { v: Vec<T>, i: i64, end: i64 }
+impl<T> Iterator for VecIterRev<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
+        if self.i < self.end {
+            self.end = self.end - 1;
+            Option::Some(self.v[self.end])
+        } else { Option::None }
+    }
+}
+impl<T> Vec<T> {
+    fn iter(self) -> VecIter<T> { VecIter { v: self, i: 0, end: self.len } }
+    fn into_iter(self) -> VecIter<T> { VecIter { v: self, i: 0, end: self.len } }
+    fn iter_mut(self) -> VecIter<T> { VecIter { v: self, i: 0, end: self.len } }
+    // Iterator adapters straight on a Vec (`s.chars().rev()`); each starts
+    // from `iter()`. `map`, `filter`, `fold`, ... are the Vec's own eager forms.
+    fn rev(self) -> VecIterRev<T> { VecIterRev { v: self, i: 0, end: self.len } }
+    fn count(self) -> i64 { self.len }
+    fn nth(self, n: i64) -> Option<T> { self.get(n) }
+    fn enumerate(self) -> Enumerate<VecIter<T>> { self.iter().enumerate() }
+    fn skip(self, n: i64) -> Skip<VecIter<T>> { self.iter().skip(n) }
+    fn take(self, n: i64) -> Take<VecIter<T>> { self.iter().take(n) }
+    fn step_by(self, n: i64) -> StepBy<VecIter<T>> { self.iter().step_by(n) }
+    fn zip<J: Iterator>(self, other: J) -> Zip<VecIter<T>, J> { self.iter().zip(other) }
+    fn peekable(self) -> Peekable<VecIter<T>, T> { self.iter().peekable() }
+    fn filter_map<B>(self, f: fn(T) -> Option<B>) -> FilterMap<VecIter<T>, T, B> { self.iter().filter_map(f) }
+    fn flat_map<J: Iterator>(self, f: fn(T) -> J) -> FlatMap<VecIter<T>, T, J> { self.iter().flat_map(f) }
+    fn take_while(self, p: fn(T) -> bool) -> TakeWhile<VecIter<T>, T> { self.iter().take_while(p) }
+    fn skip_while(self, p: fn(T) -> bool) -> SkipWhile<VecIter<T>, T> { self.iter().skip_while(p) }
+    fn cloned(self) -> Vec<T> { self }
+    fn copied(self) -> Vec<T> { self }
+
+    fn drain(mut self) -> VecIter<T> {
+        let copy = self.clone();
+        self.clear();
+        VecIter { v: copy, i: 0, end: copy.len }
+    }
+}
+impl<K: Eq + Hash, V> HashMap<K, V> {
+    // (key, value) pairs; like Rust's, in no particular order.
+    fn iter(self) -> VecIter<(K, V)> {
+        let ks = self.keys();
+        let vs = self.values();
+        let mut pairs: Vec<(K, V)> = Vec::new();
+        let mut i = 0;
+        while i < ks.len() { pairs.push((ks[i], vs[i])); i += 1; }
+        pairs.iter()
+    }
+}
+
+struct Map<I, A, B> { iter: I, f: fn(A) -> B }
+impl<I: Iterator<Item = A>, A, B> Iterator for Map<I, A, B> {
+    type Item = B;
+    fn next(mut self) -> Option<B> {
+        match self.iter.next() { Option::Some(x) => Option::Some((self.f)(x)), Option::None => Option::None }
+    }
+}
+struct Filter<I, A> { iter: I, p: fn(A) -> bool }
+impl<I: Iterator<Item = A>, A> Iterator for Filter<I, A> {
+    type Item = A;
+    fn next(mut self) -> Option<A> {
+        while let Option::Some(x) = self.iter.next() { if (self.p)(x) { return Option::Some(x); } }
+        Option::None
+    }
+}
+struct FilterMap<I, A, B> { iter: I, f: fn(A) -> Option<B> }
+impl<I: Iterator<Item = A>, A, B> Iterator for FilterMap<I, A, B> {
+    type Item = B;
+    fn next(mut self) -> Option<B> {
+        while let Option::Some(x) = self.iter.next() {
+            match (self.f)(x) { Option::Some(y) => { return Option::Some(y); }, Option::None => {} }
+        }
+        Option::None
+    }
+}
+struct Enumerate<I> { iter: I, i: i64 }
+impl<I: Iterator> Iterator for Enumerate<I> {
+    type Item = (i64, I::Item);
+    fn next(mut self) -> Option<(i64, I::Item)> {
+        match self.iter.next() {
+            Option::Some(x) => { let i = self.i; self.i = i + 1; Option::Some((i, x)) }
+            Option::None => Option::None,
+        }
+    }
+}
+struct Take<I> { iter: I, n: i64 }
+impl<I: Iterator> Iterator for Take<I> {
+    type Item = I::Item;
+    fn next(mut self) -> Option<I::Item> {
+        if self.n <= 0 { return Option::None; }
+        self.n = self.n - 1;
+        self.iter.next()
+    }
+}
+struct Skip<I> { iter: I, n: i64 }
+impl<I: Iterator> Iterator for Skip<I> {
+    type Item = I::Item;
+    fn next(mut self) -> Option<I::Item> {
+        while self.n > 0 {
+            self.n = self.n - 1;
+            if self.iter.next().is_none() { return Option::None; }
+        }
+        self.iter.next()
+    }
+}
+struct StepBy<I> { iter: I, step: i64, first: bool }
+impl<I: Iterator> Iterator for StepBy<I> {
+    type Item = I::Item;
+    fn next(mut self) -> Option<I::Item> {
+        if self.first {
+            self.first = false;
+            return self.iter.next();
+        }
+        let mut k = 1;
+        while k < self.step {
+            if self.iter.next().is_none() { return Option::None; }
+            k += 1;
+        }
+        self.iter.next()
+    }
+}
+struct Zip<I, J> { a: I, b: J }
+impl<I: Iterator, J: Iterator> Iterator for Zip<I, J> {
+    type Item = (I::Item, J::Item);
+    fn next(mut self) -> Option<(I::Item, J::Item)> {
+        match self.a.next() {
+            Option::Some(x) => match self.b.next() {
+                Option::Some(y) => Option::Some((x, y)),
+                Option::None => Option::None,
+            },
+            Option::None => Option::None,
+        }
+    }
+}
+struct Chain<I, J> { a: I, b: J, first: bool }
+impl<I: Iterator, J: Iterator> Iterator for Chain<I, J> {
+    type Item = I::Item;
+    fn next(mut self) -> Option<I::Item> {
+        if self.first {
+            match self.a.next() {
+                Option::Some(x) => { return Option::Some(x); }
+                Option::None => { self.first = false; }
+            }
+        }
+        self.b.next()
+    }
+}
+struct TakeWhile<I, A> { iter: I, p: fn(A) -> bool, done: bool }
+impl<I: Iterator<Item = A>, A> Iterator for TakeWhile<I, A> {
+    type Item = A;
+    fn next(mut self) -> Option<A> {
+        if self.done { return Option::None; }
+        match self.iter.next() {
+            Option::Some(x) => { if (self.p)(x) { Option::Some(x) } else { self.done = true; Option::None } }
+            Option::None => Option::None,
+        }
+    }
+}
+struct SkipWhile<I, A> { iter: I, p: fn(A) -> bool, started: bool }
+impl<I: Iterator<Item = A>, A> Iterator for SkipWhile<I, A> {
+    type Item = A;
+    fn next(mut self) -> Option<A> {
+        if self.started { return self.iter.next(); }
+        while let Option::Some(x) = self.iter.next() {
+            if !(self.p)(x) { self.started = true; return Option::Some(x); }
+        }
+        Option::None
+    }
+}
+struct FlatMap<I, A, J> { iter: I, f: fn(A) -> J, current: Option<J> }
+impl<I: Iterator<Item = A>, A, J: Iterator> Iterator for FlatMap<I, A, J> {
+    type Item = J::Item;
+    fn next(mut self) -> Option<J::Item> {
+        loop {
+            match self.current {
+                Option::Some(inner) => {
+                    let mut cur = inner;
+                    match cur.next() {
+                        Option::Some(x) => { return Option::Some(x); }
+                        Option::None => { self.current = Option::None; }
+                    }
+                }
+                Option::None => {
+                    match self.iter.next() {
+                        Option::Some(x) => { self.current = Option::Some((self.f)(x)); }
+                        Option::None => { return Option::None; }
+                    }
+                }
+            }
+        }
+    }
+}
+struct Inspect<I, A> { iter: I, f: fn(A) }
+impl<I: Iterator<Item = A>, A> Iterator for Inspect<I, A> {
+    type Item = A;
+    fn next(mut self) -> Option<A> {
+        match self.iter.next() {
+            Option::Some(x) => { (self.f)(x); Option::Some(x) }
+            Option::None => Option::None,
+        }
+    }
+}
+struct Peekable<I, A> { iter: I, peeked: Option<Option<A>> }
+impl<I: Iterator<Item = A>, A> Iterator for Peekable<I, A> {
+    type Item = A;
+    fn next(mut self) -> Option<A> {
+        match self.peeked {
+            Option::Some(p) => { self.peeked = Option::None; p }
+            Option::None => self.iter.next(),
+        }
+    }
+}
+impl<I: Iterator<Item = A>, A> Peekable<I, A> {
+    fn peek(mut self) -> Option<A> {
+        match self.peeked {
+            Option::Some(p) => p,
+            Option::None => {
+                let p = self.iter.next();
+                self.peeked = Option::Some(p);
+                p
+            }
+        }
+    }
+}
+
+// ---- char methods ---------------------------------------------------------------
+
+impl char {
+    fn is_ascii_digit(self) -> bool { self >= '0' && self <= '9' }
+    fn is_ascii_lowercase(self) -> bool { self >= 'a' && self <= 'z' }
+    fn is_ascii_uppercase(self) -> bool { self >= 'A' && self <= 'Z' }
+    fn is_ascii_alphabetic(self) -> bool { self.is_ascii_lowercase() || self.is_ascii_uppercase() }
+    fn is_ascii_alphanumeric(self) -> bool { self.is_ascii_alphabetic() || self.is_ascii_digit() }
+    fn is_ascii_whitespace(self) -> bool { self == ' ' || self == '\t' || self == '\n' || self == '\r' || (self as i64) == 12 }
+    fn is_ascii_punctuation(self) -> bool {
+        let c = self as i64;
+        (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126)
+    }
+    fn is_ascii_hexdigit(self) -> bool { self.is_ascii_digit() || (self >= 'a' && self <= 'f') || (self >= 'A' && self <= 'F') }
+    fn is_ascii(self) -> bool { (self as i64) < 128 }
+    // Unicode classes beyond ASCII are approximated by their ASCII ranges
+    // plus "any non-ASCII letter-like char" for alphabetic.
+    fn is_alphabetic(self) -> bool { self.is_ascii_alphabetic() || (self as i64) > 127 }
+    fn is_numeric(self) -> bool { self.is_ascii_digit() }
+    fn is_alphanumeric(self) -> bool { self.is_alphabetic() || self.is_numeric() }
+    fn is_whitespace(self) -> bool { self.is_ascii_whitespace() || (self as i64) == 11 || (self as i64) == 133 || (self as i64) == 160 }
+    fn is_lowercase(self) -> bool { self.is_ascii_lowercase() }
+    fn is_uppercase(self) -> bool { self.is_ascii_uppercase() }
+    fn is_control(self) -> bool { (self as i64) < 32 || (self as i64) == 127 }
+    fn to_ascii_uppercase(self) -> char { if self.is_ascii_lowercase() { ((self as i64) - 32) as char } else { self } }
+    fn to_ascii_lowercase(self) -> char { if self.is_ascii_uppercase() { ((self as i64) + 32) as char } else { self } }
+    fn eq_ignore_ascii_case(self, other: char) -> bool { self.to_ascii_lowercase() == other.to_ascii_lowercase() }
+    // The value of the digit `self` in base `radix`, if it is one.
+    fn to_digit(self, radix: i64) -> Option<i64> {
+        let c = self as i64;
+        let d = if c >= 48 && c <= 57 { c - 48 }
+            else if c >= 97 && c <= 122 { c - 87 }
+            else if c >= 65 && c <= 90 { c - 55 }
+            else { 99 };
+        if d < radix { Option::Some(d) } else { Option::None }
+    }
+    fn from_digit(d: i64, radix: i64) -> Option<char> {
+        if d < 0 || d >= radix { return Option::None; }
+        Option::Some(if d < 10 { (d + 48) as char } else { (d + 87) as char })
+    }
+    fn len_utf8(self) -> i64 {
+        let c = self as i64;
+        if c < 128 { 1 } else if c < 2048 { 2 } else if c < 65536 { 3 } else { 4 }
+    }
+}

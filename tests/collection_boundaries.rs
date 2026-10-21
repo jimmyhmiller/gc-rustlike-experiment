@@ -8,10 +8,14 @@ fn backing_array_bounds_and_allocation_sizes_fail_before_memory_access() {
     let dir =
         std::env::temp_dir().join(format!("gcr-collection-boundaries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // The raw-handle mismatch case keeps the original wrapper live through
+    // the call: a borrowed native control does not retain its managed owner.
     let cases = [
         ("zero-channel-capacity", "let ch: Channel<i64> = Channel::new(0); 0", "channel capacity must be positive"),
         ("negative-channel-capacity", "let ch: Channel<i64> = Channel::new(0 - 1); 0", "channel capacity must be positive"),
-        ("channel-type-mismatch", "let mut ints: Channel<i64> = Channel::new(1); let strings: Channel<String> = Channel::new(1); ints.ctrl = strings.ctrl; ints.send(42); 0", "channel handle/message type mismatch"),
+        ("channel-type-mismatch", "let mut ints: Channel<i64> = Channel::new(1); let strings: Channel<String> = Channel::new(1); unsafe { ints.ctrl = strings.ctrl; } ints.send(42); strings.close(); 0", "channel handle/message type mismatch"),
+        ("unit-negative-index", "let a: Array<()> = Array::new(1); a[0 - 1]; 42", "array index out of bounds"),
+        ("unit-past-end-write", "let mut a: Array<()> = Array::new(1); a[1] = (); 42", "array index out of bounds"),
         ("negative-index", "let a: Array<i64> = Array::new(1); a[0 - 1]", "array index out of bounds"),
         ("past-end", "let a: Array<i64> = Array::new(1); a[1]", "array index out of bounds"),
         ("metadata-mismatch", "let mut v: Vec<i64> = Vec::new(); v.len = 10; match v.get(9) { Option::Some(n) => n, Option::None => 0 }", "array index out of bounds"),

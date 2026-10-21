@@ -16,7 +16,7 @@ fn lower(src: &str) -> gcrust::core::CoreProgram {
 }
 
 fn run(src: &str) -> i64 {
-    jit_run_i64_gc(&lower(src), false).expect("run")
+    unsafe { jit_run_i64_gc(&lower(src), false) }.expect("run")
 }
 
 /// `type_id_of(x)` reads the object header, and `type_name_of(x)` resolves it
@@ -170,7 +170,7 @@ fn held_values_survive_collection_during_construction() {
     "#);
     // 64 KiB semi-space: the ~80×60 vec churn (plus reallocations) far exceeds it,
     // forcing many collections, while the live set stays tiny.
-    let r = jit_run_i64_mode(&prog, GcRunMode::SemiSpace(64 << 10)).expect("run");
+    let r = unsafe { jit_run_i64_mode(&prog, GcRunMode::SemiSpace(64 << 10)) }.expect("run");
     assert_eq!(r, 4950);
 }
 
@@ -187,42 +187,44 @@ fn indirect_frame_root_relocates_value_interior_ref() {
     let leaf = TypeInfo::for_header(Full::SIZE).with_type_id(0);
     let mut ctx = RuntimeContext::new(1 << 16, vec![leaf]);
     let thread = ctx.thread_ptr();
-    runtime::set_current_thread(thread);
+    let execute = || {
 
-    // Allocate a child. Its identity (pre-GC pointer) is captured via a sentinel
-    // we can re-find: we read its type_id after relocation to confirm it's live.
-    let child = unsafe { runtime::ai_gc_alloc_fixed(thread, 0, 0) };
-    assert!(!child.is_null());
+        // Allocate a child. Its identity (pre-GC pointer) is captured via a sentinel
+        // we can re-find: we read its type_id after relocation to confirm it's live.
+        let child = unsafe { runtime::ai_gc_alloc_fixed(thread, 0, 0) };
+        assert!(!child.is_null());
 
-    // Simulate a value-with-ref local's alloca interior: a stack word holding the
-    // child pointer. The frame's single INDIRECT slot points at it.
-    let mut interior: u64 = child as u64;
+        // Simulate a value-with-ref local's alloca interior: a stack word holding the
+        // child pointer. The frame's single INDIRECT slot points at it.
+        let mut interior: u64 = child as u64;
 
-    // FrameOrigin with 0 direct, 1 indirect root.
-    let origin = FrameOrigin { num_roots: 0, num_indirect: 1, name: std::ptr::null() };
-    // Frame memory: [parent][origin][indirect0]  (matches the #[repr(C)] Frame
-    // header + trailing slots the GC walker reads).
-    let frame_buf: [u64; 3] = [
-        0,                                              // parent = null
-        &origin as *const FrameOrigin as u64,           // origin
-        &mut interior as *mut u64 as u64,               // indirect[0] → &interior
-    ];
+        // FrameOrigin with 0 direct, 1 indirect root.
+        let origin = FrameOrigin { num_roots: 0, num_indirect: 1, name: std::ptr::null() };
+        // Frame memory: [parent][origin][indirect0]  (matches the #[repr(C)] Frame
+        // header + trailing slots the GC walker reads).
+        let frame_buf: [u64; 3] = [
+            0,                                              // parent = null
+            &origin as *const FrameOrigin as u64,           // origin
+            &mut interior as *mut u64 as u64,               // indirect[0] → &interior
+        ];
 
-    unsafe {
-        (*thread).top_frame = frame_buf.as_ptr() as *mut Frame;
-        ctx.force_collect(&*thread);
-        (*thread).top_frame = std::ptr::null_mut();
-    }
+        unsafe {
+            (*thread).top_frame = frame_buf.as_ptr() as *mut Frame;
+            ctx.force_collect(&*thread);
+            (*thread).top_frame = std::ptr::null_mut();
+        }
 
-    // The interior ref was traced (child survived) and fixed up in place.
-    let relocated = IdentityPtrPolicy::try_decode_ptr(interior).expect("interior still a pointer");
-    assert!(
-        ctx.heap().from_space_contains(relocated),
-        "indirect root not relocated → value-local interior ref would dangle"
-    );
-    let tid = unsafe { ctx.heap().obj_type_id(relocated) };
-    assert_eq!(tid, 0, "relocated object is not the child leaf type");
-    assert_eq!(ctx.heap().collections(), 1);
+        // The interior ref was traced (child survived) and fixed up in place.
+        let relocated = IdentityPtrPolicy::try_decode_ptr(interior).expect("interior still a pointer");
+        assert!(
+            ctx.heap().from_space_contains(relocated),
+            "indirect root not relocated → value-local interior ref would dangle"
+        );
+        let tid = unsafe { ctx.heap().obj_type_id(relocated) };
+        assert_eq!(tid, 0, "relocated object is not the child leaf type");
+        assert_eq!(ctx.heap().collections(), 1);
+    };
+    unsafe { runtime::with_current_thread(thread, execute); }
 }
 
 /// POD `#[value]` aggregates are flattened into a heap struct's raw region:
@@ -278,8 +280,8 @@ fn value_enum_with_ref_heap_field_works_and_survives_gc() {
         }
     "#);
     // Plain JIT first (correctness), then a tiny heap to force real GCs.
-    assert_eq!(jit_run_i64_mode(&prog, GcRunMode::Generational).expect("run"), 1234);
-    assert_eq!(jit_run_i64_mode(&prog, GcRunMode::SemiSpace(64 << 10)).expect("run gc"), 1234);
+    assert_eq!(unsafe { jit_run_i64_mode(&prog, GcRunMode::Generational) }.expect("run"), 1234);
+    assert_eq!(unsafe { jit_run_i64_mode(&prog, GcRunMode::SemiSpace(64 << 10)) }.expect("run gc"), 1234);
 }
 
 /// A value-enum-with-ref held as a bare LOCAL (not inside a heap object) is
@@ -298,7 +300,7 @@ fn value_enum_ref_local_survives_gc() {
             match c { Cell::Empty => 0, Cell::Full(node) => node.n }
         }
     "#);
-    assert_eq!(jit_run_i64_mode(&prog, GcRunMode::SemiSpace(64 << 10)).expect("run"), 777);
+    assert_eq!(unsafe { jit_run_i64_mode(&prog, GcRunMode::SemiSpace(64 << 10)) }.expect("run"), 777);
 }
 
 /// Embedded ref offsets in a value-enum heap field land in the shared leading
@@ -361,14 +363,16 @@ fn heap_dump_renders_flattened_value_field() {
     ctx.heap().set_type_meta(vec![holder_meta]);
     ctx.heap().set_value_meta(vec![point_vm]);
     let thread = ctx.thread_ptr();
-    runtime::set_current_thread(thread);
-    let h = unsafe { runtime::ai_gc_alloc_fixed(thread, 0, 0) };
-    unsafe {
-        (h.add(16) as *mut i64).write(3); // Point.x (value-relative 0)
-        (h.add(24) as *mut i64).write(4); // Point.y (value-relative 8)
-    }
-    let dump = unsafe { gcrust::gc::dump_heap_text(ctx.heap()) };
-    assert!(dump.contains("Holder { p: Point { x: 3, y: 4 } }"), "dump was:\n{dump}");
+    let execute = || {
+        let h = unsafe { runtime::ai_gc_alloc_fixed(thread, 0, 0) };
+        unsafe {
+            (h.add(16) as *mut i64).write(3); // Point.x (value-relative 0)
+            (h.add(24) as *mut i64).write(4); // Point.y (value-relative 8)
+        }
+        let dump = unsafe { gcrust::gc::dump_heap_text(ctx.heap()) };
+        assert!(dump.contains("Holder { p: Point { x: 3, y: 4 } }"), "dump was:\n{dump}");
+    };
+    unsafe { runtime::with_current_thread(thread, execute); }
 }
 
 /// The runtime heap dump renders the live object graph with names, decoded
@@ -404,53 +408,56 @@ fn heap_dump_renders_object_graph() {
         },
     };
 
-    let mut ctx = RuntimeContext::new_generational(1 << 20, 8 << 20, vec![point_ti, boxed_ti]);
-    ctx.heap().set_type_meta(vec![point_meta, boxed_meta]);
-    let thread = ctx.thread_ptr();
-    runtime::set_current_thread(thread);
-
-    // Allocate a Point and write x=3, y=4. (No GC is triggered for two small
-    // allocations, so raw pointers stay valid without rooting.)
-    let point = unsafe { runtime::ai_gc_alloc_fixed(thread, 0, 0) };
-    unsafe {
-        (point.add(16) as *mut i64).write(3);
-        (point.add(24) as *mut i64).write(4);
-    }
-    // Allocate a Boxed whose `inner` points at the Point.
-    let boxed = unsafe { runtime::ai_gc_alloc_fixed(thread, 1, 0) };
-    unsafe { (boxed.add(16) as *mut *mut u8).write(point) };
-
-    // Root `boxed` for real — the snapshot uses the REAL GC root set (not an
-    // in-degree-0 proxy), so an object must be held by an actual root to count as
-    // reachable. A permanent-extra RootSource is the simplest GC root here.
     struct Root(std::cell::Cell<u64>);
     unsafe impl gcrust::gc::RootSource for Root {
         unsafe fn scan_roots(&self, v: &mut dyn FnMut(*mut u64)) {
             v(self.0.as_ptr());
         }
     }
-    let root = Root(std::cell::Cell::new(boxed as u64));
-    unsafe { ctx.heap().register_permanent_extra(&root as *const dyn gcrust::gc::RootSource) };
+    let root = Root(std::cell::Cell::new(0));
+    let mut ctx = RuntimeContext::new_generational(1 << 20, 8 << 20, vec![point_ti, boxed_ti]);
+    ctx.heap().set_type_meta(vec![point_meta, boxed_meta]);
+    let thread = ctx.thread_ptr();
+    let execute = || {
 
-    let dump = unsafe { gcrust::gc::dump_heap_text(ctx.heap()) };
-    // Point with decoded scalar fields.
-    assert!(dump.contains("Point { x: 3, y: 4 }"), "dump was:\n{dump}");
-    // Boxed's pointer field resolves to the Point's object id (#0).
-    assert!(dump.contains("Boxed { inner: #0 }"), "dump was:\n{dump}");
+        // Allocate a Point and write x=3, y=4. (No GC is triggered for two small
+        // allocations, so raw pointers stay valid without rooting.)
+        let point = unsafe { runtime::ai_gc_alloc_fixed(thread, 0, 0) };
+        unsafe {
+            (point.add(16) as *mut i64).write(3);
+            (point.add(24) as *mut i64).write(4);
+        }
+        // Allocate a Boxed whose `inner` points at the Point.
+        let boxed = unsafe { runtime::ai_gc_alloc_fixed(thread, 1, 0) };
+        unsafe { (boxed.add(16) as *mut *mut u8).write(point) };
 
-    // The JSON snapshot of the same heap: summary, histogram, and the edge.
-    let json = unsafe { gcrust::gc::dump_heap_json(ctx.heap()) };
-    assert!(json.contains("\"objects\": 2"), "json was:\n{json}");
-    assert!(json.contains("\"Boxed\""), "json was:\n{json}");
-    assert!(json.contains("\"Point\""), "json was:\n{json}");
-    // Boxed (id 1) references Point (id 0): an edge "refs": [0].
-    assert!(json.contains("\"refs\": [0]"), "json was:\n{json}");
-    // Real-rooted reachability: rooted Boxed reaches the Point → both reachable.
-    assert!(json.contains("\"reachable_objects\": 2"), "json was:\n{json}");
-    assert!(json.contains("\"reachable_bytes\""), "json was:\n{json}");
-    assert!(json.contains("\"reachable\": true"), "json was:\n{json}");
-    // Versioned snapshot header with the measured STW pause.
-    assert!(json.contains("\"snapshot_pause_ns\""), "json was:\n{json}");
+        // Root `boxed` for real — the snapshot uses the REAL GC root set (not an
+        // in-degree-0 proxy), so an object must be held by an actual root to count as
+        // reachable. A permanent-extra RootSource is the simplest GC root here.
+        root.0.set(boxed as u64);
+        unsafe { ctx.heap().register_permanent_extra(&root as *const dyn gcrust::gc::RootSource) };
+
+        let dump = unsafe { gcrust::gc::dump_heap_text(ctx.heap()) };
+        // Point with decoded scalar fields.
+        assert!(dump.contains("Point { x: 3, y: 4 }"), "dump was:\n{dump}");
+        // Boxed's pointer field resolves to the Point's object id (#0).
+        assert!(dump.contains("Boxed { inner: #0 }"), "dump was:\n{dump}");
+
+        // The JSON snapshot of the same heap: summary, histogram, and the edge.
+        let json = unsafe { gcrust::gc::dump_heap_json(ctx.heap()) };
+        assert!(json.contains("\"objects\": 2"), "json was:\n{json}");
+        assert!(json.contains("\"Boxed\""), "json was:\n{json}");
+        assert!(json.contains("\"Point\""), "json was:\n{json}");
+        // Boxed (id 1) references Point (id 0): an edge "refs": [0].
+        assert!(json.contains("\"refs\": [0]"), "json was:\n{json}");
+        // Real-rooted reachability: rooted Boxed reaches the Point → both reachable.
+        assert!(json.contains("\"reachable_objects\": 2"), "json was:\n{json}");
+        assert!(json.contains("\"reachable_bytes\""), "json was:\n{json}");
+        assert!(json.contains("\"reachable\": true"), "json was:\n{json}");
+        // Versioned snapshot header with the measured STW pause.
+        assert!(json.contains("\"snapshot_pause_ns\""), "json was:\n{json}");
+    };
+    unsafe { runtime::with_current_thread(thread, execute); }
 }
 
 #[test]
@@ -483,5 +490,22 @@ fn enum_header_tag_and_physical_shapes_have_consistent_metadata() {
     let data = metas.iter().find(|m| m.name == "Data").unwrap();
     let TypeKind::Enum { variants, .. } = &data.kind else { panic!() };
     assert_eq!(variants[1].fields[0].offset, 16);
-    assert_eq!(jit_run_i64_gc(&prog, true).unwrap(), 44);
+    assert_eq!(unsafe { jit_run_i64_gc(&prog, true) }.unwrap(), 44);
+}
+
+#[test]
+fn type_id_reads_keep_phase_checked_resolution_and_nominal_enum_mapping() {
+    let program = lower(r#"
+        enum Tree { Empty, Node(Tree) }
+        fn main() -> i64 {
+            let empty = Tree::Empty;
+            let node = Tree::Node(empty);
+            if type_id_of(empty) == type_id_of(node) { 0 } else { 1 }
+        }
+    "#);
+    let ir = gcrust::codegen::emit_llvm_ir(&program, false).unwrap();
+    assert!(ir.contains("copy.phase") && ir.contains("load atomic i8"), "{ir}");
+    assert!(ir.lines().any(|line| line.contains("call i16 @ai_object_type_id(")), "{ir}");
+    assert!(ir.contains("tid.nominal"), "compact physical IDs escaped nominal mapping: {ir}");
+    assert_eq!(unsafe { jit_run_i64_gc(&program, true) }.unwrap(), 0);
 }

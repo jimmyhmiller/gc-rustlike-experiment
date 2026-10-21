@@ -10,10 +10,12 @@ use crate::gc::type_info::TypeInfo;
 ///
 /// Implementations must have a stable layout, with `SIZE == size_of::<Self>()`,
 /// a size of at least eight bytes that is a multiple of eight, and an aligned
-/// `u16` type-id field at `TYPE_ID_OFFSET` wholly within the header. `new(id)`
-/// must initialize that field to `id` and every byte read by the collector.
+/// native-endian `u16` type-ID slot at `TYPE_ID_OFFSET` wholly within the
+/// header. `new(id)` must initialize that slot to `id` and every byte read by
+/// the collector.
 /// The first eight-byte word is reserved for forwarding during collection;
 /// newly initialized headers must leave its forwarding bit (bit 63) clear.
+/// The same requirement applies to `HEAP_FORWARDING_OFFSET`, used by Heap.
 /// Implementations must not require an address-dependent representation.
 pub unsafe trait ObjHeader: Copy + 'static {
     /// Size of this header in bytes.
@@ -23,6 +25,10 @@ pub unsafe trait ObjHeader: Copy + 'static {
     /// Used by the heap walker to recover the type from any object.
     const TYPE_ID_OFFSET: usize;
 
+    /// Aligned eight-byte word reserved for Heap forwarding. Independent of the
+    /// type-ID field; the default uses the first word, as SemiSpace does.
+    const HEAP_FORWARDING_OFFSET: usize = 0;
+
     /// Initialize a header for a newly allocated object.
     fn new(type_id: u16) -> Self;
 
@@ -30,63 +36,59 @@ pub unsafe trait ObjHeader: Copy + 'static {
     fn type_id(&self) -> u16;
 }
 
-// Compact header: type_id + padding (8 bytes total).
-// The remaining 6 bytes after type_id are available for future use
-// (e.g., GC mark bits, hash code, etc.)
+// Store IDs in the numeric low 16 bits, leaving the forwarding marker clear
+// on both byte orders. A native u16 view is at the start on little-endian and
+// at the end of the word on big-endian machines.
+const LOW_U16_OFFSET: usize = if cfg!(target_endian = "big") { 6 } else { 0 };
+
+// Compact header: numeric type-ID word (8 bytes total).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Compact {
-    type_id: u16,
-    _pad: u16,
-    _pad2: u32,
+    type_id_word: u64,
 }
 
 unsafe impl ObjHeader for Compact {
     const SIZE: usize = core::mem::size_of::<Compact>();
-    const TYPE_ID_OFFSET: usize = core::mem::offset_of!(Compact, type_id);
+    const TYPE_ID_OFFSET: usize = core::mem::offset_of!(Compact, type_id_word) + LOW_U16_OFFSET;
 
     #[inline(always)]
     fn new(type_id: u16) -> Self {
         Compact {
-            type_id,
-            _pad: 0,
-            _pad2: 0,
+            type_id_word: u64::from(type_id),
         }
     }
 
     #[inline(always)]
     fn type_id(&self) -> u16 {
-        self.type_id
+        self.type_id_word as u16
     }
 }
 
-// Full header: GC word + type_id + padding (16 bytes total).
+// Full header: GC word + numeric type-ID word (16 bytes total).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Full {
     gc_word: u64,
-    type_id: u16,
-    _pad: u16,
-    _pad2: u32,
+    type_id_word: u64,
 }
 
 unsafe impl ObjHeader for Full {
+    const HEAP_FORWARDING_OFFSET: usize = 8;
     const SIZE: usize = core::mem::size_of::<Full>();
-    const TYPE_ID_OFFSET: usize = core::mem::offset_of!(Full, type_id);
+    const TYPE_ID_OFFSET: usize = core::mem::offset_of!(Full, type_id_word) + LOW_U16_OFFSET;
 
     #[inline(always)]
     fn new(type_id: u16) -> Self {
         Full {
             gc_word: 0,
-            type_id,
-            _pad: 0,
-            _pad2: 0,
+            type_id_word: u64::from(type_id),
         }
     }
 
     #[inline(always)]
     fn type_id(&self) -> u16 {
-        self.type_id
+        self.type_id_word as u16
     }
 }
 
@@ -94,8 +96,8 @@ impl Full {
     /// A live reference-enum tag occupies the low 32 bits of the first word.
     /// Copying collectors preserve this word in the destination before using
     /// the source for forwarding. Bit 63 remains reserved for forwarding.
-    pub const ENUM_TAG_OFFSET: usize = core::mem::offset_of!(Full, gc_word)
-        + if cfg!(target_endian = "big") { 4 } else { 0 };
+    pub const ENUM_TAG_OFFSET: usize =
+        core::mem::offset_of!(Full, gc_word) + if cfg!(target_endian = "big") { 4 } else { 0 };
 
     #[inline(always)]
     pub fn gc_word(&self) -> u64 {
@@ -119,6 +121,7 @@ pub(crate) struct HeaderLayout {
     size: usize,
     align: usize,
     type_id_offset: usize,
+    pub(crate) forwarding_offset: usize,
 }
 
 impl HeaderLayout {
@@ -127,6 +130,7 @@ impl HeaderLayout {
             size: core::mem::size_of::<H>(),
             align: core::mem::align_of::<H>(),
             type_id_offset: H::TYPE_ID_OFFSET,
+            forwarding_offset: H::HEAP_FORWARDING_OFFSET,
         };
         assert_eq!(
             H::SIZE,
@@ -145,7 +149,27 @@ impl HeaderLayout {
                     .is_some_and(|end| end <= layout.size),
             "header type-id offset is invalid"
         );
+        assert!(
+            layout.forwarding_offset % 8 == 0
+                && layout.forwarding_offset.checked_add(8).is_some_and(|end| end <= layout.size),
+            "header forwarding-word offset is invalid"
+        );
         layout
+    }
+
+    /// Recover the ID without reading bytes concurrently replaced by a claim.
+    /// Outside the forwarding word the immutable ID remains readable; inside it
+    /// use the captured original bytes, respecting native byte order.
+    pub(crate) unsafe fn type_id_from_word(&self, object: *const u8, word: u64) -> u16 {
+        if self.type_id_offset >= self.forwarding_offset
+            && self.type_id_offset < self.forwarding_offset + 8
+        {
+            let index = self.type_id_offset - self.forwarding_offset;
+            let bytes = word.to_ne_bytes();
+            u16::from_ne_bytes([bytes[index], bytes[index + 1]])
+        } else {
+            unsafe { object.add(self.type_id_offset).cast::<u16>().read() }
+        }
     }
 
     pub(crate) fn accepts(&self, info: &TypeInfo, len: usize) -> bool {
@@ -164,3 +188,39 @@ impl HeaderLayout {
         self.align <= 8
     }
 }
+
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    #[test]
+    fn collector_header_id_extraction_preserves_captured_word_and_separate_slots() {
+        #[repr(align(8))]
+        struct Bytes([u8; 16]);
+        for forwarding_offset in [0, 8] {
+            for type_id_offset in (0..16).step_by(2) {
+                for id in [0u16, 1, 513, 32767, 65535] {
+                    let mut object = Bytes([0x25; 16]);
+                    object.0[type_id_offset..type_id_offset + 2]
+                        .copy_from_slice(&id.to_ne_bytes());
+                    let layout = HeaderLayout {
+                        size: 16, align: 8, type_id_offset, forwarding_offset,
+                    };
+                    let pointer = object.0.as_mut_ptr();
+                    let captured = unsafe { pointer.add(forwarding_offset).cast::<u64>().read() };
+                    // An exclusive claim may replace the whole source word.
+                    // Overlapping IDs must come from captured bytes; separate
+                    // immutable IDs must still come from their actual slot.
+                    unsafe { pointer.add(forwarding_offset).cast::<u64>().write(u64::MAX); }
+                    assert_eq!(unsafe { layout.type_id_from_word(pointer, captured) }, id,
+                        "ID offset {type_id_offset}, forwarding offset {forwarding_offset}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "default_header_tests.rs"]
+mod default_header_tests;

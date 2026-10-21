@@ -31,3 +31,14 @@ For exact enums, fields, and serialized IR, read `src/core.rs` or run:
 
 The first three views emit JSON; `llvm` emits LLVM IR text. These are inspection
 interfaces, not a promised stable compiler ABI. See STATUS.md for tested coverage.
+
+## Surface AST ownership for Rust consumers
+
+`ast::Expr::kind` now uses `std::sync::Arc<ExprKind>` rather than `Box<ExprKind>`.
+Construct it with `Arc::new(kind)`. Read-only dereferencing is unchanged; use
+`Arc::make_mut(&mut expression.kind)` when modifying a potentially shared node.
+Cloning an expression shares its immutable subtree, and copy-on-write mutation
+keeps other clones independent. The serialized AST JSON shape is unchanged.
+This preserves cross-thread sharing of the surface AST and gives contextual
+type probes stable node identities across syntax clones. Probe entries retain
+node ownership so an allocation address cannot be reused as another node's key.

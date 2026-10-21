@@ -21,7 +21,7 @@ fn run_stress(src: &str) -> i64 {
     let (module, _) = parse_with_prelude(src).unwrap();
     let resolved = resolve_module(module).unwrap();
     let prog = lower_program(&resolved.globals).unwrap();
-    jit_run_i64_gc(&prog, true).unwrap() // stress = semi-space + collect-every-alloc
+    unsafe { jit_run_i64_gc(&prog, true) }.unwrap() // stress = semi-space + collect-every-alloc
 }
 
 /// A tiny deterministic PRNG (xorshift) so failures are reproducible from a seed.

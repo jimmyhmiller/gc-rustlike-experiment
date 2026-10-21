@@ -67,11 +67,17 @@ pub struct GlobalTable {
     pub enums: HashMap<String, EnumDef>,
     pub traits: HashMap<String, TraitDef>,
     pub impls: Vec<ImplBlock>,
+    pub(crate) impl_modules: Vec<String>,
     pub fns: HashMap<String, FnDef>,
     pub consts: HashMap<String, ConstDef>,
     pub aliases: HashMap<String, TypeAlias>,
+    /// Modules occupy the same type namespace as aliases.
+    modules: std::collections::HashSet<String>,
+    pub(crate) resolved_aliases: HashMap<String, std::rc::Rc<crate::type_alias::ResolvedAlias>>,
     /// `use` declarations, applied after the whole table is collected.
     pub pending_uses: Vec<crate::ast::UsePath>,
+    pub(crate) pending_scoped_uses: Vec<(String, crate::ast::UsePath)>,
+    pub(crate) scoped_use_aliases: HashMap<String, HashMap<String, Vec<String>>>,
     /// `use` aliases: a short name → the fully-qualified path it refers to.
     pub use_aliases: HashMap<String, String>,
 }
@@ -97,6 +103,8 @@ impl GlobalTable {
                 }
             }
         }
+        // Qualified paths must name their actual declaration.
+        if !path.is_single() { return None; }
         // Try last-segment if unambiguous.
         if let Some(paths) = self.by_last.get(path.last()) {
             if paths.len() == 1 {
@@ -110,6 +118,29 @@ impl GlobalTable {
     /// `use a::b::c;` maps `c` → `a::b::c`; a `use a::b::*;` maps every item
     /// directly in module `a::b` by its last segment.
     fn apply_uses(&mut self) {
+        for (module, u) in std::mem::take(&mut self.pending_scoped_uses) {
+            let glob = u.segments.last().is_some_and(|part| part == "*");
+            let parts = if glob { &u.segments[..u.segments.len()-1] } else { &u.segments[..] };
+            let written = parts.join("::");
+            let exists = |name: &str| self.by_path.contains_key(name) || self.by_path.keys().any(|key| key.starts_with(&format!("{name}::")));
+            let mut full = written.clone();
+            if !exists(&full) {
+                let mut scope = module.as_str();
+                while !scope.is_empty() {
+                    let candidate = format!("{scope}::{written}");
+                    if exists(&candidate) { full = candidate; break; }
+                    scope = scope.rsplit_once("::").map_or("", |(parent,_)|parent);
+                }
+            }
+            let members: Vec<(String,String)> = if glob {
+                let prefix = format!("{full}::");
+                self.by_path.keys().filter_map(|key|key.strip_prefix(&prefix).filter(|tail|!tail.contains("::")).map(|tail|(tail.to_string(),key.clone()))).collect()
+            } else { vec![(parts.last().cloned().unwrap_or_default(),full)] };
+            for (short, full) in members {
+                let targets = self.scoped_use_aliases.entry(module.clone()).or_default().entry(short).or_default();
+                if !targets.contains(&full) { targets.push(full); targets.sort(); }
+            }
+        }
         let uses = std::mem::take(&mut self.pending_uses);
         for u in &uses {
             if u.segments.last().map(|s| s.as_str()) == Some("*") {
@@ -142,23 +173,185 @@ impl GlobalTable {
 pub fn resolve_module(module: Module) -> Result<Resolved, ResolveError> {
     let mut globals = GlobalTable::default();
     collect_items(&module.items, &mut Vec::new(), &mut globals)?;
+    synthesize_trait_objects(&mut globals);
     globals.apply_uses();
+    globals.resolved_aliases = crate::type_alias::resolve_aliases(&globals).map_err(|e| ResolveError { msg: e.msg, span: e.span })?;
+    crate::type_alias::qualify_types(&mut globals)?;
     validate_types(&globals)?;
+    let trait_order = validate_supertrait_hierarchy(&globals)?;
+    validate_impl_parameters(&globals)?;
     validate_methods(&globals)?;
     validate_trait_impls(&globals)?;
+    crate::trait_solver::validate_impl_obligations(&globals, &trait_order)
+        .map_err(|error| ResolveError { msg: error.msg, span: error.span })?;
+    crate::trait_solver::validate_alias_obligations(&globals)
+        .map_err(|error| ResolveError { msg: error.msg, span: error.span })?;
     validate_visibility(&module.items, &mut Vec::new(), &globals)?;
     Ok(Resolved { module, globals })
 }
 
-/// Reject two methods with the same name on the same receiver type. Methods are
-/// indexed by (receiver base name, method name), so a second definition would
-/// otherwise silently replace the first.
+/// The type a `dyn Trait` names: a hidden struct `dyn#Trait` beside the trait,
+/// holding one closure per object-safe method (the trait's and its
+/// supertraits'). Coercing a value to `dyn Trait` builds the closures over it;
+/// calling a method on the object calls its closure. A method is object-safe
+/// when it takes `self`, has no type parameters of its own, and does not
+/// mention `Self` in its parameters or result.
+fn synthesize_trait_objects(g: &mut GlobalTable) {
+    fn mentions_self(t: &Type) -> bool {
+        match &t.kind {
+            TypeKind::SelfType => true,
+            TypeKind::Path(p, args) => (p.is_single() && p.last() == "Self") || args.iter().any(mentions_self),
+            TypeKind::Tuple(ts) => ts.iter().any(mentions_self),
+            TypeKind::Array(e, _) => mentions_self(e),
+            TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => ps.iter().any(mentions_self) || r.as_deref().is_some_and(mentions_self),
+        }
+    }
+    fn find_trait<'a>(g: &'a GlobalTable, module: &str, path: &Path) -> Option<(String, &'a TraitDef)> {
+        let written = path.segments.join("::");
+        let candidates = [if module.is_empty() { written.clone() } else { format!("{module}::{written}") }, written.clone()];
+        for c in candidates {
+            if let Some(t) = g.traits.get(&c) { return Some((c, t)); }
+        }
+        let mut found = g.traits.iter().filter(|(k, _)| k.rsplit("::").next() == Some(path.last()));
+        let first = found.next()?;
+        found.next().is_none().then(|| (first.0.clone(), first.1))
+    }
+    let mut out = Vec::new();
+    for (path, def) in &g.traits {
+        let module = path.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
+        let mut fields: Vec<FieldDef> = Vec::new();
+        let mut seen_traits = std::collections::HashSet::new();
+        let mut pending = vec![(path.clone(), def)];
+        while let Some((tpath, t)) = pending.pop() {
+            if !seen_traits.insert(tpath.clone()) { continue; }
+            for item in &t.items {
+                let (name, generics, params, has_self, ret, span) = match item {
+                    TraitItem::Required(f) => (&f.name, &f.generics, &f.params, f.has_self, &f.ret, f.span),
+                    TraitItem::Provided(f) => (&f.name, &f.generics, &f.params, f.has_self, &f.ret, f.span),
+                    TraitItem::AssocType(_) => continue,
+                };
+                if !has_self || !generics.params.is_empty() || params.iter().any(|p| mentions_self(&p.ty))
+                    || ret.as_ref().is_some_and(mentions_self) || fields.iter().any(|f| &f.name == name)
+                {
+                    continue;
+                }
+                let ty = Type { kind: TypeKind::Fn(params.iter().map(|p| p.ty.clone()).collect(), ret.clone().map(Box::new)), span };
+                fields.push(FieldDef { vis: true, name: name.clone(), ty, span });
+            }
+            let tmodule = tpath.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
+            for sup in &t.supertraits {
+                if let Some(found) = find_trait(g, &tmodule, &sup.path) { pending.push(found); }
+            }
+        }
+        let name = format!("dyn#{}", def.name);
+        let struct_path = if module.is_empty() { name.clone() } else { format!("{module}::{name}") };
+        out.push((struct_path, module, StructDef {
+            vis: def.vis,
+            is_value: false,
+            name,
+            generics: Generics { params: def.generics.params.clone(), where_clauses: vec![] },
+            body: StructBody::Named(fields),
+            span: def.span,
+        }));
+    }
+    for (path, module, def) in out {
+        g.insert(path.clone(), Symbol { kind: SymKind::Struct, span: def.span, vis: def.vis, module });
+        g.structs.insert(path, def);
+    }
+}
+
+/// Supertrait inheritance must be acyclic even when no impl or call uses it.
+/// Work on canonical trait identities and walk iteratively for long chains.
+fn validate_supertrait_hierarchy(g: &GlobalTable) -> Result<Vec<String>, ResolveError> {
+    use std::collections::{BTreeSet, HashMap};
+    let mut dependencies = HashMap::new();
+    let mut users: HashMap<String, Vec<String>> = HashMap::new();
+    let mut remaining = HashMap::new();
+    let mut ready = BTreeSet::new();
+    for (name, definition) in &g.traits {
+        let parents: BTreeSet<String> = definition.supertraits.iter()
+            .map(|parent| parent.path.segments.join("::")).collect();
+        remaining.insert(name.clone(), parents.len());
+        if parents.is_empty() { ready.insert(name.clone()); }
+        for parent in &parents { users.entry(parent.clone()).or_default().push(name.clone()); }
+        dependencies.insert(name.clone(), parents);
+    }
+    let mut order = Vec::new();
+    while let Some(name) = ready.pop_first() {
+        order.push(name.clone());
+        if let Some(children) = users.get(&name) {
+            for child in children {
+                let count = remaining.get_mut(child).expect("collected trait");
+                *count -= 1;
+                if *count == 0 { ready.insert(child.clone()); }
+            }
+        }
+    }
+    let Some(mut current) = remaining.iter().filter(|(_, count)| **count > 0)
+        .map(|(name, _)| name.clone()).min() else { return Ok(order) };
+    let mut positions = HashMap::new();
+    let mut path = Vec::new();
+    loop {
+        if let Some(&position) = positions.get(&current) {
+            let mut cycle = path[position..].to_vec();
+            cycle.push(current.clone());
+            return Err(ResolveError {
+                msg: format!("cyclic supertraits: {}", cycle.join(" -> ")),
+                span: g.traits[&current].span,
+            });
+        }
+        positions.insert(current.clone(), path.len());
+        path.push(current.clone());
+        current = dependencies[&current].iter().find(|parent| remaining[*parent] > 0)
+            .expect("an unfinished trait depends on an unfinished parent").clone();
+    }
+}
+
+/// An impl parameter must be recoverable from its normalized receiver or
+/// trait arguments. A where condition alone does not bind an unknown type.
+fn validate_impl_parameters(g: &GlobalTable) -> Result<(), ResolveError> {
+    use crate::types::{Ty, lower_type_with};
+    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
+    for imp in &g.impls {
+        let params = imp.generics.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        let mut roots = vec![lower_type_with(&imp.self_ty, &params, &env)
+            .map_err(|e| ResolveError { msg: e.msg, span: e.span })?];
+        if let Some(tr) = &imp.trait_ref {
+            for arg in &tr.args {
+                roots.push(lower_type_with(arg, &params, &env).map_err(|e| ResolveError { msg: e.msg, span: e.span })?);
+            }
+        }
+        let mut used = std::collections::HashSet::new();
+        let mut pending: Vec<&Ty> = roots.iter().collect();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Ty::Var(name) => { used.insert(name.as_str()); }
+                Ty::Named { args, .. } | Ty::Tuple(args) => pending.extend(args),
+                Ty::Array(elem, _) => pending.push(elem),
+                Ty::Fn { params, ret } | Ty::ExternFn { params, ret } => { pending.extend(params); pending.push(ret); }
+                Ty::Prim(_) | Ty::Infer(_) => {}
+            }
+        }
+        for parameter in &imp.generics.params {
+            if !used.contains(parameter.name.as_str()) {
+                return Err(ResolveError { msg: format!("unconstrained impl type parameter `{}`: it must occur in the receiver or trait arguments after alias expansion", parameter.name), span: parameter.span });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject two methods with the same name on the same receiver type, unless
+/// they implement different traits (`Display::fmt` and `Debug::fmt`). Methods
+/// are indexed by (receiver base name, [trait,] method name), so a second
+/// definition would otherwise silently replace the first.
 fn validate_methods(g: &GlobalTable) -> Result<(), ResolveError> {
     let mut seen = std::collections::HashSet::new();
     for imp in &g.impls {
-        let base = crate::types::type_base_name(&imp.self_ty);
+        let base = crate::types::impl_receiver_base(imp, g).map_err(|error| ResolveError { msg: error.msg, span: error.span })?;
+        let tr = imp.trait_ref.as_ref().map(|t| t.path.segments.join("::"));
         for m in &imp.items {
-            if !seen.insert((base.clone(), m.name.clone())) {
+            if !seen.insert((base.clone(), tr.clone(), m.name.clone())) {
                 return Err(ResolveError {
                     msg: format!("duplicate method `{}` on `{}`: another impl block already defines it", m.name, base),
                     span: m.span,
@@ -177,8 +370,8 @@ fn validate_methods(g: &GlobalTable) -> Result<(), ResolveError> {
 fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
     for imp in &g.impls {
         let Some(tr) = &imp.trait_ref else { continue };
-        let tname = tr.path.last();
-        let def = g.traits.iter().find(|(k, _)| k.rsplit("::").next() == Some(tname)).map(|(_, d)| d)
+        let tname = tr.path.segments.join("::");
+        let def = g.traits.get(&tname)
             .ok_or_else(|| ResolveError { msg: format!("unknown trait `{}`", tname), span: tr.span })?;
         if tr.args.len() != def.generics.params.len() {
             return Err(ResolveError {
@@ -202,11 +395,14 @@ fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
                     span: f.span,
                 }, true),
                 TraitItem::AssocType(name) => {
-                    return Err(ResolveError { msg: format!("associated type `{}` in trait `{}` is not supported", name, tname), span: def.span });
+                    if !imp.assoc_types.iter().any(|(n, _)| n == name) {
+                        return Err(ResolveError { msg: format!("`impl {} for {}` is missing associated type `{}`", tname, self_name, name), span: imp.span });
+                    }
+                    continue;
                 }
             };
             match imp.items.iter().find(|m| m.name == sig.name) {
-                Some(m) => check_impl_signature(&sig, m, &subst, tname)?,
+                Some(m) => check_impl_signature(&sig, m, &subst, &tname, g, imp, def)?,
                 None if provided => {}
                 None => {
                     return Err(ResolveError {
@@ -214,6 +410,11 @@ fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
                         span: imp.span,
                     });
                 }
+            }
+        }
+        for (name, _) in &imp.assoc_types {
+            if !def.items.iter().any(|item| matches!(item, TraitItem::AssocType(n) if n == name)) {
+                return Err(ResolveError { msg: format!("associated type `{}` is not a member of trait `{}`", name, tname), span: imp.span });
             }
         }
         for m in &imp.items {
@@ -232,7 +433,7 @@ fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
 
 /// An impl method must have the trait method's receiver, parameter types, and
 /// return type, after `subst` (Self and the trait's type parameters).
-fn check_impl_signature(sig: &FnSig, m: &FnDef, subst: &HashMap<String, Type>, tname: &str) -> Result<(), ResolveError> {
+fn check_impl_signature(sig: &FnSig, m: &FnDef, subst: &HashMap<String, Type>, tname: &str, g: &GlobalTable, imp: &ImplBlock, def: &TraitDef) -> Result<(), ResolveError> {
     let fail = |what: String| Err(ResolveError {
         msg: format!("method `{}` does not match trait `{}`: {}", m.name, tname, what),
         span: m.span,
@@ -254,47 +455,68 @@ fn check_impl_signature(sig: &FnSig, m: &FnDef, subst: &HashMap<String, Type>, t
     for (tp, mp) in sig.generics.params.iter().zip(&m.generics.params) {
         subst.insert(tp.name.clone(), Type { kind: TypeKind::Path(Path::single(mp.name.clone(), mp.span), vec![]), span: mp.span });
     }
-    let self_ty = subst.get("Self").cloned().expect("Self is substituted");
+    // Normalize each side in its own binder scope, then substitute semantic
+    // types once. Internal binder names cannot capture user generic names.
+    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
+    let lower = |ty: &Type, scope: &[String]| crate::types::lower_type_with(ty, scope, &env)
+        .map_err(|error| ResolveError { msg: error.msg, span: error.span });
+    let impl_scope: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
+    let mut actual_subst: HashMap<String, crate::types::Ty> = impl_scope.iter().enumerate()
+        .map(|(i, name)| (name.clone(), crate::types::Ty::Var(format!("$impl{i}")))).collect();
+    let self_ty = crate::types::subst_ty(&lower(&imp.self_ty, &impl_scope)?, &actual_subst);
+    actual_subst.insert("Self".into(), self_ty.clone());
+    let mut expected_subst = HashMap::new();
+    let tr = imp.trait_ref.as_ref().expect("trait implementation");
+    for (param, argument) in def.generics.params.iter().zip(&tr.args) {
+        expected_subst.insert(param.name.clone(), crate::types::subst_ty(&lower(argument, &impl_scope)?, &actual_subst));
+    }
+    expected_subst.insert("Self".into(), self_ty);
+    let mut expected_scope: Vec<String> = def.generics.params.iter().map(|p| p.name.clone()).collect();
+    let mut actual_scope = impl_scope;
+    for (i, (tp, mp)) in sig.generics.params.iter().zip(&m.generics.params).enumerate() {
+        let binder = crate::types::Ty::Var(format!("$method{i}"));
+        expected_scope.push(tp.name.clone());
+        actual_scope.push(mp.name.clone());
+        expected_subst.insert(tp.name.clone(), binder.clone());
+        actual_subst.insert(mp.name.clone(), binder);
+    }
+    // `Self::Item` on either side is the impl's `type Item = ..`.
+    let mut assoc = HashMap::new();
+    for (name, ty) in &imp.assoc_types {
+        assoc.insert(name.clone(), crate::types::subst_ty(&lower(ty, &actual_scope)?, &actual_subst));
+    }
+    let self_ty = expected_subst["Self"].clone();
+    fn resolve_self(ty: crate::types::Ty, self_ty: &crate::types::Ty, assoc: &HashMap<String, crate::types::Ty>) -> crate::types::Ty {
+        use crate::types::Ty;
+        match ty {
+            Ty::Named { name, args } => {
+                if let (Some(n), Some(base)) = (name.strip_prefix("proj#"), args.first()) {
+                    if base == self_ty { if let Some(t) = assoc.get(n) { return t.clone(); } }
+                }
+                Ty::Named { name, args: args.into_iter().map(|a| resolve_self(a, self_ty, assoc)).collect() }
+            }
+            Ty::Tuple(es) => Ty::Tuple(es.into_iter().map(|a| resolve_self(a, self_ty, assoc)).collect()),
+            Ty::Array(e, n) => Ty::Array(Box::new(resolve_self(*e, self_ty, assoc)), n),
+            Ty::Fn { params, ret } => Ty::Fn { params: params.into_iter().map(|a| resolve_self(a, self_ty, assoc)).collect(), ret: Box::new(resolve_self(*ret, self_ty, assoc)) },
+            other => other,
+        }
+    }
+    let same_type = |expected: &Type, actual: &Type| -> Result<bool, ResolveError> {
+        Ok(resolve_self(crate::types::subst_ty(&lower(expected, &expected_scope)?, &expected_subst), &self_ty, &assoc)
+            == resolve_self(crate::types::subst_ty(&lower(actual, &actual_scope)?, &actual_subst), &self_ty, &assoc))
+    };
     for (i, (tp, mp)) in sig.params.iter().zip(&m.params).enumerate() {
-        if !same_type(&tp.ty, &subst, &mp.ty, &self_ty) {
+        if !same_type(&tp.ty, &mp.ty)? {
             return fail(format!("parameter {} should be `{}`, found `{}`", i + 1, type_text(&tp.ty, &subst), type_text(&mp.ty, &HashMap::new())));
         }
     }
     let unit = Type { kind: TypeKind::Tuple(vec![]), span: m.span };
     let tret = sig.ret.clone().unwrap_or_else(|| unit.clone());
     let mret = m.ret.clone().unwrap_or(unit);
-    if !same_type(&tret, &subst, &mret, &self_ty) {
+    if !same_type(&tret, &mret)? {
         return fail(format!("it should return `{}`, found `{}`", type_text(&tret, &subst), type_text(&mret, &HashMap::new())));
     }
     Ok(())
-}
-
-/// Is the trait-side type `t` (under `subst`) the impl-side type `u` (whose
-/// `Self` is `self_ty`)? Named types compare by their last path segment.
-fn same_type(t: &Type, subst: &HashMap<String, Type>, u: &Type, self_ty: &Type) -> bool {
-    let empty = HashMap::new();
-    match (&t.kind, &u.kind) {
-        (TypeKind::SelfType, _) => match subst.get("Self") {
-            Some(s) => same_type(s, &empty, u, self_ty),
-            None => false,
-        },
-        (_, TypeKind::SelfType) => same_type(t, subst, self_ty, self_ty),
-        (TypeKind::Path(p, args), _) if args.is_empty() && p.is_single() && subst.contains_key(p.last()) => {
-            same_type(&subst[p.last()], &empty, u, self_ty)
-        }
-        (TypeKind::Path(p, pa), TypeKind::Path(q, qa)) => {
-            p.last() == q.last() && pa.len() == qa.len() && pa.iter().zip(qa).all(|(a, b)| same_type(a, subst, b, self_ty))
-        }
-        (TypeKind::Tuple(a), TypeKind::Tuple(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_type(x, subst, y, self_ty)),
-        (TypeKind::Array(a, _), TypeKind::Array(b, _)) => same_type(a, subst, b, self_ty),
-        (TypeKind::Fn(ap, ar), TypeKind::Fn(bp, br)) | (TypeKind::ExternFn(ap, ar), TypeKind::ExternFn(bp, br)) => {
-            let unit = Type { kind: TypeKind::Tuple(vec![]), span: t.span };
-            ap.len() == bp.len()
-                && ap.iter().zip(bp).all(|(x, y)| same_type(x, subst, y, self_ty))
-                && same_type(ar.as_deref().unwrap_or(&unit), subst, br.as_deref().unwrap_or(&unit), self_ty)
-        }
-        _ => false,
-    }
 }
 
 /// Render a surface type for a diagnostic, applying `subst`.
@@ -317,7 +539,7 @@ fn type_text(t: &Type, subst: &HashMap<String, Type>) -> String {
 /// an ancestor module of `from_mod` (a child can see its parents' privates, and
 /// every module can see the crate root). This mirrors Rust's rule closely
 /// enough for v1.
-fn visible_from(g: &GlobalTable, target: &str, from_mod: &str) -> bool {
+pub(crate) fn visible_from(g: &GlobalTable, target: &str, from_mod: &str) -> bool {
     let Some(sym) = g.by_path.get(target) else { return true }; // unknown → let later passes report
     if sym.vis {
         return true;
@@ -420,7 +642,7 @@ fn collect_paths_expr(e: &Expr, out: &mut Vec<(Vec<String>, Span)>) {
         Tuple(xs) => for x in xs { collect_paths_expr(x, out); },
         Array(crate::ast::ArrayLit::Elems(xs)) => for x in xs { collect_paths_expr(x, out); },
         Array(crate::ast::ArrayLit::Repeat(v, n)) => { collect_paths_expr(v, out); collect_paths_expr(n, out); }
-        Block(b) => collect_paths_block(b, out),
+        Block(b) | Unsafe(b) => collect_paths_block(b, out),
         If { cond, then_branch, else_branch } => {
             collect_paths_expr(cond, out);
             collect_paths_block(then_branch, out);
@@ -446,6 +668,30 @@ fn collect_paths_expr(e: &Expr, out: &mut Vec<(Vec<String>, Span)>) {
     }
 }
 
+/// Declaration member names must be unique before layout or construction can
+/// address them by name. Report the second declaration at its own source span.
+fn validate_field_names(fields: &[FieldDef]) -> Result<(), ResolveError> {
+    let mut names = std::collections::HashSet::new();
+    for field in fields {
+        if !names.insert(field.name.as_str()) {
+            return Err(ResolveError { msg: format!("duplicate field `{}`", field.name), span: field.span });
+        }
+    }
+    Ok(())
+}
+
+/// Repeated wildcard parameters are permitted; named parameter bindings must
+/// be unique within each callable.
+pub(crate) fn validate_parameter_names<'a>(parameters: impl IntoIterator<Item = (&'a str, Span)>) -> Result<(), ResolveError> {
+    let mut names = std::collections::HashSet::new();
+    for (name, span) in parameters {
+        if name != "_" && !names.insert(name) {
+            return Err(ResolveError { msg: format!("duplicate parameter `{name}`"), span });
+        }
+    }
+    Ok(())
+}
+
 fn collect_items(
     items: &[Item],
     prefix: &mut Vec<String>,
@@ -453,19 +699,46 @@ fn collect_items(
 ) -> Result<(), ResolveError> {
     let module = prefix.join("::");
     for item in items {
+        let declared = match &item.kind {
+            ItemKind::Fn(d) => Some((&d.name, d.span, false)),
+            ItemKind::Struct(d) => Some((&d.name, d.span, false)),
+            ItemKind::Enum(d) => Some((&d.name, d.span, false)),
+            ItemKind::Trait(d) => Some((&d.name, d.span, false)),
+            ItemKind::Const(d) => Some((&d.name, d.span, false)),
+            ItemKind::TypeAlias(d) => Some((&d.name, d.span, true)),
+            ItemKind::Mod(d) => Some((&d.name, d.span, false)),
+            _ => None,
+        };
+        if let Some((name, span, alias)) = declared {
+            let path = qualify(prefix,name);
+            if (alias && (g.by_path.contains_key(&path) || g.modules.contains(&path))) || g.aliases.contains_key(&path) {
+                return Err(ResolveError { msg: format!("duplicate declaration `{path}` conflicts with a type alias"), span });
+            }
+        }
         match &item.kind {
             ItemKind::Fn(f) => {
+                validate_parameter_names(f.params.iter().map(|p| (p.name.as_str(), p.span)))?;
                 let path = qualify(prefix, &f.name);
                 g.insert(path.clone(), Symbol { kind: SymKind::Fn, span: f.span, vis: f.vis, module: module.clone() });
                 g.fns.insert(path, f.clone());
             }
             ItemKind::Struct(s) => {
+                if let StructBody::Named(fields) = &s.body { validate_field_names(fields)?; }
                 let path = qualify(prefix, &s.name);
+                if path == "Array" { return Err(ResolveError { msg: "cannot redefine builtin type `Array`".into(), span: s.span }); }
                 g.insert(path.clone(), Symbol { kind: SymKind::Struct, span: s.span, vis: s.vis, module: module.clone() });
                 g.structs.insert(path, s.clone());
             }
             ItemKind::Enum(e) => {
+                let mut variants = std::collections::HashSet::new();
+                for variant in &e.variants {
+                    if !variants.insert(variant.name.as_str()) {
+                        return Err(ResolveError { msg: format!("duplicate variant `{}`", variant.name), span: variant.span });
+                    }
+                    if let VariantPayload::Named(fields) = &variant.payload { validate_field_names(fields)?; }
+                }
                 let path = qualify(prefix, &e.name);
+                if path == "Array" { return Err(ResolveError { msg: "cannot redefine builtin type `Array`".into(), span: e.span }); }
                 g.insert(path.clone(), Symbol { kind: SymKind::Enum, span: e.span, vis: e.vis, module: module.clone() });
                 g.enums.insert(path.clone(), e.clone());
                 // Register variants as `Enum::Variant`. A variant is as visible
@@ -489,12 +762,24 @@ fn collect_items(
                 }
             }
             ItemKind::Trait(t) => {
+                for item in &t.items {
+                    let parameters = match item {
+                        TraitItem::Required(method) => &method.params,
+                        TraitItem::Provided(method) => &method.params,
+                        TraitItem::AssocType(_) => continue,
+                    };
+                    validate_parameter_names(parameters.iter().map(|p| (p.name.as_str(), p.span)))?;
+                }
                 let path = qualify(prefix, &t.name);
                 g.insert(path.clone(), Symbol { kind: SymKind::Trait, span: t.span, vis: t.vis, module: module.clone() });
                 g.traits.insert(path, t.clone());
             }
             ItemKind::Impl(b) => {
+                for method in &b.items {
+                    validate_parameter_names(method.params.iter().map(|p| (p.name.as_str(), p.span)))?;
+                }
                 g.impls.push(b.clone());
+                g.impl_modules.push(module.clone());
             }
             ItemKind::Const(c) => {
                 let path = qualify(prefix, &c.name);
@@ -503,10 +788,12 @@ fn collect_items(
             }
             ItemKind::TypeAlias(a) => {
                 let path = qualify(prefix, &a.name);
+                if path == "Array" { return Err(ResolveError { msg: "cannot redefine builtin type `Array`".into(), span: a.span }); }
                 g.insert(path.clone(), Symbol { kind: SymKind::TypeAlias, span: a.span, vis: a.vis, module: module.clone() });
                 g.aliases.insert(path, a.clone());
             }
             ItemKind::Mod(m) => {
+                g.modules.insert(qualify(prefix, &m.name));
                 prefix.push(m.name.clone());
                 collect_items(&m.items, prefix, g)?;
                 prefix.pop();
@@ -518,6 +805,7 @@ fn collect_items(
                 // We record aliases now and apply them after the full table is
                 // built (so forward references to not-yet-collected items work).
                 g.pending_uses.push(u.clone());
+                g.pending_scoped_uses.push((module.clone(),u.clone()));
             }
         }
     }
@@ -594,6 +882,9 @@ fn check_type(
     is_known: &impl Fn(&str, &[String]) -> bool,
 ) -> Result<(), ResolveError> {
     match &t.kind {
+        // `Self::Item` / `I::Item`: an associated type of a type parameter.
+        TypeKind::Path(path, args) if path.segments.len() == 2 && args.is_empty()
+            && (path.segments[0] == "Self" || generics.iter().any(|g| *g == path.segments[0])) => {}
         TypeKind::Path(path, args) => {
             let name = path.last();
             if !is_known(name, generics) {
@@ -628,6 +919,10 @@ pub fn is_builtin_type(name: &str) -> bool {
             | "bool" | "char" | "String" | "Bytes" | "RawPtr"
             // generic builtins resolved structurally later
             | "Vec" | "Array" | "Option" | "Result"
+            // owning pointers: the type they point to (see `lower_type_with`)
+            | "Box" | "Rc" | "Arc"
+            // a hole in `collect::<Vec<_>>()`
+            | "_"
     )
 }
 

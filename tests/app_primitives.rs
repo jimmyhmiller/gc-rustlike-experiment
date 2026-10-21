@@ -6,7 +6,7 @@ fn run(src: &str) -> i64 {
     let (m, _) = parse_with_prelude(src).unwrap();
     let r = resolve_module(m).unwrap();
     let p = lower_program(&r.globals).unwrap();
-    jit_run_i64_gc(&p, true).unwrap()
+    unsafe { jit_run_i64_gc(&p, true) }.unwrap()
 }
 #[test]
 fn generic_match_branches_receive_context_for_both_lowering_paths() {

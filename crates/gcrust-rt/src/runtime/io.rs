@@ -1,9 +1,10 @@
 //! Checked host I/O. Native resources never escape a call; owned data is copied
 //! into managed objects only after the blocking region has ended.
 use super::{
-    STR_DATA_OFF, Thread, alloc_string_from_bytes, alloc_with_published_frame, blocking_region,
-    str_bytes,
+    STR_DATA_OFF, Thread, alloc_string_from_text, alloc_with_published_frame, blocking_region,
 };
+#[cfg(test)]
+use super::str_bytes;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -201,10 +202,16 @@ pub unsafe extern "C" fn ai_host_call(
     limit: i64,
 ) -> *mut u8 {
     unsafe {
-        // Copy before publishing BLOCKED; borrowed managed bytes cannot outlive
-        // a GC by another mutator while the filesystem call is in progress.
-        let path = std::str::from_utf8(str_bytes(path)).map(str::to_owned);
-        let text = std::str::from_utf8(str_bytes(text)).map(str::to_owned);
+        // Either copy may park. Preserve both arguments before starting and
+        // reload the second root after all possible collection in the first.
+        let (path, text) = {
+            let roots = (&*(*thread).dyna_thread).scratch_scope();
+            let path_root = roots.push(path);
+            let text_root = roots.push(text);
+            let path = super::string_owned::text(thread, roots.get(path_root));
+            let text = super::string_owned::text(thread, roots.get(text_root));
+            (path, text)
+        };
         let result = match (path, text) {
             (Ok(path), Ok(text)) => {
                 let arguments = (*thread).arguments.clone();
@@ -231,7 +238,7 @@ pub unsafe extern "C" fn ai_host_call(
         let dyna = &*t.dyna_thread;
         let heap = &*t.heap;
         let mark = dyna.scratch_mark();
-        let message = alloc_string_from_bytes(thread, string_id, out.text.as_bytes());
+        let message = alloc_string_from_text(thread, string_id, &out.text);
         let message_slot = dyna.push_scratch(message);
         let array = alloc_with_published_frame(
             t,
@@ -239,13 +246,19 @@ pub unsafe extern "C" fn ai_host_call(
             heap.type_info_by_id(array_id as u16),
             out.entries.len(),
         );
-        *(array.add(16) as *mut u64) = out.entries.len() as u64;
         let array_slot = dyna.push_scratch(array);
+        #[cfg(test)]
+        publication_tests::before_entries(thread);
         for (index, entry) in out.entries.iter().enumerate() {
-            let value = alloc_string_from_bytes(thread, string_id, entry.as_bytes());
+            // Only scratch-rooted objects are live here. A long directory/args
+            // result must respond to collection requests while being built.
+            if heap.gc_requested() { super::ai_gc_pollcheck_slow(thread); }
+            let value = alloc_string_from_text(thread, string_id, entry);
             let array = dyna.scratch_at(array_slot) as *mut u8;
-            *(array.add(STR_DATA_OFF + index * 8) as *mut *mut u8) = value;
-            super::ai_gc_write_barrier(thread, array, value);
+            // Earlier allocations may have exposed this partial array to the
+            // collector. Resolve its current base and publish with SC/SATB/card
+            // semantics even though the response has not reached user code yet.
+            super::ai_slot_ref_store(thread, array, STR_DATA_OFF + index * 8, value);
         }
         let response =
             alloc_with_published_frame(t, heap, heap.type_info_by_id(response_id as u16), 0);
@@ -326,3 +339,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "io_publication_tests.rs"]
+mod publication_tests;

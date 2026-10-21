@@ -186,9 +186,217 @@ mod tests {
         let (m, _) = parse_with_prelude(src).unwrap();
         let r = resolve_module(m).unwrap();
         let prog = lower_program(&r.globals).unwrap();
-        jit_run_i64_gc(&prog, false).unwrap()
+        unsafe { jit_run_i64_gc(&prog, false) }.unwrap()
     }
 
+    #[test]
+    fn lexical_type_declarations_shadow_outer_trait_bounds() {
+        for declaration in ["struct Bound {}", "enum Bound { Value }", "type Bound = i64;"] {
+            let source = format!("trait Bound {{}} impl Bound for i64 {{}} mod inner {{ {declaration} type Alias<T: Bound> = Array<T>; }} fn main() -> i64 {{ 42 }}");
+            let (module, _) = parse_with_prelude(&source).unwrap();
+            let error = resolve_module(module).err().unwrap();
+            assert!(error.msg.contains("`inner::Bound` is not a trait"), "{}", error.msg);
+        }
+        assert_eq!(run("mod contracts { pub trait Bound {} } impl contracts::Bound for i64 {} mod inner { struct Bound {} pub type Alias<T: contracts::Bound> = Array<T>; } fn main()->i64 { let values: inner::Alias<i64> = [42]; values[0] }"), 42);
+    }
+
+    #[test]
+    fn generic_binders_shadow_trait_names_in_bounds() {
+        for declaration in [
+            "type Alias<Bound,T:Bound> = Array<T>;",
+            "struct Record<Bound,T:Bound> { value:T }",
+            "fn accept<Bound,T:Bound>(value:T)->T {value}",
+            "struct Record<Bound> {value:Bound} impl<Bound> Record<Bound> { fn accept<T:Bound>(value:T)->T {value} }",
+        ] {
+            let source = format!("trait Bound {{}} {declaration} fn main()->i64 {{42}}");
+            let (module, _) = parse_with_prelude(&source).unwrap();
+            let error = resolve_module(module).err().unwrap();
+            assert!(error.msg.contains("type parameter `Bound` is not a trait"), "{}", error.msg);
+        }
+        assert_eq!(run("mod contracts {pub trait Bound {}} impl contracts::Bound for i64 {} fn accept<Bound,T:contracts::Bound>(unused:Bound,value:T)->T {value} fn main()->i64 {accept(true,42)}"),42);
+    }
+
+    #[test]
+    fn duplicate_member_declarations_fail_before_lowering() {
+        for (declaration, diagnostic, repeated) in [
+            ("struct Record {x:i64,x:i64}", "duplicate field `x`", "x:i64"),
+            ("#[value] struct Record {x:i64,x:i64}", "duplicate field `x`", "x:i64"),
+            ("enum Choice {Value{x:i64,x:i64}}", "duplicate field `x`", "x:i64"),
+            ("enum Choice {Value,Value}", "duplicate variant `Value`", "Value"),
+        ] {
+            let source = format!("{declaration} fn main()->i64 {{42}}");
+            let (module, _) = parse_with_prelude(&source).unwrap();
+            let error = resolve_module(module).err().unwrap();
+            assert!(error.msg.contains(diagnostic), "{}", error.msg);
+            assert_eq!(error.span.start as usize, source.rfind(repeated).unwrap());
+        }
+        assert_eq!(run("struct Left {x:i64} struct Right {x:i64} enum Choice {One{x:i64},Two{x:i64}} fn main()->i64 {Left{x:40}.x+Right{x:2}.x}"),42);
+    }
+
+    #[test]
+    fn parameter_binding_names_are_unique_in_each_callable_scope() {
+        for source in [
+            "fn value(x:i64,x:i64)->i64{x} fn main()->i64{42}",
+            "extern \"C\" fn value(x:i64,x:i64)->i64; fn main()->i64{42}",
+            "struct Record {} impl Record {fn value(x:i64,x:i64)->i64{x}} fn main()->i64{42}",
+            "trait Contract {fn value(x:i64,x:i64)->i64;} fn main()->i64{42}",
+            "trait Contract {fn value(x:i64,x:i64)->i64{x}} fn main()->i64{42}",
+            "fn main()->i64{let value=|x:i64,x:i64| x; 42}",
+        ] {
+            let (module, _) = parse_with_prelude(source).unwrap();
+            let error = resolve_module(module).err().unwrap();
+            assert!(error.msg.contains("duplicate parameter `x`"), "{}", error.msg);
+            assert_eq!(error.span.start as usize, source.rfind("x:i64").unwrap());
+        }
+        assert_eq!(run("fn value(_:i64,_:i64,x:i64)->i64{x} fn main()->i64 {let f=|_:i64,_:i64,x:i64| x; value(1,2,f(3,4,42))}"),42);
+        assert_eq!(run("fn main()->i64 {let x=40; let f=|x:i64| {let x=x+1; x}; x+f(1)}"),42);
+    }
+
+    #[test]
+    fn accepted_nested_programs_lower_on_two_megabyte_worker_stacks() {
+        for (wrapped, depth) in [(false, 48usize), (true, 24)] {
+            for invalid in [false, true] {
+                std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(move || {
+                    let mut expression = if invalid { "same(true,42)" } else { "42" }.to_string();
+                    for _ in 0..depth {
+                        expression = if wrapped { format!("same({{{expression}}},42)") }
+                            else { format!("same({expression},42)") };
+                    }
+                    let source = format!("fn same<T>(left:T,right:T)->i64{{42}} fn main()->i64{{{expression}}}");
+                    let (module, _) = parse_with_prelude(&source).unwrap();
+                    let resolved = resolve_module(module).unwrap();
+                    assert_eq!(crate::lower::check_program(&resolved.globals).is_err(), invalid);
+                    assert_eq!(lower_program(&resolved.globals).is_err(), invalid);
+                }).unwrap().join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_function_values_infer_and_reject_invalid_calls() {
+        for source in [
+            "fn main()->i64{(||42)()}",
+            "fn main()->i64{(|x|x+1)(41)}",
+            "fn main()->i64{({|x|x+1})(41)}",
+            "fn make()->fn(i64)->i64{|x:i64|x+1} fn main()->i64{make()(41)}",
+            "fn main()->i64{(if true {|x:i64|x+1} else {|x:i64|x+2})(41)}",
+            "enum Choice<T>{Empty,Value(T)} fn apply(Empty:fn()->i64)->i64{Empty()} fn main()->i64{apply(||42)}",
+        ] { assert_eq!(run(source), 42, "{source}"); }
+        for source in [
+            "fn main()->i64{42()}",
+            "fn value()->i64{42} fn main()->i64{let value=7;value()}",
+            "fn main()->i64{(|x:i64|x)()}",
+            "fn main()->i64{(|x:i64|x)(true)}",
+            "fn main()->i64{(||true)()}",
+        ] {
+            let (module,_) = parse_with_prelude(source).unwrap();
+            let resolved = resolve_module(module).unwrap();
+            assert!(lower_program(&resolved.globals).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn ordinary_generic_calls_need_no_speculative_argument_lowering() {
+        let mut expression = "value".to_string();
+        for _ in 0..48 { expression = format!("same({expression},value)"); }
+        let source = format!("fn same<T>(left:T,right:T)->i64{{42}} fn main()->i64{{let value=42;{expression}}}");
+        let (module, _) = parse_with_prelude(&source).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        crate::lower::reset_probe_work();
+        lower_program(&resolved.globals).unwrap();
+        assert_eq!(crate::lower::probe_work(), 0);
+        assert!(crate::lower::expr_work() <= 4*48);
+    }
+
+    #[test]
+    fn nested_generic_calls_have_bounded_argument_probe_work() {
+        for wrapping in ["plain", "block", "arithmetic", "right", "closure"] {
+            for invalid in [false, true] {
+                for depth in if wrapping == "closure" { [2usize, 4, 8, 12] } else { [4usize, 8, 12, 24] } {
+                    let mut value = if invalid { "same(true,42)" } else { "42" }.to_string();
+                    for _ in 0..depth {
+                        value = match wrapping {
+                            "plain" => format!("same({value},42)"),
+                            "block" => format!("same({{{value}}},42)"),
+                            "arithmetic" => format!("same({value}+0,42)"),
+                            "right" => format!("same(42,{value})"),
+                            "closure" => format!("same({{let f = || {value}; f()}},42)"),
+                            _ => unreachable!(),
+                        };
+                    }
+                    let source = format!("fn same<T>(left:T,right:T)->i64 {{42}} fn main()->i64 {{{value}}}");
+                    let (module, _) = parse_with_prelude(&source).unwrap();
+                    let resolved = resolve_module(module).unwrap();
+                    crate::lower::reset_probe_work();
+                    let result = lower_program(&resolved.globals);
+                    assert_eq!(result.is_err(), invalid, "{wrapping} invalid={invalid}: {result:?}");
+                    let probes = crate::lower::probe_work();
+                    let expressions = crate::lower::expr_work();
+                    eprintln!("nested generic wrapping={wrapping} invalid={invalid} depth={depth} probe_lowerings={probes} expression_lowerings={expressions}");
+                    assert!(probes <= 8*depth*depth, "repeated probes: {probes}");
+                    assert!(expressions <= 64*depth*depth, "repeated expression lowering: {expressions}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn earlier_function_arguments_infer_from_later_concrete_arguments() {
+        for source in [
+            "fn take<T>(values:Array<T>,sample:T)->i64 {array_len(values)+42} fn main()->i64 {take([],42)}",
+            "fn empty<T>()->Array<T> {[]} fn take<T>(values:Array<T>,sample:T)->i64 {array_len(values)+42} fn main()->i64 {take(empty(),42)}",
+            "trait Bound {} impl Bound for i64 {} type Words<T:Bound> = Array<T>; fn take<T>(values:Array<T>,sample:T)->i64 {array_len(values)+42} fn main()->i64 {take(Words::new(0),42)}",
+            "struct Holder<T>{value:T} fn take<T>(holder:Holder<Array<T>>,sample:T)->i64 {array_len(holder.value)+42} fn main()->i64 {take(Holder{value:[]},42)}",
+            "fn take<T>(values:Array<T>,sample:T)->i64 {array_len(values)+42} fn main()->i64 {let mut order=0; let result=take({let scratch=[1,2]; let action=||42; order=order+1;[]},{order=order*10+2;42}); if order==12 && result==42 {42} else {0}}",
+        ] {assert_eq!(run(source),42);}
+    }
+
+    #[test]
+    fn argument_type_probes_preserve_bounds_and_nominal_checks() {
+        for (source, expected) in [
+            ("trait Bound {} type Words<T:Bound> = Array<T>; fn take<T>(values:Array<T>,sample:T)->i64 {42} fn main()->i64 {take(Words::new(0),true)}", "not satisfied"),
+            ("struct Wrong<T>{value:T} fn take<T>(values:Array<T>,sample:T)->i64 {42} fn main()->i64 {take(Wrong{value:true},true)}", "Wrong"),
+        ] {
+            let (module, _) = parse_with_prelude(source).unwrap();
+            let resolved = resolve_module(module).unwrap();
+            let error = lower_program(&resolved.globals).err().unwrap();
+            assert!(error.msg.contains(expected), "{}", error.msg);
+        }
+    }
+
+    #[test]
+    fn associated_constructor_results_infer_from_later_uses() {
+        for source in [
+            "fn main() -> i64 { let mut values = Vec::new(); values.push(42); values[0] }",
+            "trait Bound {} impl Bound for i64 {} type Values<T: Bound> = Vec<T>; fn main() -> i64 { let mut values = Values::new(); values.push(42); values[0] }",
+            "struct Factory {} impl Factory { fn empty<T>() -> Array<T> { [] } } fn take(values: Array<i64>) -> i64 { array_len(values) + 42 } fn main() -> i64 { let values = Factory::empty(); take(values) }",
+        ] { assert_eq!(run(source), 42); }
+    }
+    #[test]
+    fn map_inference_collects_keys_and_values_before_proving_bounds() {
+        for source in [
+            "fn main() -> i64 { let mut values = HashMap::new(); if values.contains_key(\"answer\") { return 0; } values.insert(\"answer\", 42); values.get(\"answer\").unwrap_or(0) }",
+            "fn main() -> i64 { let mut values = HashMap::new(); let before = values.len(); values.insert(\"answer\", 42); values.get(\"answer\").unwrap_or(0) + before }",
+        ] { assert_eq!(run(source), 42); }
+    }
+    #[test]
+    fn probe_deferral_preserves_relational_bound_checks() {
+        let valid = "trait Rel<A> {} impl Rel<i64> for String {} struct Pair<K,V> { keys: Array<K>, values: Array<V> } impl<K: Rel<V>, V> Pair<K,V> { fn new() -> Self { Pair { keys: [], values: [] } } fn touch(self, key: K) -> i64 { 0 } fn set(self, key: K, value: V) -> V { value } } fn main() -> i64 { let pair = Pair::new(); pair.touch(\"x\"); pair.set(\"x\", 42) }";
+        assert_eq!(run(valid), 42);
+        let invalid = "trait Rel<A> {} struct Pair<K,V> { keys: Array<K>, values: Array<V> } impl<K: Rel<V>, V> Pair<K,V> { fn new() -> Self { Pair { keys: [], values: [] } } fn touch(self, key: K) -> i64 { 0 } fn set(self, key: K, value: V) -> V { value } } fn main() -> i64 { let pair = Pair::new(); pair.touch(\"x\"); pair.set(\"x\", 42) }";
+        let (module, _) = parse_with_prelude(invalid).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let error = lower_program(&resolved.globals).err().unwrap();
+        assert!(error.msg.contains("not satisfied"), "{}", error.msg);
+    }
+    #[test]
+    fn inferred_associated_constructor_results_still_enforce_alias_bounds() {
+        let source = "trait Bound {} type Values<T: Bound> = Vec<T>; fn main() -> i64 { let mut values = Values::new(); values.push(true); 42 }";
+        let (module, _) = parse_with_prelude(source).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let error = lower_program(&resolved.globals).err().unwrap();
+        assert!(error.msg.contains("not satisfied"), "{}", error.msg);
+    }
     #[test]
     fn prelude_option_available_without_declaration() {
         // No `enum Option` declared by the user — it comes from the prelude.

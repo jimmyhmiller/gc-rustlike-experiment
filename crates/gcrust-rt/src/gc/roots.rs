@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Trait for types that can enumerate GC root references.
 ///
@@ -154,7 +154,11 @@ impl FrameChain {
 
     /// Root borrowed stack storage for the duration of a callback. The guard
     /// stays private, so safe code cannot forget it or outlive frame storage.
-    pub fn with_frame<R, const N: usize>(&self, frame: &mut RootFrame<N>, f: impl FnOnce(&RootFrame<N>) -> R) -> R {
+    /// # Safety
+    /// Every slot must remain null or a valid value under the active heap's
+    /// pointer policy. The caller coordinates all frame access with collection
+    /// and must retain the original header layout throughout registration.
+    pub unsafe fn with_frame<R, const N: usize>(&self, frame: &mut RootFrame<N>, f: impl FnOnce(&RootFrame<N>) -> R) -> R {
         // The exclusive frame borrow prevents duplicate registration; its
         // storage outlives this private guard, including unwinding.
         let _guard = unsafe { self.push(frame) };
@@ -353,7 +357,10 @@ impl DynRootFrame {
 
     /// Register for a callback, unlinking the frame on normal return or unwind.
     /// The private guard cannot be forgotten by the callback.
-    pub fn with_pushed<R>(&self, chain: &FrameChain, body: impl FnOnce(&Self) -> R) -> R {
+    /// # Safety
+    /// Slots must contain valid traced values for the heap's pointer policy,
+    /// and the caller must coordinate root reads/writes with collection.
+    pub unsafe fn with_pushed<R>(&self, chain: &FrameChain, body: impl FnOnce(&Self) -> R) -> R {
         let _guard = unsafe { self.push_onto(chain) };
         body(self)
     }
@@ -457,7 +464,10 @@ impl<'scope, T: ?Sized> Rooted<'scope, T> {
     /// Update the rooted value. The GC will see the new value at the next
     /// collection.
     #[inline]
-    pub fn set(&self, value: u64) {
+    /// # Safety
+    /// `value` must be null or a valid live value under this scope's heap/pointer
+    /// policy. Update only on the owning running mutator, between safepoints.
+    pub unsafe fn set(&self, value: u64) {
         self.slot.set(value);
     }
 }
@@ -504,7 +514,16 @@ impl<'chain> RootScope<'chain> {
     /// Mint a fresh `Rooted` initialized to `value`. The handle borrows
     /// from this scope and cannot outlive it. Panics if the scope's slot
     /// capacity is exhausted.
-    pub fn root<T>(&self, value: u64) -> Rooted<'_, T> {
+    /// # Safety
+    /// `value` must be null or a live traced value belonging to this scope's
+    /// heap/pointer policy. Register only on the owning running mutator.
+    /// ```compile_fail
+    /// use gcrust_rt::gc::roots::{FrameChain, RootScope};
+    /// let chain = FrameChain::new();
+    /// let scope = RootScope::new(&chain, 1);
+    /// let root = scope.root::<u64>(1);
+    /// ```
+    pub unsafe fn root<T>(&self, value: u64) -> Rooted<'_, T> {
         let i = self.cursor.get();
         assert!(
             i < self.frame.slot_count(),
@@ -653,67 +672,98 @@ unsafe impl RootSource for RootSet {
 
 // ─── AtomicRootSet (thread-safe globals) ────────────────────────────
 
-/// Thread-safe set of GC roots for globals and shared constants.
-///
-/// Lock-free reads via RCU (Read-Copy-Update) pattern:
-/// - `get`/`set` load a raw pointer (Relaxed) and do an atomic
-///   load/store on the slot. No mutex, no RwLock — just pointer
-///   arithmetic + atomic access (~1-2ns).
-/// - `add` takes a mutex to grow the backing Vec, then publishes
-///   the (possibly new) buffer pointer with Release ordering.
-/// - `scan_roots` iterates slots during STW — no concurrent mutation.
-///
-/// Safety relies on the single-threaded mutator invariant: `add()`
-/// and `get()`/`set()` are never called concurrently. The GC only
-/// calls `scan_roots` during STW pauses. See per-method safety notes.
+pub(crate) type AtomicRootStorage = allocator_api2::vec::Vec<
+    AtomicU64, crate::runtime::metadata_allocator::MetadataAllocator,
+>;
+
+/// Shared traced root storage. The backing lock protects growth and root
+/// reads/writes, and remains held throughout collector visitation. Registered
+/// mutators pause for collection, but external Rust observers need not be
+/// registered: they synchronize through this same lock.
 pub struct AtomicRootSet {
-    /// Raw pointer to the Vec's backing buffer. Hot-path reads
-    /// go through this pointer — no lock needed.
-    ptr: AtomicPtr<AtomicU64>,
-
-    /// Current number of live slots.
     len: AtomicUsize,
-
-    /// Mutex protects the Vec (which owns the allocation) during
-    /// growth. Never touched on the hot path (get/set).
-    backing: Mutex<Vec<AtomicU64>>,
+    backing: Mutex<AtomicRootStorage>,
 }
-
-// AtomicRootSet is Send + Sync:
-// - AtomicPtr/AtomicUsize are Send+Sync
-// - Mutex<Vec<AtomicU64>> is Send+Sync
-// - Raw pointer dereferences in get/set are safe due to
-//   single-threaded mutator invariant (no concurrent add+get)
-unsafe impl Sync for AtomicRootSet {}
 
 impl AtomicRootSet {
     pub fn new() -> Self {
-        AtomicRootSet {
-            ptr: AtomicPtr::new(core::ptr::null_mut()),
-            len: AtomicUsize::new(0),
-            backing: Mutex::new(Vec::new()),
-        }
+        Self::with_allocator(Default::default())
+    }
+    pub(crate) fn with_allocator(allocator: crate::runtime::metadata_allocator::MetadataAllocator) -> Self {
+        let backing = Mutex::new(AtomicRootStorage::new_in(allocator));
+        drop(backing.lock().unwrap());
+        AtomicRootSet { len: AtomicUsize::new(0), backing }
+    }
+    pub(crate) fn allocator(&self) -> crate::runtime::metadata_allocator::MetadataAllocator {
+        self.backing.lock().unwrap().allocator().clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn backing_bytes(&self) -> usize {
+        self.backing.lock().unwrap().capacity() * std::mem::size_of::<AtomicU64>()
     }
 
     /// Add a root value, returning its index for later access.
     ///
-    /// Takes the mutex to grow the vector, then publishes the
-    /// (possibly reallocated) buffer pointer with Release ordering.
+    /// Grows under the backing mutex, then publishes the initialized length
+    /// with Release ordering. Heap-owned storage uses its native ledger.
     ///
-    /// # Safety invariant
-    /// Must not be called concurrently with `get`/`set` on the same
-    /// indices that might be affected by reallocation. In practice,
-    /// the single-threaded mutator guarantees this.
-    pub fn add(&self, bits: u64) -> usize {
+    /// # Safety
+    /// `bits` must be null or a valid traced value under the heap's pointer
+    /// policy. The caller must keep that value live and coordinate publication
+    /// with relocation (normally by running on a registered mutator).
+    /// ```compile_fail
+    /// use gcrust_rt::gc::roots::AtomicRootSet;
+    /// let roots = AtomicRootSet::new();
+    /// roots.add(1);
+    /// ```
+    pub unsafe fn add(&self, bits: u64) -> usize {
         let mut vec = self.backing.lock().unwrap();
         let index = vec.len();
         vec.push(AtomicU64::new(bits));
-        // Publish the (possibly new) buffer pointer and length.
-        // Release ordering ensures the new slot's data is visible
-        // before any reader sees the updated ptr/len.
-        self.ptr.store(vec.as_mut_ptr(), Ordering::Release);
+        // Publish initialized storage before advertising the updated length.
         self.len.store(vec.len(), Ordering::Release);
         index
+    }
+
+    /// Native metadata needed for a non-allocating append.
+    pub(crate) fn capacity_for_next(&self) -> Option<usize> {
+        let backing = self.backing.lock().unwrap();
+        (backing.capacity() == backing.len()).then(|| {
+            backing.len().checked_add(1).and_then(|n| n.checked_mul(2))
+                .expect("global root capacity overflow")
+        })
+    }
+
+    /// # Safety
+    /// As add: the caller excludes collection and publishes a valid value.
+    /// Insufficient storage is reported without modifying the root set.
+    pub(crate) unsafe fn try_add_reserved(&self, bits: u64) -> Result<usize, usize> {
+        let mut backing = self.backing.lock().unwrap();
+        if backing.capacity() == backing.len() {
+            return Err(backing.len().checked_add(1).and_then(|n| n.checked_mul(2))
+                .expect("global root capacity overflow"));
+        }
+        let index = backing.len();
+        backing.push(AtomicU64::new(bits));
+        self.len.store(backing.len(), Ordering::Release);
+        Ok(index)
+    }
+
+    /// Install empty native storage prepared off-lock. Preserve slot indices
+    /// and values; return the old empty backing for disposal outside the lock.
+    /// # Safety
+    /// The caller excludes collection for the whole operation. Enumeration can
+    /// retain slot addresses after its backing guard has been released.
+    pub(crate) unsafe fn install_backing(&self, staged: &mut AtomicRootStorage) -> bool {
+        assert!(staged.is_empty());
+        let mut backing = self.backing.lock().unwrap();
+        if backing.capacity() > backing.len() || staged.capacity() <= backing.len()
+            || !backing.allocator().same_counter(staged.allocator()) {
+            return false;
+        }
+        staged.extend(backing.drain(..));
+        std::mem::swap(&mut *backing, staged);
+        true
     }
 
     /// Read a root's current value.
@@ -722,15 +772,21 @@ impl AtomicRootSet {
     /// threads spawning at once during the env handoff in `ai_thread_spawn`) may
     /// reallocate and FREE the backing buffer, so a lock-free `ptr` load + deref
     /// would be a use-after-free. The lock makes the buffer stable for the read.
-    /// (`get`/`set` are off the hot path — only `scan_roots`, which runs under
-    /// stop-the-world with no concurrent `add`, is lock-free.)
+    /// Collector enumeration takes the same backing lock. Retained evacuation
+    /// addresses additionally rely on `add`/`set` callers excluding collection.
     pub fn get(&self, index: usize) -> u64 {
         let vec = self.backing.lock().unwrap();
         vec[index].load(Ordering::Relaxed)
     }
 
     /// Update a root's value. Takes the backing lock — see `get`.
-    pub fn set(&self, index: usize, bits: u64) {
+    /// # Safety
+    /// As `add`: publish only a live value belonging to this heap/pointer policy.
+    /// Even clearing to zero must exclude an in-flight evacuation: workers can
+    /// retain slot addresses and publish forwarding values after enumeration.
+    /// The backing mutex alone does not exclude that later work. Use a RUNNING
+    /// registered owner or exclusion through the heap's collection coordinator.
+    pub unsafe fn set(&self, index: usize, bits: u64) {
         let vec = self.backing.lock().unwrap();
         vec[index].store(bits, Ordering::Relaxed);
     }
@@ -746,12 +802,9 @@ impl AtomicRootSet {
 
 unsafe impl RootSource for AtomicRootSet {
     unsafe fn scan_roots(&self, visitor: &mut dyn FnMut(*mut u64)) {
-        let ptr = self.ptr.load(Ordering::Relaxed);
-        let len = self.len.load(Ordering::Relaxed);
-        for i in 0..len {
-            unsafe {
-                visitor((*ptr.add(i)).as_ptr());
-            }
+        let backing = self.backing.lock().unwrap();
+        for slot in backing.iter() {
+            visitor(slot.as_ptr());
         }
     }
 }
@@ -765,6 +818,40 @@ mod atomic_root_set_tests {
     use std::sync::Barrier;
     use std::thread;
 
+    #[test]
+    fn collector_visit_excludes_external_root_observers() {
+        // The collector visitor reads/writes plain words. Safe Rust observers
+        // may not be registered mutators, so STW alone cannot exclude them.
+        let roots = AtomicRootSet::new();
+        unsafe { roots.add(0); }
+        unsafe {
+            roots.scan_roots(&mut |slot| {
+                assert!(roots.backing.try_lock().is_err(), "collector did not hold the root storage lock");
+                slot.write(0);
+            });
+        }
+        assert_eq!(roots.get(0), 0);
+    }
+
+    #[test]
+    fn collector_root_updates_and_external_readers_synchronize() {
+        let roots = Arc::new(AtomicRootSet::new());
+        // Null is a valid root under every supported pointer policy.
+        unsafe { roots.add(0); }
+        let start = Arc::new(Barrier::new(2));
+        let reader_roots = roots.clone();
+        let reader_start = start.clone();
+        let reader = thread::spawn(move || {
+            reader_start.wait();
+            for _ in 0..10_000 { assert_eq!(reader_roots.get(0), 0); }
+        });
+        start.wait();
+        for _ in 0..10_000 {
+            unsafe { roots.scan_roots(&mut |slot| slot.write(0)); }
+        }
+        reader.join().unwrap();
+    }
+
     // --- Basic functionality ---
 
     #[test]
@@ -773,9 +860,9 @@ mod atomic_root_set_tests {
         assert!(rs.is_empty());
         assert_eq!(rs.len(), 0);
 
-        let i0 = rs.add(100);
-        let i1 = rs.add(200);
-        let i2 = rs.add(300);
+        let i0 = unsafe { rs.add(100) };
+        let i1 = unsafe { rs.add(200) };
+        let i2 = unsafe { rs.add(300) };
 
         assert_eq!(i0, 0);
         assert_eq!(i1, 1);
@@ -791,19 +878,19 @@ mod atomic_root_set_tests {
     #[test]
     fn set_updates_value() {
         let rs = AtomicRootSet::new();
-        rs.add(42);
+        unsafe { rs.add(42) };
         assert_eq!(rs.get(0), 42);
 
-        rs.set(0, 99);
+        unsafe { rs.set(0, 99) };
         assert_eq!(rs.get(0), 99);
     }
 
     #[test]
     fn scan_roots_visits_all_slots() {
         let rs = AtomicRootSet::new();
-        rs.add(10);
-        rs.add(20);
-        rs.add(30);
+        unsafe { rs.add(10) };
+        unsafe { rs.add(20) };
+        unsafe { rs.add(30) };
 
         let mut visited = Vec::new();
         unsafe { rs.scan_roots(&mut |slot_ptr| {
@@ -815,8 +902,8 @@ mod atomic_root_set_tests {
     #[test]
     fn scan_roots_can_update_in_place() {
         let rs = AtomicRootSet::new();
-        rs.add(100);
-        rs.add(200);
+        unsafe { rs.add(100) };
+        unsafe { rs.add(200) };
 
         // Simulate GC forwarding: double every root value
         unsafe { rs.scan_roots(&mut |slot_ptr| {
@@ -832,7 +919,7 @@ mod atomic_root_set_tests {
     fn many_adds_trigger_reallocation() {
         let rs = AtomicRootSet::new();
         for i in 0..1000u64 {
-            rs.add(i * 7);
+            unsafe { rs.add(i * 7) };
         }
         assert_eq!(rs.len(), 1000);
         for i in 0..1000u64 {
@@ -849,7 +936,7 @@ mod atomic_root_set_tests {
         let rs = Arc::new(AtomicRootSet::new());
         let n = 100;
         for i in 0..n {
-            rs.add(i as u64 * 11);
+            unsafe { rs.add(i as u64 * 11) };
         }
 
         let barrier = Arc::new(Barrier::new(8));
@@ -881,7 +968,7 @@ mod atomic_root_set_tests {
         let rs = Arc::new(AtomicRootSet::new());
         let n = 64;
         for i in 0..n {
-            rs.add(i as u64);
+            unsafe { rs.add(i as u64) };
         }
 
         let barrier = Arc::new(Barrier::new(5));
@@ -896,7 +983,7 @@ mod atomic_root_set_tests {
                 barrier.wait();
                 for round in 1u64..=50_000 {
                     for i in 0..n {
-                        rs.set(i, round * 1000 + i as u64);
+                        unsafe { rs.set(i, round * 1000 + i as u64) };
                     }
                 }
                 done.store(true, Ordering::Release);
@@ -952,7 +1039,7 @@ mod atomic_root_set_tests {
 
         // Init phase: add a bunch of roots
         for i in 0..500u64 {
-            rs.add(i * 3 + 7);
+            unsafe { rs.add(i * 3 + 7) };
         }
 
         // Read phase: many threads verify all values
@@ -986,7 +1073,7 @@ mod atomic_root_set_tests {
         let rs = Arc::new(AtomicRootSet::new());
         let n = 32;
         for i in 0..n {
-            rs.add(i as u64 + 1); // values 1..=32
+            unsafe { rs.add(i as u64 + 1) }; // values 1..=32
         }
 
         let barrier = Arc::new(Barrier::new(5));
@@ -1054,7 +1141,7 @@ mod atomic_root_set_tests {
         let rs = Arc::new(AtomicRootSet::new());
         let n = 2048;
         for i in 0..n {
-            rs.add(i as u64);
+            unsafe { rs.add(i as u64) };
         }
 
         let barrier = Arc::new(Barrier::new(16));
@@ -1070,7 +1157,7 @@ mod atomic_root_set_tests {
                     for _ in 0..10_000 {
                         for i in start..end {
                             let val = rs.get(i);
-                            rs.set(i, val.wrapping_add(1));
+                            unsafe { rs.set(i, val.wrapping_add(1)); }
                         }
                     }
                 })
@@ -1101,19 +1188,19 @@ mod atomic_root_set_tests {
         // interleaved with get()/set() on existing indices.
         let rs = AtomicRootSet::new();
 
-        let i0 = rs.add(10);
+        let i0 = unsafe { rs.add(10) };
         assert_eq!(rs.get(i0), 10);
-        rs.set(i0, 11);
+        unsafe { rs.set(i0, 11) };
         assert_eq!(rs.get(i0), 11);
 
-        let i1 = rs.add(20);
+        let i1 = unsafe { rs.add(20) };
         // Old slot still accessible after growth
         assert_eq!(rs.get(i0), 11);
         assert_eq!(rs.get(i1), 20);
 
         // Add many more to force reallocation
         for i in 0..100 {
-            rs.add(i * 5);
+            unsafe { rs.add(i * 5) };
         }
         // Original slots still correct
         assert_eq!(rs.get(i0), 11);
@@ -1135,9 +1222,9 @@ mod rooted_tests {
     fn rooted_get_set_round_trip() {
         let chain = FrameChain::new();
         let scope = RootScope::new(&chain, 4);
-        let r: Rooted<'_, TestVal> = scope.root(0xDEAD_BEEF);
+        let r: Rooted<'_, TestVal> = unsafe { scope.root(0xDEAD_BEEF) };
         assert_eq!(r.get(), 0xDEAD_BEEF);
-        r.set(0x1234);
+        unsafe { r.set(0x1234) };
         assert_eq!(r.get(), 0x1234);
     }
 
@@ -1148,7 +1235,7 @@ mod rooted_tests {
         // Rooted safe across moving collections.
         let chain = FrameChain::new();
         let scope = RootScope::new(&chain, 1);
-        let r: Rooted<'_, TestVal> = scope.root(0xAAAA);
+        let r: Rooted<'_, TestVal> = unsafe { scope.root(0xAAAA) };
         assert_eq!(r.get(), 0xAAAA);
 
         // Simulate a moving GC: walk the chain via scan_roots, rewrite
@@ -1179,12 +1266,12 @@ mod rooted_tests {
         let chain = FrameChain::new();
         let outer = RootScope::new(&chain, 2);
         assert_eq!(chain.depth(), 1);
-        let outer_r: Rooted<'_, TestVal> = outer.root(1);
+        let outer_r: Rooted<'_, TestVal> = unsafe { outer.root(1) };
 
         {
             let inner = RootScope::new(&chain, 2);
             assert_eq!(chain.depth(), 2);
-            let inner_r: Rooted<'_, TestVal> = inner.root(2);
+            let inner_r: Rooted<'_, TestVal> = unsafe { inner.root(2) };
             assert_eq!(inner_r.get(), 2);
             assert_eq!(outer_r.get(), 1);
 
@@ -1211,10 +1298,10 @@ mod rooted_tests {
     fn scope_exhaustion_panics() {
         let chain = FrameChain::new();
         let scope = RootScope::new(&chain, 2);
-        let _a: Rooted<'_, TestVal> = scope.root(1);
-        let _b: Rooted<'_, TestVal> = scope.root(2);
+        let _a: Rooted<'_, TestVal> = unsafe { scope.root(1) };
+        let _b: Rooted<'_, TestVal> = unsafe { scope.root(2) };
         // 3rd root exceeds capacity 2.
-        let _c: Rooted<'_, TestVal> = scope.root(3);
+        let _c: Rooted<'_, TestVal> = unsafe { scope.root(3) };
     }
 
     #[test]
@@ -1222,7 +1309,7 @@ mod rooted_tests {
         let chain = FrameChain::new();
         let _g = unsafe { install_chain(&chain) };
         let result = with_scope(2, |scope| {
-            let r: Rooted<'_, TestVal> = scope.root(42);
+            let r: Rooted<'_, TestVal> = unsafe { scope.root(42) };
             r.get()
         });
         assert_eq!(result, 42);
@@ -1244,14 +1331,14 @@ mod rooted_tests {
         let _g1 = unsafe { install_chain(&outer_chain) };
         // outer is active
         with_scope(1, |s| {
-            let _r: Rooted<'_, TestVal> = s.root(10);
+            let _r: Rooted<'_, TestVal> = unsafe { s.root(10) };
             assert_eq!(outer_chain.depth(), 1);
         });
 
         {
             let _g2 = unsafe { install_chain(&inner_chain) };
             with_scope(1, |s| {
-                let _r: Rooted<'_, TestVal> = s.root(20);
+                let _r: Rooted<'_, TestVal> = unsafe { s.root(20) };
                 assert_eq!(inner_chain.depth(), 1);
                 assert_eq!(outer_chain.depth(), 0,
                     "inner install must hide outer chain");
@@ -1260,7 +1347,7 @@ mod rooted_tests {
 
         // After inner guard drops, outer is active again.
         with_scope(1, |s| {
-            let _r: Rooted<'_, TestVal> = s.root(30);
+            let _r: Rooted<'_, TestVal> = unsafe { s.root(30) };
             assert_eq!(outer_chain.depth(), 1);
         });
     }
@@ -1281,11 +1368,11 @@ mod registration_lifetime_tests {
     fn owned_scopes_can_retire_out_of_order_without_dangling_frames() {
         let chain = FrameChain::new();
         let outer = RootScope::new(&chain, 1);
-        let _outer_root = outer.root::<u64>(10);
+        let _outer_root = unsafe { outer.root::<u64>(10) };
         let middle = RootScope::new(&chain, 1);
-        let _middle_root = middle.root::<u64>(20);
+        let _middle_root = unsafe { middle.root::<u64>(20) };
         let inner = RootScope::new(&chain, 1);
-        let _inner_root = inner.root::<u64>(30);
+        let _inner_root = unsafe { inner.root::<u64>(30) };
         drop(middle);
         assert_eq!(values(&chain), vec![30, 10]);
         drop(outer);
@@ -1298,7 +1385,7 @@ mod registration_lifetime_tests {
     fn callback_frame_unregisters_on_unwind() {
         let chain = FrameChain::new();
         let mut frame = RootFrame::<1>::new();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             chain.with_frame(&mut frame, |roots| {
                 roots.slots[0].set(42);
                 assert_eq!(values(&chain), vec![42]);
@@ -1314,12 +1401,12 @@ mod registration_lifetime_tests {
         let outer = FrameChain::new();
         let inner = FrameChain::new();
         with_chain(&outer, || {
-            with_scope(1, |scope| { let _root = scope.root::<u64>(10); assert_eq!(values(&outer), vec![10]); });
+            with_scope(1, |scope| { let _root = unsafe { scope.root::<u64>(10) }; assert_eq!(values(&outer), vec![10]); });
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 with_chain(&inner, || { panic!("exercise installation cleanup"); });
             }));
             assert!(outcome.is_err());
-            with_scope(1, |scope| { let _root = scope.root::<u64>(20); assert_eq!(values(&outer), vec![20]); });
+            with_scope(1, |scope| { let _root = unsafe { scope.root::<u64>(20) }; assert_eq!(values(&outer), vec![20]); });
         });
         assert!(ACTIVE_CHAIN.with(|active| active.get().is_null()));
     }

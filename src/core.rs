@@ -65,7 +65,7 @@ pub type LocalId = u32;
 // Heap object layout → gc::TypeInfo
 // ============================================================================
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Layout {
     /// Number of leading 8-byte GC pointer slots (traced). Must come first.
     pub ptr_fields: u16,
@@ -98,8 +98,10 @@ pub struct Layout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum VarLen { None, Values, Bytes }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
 pub enum FieldLoc {
+    /// A source field with zero-size unit representation. No address or storage.
+    Unit,
     /// A GC pointer slot at pointer-index `idx` (byte offset = header + idx*8).
     Ptr { idx: u16 },
     /// A raw scalar at byte `offset` within the raw section.
@@ -117,7 +119,7 @@ pub enum FieldLoc {
 // Inline value aggregates (unboxed)
 // ============================================================================
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ValueLayout {
     pub name: String,
     /// `None` for a value struct; `Some` for a value enum (tagged union).
@@ -131,10 +133,12 @@ pub struct ValueLayout {
     pub align: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ValueVariant {
     pub name: String,
     pub fields: Vec<Repr>,
+    /// Source names (or positional indices) retained for reflection.
+    pub field_names: Vec<String>,
 }
 
 /// The number of leading GC-pointer slots a flattened value enum reserves —
@@ -145,25 +149,51 @@ pub struct ValueVariant {
 /// and GC interior-pointer offsets. `0` means no ref payloads (the value enum
 /// keeps its compact `{ tag, raw }` form).
 pub fn value_enum_max_ptrs(variants: &[ValueVariant], values: &[ValueLayout]) -> u16 {
-    fn count(repr: &Repr, values: &[ValueLayout]) -> u16 {
+    checked_value_enum_max_ptrs(variants, values)
+        .expect("value enum reference count must be validated during layout construction")
+}
+
+/// Count references without wrapping. Layout construction uses this fallible
+/// entry point before publishing a shape; codegen consumes validated layouts.
+pub fn checked_value_enum_max_ptrs(variants: &[ValueVariant], values: &[ValueLayout]) -> Option<u16> {
+    fn count(repr: &Repr, values: &[ValueLayout]) -> Option<u16> {
         match repr {
-            Repr::Ref(_) => 1,
+            Repr::Ref(_) => Some(1),
             Repr::Value(id) => {
                 let value = &values[*id as usize];
-                if let Some(variants) = &value.variants { value_enum_max_ptrs(variants, values) }
-                else { value.fields.iter().map(|field| count(field, values)).sum() }
+                match &value.variants {
+                    Some(variants) => checked_value_enum_max_ptrs(variants, values),
+                    None => fields(&value.fields, values),
+                }
             }
-            _ => 0,
+            _ => Some(0),
         }
     }
-    variants.iter().map(|variant| variant.fields.iter().map(|field| count(field, values)).sum()).max().unwrap_or(0)
+    fn fields(reprs: &[Repr], values: &[ValueLayout]) -> Option<u16> {
+        reprs.iter().try_fold(0u16, |total, repr| total.checked_add(count(repr, values)?))
+    }
+    variants.iter().try_fold(0u16, |maximum, variant| Some(maximum.max(fields(&variant.fields, values)?)))
+}
+
+#[cfg(test)]
+mod value_enum_count_tests {
+    use super::*;
+    #[test]
+    fn checked_enum_reference_count_preserves_boundary_and_rejects_direct_or_nested_overflow() {
+        let variant = |fields| ValueVariant { name: "All".into(), fields, field_names: vec![] };
+        assert_eq!(checked_value_enum_max_ptrs(&[], &[]), Some(0));
+        assert_eq!(checked_value_enum_max_ptrs(&[variant(vec![Repr::Ref(0); 65535])], &[]), Some(65535));
+        assert_eq!(checked_value_enum_max_ptrs(&[variant(vec![Repr::Ref(0); 65536])], &[]), None);
+        let value = ValueLayout { name: "Nested".into(), variants: None, fields: vec![Repr::Ref(0); 65535], field_names: vec![], size: 65535 * 8, align: 8 };
+        assert_eq!(checked_value_enum_max_ptrs(&[variant(vec![Repr::Value(0), Repr::Ref(0)])], &[value]), None);
+    }
 }
 
 // ============================================================================
 // Program / functions
 // ============================================================================
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct CoreProgram {
     pub funcs: Vec<CoreFn>,
     /// Index = `type_id` in the runtime type table.
@@ -184,13 +214,13 @@ pub struct CoreProgram {
 }
 
 /// One source in the [`CoreProgram`] SourceMap: its display path + full text.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct SourceEntry {
     pub path: String,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CoreFn {
     /// Mangled, globally-unique name.
     pub name: String,
@@ -217,6 +247,9 @@ pub struct CoreFn {
     /// locals are initialized by loading the corresponding field from `env`.
     /// Empty for ordinary functions.
     pub closure_captures: Vec<ClosureCapture>,
+    /// Closure calling convention, including an environment argument even when
+    /// there are no captures. Never inferred from a source function name.
+    pub is_closure: bool,
     /// `true` for a foreign `extern "C"` function. Such a function has no body
     /// (`body` is empty and must not be defined), takes no leading `Thread*`,
     /// and `name` is the unmangled C symbol resolved at link/JIT time. Calls to
@@ -231,7 +264,7 @@ pub struct CoreFn {
 }
 
 /// How to initialize one capture local from the closure env object.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
 pub struct ClosureCapture {
     /// The local slot (in `CoreFn.locals`) this capture initializes.
     pub local: LocalId,
@@ -240,13 +273,13 @@ pub struct ClosureCapture {
     pub offset: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CoreBlock {
     pub stmts: Vec<CoreStmt>,
     pub tail: Option<CoreExpr>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum CoreStmt {
     Let(LocalId, CoreExpr),
     Expr(CoreExpr),
@@ -266,7 +299,7 @@ pub type SpanId = u32;
 /// Sentinel `SpanId` meaning "no source location attached".
 pub const NO_SPAN: SpanId = 0;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CoreExpr {
     pub kind: Box<CoreExprKind>,
     pub repr: Repr,
@@ -276,7 +309,7 @@ pub struct CoreExpr {
     pub span: SpanId,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum CoreExprKind {
     ConstInt(u64, ScalarRepr),
     ConstFloat(f64, ScalarRepr),
@@ -340,11 +373,11 @@ pub enum CoreExprKind {
     /// metadata table, allocated as a heap String (`layout` is the String
     /// layout). `obj` must be a `Ref` value. Reflection primitive.
     TypeNameOf { layout: LayoutId, obj: Box<CoreExpr> },
-    /// FFI `as_c_bytes(x)` → a `RawPtr` (`Scalar(Ptr)`) to a stack-resident copy
+    /// FFI `as_c_bytes(x)` → a `RawPtr` (`Scalar(Ptr)`) to a native heap copy
     /// of a `String`'s or scalar `Array`'s contents. Codegen copies the heap
-    /// bytes into a fresh stack alloca for the duration of the enclosing extern
+    /// bytes into a scoped native allocation for the duration of the enclosing extern
     /// call (the only place this node may appear). Because the copy lives on the
-    /// non-moving native stack, the pointer is stable across the call with no
+    /// non-moving native storage, the pointer is stable across the call with no
     /// pinning. See `docs/ffi.md`.
     ///
     /// * `src` is the `Ref` to the String/Array object.
@@ -353,7 +386,7 @@ pub enum CoreExprKind {
     /// * `is_string` adds a trailing NUL (C-string convention) and sizes the
     ///   buffer from the String's byte count.
     /// * `copy_out` (a `mut` array argument) means: after the enclosing extern
-    ///   call returns, copy the stack buffer back into the heap object, so writes
+    ///   call returns, copy the native buffer back into the heap object, so writes
     ///   the C function made are visible to the caller (e.g. `read(fd, buf, n)`).
     AsCBytes { src: Box<CoreExpr>, elem: ScalarRepr, is_string: bool, copy_out: bool },
 
@@ -375,7 +408,7 @@ pub enum CoreExprKind {
     /// indexing. (`array_get` the function returns `Option<T>` instead.) Repr is
     /// the element repr.
     ArrayGetChecked { array: Box<CoreExpr>, index: Box<CoreExpr>, elem: Repr },
-    /// Write `value` to element `index` of an array. Yields i64 0.
+    /// Write `value` to element `index` of an array. Yields unit.
     ArraySet { array: Box<CoreExpr>, index: Box<CoreExpr>, value: Box<CoreExpr>, elem: Repr },
     /// Numeric conversion: trunc / sext / zext / fp<->int / fp resize.
     Cast { value: Box<CoreExpr>, from: Repr, to: Repr },
@@ -448,7 +481,7 @@ pub enum CoreExprKind {
 
     /// Field access by resolved location.
     Field { base: Box<CoreExpr>, loc: FieldLoc },
-    /// Store `value` into a reference object's field. Yields i64 0. (Only
+    /// Store `value` into a reference object's field. Yields unit. (Only
     /// reference-struct fields; value structs are immutable SSA aggregates.)
     SetField { base: Box<CoreExpr>, loc: FieldLoc, value: Box<CoreExpr> },
 
@@ -472,7 +505,7 @@ pub enum CoreExprKind {
     Assign { local: LocalId, value: Box<CoreExpr> },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CoreArm {
     /// Variant tag this arm matches.
     pub tag: u32,

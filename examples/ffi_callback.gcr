@@ -5,14 +5,14 @@
 // C invoked it with no `Thread*`. See docs/ffi.md.
 
 // qsort sorts `n` elements of `size` bytes at `base`, ordering by `compar`.
-// `mut base` → the sorted stack buffer is copied back into the caller's array.
+// `mut base` → the sorted native buffer is copied back into the caller's array.
 extern "C" fn qsort(mut base: RawPtr, n: i64, size: i64, compar: extern fn(RawPtr, RawPtr) -> i32);
 
 // Comparator: ascending i64 order. `a`/`b` are pointers into the array C is
 // sorting; ptr_read_i64 reads through them.
 fn cmp(a: RawPtr, b: RawPtr) -> i32 {
-    let x = ptr_read_i64(a);
-    let y = ptr_read_i64(b);
+    let x = (unsafe { ptr_read_i64(a) });
+    let y = (unsafe { ptr_read_i64(b) });
     if x < y { (-1) as i32 } else if x > y { 1i32 } else { 0i32 }
 }
 
@@ -25,7 +25,7 @@ fn main() -> i64 {
     arr[3] = 20;
     arr[4] = 40;
 
-    qsort(as_c_bytes(arr), 5, 8, cmp);
+    (unsafe { qsort(as_c_bytes(arr), 5, 8, cmp) });
 
     // After sorting: [10,20,30,40,50]. Return arr[0]*100 + arr[4] = 1050.
     arr[0] * 100 + arr[4]

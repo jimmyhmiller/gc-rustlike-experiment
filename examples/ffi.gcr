@@ -7,11 +7,11 @@ extern "C" fn abs(x: i32) -> i32;
 
 fn main() -> i64 {
     // sqrt(144.0) = 12.0
-    let r = sqrt(144.0);
+    let r = (unsafe { sqrt(144.0) });
     // pow(2.0, 10.0) = 1024.0
-    let p = pow(2.0, 10.0);
+    let p = (unsafe { pow(2.0, 10.0) });
     // abs(-30) = 30
-    let a = abs((0 - 30) as i32);
+    let a = (unsafe { abs((0 - 30) as i32) });
 
     // 12 + 1024 + 30 = 1066
     (r as i64) + (p as i64) + (a as i64)

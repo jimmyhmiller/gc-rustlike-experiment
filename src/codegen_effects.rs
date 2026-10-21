@@ -5,6 +5,11 @@
 //! extending the IR cannot accidentally omit a required relocation check.
 use crate::core::{CoreBlock, CoreExpr, CoreExprKind, CoreProgram, CoreStmt, FuncId};
 
+pub(crate) fn native_atomic_is_nonrelocating(symbol: &str) -> bool {
+    matches!(symbol, "ai_atomic_i64_load" | "ai_atomic_i64_store" |
+        "ai_atomic_i64_fetch_add" | "ai_atomic_i64_compare_and_set")
+}
+
 pub(crate) fn nonrelocating_functions(program: &CoreProgram) -> Vec<bool> {
     let mut calls = vec![Vec::new(); program.funcs.len()];
     let mut safe: Vec<bool> = program
@@ -74,8 +79,9 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
                 .all(|argument| expression_is_nonrelocating(argument, calls))
         }
         // Array reads (including immutable value boxes) and scalar/reference
-        // writes use inline operations and noncollecting failure/barrier paths.
-        // Inline aggregate construction also cannot park or allocate.
+        // writes use inline operations and noncollecting barriers. Failure
+        // paths may park for diagnostics but never return. Inline aggregate
+        // construction also cannot park or allocate on a returning path.
         ArrayLen(array) | TypeIdOf(array) => expression_is_nonrelocating(array, calls),
         ArrayGet { array, index, .. }
         | ArrayGetUnchecked { array, index, .. }
@@ -93,6 +99,10 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
                 && expression_is_nonrelocating(index, calls)
                 && expression_is_nonrelocating(value, calls)
         }
+        // Stable native scalar atomics neither allocate nor park. Their wrapper
+        // field read and native operation cannot expose a collection safepoint.
+        RuntimeCall { func, args, .. } if native_atomic_is_nonrelocating(func) =>
+            args.iter().all(|arg| expression_is_nonrelocating(arg, calls)),
         Field { base, loc } => {
             !matches!(loc, crate::core::FieldLoc::ValueAt { .. })
                 && expression_is_nonrelocating(base, calls)
@@ -100,7 +110,7 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
         SetField { base, value, loc } => {
             matches!(
                 loc,
-                crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. }
+                crate::core::FieldLoc::Unit | crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. }
             ) && expression_is_nonrelocating(base, calls)
                 && expression_is_nonrelocating(value, calls)
         }
@@ -146,10 +156,24 @@ mod tests {
     }
 
     #[test]
+    fn atomic_operations_are_nonrelocating_but_wrapper_creation_allocates() {
+        let (program, safe) = analyze("
+            fn step(a: AtomicI64) -> i64 {
+                a.store(1); a.compare_and_set(1, 2); a.fetch_add(1); a.load()
+            }
+            fn create() -> AtomicI64 { AtomicI64::new(0) }
+            fn main() -> i64 { step(create()) }
+        ");
+        assert!(effect(&program, &safe, "step"));
+        assert!(!effect(&program, &safe, "create"));
+        assert!(!effect(&program, &safe, "main"));
+    }
+
+    #[test]
     fn polling_allocating_foreign_and_transitive_calls_are_effectful() {
         let source = "
             extern \"C\" fn unknown() -> i64;
-            fn foreign() -> i64 { unknown() }
+            fn foreign() -> i64 { unsafe { unknown() } }
             fn allocate() -> i64 { let a: Array<i64> = array_new(1); array_len(a) }
             fn polling() -> i64 { let mut i = 0; while i < 4 { i = i+1; } i }
             fn transit() -> i64 { polling() }
@@ -193,7 +217,7 @@ mod tests {
         for name in ["snapshot", "write_values", "main"] {
             assert!(!effect(&program, &safe, name), "{name}");
         }
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 20);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 20);
     }
 
     #[test]
@@ -265,7 +289,7 @@ mod tests {
             let f = program.funcs.iter().find(|f| f.name == name).unwrap();
             assert_eq!(body_nonrelocating(&f.body, &safe, &loops), expected, "{name}");
         }
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 13);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 13);
     }
 
     #[test]
@@ -298,7 +322,7 @@ mod tests {
                 .to_string();
             assert_eq!(ir.contains("roots.active"), deferred, "{ir}");
         }
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 766);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 766);
     }
 
     fn analyze(source: &str) -> (CoreProgram, Vec<bool>) {
@@ -364,7 +388,7 @@ pub(crate) fn body_nonrelocating(
                     && expression_safe(base, callees, loops)
             }
             SetField { base, value, loc } => {
-                matches!(loc, crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. })
+                matches!(loc, crate::core::FieldLoc::Unit | crate::core::FieldLoc::Ptr { .. } | crate::core::FieldLoc::Raw { .. })
                     && expression_safe(base, callees, loops)
                     && expression_safe(value, callees, loops)
             }

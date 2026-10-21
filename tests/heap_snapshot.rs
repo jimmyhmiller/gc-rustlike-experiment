@@ -52,3 +52,75 @@ fn main() -> i64 {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+mod support;
+
+#[test]
+fn heap_snapshot_renders_compiled_inline_enum_variants_and_payloads() {
+    let root = std::env::temp_dir().join(format!("gcr-inline-enum-snapshot-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.gcr");
+    std::fs::write(&source, r#"
+        struct Node { n: i64 }
+        #[value] struct Pair { left: Node, right: Node, n: i64 }
+        #[value] enum Nested { Empty, Full(Node), Pair(Pair) }
+        #[value] enum Cell { Empty, Full(Node), Pair(Pair), Nested(Nested), Named { node: Node, n: i64 } }
+        struct Board { c: Cell }
+        enum BoxChoice { Empty, Full(Pair) }
+        fn main() -> i64 {
+            let empty = Board { c: Cell::Empty };
+            let full = Board { c: Cell::Full(Node { n: 42 }) };
+            let paired = Board { c: Cell::Pair(Pair { left: Node { n: 11 }, right: Node { n: 22 }, n: 7 }) };
+            let nested = Board { c: Cell::Nested(Nested::Pair(Pair { left: Node { n: 33 }, right: Node { n: 44 }, n: 9 })) };
+            let boxed = BoxChoice::Full(Pair { left: Node { n: 55 }, right: Node { n: 66 }, n: 13 });
+            let named = Board { c: Cell::Named { node: Node { n: 77 }, n: 5 } };
+            heap_snapshot();
+            let n = match full.c { Cell::Full(node) => node.n, _ => 0 };
+            let p = match paired.c { Cell::Pair(pair) => pair.n, _ => 0 };
+            let q = match nested.c { Cell::Nested(value) => match value { Nested::Pair(pair) => pair.n, _ => 0 }, _ => 0 };
+            let e = match empty.c { Cell::Empty => 0, _ => 1 };
+            let b = match boxed { BoxChoice::Full(pair) => pair.n, _ => 0 };
+            let z = match named.c { Cell::Named { node: point, n: count } => point.n + count, _ => 0 };
+            if n + p + q + e + b + z == 153 { 0 } else { 1 }
+        }
+    "#).unwrap();
+    let binary = root.join("program");
+    let built = support::run_with_timeout(Command::new(env!("CARGO_BIN_EXE_gcr"))
+        .arg("build").arg(&source).arg("-o").arg(&binary)
+        .env("GCRUST_RUNTIME_LIB", support::runtime_staticlib()), 60);
+    assert!(built.status.success(), "{built:?}");
+    for (mode, native, stress) in [("jit-normal", false, false), ("jit-stress", false, true),
+                                  ("native-normal", true, false), ("native-stress", true, true)] {
+        let directory = root.join(mode);
+        std::fs::create_dir(&directory).unwrap();
+        let mut command = if native { Command::new(&binary) } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
+            command.args(["run", source.to_str().unwrap(), "--jit"]);
+            if stress { command.arg("--gc-stress"); }
+            command
+        };
+        command.env("GCR_HEAP_SNAPSHOT_DIR", &directory).env("GCR_GC_VERIFY", "1").env_remove("GCR_GC_STRESS");
+        if native && stress { command.env("GCR_GC_STRESS", "1"); }
+        let output = support::run_with_timeout(&mut command, 60);
+        assert!(output.status.success(), "stress={stress}: {output:?}");
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("snapshot-0000.json")).unwrap()).unwrap();
+        let objects = snapshot["objects"].as_array().unwrap();
+        let node = objects.iter().find(|object| object["render"] == "Node { n: 42 }").unwrap();
+        let expected = format!("Board {{ c: Cell::Full(#{}) }}", node["id"].as_u64().unwrap());
+        assert!(objects.iter().any(|object| object["render"] == expected), "{snapshot}");
+        assert!(objects.iter().any(|object| object["render"] == "Board { c: Cell::Empty }"), "{snapshot}");
+        let node_id = |n| objects.iter().find(|object| object["render"] == format!("Node {{ n: {n} }}")).unwrap()["id"].as_u64().unwrap();
+        let pair = format!("Board {{ c: Cell::Pair(Pair {{ left: #{}, right: #{}, n: 7 }}) }}", node_id(11), node_id(22));
+        let nested = format!("Board {{ c: Cell::Nested(Nested::Pair(Pair {{ left: #{}, right: #{}, n: 9 }})) }}", node_id(33), node_id(44));
+        let boxed = format!("BoxChoice::Full(Pair {{ left: #{}, right: #{}, n: 13 }})", node_id(55), node_id(66));
+        assert!(objects.iter().any(|object| object["render"] == pair), "mode={mode}: {snapshot}");
+        assert!(objects.iter().any(|object| object["render"] == nested), "mode={mode}: {snapshot}");
+        assert!(objects.iter().any(|object| object["render"] == boxed), "mode={mode}: {snapshot}");
+        let named = format!("Board {{ c: Cell::Named(node: #{}, n: 5) }}", node_id(77));
+        assert!(objects.iter().any(|object| object["render"] == named), "mode={mode}: {snapshot}");
+        assert_eq!(snapshot["summary"]["reachable_objects"], 14, "mode={mode}: {snapshot}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

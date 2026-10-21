@@ -58,14 +58,15 @@ pub fn layouts_view(prog: &CoreProgram) -> Value {
 /// heap-exploration tooling and in-language reflection can recover nominal
 /// type/field information the GC type table omits. One entry per `type_id`,
 /// built from each layout's [`crate::core::Layout::meta`].
-pub fn reflect_view(prog: &CoreProgram) -> Value {
+pub fn reflect_view(prog: &CoreProgram) -> Result<Value, crate::codegen::CodegenError> {
     use crate::gc::{FieldMeta, FieldTy, TypeKind, TypeMeta};
 
     fn field_json(f: &FieldMeta) -> Value {
-        let ty = match f.ty {
+        let ty = match &f.ty {
             FieldTy::Ref(tid) => json!({ "kind": "ref", "type_id": tid }),
             FieldTy::Scalar(s) => json!({ "kind": "scalar", "scalar": s.as_str() }),
             FieldTy::Value(vid) => json!({ "kind": "value", "value_id": vid }),
+            FieldTy::ProjectedValue { value_id, reference_offsets } => json!({ "kind": "projected_value", "value_id": value_id, "reference_offsets": reference_offsets }),
         };
         json!({ "name": f.name, "offset": f.offset, "ty": ty })
     }
@@ -106,7 +107,7 @@ pub fn reflect_view(prog: &CoreProgram) -> Value {
     // Value-aggregate table (inline `#[value]` structs/enums), with the same
     // per-entry shape, computed by the codegen bridge so it matches exactly what
     // the runtime installs.
-    let value_metas = crate::codegen::layouts_to_value_meta(prog);
+    let value_metas = crate::codegen::layouts_to_value_meta(prog)?;
     let values: Vec<Value> = value_metas
         .iter()
         .map(|m| {
@@ -114,12 +115,12 @@ pub fn reflect_view(prog: &CoreProgram) -> Value {
             meta_json(m.value_id as usize, &v)
         })
         .collect();
-    json!({
+    Ok(json!({
         "type_count": prog.layouts.len(),
         "types": types,
         "value_count": value_metas.len(),
         "values": values,
-    })
+    }))
 }
 
 /// The `mono` stage: the monomorphization table. Every monomorphic function

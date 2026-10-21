@@ -289,7 +289,7 @@ fn main() -> ExitCode {
                     program_args.extend(raw_args[separator + 1..].iter().cloned());
                 }
                 let mode = if stress { gcrust::codegen::GcRunMode::Stress } else { gcrust::codegen::GcRunMode::Generational };
-                let result = gcrust::codegen::jit_run_i64_with_args(&prog, mode, program_args);
+                let result = unsafe { gcrust::codegen::jit_run_i64_with_args(&prog, mode, program_args) };
                 match result {
                     Ok(v) => {
                         if manifest.is_some() { return ExitCode::from(v as u8); }
@@ -590,7 +590,10 @@ fn run_emit(args: &[String]) -> ExitCode {
             let out = match stage {
                 "core" => gcrust::emit::pretty(&prog),
                 "layout" => gcrust::emit::pretty(&gcrust::emit::layouts_view(&prog)),
-                "reflect" => gcrust::emit::pretty(&gcrust::emit::reflect_view(&prog)),
+                "reflect" => match gcrust::emit::reflect_view(&prog) {
+                    Ok(view) => gcrust::emit::pretty(&view),
+                    Err(error) => { eprintln!("gcr: reflection metadata error: {}", error.0); return ExitCode::FAILURE; }
+                },
                 "mono" => gcrust::emit::pretty(&gcrust::emit::mono_table(&prog)),
                 _ => unreachable!(),
             };
@@ -699,9 +702,16 @@ fn run_bench(args: &[String]) -> ExitCode {
         {"key": "gc_major", "label": "major GCs", "unit": "", "lower_better": true},
         {"key": "gc_pause_max_ms", "label": "max GC pause", "unit": "ms", "lower_better": true},
         {"key": "gc_pause_total_ms", "label": "total GC pause", "unit": "ms", "lower_better": true},
+        {"key": "gc_elapsed_total_ms", "label": "total GC elapsed", "unit": "ms", "lower_better": true},
+        {"key": "gc_pause_p50_ms", "label": "GC pause p50 upper estimate", "unit": "ms", "lower_better": true},
+        {"key": "gc_pause_p99_ms", "label": "GC pause p99 upper estimate", "unit": "ms", "lower_better": true},
+        {"key": "gc_pause_quantile_error_ratio", "label": "GC quantile relative error bound", "unit": "", "lower_better": true},
         {"key": "alloc_objects", "label": "allocations", "unit": "", "lower_better": true},
         {"key": "alloc_bytes", "label": "alloc churn", "unit": "B", "lower_better": true},
-        {"key": "peak_heap_bytes", "label": "peak heap", "unit": "B", "lower_better": true}
+        {"key": "peak_heap_bytes", "label": "sampled heap peak", "unit": "B", "lower_better": true},
+        {"key": "native_buffer_bytes", "label": "retained native buffers", "unit": "B", "lower_better": true},
+        {"key": "native_buffer_peak_bytes", "label": "accounted native buffer peak", "unit": "B", "lower_better": true},
+        {"key": "native_pressure_collections", "label": "native-pressure GCs", "unit": "", "lower_better": true}
     ]);
 
     let mut groups: Vec<Value> = Vec::new();
@@ -785,7 +795,7 @@ fn run_bench(args: &[String]) -> ExitCode {
                 if output.status.code().is_none() { return Err(format!("metrics run terminated with {}: {}", output.status, String::from_utf8_lossy(&output.stderr))); }
                 let bytes = std::fs::read(&mfile).map_err(|e| format!("metrics capture failed: {e}"))?;
                 let metrics: Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid runtime metrics: {e}"))?;
-                for key in ["gc_minor", "gc_major", "gc_pause_max_ms", "gc_pause_total_ms", "alloc_objects", "alloc_bytes", "peak_heap_bytes"] {
+                for key in ["gc_minor", "gc_major", "gc_pause_max_ms", "gc_pause_total_ms", "gc_elapsed_total_ms", "gc_pause_p50_ms", "gc_pause_p99_ms", "gc_pause_quantile_error_ratio", "alloc_objects", "alloc_bytes", "peak_heap_bytes", "native_buffer_bytes", "native_buffer_peak_bytes", "native_pressure_collections"] {
                     if !metrics[key].is_number() { return Err(format!("missing numeric runtime metric `{key}`")); }
                 }
                 Ok(metrics)
@@ -809,9 +819,16 @@ fn run_bench(args: &[String]) -> ExitCode {
                 "gc_major": mv("gc_major"),
                 "gc_pause_max_ms": mv("gc_pause_max_ms"),
                 "gc_pause_total_ms": mv("gc_pause_total_ms"),
+                "gc_elapsed_total_ms": mv("gc_elapsed_total_ms"),
+                "gc_pause_p50_ms": mv("gc_pause_p50_ms"),
+                "gc_pause_p99_ms": mv("gc_pause_p99_ms"),
+                "gc_pause_quantile_error_ratio": mv("gc_pause_quantile_error_ratio"),
                 "alloc_objects": mv("alloc_objects"),
                 "alloc_bytes": mv("alloc_bytes"),
-                "peak_heap_bytes": mv("peak_heap_bytes")
+                "peak_heap_bytes": mv("peak_heap_bytes"),
+                "native_buffer_bytes": mv("native_buffer_bytes"),
+                "native_buffer_peak_bytes": mv("native_buffer_peak_bytes"),
+                "native_pressure_collections": mv("native_pressure_collections")
             });
             let label = variant_label(&env_name, variant);
             series.push(json!({"label": label, "values": values}));
@@ -1180,7 +1197,7 @@ fn compile_and_run(src: &str, stress: bool) -> Result<i64, (String, String)> {
         return Err(("typecheck".into(), msg));
     }
     let prog = lower_program(&resolved.globals).map_err(|e| ("lower".into(), e.msg))?;
-    let res = if stress { jit_run_i64_gc(&prog, true) } else { jit_run_i64(&prog) };
+    let res = if stress { unsafe { jit_run_i64_gc(&prog, true) } } else { unsafe { jit_run_i64(&prog) } };
     res.map_err(|e| ("codegen".into(), e.0))
 }
 

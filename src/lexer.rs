@@ -63,7 +63,7 @@ pub enum TokKind {
     // punctuation / operators
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Semi, Colon, ColonColon, Arrow, FatArrow, Dot, DotDot, DotDotEq,
-    Question, At, Hash,
+    Question, At, Hash, Dollar,
     Plus, Minus, Star, Slash, Percent,
     Eq, EqEq, Ne, Lt, Le, Gt, Ge,
     AndAnd, OrOr, Not,
@@ -76,7 +76,7 @@ pub enum TokKind {
 pub enum Kw {
     Fn, Let, Mut, Struct, Enum, Impl, Trait, For, In, If, Else, Match,
     While, Loop, Return, Break, Continue, True, False, As, Where, Pub, Mod,
-    Use, Type, Const, Static, SelfValue, SelfType, Extern,
+    Use, Type, Const, Static, SelfValue, SelfType, Extern, Unsafe,
 }
 
 impl Kw {
@@ -94,6 +94,7 @@ impl Kw {
             "static" => Kw::Static, "self" => Kw::SelfValue,
             "Self" => Kw::SelfType,
             "extern" => Kw::Extern,
+            "unsafe" => Kw::Unsafe,
             _ => return None,
         })
     }
@@ -119,7 +120,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
 /// Used by `compile.rs` for the prelude / `mod` files (lexed in their own offset
 /// spaces) so their spans resolve against the right text. `lex` is `source = 0`.
 pub fn lex_with_source(src: &str, source: SourceId) -> Result<Vec<Token>, LexError> {
-    let mut toks = Lexer::new(src).run()?;
+    let mut toks = Lexer::new(src).run().map_err(|mut error| {
+        error.span.source = source;
+        error
+    })?;
     for t in &mut toks {
         t.span.source = source;
     }
@@ -146,8 +150,16 @@ impl<'a> Lexer<'a> {
     }
     fn bump(&mut self) -> u8 {
         let c = self.peek();
-        self.pos += 1;
+        if self.pos < self.src.len() {
+            self.pos += 1;
+        }
         c
+    }
+
+    fn bump_char(&mut self) -> Option<char> {
+        let ch = self.text[self.pos..].chars().next()?;
+        self.pos += ch.len_utf8();
+        Some(ch)
     }
 
     fn err(&self, msg: impl Into<String>, start: usize) -> LexError {
@@ -236,10 +248,16 @@ impl<'a> Lexer<'a> {
             let v = u64::from_str_radix(&raw, radix)
                 .map_err(|_| self.err("integer literal out of range", start))?;
             let suffix = self.lex_num_suffix();
+            if matches!(suffix, NumSuffix::F32 | NumSuffix::F64) {
+                return Err(self.err("non-decimal integer literal cannot have a floating suffix", start));
+            }
             self.push(TokKind::Int(v, suffix), start);
             return Ok(());
         }
 
+        // A number following field access is a tuple index. Its following
+        // dot belongs to the next access, not a fractional component.
+        let tuple_index = self.toks.last().is_some_and(|token| token.kind == TokKind::Dot);
         // Decimal integer or float.
         while self.peek().is_ascii_digit() || self.peek() == b'_' {
             self.pos += 1;
@@ -247,7 +265,7 @@ impl<'a> Lexer<'a> {
         let mut is_float = false;
         // Fractional part: a dot NOT followed by another dot (range) or an
         // ident-start (method/field access like `1.foo`).
-        if self.peek() == b'.' && self.peek2().is_ascii_digit() {
+        if !tuple_index && self.peek() == b'.' && self.peek2().is_ascii_digit() {
             is_float = true;
             self.pos += 1;
             while self.peek().is_ascii_digit() || self.peek() == b'_' {
@@ -255,7 +273,7 @@ impl<'a> Lexer<'a> {
             }
         }
         // Exponent.
-        if matches!(self.peek(), b'e' | b'E') {
+        if !tuple_index && matches!(self.peek(), b'e' | b'E') {
             let save = self.pos;
             self.pos += 1;
             if matches!(self.peek(), b'+' | b'-') {
@@ -276,6 +294,9 @@ impl<'a> Lexer<'a> {
             self.text[start..self.pos].chars().filter(|c| *c != '_').collect();
         let suffix = self.lex_num_suffix();
         let suffix_is_float = matches!(suffix, NumSuffix::F32 | NumSuffix::F64);
+        if is_float && suffix != NumSuffix::None && !suffix_is_float {
+            return Err(self.err("floating literal cannot have an integer suffix", start));
+        }
         if is_float || suffix_is_float {
             let v: f64 = body
                 .parse()
@@ -358,17 +379,20 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_escape(&mut self, start: usize) -> Result<char, LexError> {
-        let e = self.bump();
+        let e = self.bump_char().ok_or_else(|| self.err("unterminated escape", start))?;
         Ok(match e {
-            b'n' => '\n', b't' => '\t', b'r' => '\r', b'0' => '\0',
-            b'\\' => '\\', b'\'' => '\'', b'"' => '"',
-            b'u' => {
-                if self.bump() != b'{' {
+            'n' => '\n', 't' => '\t', 'r' => '\r', '0' => '\0',
+            '\\' => '\\', '\'' => '\'', '"' => '"',
+            'u' => {
+                if self.bump_char() != Some('{') {
                     return Err(self.err("expected `{` in unicode escape", start));
                 }
                 let hs = self.pos;
                 while self.peek() != b'}' && self.pos < self.src.len() {
-                    self.pos += 1;
+                    self.bump_char();
+                }
+                if self.pos == self.src.len() {
+                    return Err(self.err("unterminated unicode escape", start));
                 }
                 let code = u32::from_str_radix(&self.text[hs..self.pos], 16)
                     .map_err(|_| self.err("invalid unicode escape", start))?;
@@ -388,7 +412,7 @@ impl<'a> Lexer<'a> {
             b'{' => TokKind::LBrace, b'}' => TokKind::RBrace,
             b'[' => TokKind::LBracket, b']' => TokKind::RBracket,
             b',' => TokKind::Comma, b';' => TokKind::Semi,
-            b'@' => TokKind::At, b'#' => TokKind::Hash,
+            b'@' => TokKind::At, b'#' => TokKind::Hash, b'$' => TokKind::Dollar,
             b':' => if self.peek() == b':' { two(self, TokKind::ColonColon) } else { TokKind::Colon },
             b'-' => match self.peek() {
                 b'>' => two(self, TokKind::Arrow),
@@ -426,7 +450,13 @@ impl<'a> Lexer<'a> {
                 }
                 _ => TokKind::Dot,
             },
-            _ => return Err(self.err(format!("unexpected character {:?}", c as char), start)),
+            _ => {
+                // Punctuation dispatch is byte-based; diagnostics must consume
+                // the entire scalar, including for unsupported identifiers.
+                self.pos = start;
+                let ch = self.bump_char().expect("punctuation starts before EOF");
+                return Err(self.err(format!("unexpected character {ch:?}"), start));
+            }
         };
         self.push(kind, start);
         Ok(())
@@ -449,6 +479,30 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<TokKind> {
         lex(src).unwrap().into_iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn malformed_unicode_and_truncated_escapes_have_valid_spans() {
+        for src in ["é", "🦀", "\"\\é\"", "'\\🦀'", "\"\\", "'\\", "\"\\u", "\"\\ué", "\"\\u{41", "\"\\u{🦀}"] {
+            let error = lex(src).unwrap_err();
+            let start = error.span.start as usize;
+            let end = error.span.end as usize;
+            assert!(start <= end && end <= src.len(), "{src:?}: {error:?}");
+            assert!(src.is_char_boundary(start) && src.is_char_boundary(end), "{src:?}: {error:?}");
+            let rendered = crate::diag::render("bad.gcr", src, error.span, &error.msg);
+            assert!(rendered.contains("bad.gcr:1:1"), "{rendered}");
+        }
+        assert!(lex("é").unwrap_err().msg.contains('é'));
+        assert!(lex("🦀").unwrap_err().msg.contains('🦀'));
+    }
+
+    #[test]
+    fn lexer_errors_preserve_source_identity() {
+        for src in ["é", "\"\\", "/* unfinished", "18446744073709551616"] {
+            let error = lex_with_source(src, 17).unwrap_err();
+            assert_eq!(error.span.source, 17, "{src:?}");
+        }
+        assert!(lex_with_source("42", 17).unwrap().iter().all(|t| t.span.source == 17));
     }
 
     #[test]
@@ -475,6 +529,20 @@ mod tests {
         assert_eq!(kinds("3.14")[0], TokKind::Float(3.14, NumSuffix::None));
         assert_eq!(kinds("2.5f32")[0], TokKind::Float(2.5, NumSuffix::F32));
         assert_eq!(kinds("1.0e-9")[0], TokKind::Float(1.0e-9, NumSuffix::None));
+    }
+
+    #[test]
+    fn chained_tuple_indices_keep_their_access_dots() {
+        let tokens = kinds("value.0.1 + 2.5");
+        assert_eq!(&tokens[..7], &[
+            TokKind::Ident("value".into()), TokKind::Dot, TokKind::Int(0, NumSuffix::None),
+            TokKind::Dot, TokKind::Int(1, NumSuffix::None), TokKind::Plus,
+            TokKind::Float(2.5, NumSuffix::None),
+        ]);
+        let tokens = kinds("value . /* field */ 0 . 1");
+        assert_eq!(tokens[2], TokKind::Int(0, NumSuffix::None));
+        assert_eq!(tokens[3], TokKind::Dot);
+        assert_eq!(tokens[4], TokKind::Int(1, NumSuffix::None));
     }
 
     #[test]
@@ -508,6 +576,9 @@ mod tests {
         assert_eq!(kinds("'a'")[0], TokKind::Char('a'));
         assert_eq!(kinds(r"'\n'")[0], TokKind::Char('\n'));
         assert_eq!(kinds(r"'\u{41}'")[0], TokKind::Char('A'));
+        assert_eq!(kinds("'🦀'")[0], TokKind::Char('🦀'));
+        assert_eq!(kinds(r"'\u{1F980}'")[0], TokKind::Char('🦀'));
+        assert_eq!(kinds(r#""é界🦀\u{1F980}""#)[0], TokKind::Str("é界🦀🦀".into()));
     }
 
     #[test]

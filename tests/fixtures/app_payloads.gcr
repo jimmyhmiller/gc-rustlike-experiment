@@ -25,7 +25,9 @@ fn main() -> i64 {
     let ref_status = match unit_ref { Ok(value) if true => { let copy = value; 0 }, _ => 15 };
     if ref_status != 0 { return ref_status; }
     let packet = Packet::Data(7,Inline::Record(Label { text:"persist λ",number:42 }),91,Some("tail 🦀"));
-    if field_count(packet) != 2 || field_i64(packet,0) != 7 || field_i64(packet,1) != 91 { return 13; }
+    if field_count(packet) != 4 || field_i64(packet,0) != 7 || field_kind(packet,1) != 5
+        || field_i64(packet,2) != 91 || field_kind(packet,3) != 5 { return 13; }
+    if field_name(packet,1) != "1" || field_name(packet,3) != "3" { return 16; }
     let status = inspect(packet);
     if status != 0 { return status; }
     match packet {

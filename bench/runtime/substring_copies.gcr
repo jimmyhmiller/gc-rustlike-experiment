@@ -1,0 +1,21 @@
+// Native substring control: output hashing is independently checked by driver.
+fn main() -> i64 {
+    let args = process_args().expect("arguments");
+    if args.len() != 3 { return 2; }
+    let seed = if args[2] == "unicode" { "λ中🦀" } else { "aBc123xyz" };
+    let mut body = seed;
+    for _ in 0..14 { body = body + body; }
+    let prefix = "skip-λ/";
+    let source = prefix + body + "/end";
+    let large = args[1] == "large";
+    let length = if large { body.len() } else { seed.len() };
+    let iterations = if large { 1000 } else { 1000000 };
+    let mut checksum = 0;
+    for _ in 0..iterations {
+        let result = str_substring(source, prefix.len(), prefix.len()+length);
+        if result.len() != length { return 3; }
+        checksum += str_hash(result) % 1000003;
+    }
+    print!("{}", checksum);
+    0
+}

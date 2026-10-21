@@ -1,0 +1,73 @@
+name: GC validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gc-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: core
+            runner: macos-15
+          - suite: tsan
+            runner: macos-15
+          - suite: big-endian
+            runner: ubuntu-24.04
+          - suite: soak
+            runner: macos-15
+          - suite: linux
+            runner: ubuntu-24.04
+          - suite: linux-tsan
+            runner: ubuntu-24.04
+          - suite: linux-miri
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: 1.96.0
+      GCR_TSAN_TOOLCHAIN: nightly-2026-03-12
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Install LLVM 21
+        if: matrix.suite == 'core' || matrix.suite == 'tsan'
+        run: |
+          brew install llvm@21
+          echo "LLVM_SYS_211_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+      - name: Install sanitizer toolchain
+        if: matrix.suite == 'tsan'
+        run: rustup toolchain install "$GCR_TSAN_TOOLCHAIN" --profile minimal --component rust-src
+      - name: Install Linux sanitizer toolchain
+        if: matrix.suite == 'linux-tsan'
+        run: rustup toolchain install nightly-2026-06-24 --profile minimal --component rust-src
+      - name: Install Linux Miri toolchain
+        if: matrix.suite == 'linux-miri'
+        run: rustup toolchain install nightly-2026-06-24 --profile minimal --component rust-src --component miri
+      - name: Validate
+        run: >-
+          python3 scripts/check_gc_release.py
+          --suite "${{ matrix.suite }}"
+          --output "target/gc-validation/ci-${{ matrix.suite }}"
+          --tsan-toolchain "$GCR_TSAN_TOOLCHAIN"
+      - name: Retain validation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gc-validation-${{ matrix.suite }}
+          path: target/gc-validation/ci-${{ matrix.suite }}
+          retention-days: 14
+          if-no-files-found: warn

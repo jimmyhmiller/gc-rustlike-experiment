@@ -36,7 +36,9 @@ impl CardTable {
     /// acquire edge before the collector scans cards and object fields.
     #[inline(always)]
     pub fn mark_dirty(&self, addr: *const u8) {
-        let offset = addr as usize - self.base_addr;
+        let Some(offset) = (addr as usize).checked_sub(self.base_addr) else {
+            return;
+        };
         let card_idx = offset >> CARD_SHIFT;
         if card_idx < self.count {
             self.cards[card_idx / 64].fetch_or(1 << (card_idx % 64), Ordering::Relaxed);
@@ -127,6 +129,10 @@ mod tests {
     fn bitmap_word_boundaries_and_partial_last_word() {
         let base = 0x1000usize;
         let table = CardTable::new(base as *const u8, 130 * 512 - 1);
+        for address in [0, base - 1, base + 130 * 512, usize::MAX] {
+            table.mark_dirty(address as *const u8);
+        }
+        assert_eq!(table.iter_dirty().count(), 0);
         for card in [0, 63, 64, 65, 127, 128, 129, 130] {
             table.mark_dirty((base + card * 512) as *const u8);
         }

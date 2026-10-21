@@ -58,7 +58,7 @@ fn ordered_parallel_map_jit_and_aot_under_gc_stress() {
     let (m, _) = parse_with_prelude(SOURCE).unwrap();
     let r = resolve_module(m).unwrap();
     let p = lower_program(&r.globals).unwrap();
-    assert_eq!(jit_run_i64_gc(&p, true).unwrap(), 11);
+    assert_eq!(unsafe { jit_run_i64_gc(&p, true) }.unwrap(), 11);
     let path = std::env::temp_dir().join(format!("gcr-parallel-{}", std::process::id()));
     let lib = support::runtime_staticlib();
     let source = path.with_extension("gcr");

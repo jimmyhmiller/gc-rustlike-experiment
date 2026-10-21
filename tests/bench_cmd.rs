@@ -32,7 +32,7 @@ fn bench_emits_general_schema_with_all_metrics() {
         .map(|m| m["key"].as_str().unwrap()).collect();
     for want in [
         "wall_ms", "compile_ms", "binary_kb", "gc_minor", "gc_major",
-        "gc_pause_max_ms", "gc_pause_total_ms", "alloc_objects", "alloc_bytes", "peak_heap_bytes",
+        "gc_pause_max_ms", "gc_pause_total_ms", "gc_elapsed_total_ms", "gc_pause_p50_ms", "gc_pause_p99_ms", "gc_pause_quantile_error_ratio", "alloc_objects", "alloc_bytes", "peak_heap_bytes", "native_buffer_bytes", "native_buffer_peak_bytes", "native_pressure_collections",
     ] {
         assert!(keys.contains(&want), "metric {want} missing from {keys:?}");
     }
@@ -50,6 +50,10 @@ fn bench_emits_general_schema_with_all_metrics() {
         "benchmark result: {v}"
     );
     assert!(s["values"]["binary_kb"].as_f64().unwrap() > 0.0);
+    assert!(s["values"]["gc_elapsed_total_ms"].is_number());
+    assert!(s["values"]["gc_pause_p50_ms"].is_number());
+    assert!(s["values"]["gc_pause_p99_ms"].is_number());
+    assert_eq!(s["values"]["gc_pause_quantile_error_ratio"], 0);
 }
 
 #[test]
@@ -206,7 +210,7 @@ fn bench_reports_missing_metrics_without_fabricating_zero_counters() {
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("no_metrics.gcr");
     let json = dir.join("bench.json");
-    std::fs::write(&source,r#"extern "C" fn unsetenv(name:RawPtr)->i32; fn main()->i64 { unsetenv(as_c_bytes("GCR_METRICS_FILE")); 0 }"#).unwrap();
+    std::fs::write(&source,r#"extern "C" fn unsetenv(name:RawPtr)->i32; fn main()->i64 { (unsafe { unsetenv(as_c_bytes("GCR_METRICS_FILE")) }); 0 }"#).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
     command
         .arg("bench")
@@ -230,4 +234,14 @@ fn bench_reports_missing_metrics_without_fabricating_zero_counters() {
     );
     assert!(series["values"].get("alloc_objects").is_none());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn bench_reports_native_buffer_pressure() {
+    let result = bench("native-pressure", include_str!("fixtures/native_pressure.gcr"));
+    let values = &result["groups"][0]["series"][0]["values"];
+    assert_eq!(values["native_buffer_bytes"], 0);
+    let peak = values["native_buffer_peak_bytes"].as_u64().unwrap();
+    assert!(peak > 0 && peak <= (1 << 20) + 262144, "{result}");
+    assert!(values["native_pressure_collections"].as_u64().unwrap() > 0, "{result}");
 }

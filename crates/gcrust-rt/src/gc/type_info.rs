@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// Describes the shape of a heap object so the runtime can compute
 /// field offsets, allocation sizes, and GC scan boundaries.
 ///
@@ -20,7 +22,7 @@
 /// │   varlen[0..n]    │  n elements (Values or bytes)
 /// └───────────────────┘
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeInfo {
     /// Numeric type identifier. Stored in the object header for fast type dispatch.
     /// Set by the runtime when registering types (e.g., 0=String, 1=Closure, etc.)
@@ -47,11 +49,10 @@ pub struct TypeInfo {
     /// pointer fields; these cover interior pointers the contiguous-slots model
     /// can't express. Empty for the common case.
     ///
-    /// A `&'static` slice keeps `TypeInfo` `Copy` and const-constructible.
-    /// Dynamically-built type tables (JIT/AOT) leak the slice once at startup;
-    /// the type table lives for the whole program, so this is a bounded one-time
-    /// leak, not a per-object cost.
-    pub interior_ptrs: &'static [u16],
+    /// Static descriptors borrow their offsets. Dynamically built descriptors
+    /// own them, so repeated compilation/execution releases metadata with the
+    /// type table rather than leaking one allocation per shape.
+    pub interior_ptrs: Cow<'static, [u16]>,
 }
 
 /// Whether a heap object has a variable-length tail section.
@@ -83,6 +84,14 @@ impl TypeInfo {
     /// const STR: TypeInfo = TypeInfo::for_header(Compact::SIZE).with_varlen_bytes(0);
     /// ```
     pub const fn for_header(header_size: usize) -> Self {
+        Self::for_header_with_interior_ptrs(header_size, &[])
+    }
+
+    /// Construct a static descriptor with borrowed interior offsets.
+    pub const fn for_header_with_interior_ptrs(
+        header_size: usize,
+        offsets: &'static [u16],
+    ) -> Self {
         assert!(
             header_size >= 8 && header_size % 8 == 0 && header_size <= u16::MAX as usize,
             "header size must be representable whole eight-byte words"
@@ -94,7 +103,7 @@ impl TypeInfo {
             raw_byte_count: 0,
             varlen: VarLenKind::None,
             align_log2: 3, // 8-byte alignment minimum
-            interior_ptrs: &[],
+            interior_ptrs: Cow::Borrowed(offsets),
         }
     }
 
@@ -134,8 +143,14 @@ impl TypeInfo {
 
     /// Set the interior-pointer offsets (GC refs embedded in flattened value
     /// fields). Offsets are absolute from the object start (header included).
-    pub const fn with_interior_ptrs(mut self, offsets: &'static [u16]) -> Self {
-        self.interior_ptrs = offsets;
+    pub fn with_interior_ptrs(mut self, offsets: &'static [u16]) -> Self {
+        self.interior_ptrs = Cow::Borrowed(offsets);
+        self
+    }
+
+    /// Own dynamically generated interior offsets for this descriptor's lifetime.
+    pub fn with_owned_interior_ptrs(mut self, offsets: Vec<u16>) -> Self {
+        self.interior_ptrs = Cow::Owned(offsets);
         self
     }
 
@@ -190,6 +205,14 @@ impl TypeInfo {
         }) {
             return None;
         }
+        self.checked_size_for_valid_layout(varlen_len)
+    }
+
+    /// Checked request geometry after validating immutable descriptor metadata.
+    /// This only computes a size; callers must validate the layout before using
+    /// the result to allocate or scan. Heap does so at table installation.
+    #[inline]
+    pub(crate) fn checked_size_for_valid_layout(&self, varlen_len: usize) -> Option<usize> {
         let raw_end = self
             .raw_data_offset()
             .checked_add(self.raw_byte_count as usize)?;
@@ -246,8 +269,8 @@ mod allocation_boundary_tests {
                             .with_raw_bytes(raw)
                             .with_align_log2(alignment);
                         for info in [
-                            base,
-                            base.with_varlen_bytes(fields),
+                            base.clone(),
+                            base.clone().with_varlen_bytes(fields),
                             base.with_varlen_values(fields),
                         ] {
                             for length in [0, 1, 7, 1001] {
@@ -285,16 +308,18 @@ mod descriptor_contract_tests {
             assert_eq!(
                 TypeInfo {
                     header_size,
-                    ..valid
+                    ..valid.clone()
                 }
                 .checked_allocation_size(0),
                 None
             );
         }
         for offsets in [&[0][..], &[16][..], &[25][..], &[40][..], &[65528][..]] {
-            let offsets = Box::leak(offsets.to_vec().into_boxed_slice());
             assert_eq!(
-                valid.with_interior_ptrs(offsets).checked_allocation_size(0),
+                valid
+                    .clone()
+                    .with_owned_interior_ptrs(offsets.to_vec())
+                    .checked_allocation_size(0),
                 None
             );
         }
@@ -305,5 +330,49 @@ mod descriptor_contract_tests {
             Some(40)
         );
         assert!(std::panic::catch_unwind(|| TypeInfo::for_header(65536 + 16)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod validated_geometry_tests {
+    use super::*;
+    #[test]
+    fn collector_validated_geometry_matches_full_checks_at_tail_boundaries() {
+        for fields in [0, 1, 32] {
+            for raw in [0, 1, 7, 8, 255, 4096] {
+                for kind in [VarLenKind::None, VarLenKind::Bytes, VarLenKind::Values] {
+                    let mut info = TypeInfo::for_header(16)
+                        .with_fields(fields)
+                        .with_raw_bytes(raw);
+                    info.varlen = kind;
+                    if raw >= 8 {
+                        info = info.with_owned_interior_ptrs(vec![(16 + fields * 8)]);
+                    }
+                    for length in [
+                        0,
+                        1,
+                        7,
+                        8,
+                        8192,
+                        isize::MAX as usize / 8,
+                        isize::MAX as usize,
+                        usize::MAX,
+                    ] {
+                        // An independent wide-integer oracle never overflows
+                        // at native usize boundaries before applying the limit.
+                        let raw_end = 16u128 + u128::from(fields) * 8 + u128::from(raw);
+                        let tail = (raw_end + 7) / 8 * 8 + 8;
+                        let wide = match kind {
+                            VarLenKind::None => (raw_end + 7) / 8 * 8,
+                            VarLenKind::Bytes => (tail + length as u128 + 7) / 8 * 8,
+                            VarLenKind::Values => tail + length as u128 * 8,
+                        };
+                        let expected = (wide <= isize::MAX as u128).then_some(wide as usize);
+                        assert_eq!(info.checked_size_for_valid_layout(length), expected);
+                        assert_eq!(info.checked_allocation_size(length), expected);
+                    }
+                }
+            }
+        }
     }
 }

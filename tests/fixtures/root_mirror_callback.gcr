@@ -9,8 +9,8 @@ fn compare(a: RawPtr, b: RawPtr) -> i32 {
         scratch[8191] = i;
         if scratch[8191] != i { panic("callback array corrupted"); }
     }
-    let x = ptr_read_i64(a);
-    let y = ptr_read_i64(b);
+    let x = (unsafe { ptr_read_i64(a) });
+    let y = (unsafe { ptr_read_i64(b) });
     if x < y { -1 as i32 } else if x > y { 1 as i32 } else { 0 as i32 }
 }
 
@@ -19,7 +19,7 @@ fn main() -> i64 {
     let mut values: Array<i64> = Array::new(5);
     values[0] = 30; values[1] = 10; values[2] = 50;
     values[3] = 20; values[4] = 40;
-    qsort(as_c_bytes(values), 5, 8, compare);
+    (unsafe { qsort(as_c_bytes(values), 5, 8, compare) });
     if sentinel.sequence != 42 || !(sentinel.text == "42") { panic("native callback lost caller root"); }
     let checksum = values[0] * 100 + values[4];
     if checksum != 1050 { panic("copy-out used stale array"); }

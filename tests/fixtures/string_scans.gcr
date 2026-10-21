@@ -1,0 +1,29 @@
+// Exercise versioned scans and live caller roots while another mutator allocates.
+struct Sentinel { number: i64, text: String }
+fn digest(s: String) -> i64 { str_hash(s) }
+fn same(a: String, b: String) -> bool { str_eq(a, b) }
+fn main() -> i64 {
+    let mut text = "κλειδί-λ";
+    for _ in 0..13 { text = text + text; }
+    let equal = str_substring(text, 0, text.len());
+    let changed = str_substring(text, 0, text.len()-2) + "μ";
+    let sentinel = Sentinel { number: 42, text: "retained" + "λ" };
+    let worker = Thread::spawn(|| {
+        let mut total = 0;
+        for i in 0..128 {
+            let mut a: Array<i64> = Array::new(4096);
+            a[4095] = i;
+            total += a[4095];
+        }
+        total
+    });
+    for _ in 0..64 {
+        if digest(text) != 4168304961293624101 { return 1; }
+        if !same(text, equal) || same(text, changed) { return 2; }
+        if sentinel.number != 42 || sentinel.text != "retainedλ" { return 3; }
+        if str_get(text, text.len()-1) != 187 { return 4; }
+    }
+    if worker.join() != 8128 { return 5; }
+    print_int(sentinel.number);
+    0
+}

@@ -2,6 +2,8 @@
 //! mirrors avoids retaining garbage through later calls and loop iterations.
 //! Loop headers use a monotone fixed point; break/continue and returns have
 //! their actual successor sets. Every operand kind is handled explicitly.
+//! Only direct reference locals have mirrors cleared by this analysis; scalar
+//! and indirect aggregate locals do not participate in its liveness sets.
 use std::collections::{BTreeSet, HashMap};
 use crate::core::*;
 type Live = BTreeSet<LocalId>;
@@ -15,7 +17,7 @@ impl RootLiveness {
             if function.is_extern { continue; }
             let mut analysis = Analysis {
                 dead: &mut result.dead, loops: Vec::new(), definitions: Live::new(),
-                all: (0..function.locals.len() as LocalId).collect(),
+                all: function.locals.iter().enumerate().filter_map(|(id, repr)| matches!(repr, Repr::Ref(_)).then_some(id as LocalId)).collect(),
             };
             analysis.block(&function.body, Live::new());
         }
@@ -39,7 +41,7 @@ impl Analysis<'_> {
             let surrounding_defs = std::mem::take(&mut self.definitions);
             let expression = match statement {
                 CoreStmt::Let(local, expression) => {
-                    live.remove(local); self.definitions.insert(*local); expression
+                    live.remove(local); if self.all.contains(local) { self.definitions.insert(*local); } expression
                 }
                 CoreStmt::Expr(expression) => expression,
             };
@@ -59,10 +61,10 @@ impl Analysis<'_> {
     fn expr(&mut self, expression: &CoreExpr, mut live: Live) -> Live {
         use CoreExprKind::*;
         match expression.kind.as_ref() {
-            Local(local) => { live.insert(*local); live }
+            Local(local) => { if self.all.contains(local) { live.insert(*local); } live }
             ConstInt(..) | ConstFloat(..) | ConstBool(..) | ConstChar(..) | ConstZero(..)
             | ConstStr(..) | Unit | CallbackPtr(..) | ThreadYield | ThreadCurrentId => live,
-            Assign { local, value } => { self.definitions.insert(*local); live.remove(local); self.expr(value, live) }
+            Assign { local, value } => { if self.all.contains(local) { self.definitions.insert(*local); } live.remove(local); self.expr(value, live) }
             Bin(_, a, b) | StrEq(a, b) | StrGet(a, b) | StrConcat { a, b, .. } => {
                 let live = self.expr(b, live); self.expr(a, live)
             }
@@ -145,6 +147,31 @@ mod tests {
         Analysis { dead: &mut after, loops: Vec::new(), definitions: Live::new(), all: (0..count).collect() }.block(block, Live::new());
         after
     }
+    #[test]
+    fn reference_only_analysis_matches_full_liveness_on_mixed_control_flow() {
+        let scalar = || CoreExpr::new(CoreExprKind::Local(1), Repr::Scalar(ScalarRepr::I64));
+        let loop_body = CoreBlock {
+            stmts: vec![statement(CoreExpr::new(CoreExprKind::If(
+                Box::new(scalar()),
+                Box::new(CoreBlock { stmts: vec![statement(local(0)), statement(CoreExpr::new(CoreExprKind::Break(Some(Box::new(local(2)))), Repr::Unit))], tail: None }),
+                Box::new(CoreBlock { stmts: vec![CoreStmt::Let(3, scalar()), statement(local(2)), statement(CoreExpr::new(CoreExprKind::Continue, Repr::Unit))], tail: None }),
+            ), Repr::Unit))],
+            tail: None,
+        };
+        let block = CoreBlock {
+            stmts: vec![CoreStmt::Let(1, scalar()), statement(CoreExpr::new(CoreExprKind::Loop(Box::new(loop_body)), Repr::Unit)), statement(local(0)), statement(CoreExpr::new(CoreExprKind::Return(Some(Box::new(local(2)))), Repr::Unit))],
+            tail: None,
+        };
+        let expected = analyze(&block, 4);
+        let tracked: Live = [0, 2].into();
+        let mut actual = HashMap::new();
+        Analysis { dead: &mut actual, loops: Vec::new(), definitions: Live::new(), all: tracked.clone() }.block(&block, Live::new());
+        assert_eq!(actual.len(), expected.len());
+        for (statement, live) in expected {
+            assert_eq!(actual[&statement], live.intersection(&tracked).copied().collect());
+        }
+    }
+
     #[test]
     fn last_reads_and_redefinitions_end_root_lifetimes() {
         let block = CoreBlock { stmts: vec![statement(local(0)),

@@ -13,7 +13,7 @@ fn run(src: &str) -> i64 {
     let (module, _) = parse_with_prelude(src).expect("parse");
     let resolved = resolve_module(module).expect("resolve");
     let prog = lower_program(&resolved.globals).expect("lower");
-    jit_run_i64_gc(&prog, true).expect("run")
+    unsafe { jit_run_i64_gc(&prog, true) }.expect("run")
 }
 
 /// The first compile-time error for `src`, from whichever phase reports it.
@@ -150,8 +150,10 @@ fn duplicate_methods_and_unknown_attributes_are_errors() {
         fn main() -> i64 { P { x: 0 }.get() }
     "#);
     assert!(msg.contains("duplicate method `get` on `P`"), "{msg}");
-    let msg = compile_error("#[derive(Clone)]\nstruct P { x: i64 }\nfn main() -> i64 { 0 }");
-    assert!(msg.contains("unknown attribute `#[derive]`"), "{msg}");
+    let msg = compile_error("#[frobnicate]\nstruct P { x: i64 }\nfn main() -> i64 { 0 }");
+    assert!(msg.contains("unknown attribute `#[frobnicate]`"), "{msg}");
+    let msg = compile_error("#[derive(Serialize)]\nstruct P { x: i64 }\nfn main() -> i64 { 0 }");
+    assert!(msg.contains("cannot derive `Serialize`"), "{msg}");
     let msg = compile_error("#[value]\nfn main() -> i64 { 0 }");
     assert!(msg.contains("`#[value]` applies only to a struct or enum"), "{msg}");
 }
@@ -451,7 +453,7 @@ fn format_vec_and_assert_macros() {
     "#);
     assert_eq!(r, 10);
     for (src, want) in [
-        (r#"format!("{:?}", 1)"#, "format spec `{:?}` is not supported"),
+        (r#"format!("{:q}", 1)"#, "invalid format spec `:q`"),
         (r#"format!("{} {}", 1)"#, "uses argument 1 but 1 argument(s) were given"),
         (r#"format!("{}", 1, 2)"#, "format argument 1 is never used"),
         (r#"format!("a } b")"#, "unmatched `}`"),

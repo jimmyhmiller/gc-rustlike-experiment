@@ -11,7 +11,25 @@ fn scalar_atoms_preserve_byte_and_bit_equality_in_jit_and_native() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("gcr.toml"), "[package]\nname = \"atom-types\"\n").unwrap();
     std::fs::write(dir.join("src/main.gcr"), r#"
+        struct Item { value: i64 }
+        extern "C" fn malloc(n: i64) -> RawPtr;
+        extern "C" fn free(p: RawPtr);
         fn main() -> i64 {
+            let first = Item { value: 17 };
+            let equal = Item { value: 17 };
+            let next = Item { value: 23 };
+            let refs: Atom<Item> = Atom::new(first);
+            if refs.compare_and_set(equal, next) { return 11; }
+            if !refs.compare_and_set(first, next) { return 12; }
+            if refs.deref().value != 23 { return 13; }
+            let mut i = 0;
+            while i < 50 {
+                let previous = refs.deref();
+                let replacement = Item { value: previous.value + 1 };
+                if !refs.compare_and_set(previous, replacement) { return 14; }
+                i = i + 1;
+            }
+            if refs.deref().value != 73 { return 15; }
             let flag: Atom<bool> = Atom::new(false);
             let payload: Atom<i64> = Atom::new(0);
             let child = Thread::spawn(|| {
@@ -39,6 +57,12 @@ fn scalar_atoms_preserve_byte_and_bit_equality_in_jit_and_native() {
             let old = f64atom.deref();
             // CAS compares identical NaN bits, unlike floating-point ==.
             if !f64atom.compare_and_set(old, 3.0) || f64atom.deref() != 3.0 { return 10; }
+            let p = unsafe { malloc(8) };
+            let q = unsafe { malloc(8) };
+            let address: Atom<RawPtr> = unsafe { Atom { value: p } };
+            if address.compare_and_set(q, p) { return 16; }
+            if !address.compare_and_set(p, q) || address.deref() != q { return 17; }
+            unsafe { free(p); free(q); }
             0
         }
     "#).unwrap();
@@ -83,8 +107,8 @@ fn scalar_atoms_preserve_byte_and_bit_equality_in_jit_and_native() {
 #[test]
 fn unsupported_atoms_and_wrong_intrinsic_arity_are_frontend_errors() {
     for (source, message) in [
-        ("fn main() -> i64 { atom_load(); 0 }", "takes 1 argument"),
-        ("fn main() -> i64 { atom_cas(); 0 }", "takes 3 argument"),
+        ("fn main() -> i64 { (unsafe { atom_load() }); 0 }", "takes 1 argument"),
+        ("fn main() -> i64 { (unsafe { atom_cas() }); 0 }", "takes 3 argument"),
         (
             "#[value] struct Pair { a: i64, b: i64 } fn main() -> i64 { let a: Atom<Pair> = Atom::new(Pair { a: 1, b: 2 }); a.deref(); 0 }",
             "inline aggregates",
@@ -99,4 +123,51 @@ fn unsupported_atoms_and_wrong_intrinsic_arity_are_frontend_errors() {
         let error = lower_program(&resolved.globals).unwrap_err();
         assert!(error.msg.contains(message), "{}", error.msg);
     }
+}
+
+#[test]
+fn managed_atom_operations_reach_the_scoped_runtime_in_generated_ir() {
+    let (module, _) = parse_with_prelude(r#"
+        struct Item { n: i64 }
+        fn main() -> i64 {
+            let initial = Item { n: 1 };
+            let atom: Atom<Item> = Atom::new(initial);
+            let old = atom.deref();
+            let replacement = Item { n: 2 };
+            if atom.compare_and_set(old, replacement) { 0 } else { 1 }
+        }
+    "#).unwrap();
+    let resolved = resolve_module(module).unwrap();
+    let program = lower_program(&resolved.globals).unwrap();
+    let ir = gcrust::codegen::emit_llvm_ir(&program, false).unwrap();
+    assert!(ir.lines().any(|line| line.contains("call ptr @ai_atom_ref_load(")), "{ir}");
+    assert!(ir.lines().any(|line| line.contains("call i8 @ai_atom_ref_cas(")), "{ir}");
+    assert!(!ir.contains("cmpxchg ptr"), "managed references bypassed identity CAS: {ir}");
+}
+
+#[test]
+fn scalar_atom_ir_uses_matching_width_scoped_calls() {
+    let (module, _) = parse_with_prelude(r#"
+        fn main() -> i64 {
+            let a: Atom<i8> = Atom::new(1 as i8);
+            let b: Atom<i16> = Atom::new(2 as i16);
+            let c: Atom<i32> = Atom::new(3 as i32);
+            let d: Atom<i64> = Atom::new(4);
+            if !a.compare_and_set(a.deref(), 5 as i8) { return 1; }
+            if !b.compare_and_set(b.deref(), 6 as i16) { return 2; }
+            if !c.compare_and_set(c.deref(), 7 as i32) { return 3; }
+            if !d.compare_and_set(d.deref(), 8) { return 4; }
+            0
+        }
+    "#).unwrap();
+    let resolved = resolve_module(module).unwrap();
+    let program = lower_program(&resolved.globals).unwrap();
+    let ir = gcrust::codegen::emit_llvm_ir(&program, false).unwrap();
+    for width in [8, 16, 32, 64] {
+        for operation in ["load", "cas"] {
+            let symbol = format!("@ai_atom_bits{width}_{operation}(");
+            assert!(ir.lines().any(|line| line.contains("call ") && line.contains(&symbol)), "{ir}");
+        }
+    }
+    assert!(!ir.contains("cmpxchg ptr"), "unscoped scalar CAS: {ir}");
 }

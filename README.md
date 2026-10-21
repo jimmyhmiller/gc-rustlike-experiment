@@ -13,7 +13,11 @@ See [verified status](docs/STATUS.md) for results and limitations.
 ## Build and run
 
 The workspace uses Rust edition 2024. `Cargo.toml` selects Inkwell's LLVM 21
-feature; a compatible LLVM installation and a native linker are build inputs.
+feature; LLVM 21.1 and a native linker are build inputs. The build enforces
+this LLVM version because newer opcode enums can be incompatible with the
+bindings. When LLVM 21 is not your default, set `LLVM_SYS_211_PREFIX` to its
+installation directory. For Homebrew, use
+`export LLVM_SYS_211_PREFIX="$(brew --prefix llvm@21)"` before running Cargo.
 This repository does not yet document a tested clean-machine installation.
 
 ```sh
@@ -60,8 +64,11 @@ output file; generated reference-model tests cover native/JIT and moving GC.
 
 ## Documentation
 
+- [Comprehensive production language roadmap](docs/ROADMAP.md)
+- [Working safety contract and audit ledger](docs/SAFETY.md)
 - [Verified state and open defects](docs/STATUS.md)
 - [Production-readiness proposal and acceptance gates](docs/PRODUCTION.md)
+- [Repeatable local and CI validation](docs/release-validation.md)
 - [Implemented language surface](docs/language.md)
 - [Compiler IR and pipeline](docs/core-ir.md)
 - [GC/runtime](docs/gc.md), [threads](docs/threads.md), [FFI](docs/ffi.md)

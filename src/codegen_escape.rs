@@ -130,6 +130,11 @@ impl<'p> Analysis<'p> {
 
     fn external_entry(&mut self, id: usize) {
         let function = &self.program.funcs[id];
+        // Foreign functions have no managed local slots or body. Taking their
+        // address does not create a new managed entry point to analyze.
+        if function.is_extern {
+            return;
+        }
         let start = function.closure_captures.len();
         for (index, repr) in function.params.iter().enumerate() {
             if matches!(repr, Repr::Ref(_) | Repr::Scalar(_)) {
@@ -304,7 +309,7 @@ impl<'p> Analysis<'p> {
                 let owner = self.expression(id, base);
                 match loc {
                     crate::core::FieldLoc::Ptr { .. } => self.load(owner, result),
-                    crate::core::FieldLoc::Raw { .. } => self.unknown(result),
+                    crate::core::FieldLoc::Unit | crate::core::FieldLoc::Raw { .. } => self.unknown(result),
                     _ => {
                         self.escape(owner);
                         self.unknown(result);
@@ -316,7 +321,7 @@ impl<'p> Analysis<'p> {
                 let reference = self.expression(id, value);
                 match loc {
                     crate::core::FieldLoc::Ptr { .. } => self.store(owner, reference),
-                    crate::core::FieldLoc::Raw { .. } => {}
+                    crate::core::FieldLoc::Unit | crate::core::FieldLoc::Raw { .. } => {}
                     _ => {
                         self.escape(owner);
                         self.escape(reference);
@@ -653,7 +658,7 @@ mod tests {
         assert!(!ir.contains("load atomic i64"), "{ir}");
         assert!(!ir.contains("cnt"), "{ir}");
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             20
         );
     }
@@ -667,7 +672,7 @@ mod tests {
             let ir = function_ir(source, "use_array");
             assert!(ir.contains("store atomic i64"), "{ir}");
             assert!(ir.contains("load atomic i64"), "{ir}");
-            assert_eq!(crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(), 4);
+            assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(), 4);
         }
     }
 
@@ -693,12 +698,15 @@ mod tests {
             }
         ";
         let ir = function_ir(source, "update");
-        assert!(
-            !ir.contains("load atomic") && !ir.contains("store atomic"),
-            "{ir}"
-        );
+        assert!(!ir.contains("store atomic"), "{ir}");
+        for line in ir.lines().filter(|line| line.contains("load atomic")) {
+            assert!(line.contains("copy.phase") && line.contains("load atomic i8"),
+                "private data access became atomic: {line}\n{ir}");
+        }
+        assert!(ir.lines().any(|line| line.contains(" = load ") && line.contains("!alias.scope")),
+            "private data access lost its provenance: {ir}");
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             32
         );
     }
@@ -706,17 +714,16 @@ mod tests {
     #[test]
     fn cyclic_containers_escape_their_children_and_late_stores_reach_earlier_reads() {
         let source = "
-            struct Link { next: Link, values: Array<i64> }
+            struct Link { next: Option<Link>, values: Array<i64> }
             fn use_array(mut a: Array<i64>) -> i64 { array_set(a,0,a[0]+1); a[0] }
             fn main() -> i64 {
                 let mut a: Array<i64> = array_new(1);
                 let mut b: Array<i64> = array_new(1);
-                let mut link: Link;
-                link = Link { next: link, values: a };
-                link.next = link;
+                let mut link = Link { next: Option::None, values: a };
+                link.next = Option::Some(link);
                 let earlier = link.values;
                 link.values = b;
-                let closure = || use_array(link.next.values);
+                let closure = || use_array(link.next.unwrap().values);
                 closure()+use_array(earlier)
             }
         ";
@@ -726,7 +733,7 @@ mod tests {
             "{ir}"
         );
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             2
         );
     }
@@ -750,7 +757,7 @@ mod tests {
             "{ir}"
         );
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             8
         );
         let source = "
@@ -774,7 +781,7 @@ mod tests {
             "{ir}"
         );
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             5
         );
     }
@@ -788,7 +795,7 @@ mod tests {
         let ir = function_ir(source, "use_array");
         assert!(ir.contains("cnt"), "{ir}");
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             13
         );
         let source = "fn use_array(mut a: Array<i64>) -> i64 { array_len(a) } fn main() -> i64 { let mut a: Array<i64>; a = array_new(2); use_array(a) }";
@@ -803,7 +810,7 @@ mod tests {
             fn main() -> i64 { count(3)+count(4) }
         ";
         assert_eq!(
-            crate::codegen::jit_run_i64_gc(&program(source), true).unwrap(),
+            unsafe { crate::codegen::jit_run_i64_gc(&program(source), true) }.unwrap(),
             7
         );
     }
@@ -835,7 +842,7 @@ mod alias_tests {
         let program =
             crate::lower::lower_program(&crate::resolve::resolve_module(module).unwrap().globals)
                 .unwrap();
-        assert_eq!(crate::codegen::jit_run_i64_gc(&program, true).unwrap(), 26);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 26);
         let ir = crate::codegen::emit_llvm_ir(&program, true).unwrap();
         assert!(!ir.contains("!invariant.load"));
     }

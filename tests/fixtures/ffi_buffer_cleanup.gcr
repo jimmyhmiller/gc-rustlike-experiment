@@ -1,0 +1,56 @@
+extern "C" fn memcmp(a: RawPtr, b: RawPtr, bytes: i64) -> i32;
+#[value]
+struct Returned { text: String, code: i64 }
+fn direct() -> i64 {
+    let a: Array<u8> = Array::new(65537);
+    (unsafe { memcmp(as_c_bytes(a), as_c_bytes(a), { return 43; 0 }) }) as i64
+}
+fn conditional() -> i64 {
+    let a: Array<u8> = Array::new(65537);
+    (unsafe { memcmp(as_c_bytes(a), as_c_bytes(a), if a.len() == 65537 { return 42; } else { 0 }) }) as i64
+}
+fn exits_loop() -> i64 {
+    let a: Array<u8> = Array::new(65537);
+    let mut i = 0;
+    while i < 10 {
+        i = i + 1;
+        unsafe { memcmp(as_c_bytes(a), as_c_bytes(a), if i < 4 { continue; } else if i == 8 { break; } else { 0 }); }
+    }
+    i
+}
+fn inner_loop() -> i64 {
+    let a: Array<u8> = Array::new(65537);
+    (unsafe { memcmp(as_c_bytes(a), as_c_bytes(a), {
+        let mut i = 0;
+        while i < 3 { i = i + 1; if i < 2 { continue; } break; }
+        65537
+    }) }) as i64
+}
+fn reference() -> String {
+    let a: Array<u8> = Array::new(65537);
+    let result = "still " + "alive";
+    unsafe { memcmp(as_c_bytes(a), as_c_bytes(a), if a.len() == 65537 { return result; } else { 0 }); }
+    "bad"
+}
+fn aggregate() -> Returned {
+    let a: Array<u8> = Array::new(65537);
+    let result = Returned { text: "value " + "alive", code: 42 };
+    unsafe { memcmp(as_c_bytes(a), as_c_bytes(a), if a.len() == 65537 { return result; } else { 0 }); }
+    Returned { text: "bad", code: 0 }
+}
+fn main() -> i64 {
+    let worker = Thread::spawn(|| {
+        let mut sum = 0;
+        for i in 0..256 { let mut a: Array<i64> = Array::new(4096); a[4095] = i; sum = sum + a[4095]; }
+        sum
+    });
+    for _ in 0..16 {
+        if direct() != 43 || conditional() != 42 || exits_loop() != 8 || inner_loop() != 0 { panic("foreign cleanup control flow failed"); }
+        if reference() != "still alive" { panic("return reference lost during cleanup"); }
+        let value = aggregate();
+        if value.text != "value alive" || value.code != 42 { panic("return aggregate lost during cleanup"); }
+    }
+    if worker.join() != 32640 { panic("worker failed"); }
+    print_int(42);
+    0
+}
