@@ -192,20 +192,17 @@ pub fn resolve_module(module: Module) -> Result<Resolved, ResolveError> {
 
 /// The type a `dyn Trait` names: a hidden struct `dyn#Trait` beside the trait,
 /// holding one closure per object-safe method (the trait's and its
-/// supertraits'). Coercing a value to `dyn Trait` builds the closures over it;
-/// calling a method on the object calls its closure. A method is object-safe
-/// when it takes `self`, has no type parameters of its own, and does not
-/// mention `Self` in its parameters or result.
+/// supertraits'). Coercing a value to `dyn Trait` builds the closures over it.
+/// A method is object-safe when it takes `self`, has no type parameters of
+/// its own, and mentions `Self` only through associated types.
+///
+/// The trait's associated types (`Item` of `dyn Iterator<Item = i64>`) are
+/// extra type parameters of the object type, in name order after the trait's
+/// own. When every required method of the trait and its supertraits is
+/// object-safe, the object type also gets an ordinary `impl` of each of them
+/// whose methods call the closures, so default methods (`map`, `collect`,
+/// `to_string`, ...) work on trait objects too.
 fn synthesize_trait_objects(g: &mut GlobalTable) {
-    fn mentions_self(t: &Type) -> bool {
-        match &t.kind {
-            TypeKind::SelfType => true,
-            TypeKind::Path(p, args) => (p.is_single() && p.last() == "Self") || args.iter().any(mentions_self),
-            TypeKind::Tuple(ts) => ts.iter().any(mentions_self),
-            TypeKind::Array(e, _) => mentions_self(e),
-            TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => ps.iter().any(mentions_self) || r.as_deref().is_some_and(mentions_self),
-        }
-    }
     fn find_trait<'a>(g: &'a GlobalTable, module: &str, path: &Path) -> Option<(String, &'a TraitDef)> {
         let written = path.segments.join("::");
         let candidates = [if module.is_empty() { written.clone() } else { format!("{module}::{written}") }, written.clone()];
@@ -216,47 +213,134 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
         let first = found.next()?;
         found.next().is_none().then(|| (first.0.clone(), first.1))
     }
-    let mut out = Vec::new();
+    /// `t` with `Self::X` replaced by the object's parameter for `X`; `None`
+    /// if `t` mentions `Self` any other way.
+    fn object_type(t: &Type, assocs: &[String]) -> Option<Type> {
+        let span = t.span;
+        let kind = match &t.kind {
+            TypeKind::SelfType => return None,
+            TypeKind::Path(p, args) if p.segments.len() == 2 && p.segments[0] == "Self" && args.is_empty() => {
+                if !assocs.contains(&p.segments[1]) { return None; }
+                TypeKind::Path(Path::single(format!("assoc#{}", p.segments[1]), span), vec![])
+            }
+            TypeKind::Path(p, _) if p.is_single() && p.last() == "Self" => return None,
+            TypeKind::Path(p, args) => TypeKind::Path(p.clone(), args.iter().map(|a| object_type(a, assocs)).collect::<Option<_>>()?),
+            TypeKind::Tuple(ts) => TypeKind::Tuple(ts.iter().map(|a| object_type(a, assocs)).collect::<Option<_>>()?),
+            TypeKind::Array(e, n) => TypeKind::Array(Box::new(object_type(e, assocs)?), n.clone()),
+            TypeKind::Fn(ps, r) => TypeKind::Fn(ps.iter().map(|a| object_type(a, assocs)).collect::<Option<_>>()?, match r { Some(r) => Some(Box::new(object_type(r, assocs)?)), None => None }),
+            TypeKind::ExternFn(ps, r) => TypeKind::ExternFn(ps.iter().map(|a| object_type(a, assocs)).collect::<Option<_>>()?, match r { Some(r) => Some(Box::new(object_type(r, assocs)?)), None => None }),
+        };
+        Some(Type { kind, span })
+    }
+    struct Method { name: String, params: Vec<Param>, ret: Option<Type>, self_is_mut: bool, span: Span }
+    let mut structs = Vec::new();
+    let mut impls = Vec::new();
     for (path, def) in &g.traits {
         let module = path.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
-        let mut fields: Vec<FieldDef> = Vec::new();
-        let mut seen_traits = std::collections::HashSet::new();
-        let mut pending = vec![(path.clone(), def)];
-        while let Some((tpath, t)) = pending.pop() {
-            if !seen_traits.insert(tpath.clone()) { continue; }
-            for item in &t.items {
-                let (name, generics, params, has_self, ret, span) = match item {
-                    TraitItem::Required(f) => (&f.name, &f.generics, &f.params, f.has_self, &f.ret, f.span),
-                    TraitItem::Provided(f) => (&f.name, &f.generics, &f.params, f.has_self, &f.ret, f.span),
-                    TraitItem::AssocType(_) => continue,
-                };
-                if !has_self || !generics.params.is_empty() || params.iter().any(|p| mentions_self(&p.ty))
-                    || ret.as_ref().is_some_and(mentions_self) || fields.iter().any(|f| &f.name == name)
-                {
-                    continue;
-                }
-                let ty = Type { kind: TypeKind::Fn(params.iter().map(|p| p.ty.clone()).collect(), ret.clone().map(Box::new)), span };
-                fields.push(FieldDef { vis: true, name: name.clone(), ty, span });
-            }
+        // The trait and its supertraits, with the arguments each is used at.
+        let mut hierarchy: Vec<(String, &TraitDef, Vec<Type>)> = Vec::new();
+        let own_args: Vec<Type> = def.generics.params.iter()
+            .map(|p| Type { kind: TypeKind::Path(Path::single(p.name.clone(), p.span), vec![]), span: p.span }).collect();
+        let mut pending = vec![(path.clone(), def, own_args)];
+        while let Some((tpath, t, args)) = pending.pop() {
+            if hierarchy.iter().any(|(p, _, _)| *p == tpath) { continue; }
             let tmodule = tpath.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
             for sup in &t.supertraits {
-                if let Some(found) = find_trait(g, &tmodule, &sup.path) { pending.push(found); }
+                if let Some((sp, sd)) = find_trait(g, &tmodule, &sup.path) { pending.push((sp, sd, sup.args.clone())); }
             }
+            hierarchy.push((tpath, t, args));
+        }
+        let mut assocs: Vec<String> = hierarchy.iter()
+            .flat_map(|(_, t, _)| t.items.iter().filter_map(|i| match i { TraitItem::AssocType(n) => Some(n.clone()), _ => None }))
+            .collect();
+        assocs.sort();
+        assocs.dedup();
+        let mut fields: Vec<FieldDef> = Vec::new();
+        let mut implementable = true;
+        let mut per_trait: Vec<Vec<Method>> = Vec::new();
+        for (_, t, _) in &hierarchy {
+            let mut methods = Vec::new();
+            for item in &t.items {
+                let (name, generics, params, has_self, self_is_mut, ret, span, required) = match item {
+                    TraitItem::Required(f) => (&f.name, &f.generics, &f.params, f.has_self, f.self_is_mut, &f.ret, f.span, true),
+                    TraitItem::Provided(f) => (&f.name, &f.generics, &f.params, f.has_self, f.self_is_mut, &f.ret, f.span, false),
+                    TraitItem::AssocType(_) => continue,
+                };
+                let converted = (has_self && generics.params.is_empty()).then(|| {
+                    let ps: Option<Vec<Param>> = params.iter().map(|p| Some(Param { ty: object_type(&p.ty, &assocs)?, ..p.clone() })).collect();
+                    let r = match ret { Some(r) => Some(Some(object_type(r, &assocs)?)), None => Some(None) };
+                    Some((ps?, r?))
+                }).flatten();
+                let Some((ps, r)) = converted else {
+                    if required { implementable = false; }
+                    continue;
+                };
+                // A name another trait in the hierarchy already uses has no
+                // closure of its own.
+                if fields.iter().any(|f| &f.name == name) {
+                    if required { implementable = false; }
+                    continue;
+                }
+                let ty = Type { kind: TypeKind::Fn(ps.iter().map(|p| p.ty.clone()).collect(), r.clone().map(Box::new)), span };
+                fields.push(FieldDef { vis: true, name: name.clone(), ty, span });
+                methods.push(Method { name: name.clone(), params: ps, ret: r, self_is_mut, span });
+            }
+            per_trait.push(methods);
         }
         let name = format!("dyn#{}", def.name);
         let struct_path = if module.is_empty() { name.clone() } else { format!("{module}::{name}") };
-        out.push((struct_path, module, StructDef {
+        let mut params = def.generics.params.clone();
+        params.extend(assocs.iter().map(|a| TypeParam { name: format!("assoc#{a}"), bounds: vec![], span: def.span }));
+        let self_ty = Type {
+            kind: TypeKind::Path(Path::single(name.clone(), def.span), params.iter()
+                .map(|p| Type { kind: TypeKind::Path(Path::single(p.name.clone(), def.span), vec![]), span: def.span }).collect()),
+            span: def.span,
+        };
+        let has_methods = per_trait.iter().any(|m| !m.is_empty());
+        if implementable && has_methods {
+            for ((tpath, t, args), methods) in hierarchy.iter().zip(per_trait) {
+                let span = def.span;
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                let items = methods.into_iter().map(|m| {
+                    let callee = ex(ExprKind::Field { base: ex(ExprKind::Path(Path::single("self".into(), span))), field: FieldAccess::Named(m.name.clone()) });
+                    let args = m.params.iter().map(|p| ex(ExprKind::Path(Path::single(p.name.clone(), span)))).collect();
+                    FnDef {
+                        vis: false, name: m.name, generics: Generics::default(), params: m.params,
+                        has_self: true, self_is_mut: m.self_is_mut, ret: m.ret,
+                        body: Block { stmts: vec![], tail: Some(ex(ExprKind::Call(callee, args))), span },
+                        is_extern: false, span: m.span,
+                    }
+                }).collect();
+                let assoc_types = t.items.iter().filter_map(|i| match i {
+                    TraitItem::AssocType(n) => Some((n.clone(), Type { kind: TypeKind::Path(Path::single(format!("assoc#{n}"), span), vec![]), span })),
+                    _ => None,
+                }).collect();
+                impls.push((module.clone(), ImplBlock {
+                    generics: Generics { params: params.clone(), where_clauses: vec![] },
+                    trait_ref: Some(TraitRef { path: Path { segments: tpath.split("::").map(str::to_string).collect(), span }, args: args.clone(), bindings: vec![], span }),
+                    self_ty: self_ty.clone(),
+                    items,
+                    assoc_types,
+                    span,
+                }));
+            }
+        }
+        structs.push((struct_path, module, StructDef {
             vis: def.vis,
             is_value: false,
             name,
-            generics: Generics { params: def.generics.params.clone(), where_clauses: vec![] },
+            generics: Generics { params, where_clauses: vec![] },
             body: StructBody::Named(fields),
             span: def.span,
         }));
     }
-    for (path, module, def) in out {
+    for (path, module, def) in structs {
         g.insert(path.clone(), Symbol { kind: SymKind::Struct, span: def.span, vis: def.vis, module });
         g.structs.insert(path, def);
+    }
+    for (module, imp) in impls {
+        g.impls.push(imp);
+        g.impl_modules.push(module);
     }
 }
 
@@ -882,6 +966,10 @@ fn check_type(
     is_known: &impl Fn(&str, &[String]) -> bool,
 ) -> Result<(), ResolveError> {
     match &t.kind {
+        // `impl Trait` results.
+        TypeKind::Path(path, args) if path.last().starts_with("impl#") => {
+            for a in args { check_type(a, generics, is_known)?; }
+        }
         // `Self::Item` / `I::Item`: an associated type of a type parameter.
         TypeKind::Path(path, args) if path.segments.len() == 2 && args.is_empty()
             && (path.segments[0] == "Self" || generics.iter().any(|g| *g == path.segments[0])) => {}

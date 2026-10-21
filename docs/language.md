@@ -143,7 +143,15 @@ These follow Rust; differences come from having no references.
 - **Trait objects.** `dyn Trait` (usually `Box<dyn Trait>`) holds any value
   implementing `Trait`; a value converts where a `dyn Trait` is expected.
   Methods that take `self` without their own type parameters or `Self` in
-  their signature can be called on it, including supertrait methods.
+  their signature (other than `Self::Item`-style associated types) can be
+  called on it, including supertrait methods. Associated types are given as
+  bindings: `Box<dyn Iterator<Item = i64>>`. When all of a trait's required
+  methods qualify, the object implements the trait, so default methods
+  (`map`, `collect`, `to_string`) work on it too.
+- **`impl Trait` results.** `fn evens() -> impl Iterator<Item = i64>` returns
+  whatever concrete type the body produces; each instantiation is inferred
+  from its body, and callers see that type. A function returning
+  `impl Trait` cannot call itself.
 - **Associated types.** `type Item;` in a trait, `type Item = T;` in an impl,
   `Self::Item`, `I::Item`, `<T as Trait>::Item`, and bounds such as
   `I: Iterator<Item = i64>`.

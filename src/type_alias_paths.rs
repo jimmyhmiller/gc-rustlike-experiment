@@ -35,6 +35,10 @@ impl Qualifier<'_> {
                 for arg in args.iter_mut() {
                     self.ty(arg, generics, false)?;
                 }
+                // `impl Trait` results: only the arguments are types here.
+                if path.last().starts_with("impl#") {
+                    return Ok(());
+                }
                 // `Self::Item` / `I::Item`: an associated type of a type parameter.
                 if path.segments.len() == 2 && args.is_empty()
                     && (path.segments[0] == "Self" || generics.iter().any(|name| *name == path.segments[0]))

@@ -406,6 +406,11 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
                 if !args.is_empty() { return Err(TypeError { msg: format!("type parameter `{name}` takes no type arguments"), span: t.span }); }
                 return Ok(Ty::Var(name.to_string()));
             }
+            // An `impl Trait` result, resolved per instantiation (lower.rs).
+            if name.starts_with("impl#") {
+                let targs = args.iter().map(|a| lower_type_with(a, generics, ctx)).collect::<Result<_, _>>()?;
+                return Ok(Ty::Named { name: path.segments.join("::"), args: targs });
+            }
             if path.is_single() && name == "_" && args.is_empty() {
                 return Ok(Ty::Var("_".into()));
             }

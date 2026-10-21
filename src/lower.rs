@@ -132,6 +132,12 @@ struct Mono {
     /// functions; moved into `CoreProgram::spans` at the end. A returned id `k`
     /// means `spans[k-1]`; `NO_SPAN` (0) is never returned here.
     spans: Vec<Span>,
+    /// The concrete result type of each instantiation whose signature returns
+    /// `impl Trait`, and the ones being worked out (to report recursion).
+    /// Discovering one lowers the body and rolls it back, so these are not
+    /// part of a snapshot.
+    opaque: HashMap<InstantiationKey, Ty>,
+    opaque_pending: std::collections::HashSet<InstantiationKey>,
 }
 
 /// `Mono`'s contents at a point in time; see [`Mono::snapshot`].
@@ -144,7 +150,7 @@ struct MonoSnapshot {
 
 impl Mono {
     fn new() -> Self {
-        Mono { ids: HashMap::new(), worklist: Vec::new(), closures: Vec::new(), spans: Vec::new() }
+        Mono { ids: HashMap::new(), worklist: Vec::new(), closures: Vec::new(), spans: Vec::new(), opaque: HashMap::new(), opaque_pending: Default::default() }
     }
     /// Record the monomorphizer so a discarded lowering attempt can be undone.
     /// Everything but the interning map is append-only.
@@ -172,13 +178,16 @@ impl Mono {
     }
     /// Get (or assign) the FuncId for a job (keyed by source identity and ground types), queueing it
     /// for lowering the first time it's seen.
-    fn intern(&mut self, job: Job, count: &mut u32) -> FuncId {
+    fn key(job: &Job) -> InstantiationKey {
         let mut subst: Vec<_> = job.subst.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
         subst.sort_by(|a, b| a.0.cmp(&b.0));
-        let key = InstantiationKey {
+        InstantiationKey {
             source: job.f.span.source, start: job.f.span.start, end: job.f.span.end,
             name: job.f.name.clone(), subst, self_ty: job.self_ty.clone(),
-        };
+        }
+    }
+    fn intern(&mut self, job: Job, count: &mut u32) -> FuncId {
+        let key = Self::key(&job);
         if let Some(id) = self.ids.get(&key) {
             return *id;
         }
@@ -311,7 +320,9 @@ pub fn check_program(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<Lo
         let mut count = 0u32;
         let job = Job { f: f.clone(), subst: HashMap::new(), mangled: (*fq).clone(), self_ty: None };
         if let Err(e) = lower_fn(&job, &ctx, &mut reg, &mut mono, &mut count) {
-            errors.push(e);
+            // A caller of an `impl Trait` function lowers its body too, so
+            // the same error can arrive from both.
+            if !errors.contains(&e) { errors.push(e); }
         }
     }
 
@@ -430,6 +441,17 @@ fn bind_pattern_names(p: &Pattern, bound: &mut Vec<String>) {
 }
 
 /// A human-readable rendering of a type for diagnostics.
+/// Does `ty` contain an `impl Trait` result placeholder?
+fn has_opaque(ty: &Ty) -> bool {
+    match ty {
+        Ty::Named { name, args } => name.rsplit("::").next().is_some_and(|n| n.starts_with("impl#")) || args.iter().any(has_opaque),
+        Ty::Tuple(es) => es.iter().any(has_opaque),
+        Ty::Array(e, _) => has_opaque(e),
+        Ty::Fn { params, ret } | Ty::ExternFn { params, ret } => params.iter().any(has_opaque) || has_opaque(ret),
+        Ty::Prim(_) | Ty::Var(_) | Ty::Infer(_) => false,
+    }
+}
+
 /// The trait a `dyn Trait` object type stands for (`geo::dyn#Shape` is
 /// `geo::Shape`).
 pub(crate) fn dyn_trait(ty: &Ty) -> Option<String> {
@@ -868,12 +890,25 @@ fn lower_fn_with(lo: &mut FnLowerer<'_, '_, '_>, job: &Job, ret_ty: &Ty, fn_span
         params.push(repr);
     }
 
-    let (body, body_ty) = lo.block_expected(&f.body, Some(&ret_ty))?;
+    // An `impl Trait` result is whatever the body returns.
+    let opaque = has_opaque(&ret_ty);
+    if opaque { lo.infer_ret = true; }
+    let (body, body_ty) = lo.block_expected(&f.body, if opaque { None } else { Some(&ret_ty) })?;
     lo.check_definite_init(&body, f.body.span)?;
     // Point a body/return type mismatch at the tail expression (or the function
     // body if there's no tail), so the caret lands on the offending value.
     let body_err_span = f.body.tail.as_ref().map(|t| t.span).unwrap_or(f.body.span);
-    lo.check_assignable(&body_ty, &ret_ty, body_err_span)?;
+    let ret_ty = if opaque {
+        // Without a `return`, the tail's type; otherwise the first return's.
+        let concrete = if lo.infer_ret { body_ty.clone() } else { lo.ret_ty.clone() };
+        if !lo.infer_ret && !is_never(&body_ty) { lo.check_assignable(&body_ty, &concrete, body_err_span)?; }
+        lo.check_opaque(&ret_ty, &concrete, body_err_span)?;
+        lo.mono.opaque.insert(Mono::key(job), concrete.clone());
+        concrete
+    } else {
+        lo.check_assignable(&body_ty, &ret_ty, body_err_span)?;
+        ret_ty
+    };
     let ret = lo.repr_of(&ret_ty, f.span)?;
 
     Ok(CoreFn {
@@ -1476,10 +1511,22 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// Build the `dyn Trait` object for `value`: a `dyn#Trait` struct whose
     /// fields are closures calling each trait method on the value.
     fn coerce_to_dyn(&mut self, value: CoreExpr, ty: Ty, target: &Ty, span: Span) -> LResult<(CoreExpr, Ty)> {
-        let Ty::Named { name: object, args: trait_args } = target else { unreachable!() };
+        let Ty::Named { name: object, args: object_args } = target else { unreachable!() };
         let trait_name = dyn_trait(target).unwrap();
+        let own = self.ctx.traits.get(&trait_name).map_or(0, |d| d.generics.params.len());
+        let trait_args = &object_args[..own.min(object_args.len())];
         if !self.ctx.try_type_implements_trait_args(&ty, &trait_name, trait_args).map_err(conv)? {
             return err(format!("`{}` does not implement `{}`, so it cannot be used as `{}`", ty_display(&ty), trait_name.rsplit("::").next().unwrap(), ty_display(target)), span);
+        }
+        // `dyn Iterator<Item = i64>` needs a value whose `Item` is `i64`.
+        if let Some(def) = self.ctx.structs.get(object) {
+            for (param, want) in def.generics.params.iter().zip(object_args.iter()).skip(own) {
+                let assoc = param.name.trim_start_matches("assoc#");
+                let got = self.ctx.associated_type(&ty, assoc);
+                if got.as_ref() != Some(want) {
+                    return err(format!("`{}::{}` is `{}`, but `{}` needs `{}`", ty_display(&ty), assoc, got.as_ref().map(ty_display).unwrap_or_else(|| "undefined".into()), ty_display(target), ty_display(want)), span);
+                }
+            }
         }
         let Some(def) = self.ctx.structs.get(object).cloned() else { return err(format!("unknown trait object `{}`", ty_display(target)), span) };
         let StructBody::Named(fields) = &def.body else { unreachable!() };
@@ -1491,12 +1538,23 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let inits = fields.iter().map(|f| {
             let TypeKind::Fn(params, _) = &f.ty.kind else { unreachable!() };
             let names: Vec<String> = (0..params.len()).map(|i| format!("dyn#arg{i}")).collect();
-            let call = ex(ExprKind::MethodCall {
-                recv: var("dyn#value"),
-                method: f.name.clone(),
-                args: names.iter().map(|n| var(n)).collect(),
-                span,
-            });
+            // `Trait::method(value, ..)`: names the declaring trait, so a
+            // method name shared by two traits (`fmt`) is unambiguous.
+            let call = match self.declaring_trait(&trait_name, &f.name) {
+                Some(declaring) => {
+                    let mut segments: Vec<String> = declaring.split("::").map(str::to_string).collect();
+                    segments.push(f.name.clone());
+                    let mut call_args = vec![var("dyn#value")];
+                    call_args.extend(names.iter().map(|n| var(n)));
+                    ex(ExprKind::Call(ex(ExprKind::Path(Path { segments, span })), call_args))
+                }
+                None => ex(ExprKind::MethodCall {
+                    recv: var("dyn#value"),
+                    method: f.name.clone(),
+                    args: names.iter().map(|n| var(n)).collect(),
+                    span,
+                }),
+            };
             let closure = ex(ExprKind::Closure {
                 params: names.iter().map(|n| ClosureParam { name: n.clone(), ty: None, span }).collect(),
                 ret: None,
@@ -1565,6 +1623,85 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let (value, ty) = result?;
         let repr = value.repr.clone();
         Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, crecv)], tail: Some(value) })), repr), ty))
+    }
+
+    /// The trait in `trait_name`'s supertrait hierarchy that declares `method`.
+    fn declaring_trait(&self, trait_name: &str, method: &str) -> Option<String> {
+        let mut pending = vec![trait_name.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(t) = pending.pop() {
+            if !seen.insert(t.clone()) { continue; }
+            let def = self.ctx.traits.get(&t).or_else(|| {
+                let mut found = self.ctx.traits.iter().filter(|(k, _)| k.rsplit("::").next() == t.rsplit("::").next());
+                let first = found.next()?;
+                found.next().is_none().then_some(first.1)
+            })?;
+            let declares = def.items.iter().any(|i| match i {
+                TraitItem::Required(f) => f.name == method,
+                TraitItem::Provided(f) => f.name == method,
+                TraitItem::AssocType(_) => false,
+            });
+            if declares { return Some(t); }
+            pending.extend(def.supertraits.iter().map(|s| s.path.segments.join("::")));
+        }
+        None
+    }
+
+    /// Check that `concrete`, the type a function body returns, satisfies its
+    /// declared `impl Trait` result (the trait, and any `Item = T` bindings).
+    fn check_opaque(&self, declared: &Ty, concrete: &Ty, span: Span) -> LResult<()> {
+        let Ty::Named { name, args } = declared else { return Ok(()) };
+        let (module, last) = match name.rsplit_once("::") { Some((m, l)) => (Some(m), l), None => (None, name.as_str()) };
+        let Some(t) = last.strip_prefix("impl#") else {
+            return err("`impl Trait` is supported only as the whole result type", span);
+        };
+        let trait_name = match module { Some(m) => format!("{m}::{t}"), None => t.to_string() };
+        let (trait_name, def) = match self.ctx.traits.get(&trait_name) {
+            Some(d) => (trait_name.clone(), d.clone()),
+            None => {
+                let mut found = self.ctx.traits.iter().filter(|(k, _)| k.rsplit("::").next() == Some(t));
+                match (found.next(), found.next()) {
+                    (Some((k, d)), None) => (k.clone(), d.clone()),
+                    _ => return err(format!("unknown trait `{t}`"), span),
+                }
+            }
+        };
+        let own = def.generics.params.len();
+        if !self.ctx.try_type_implements_trait_args(concrete, &trait_name, &args[..own.min(args.len())]).map_err(conv)? {
+            return err(format!("the returned `{}` does not implement `{}`", ty_display(concrete), t), span);
+        }
+        let mut assocs: Vec<&String> = def.items.iter().filter_map(|i| match i { TraitItem::AssocType(n) => Some(n), _ => None }).collect();
+        assocs.sort();
+        for (assoc, want) in assocs.into_iter().zip(args.iter().skip(own)) {
+            let got = self.ctx.associated_type(concrete, assoc);
+            if got.as_ref() != Some(want) {
+                return err(format!("the returned `{}` has `{}` = `{}`, not `{}`", ty_display(concrete), assoc, got.as_ref().map(ty_display).unwrap_or_else(|| "undefined".into()), ty_display(want)), span);
+            }
+        }
+        Ok(())
+    }
+
+    /// The concrete result of a call whose signature returns `impl Trait`:
+    /// lower the callee's body for this instantiation (rolled back; the
+    /// worklist lowers it for real) and take the type it returns.
+    fn opaque_result(&mut self, job: &Job, declared: Ty, span: Span) -> LResult<Ty> {
+        if !has_opaque(&declared) { return Ok(declared); }
+        let key = Mono::key(job);
+        if let Some(t) = self.mono.opaque.get(&key) { return Ok(t.clone()); }
+        if !self.mono.opaque_pending.insert(key.clone()) {
+            return err(format!("`{}` returns `impl Trait` and calls itself; its result type cannot be inferred (name the type)", job.f.name), span);
+        }
+        let snap = (self.mono.snapshot(), self.reg.snapshot(), *self.count);
+        let result = lower_fn(job, self.ctx, self.reg, self.mono, self.count);
+        self.mono.restore(snap.0);
+        self.reg.restore(snap.1);
+        *self.count = snap.2;
+        self.mono.opaque_pending.remove(&key);
+        let lowered = result?;
+        let _ = lowered;
+        let concrete = self.mono.opaque.get(&key).cloned()
+            .ok_or_else(|| LowerError { msg: format!("cannot infer the result type of `{}`", job.f.name), span })?;
+        Ok(concrete)
     }
 
     /// Call `method` on a trait object: invoke the object's closure for it.
@@ -4009,7 +4146,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if let Some(elem_ty) = array_elem_ty(&recv_ty) {
             return self.array_method(crecv, elem_ty, method, args, span);
         }
-        if dyn_trait(&recv_ty).is_some() {
+        if dyn_trait(&recv_ty).is_some() && self.lookup_method(&recv_ty, method).is_none() {
             return self.dyn_method_call(crecv, recv_ty, method, args, span);
         }
         let entry = self.lookup_method(&recv_ty, method)
@@ -4244,7 +4381,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         };
 
         let job = Job { f: m, subst, mangled, self_ty: Some(recv_ty) };
-        let fid = self.mono.intern(job, self.count);
+        let fid = self.mono.intern(job.clone(), self.count);
+        let ret_ty = self.opaque_result(&job, ret_ty, span)?;
         let repr = self.repr_of(&ret_ty, span)?;
         Ok((CoreExpr::new(CoreExprKind::Call(fid, cargs), repr), ret_ty))
     }
@@ -4366,7 +4504,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let mangled = mangle(&format!("{}.{}", ty_mangle(&self_concrete), self.method_symbol(&self_concrete, entry)), &extra);
 
         let job = Job { f: m, subst, mangled, self_ty: None };
-        let fid = self.mono.intern(job, self.count);
+        let fid = self.mono.intern(job.clone(), self.count);
+        let ret_ty = self.opaque_result(&job, ret_ty, span)?;
         let repr = self.repr_of(&ret_ty, span)?;
         Ok((CoreExpr::new(CoreExprKind::Call(fid, cargs), repr), ret_ty))
     }
@@ -4875,7 +5014,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 }
                 if declared && !args.is_empty() {
                     let (crecv, recv_ty) = self.expr(&args[0], None)?;
-                    if dyn_trait(&recv_ty).is_some() {
+                    if dyn_trait(&recv_ty).is_some() && self.lookup_trait_method(&recv_ty, &trait_name, name).is_none() {
                         return self.dyn_method_call(crecv, recv_ty, name, &args[1..], span);
                     }
                     let short = trait_name.rsplit("::").next().unwrap().to_string();
@@ -5434,7 +5573,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
         let mangled = mangle(&fq, &inst_args);
         let job = Job { f: f.clone(), subst: subst.clone(), mangled, self_ty: None };
-        let fid = self.mono.intern(job, self.count);
+        let fid = self.mono.intern(job.clone(), self.count);
 
         let ret_ty = match &f.ret {
             Some(t) => {
@@ -5443,6 +5582,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             None => Ty::unit(),
         };
+        let ret_ty = self.opaque_result(&job, ret_ty, span)?;
         let repr = self.repr_of(&ret_ty, span)?;
         Ok((CoreExpr::new(CoreExprKind::Call(fid, cargs), repr), ret_ty))
     }

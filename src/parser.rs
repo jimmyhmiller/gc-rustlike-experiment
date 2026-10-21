@@ -910,7 +910,21 @@ impl Parser {
                 }
                 let span = start.to(self.prev_span());
                 let Some(sink) = self.impl_params.as_mut() else {
-                    return Err(ParseError { msg: "`impl Trait` is supported for arguments and `impl Fn(..)` results".into(), span });
+                    // A result's `impl Trait` is the concrete type the body
+                    // returns, found when the function is instantiated. It is
+                    // written like a `dyn` type with an `impl#` marker.
+                    let mut objects = bounds.into_iter().filter(|b| !matches!(b.path.last(), "Send" | "Sync" | "Unpin" | "Sized"));
+                    let Some(object) = objects.next() else {
+                        return Err(ParseError { msg: "`impl` needs a trait".into(), span });
+                    };
+                    let mut path = object.path;
+                    let last = path.segments.pop().unwrap();
+                    path.segments.push(format!("impl#{}", last));
+                    let mut bindings = object.bindings;
+                    bindings.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut args = object.args;
+                    args.extend(bindings.into_iter().map(|(_, t)| t));
+                    return Ok(Type { kind: TypeKind::Path(path, args), span });
                 };
                 let name = format!("impl#{}", sink.len());
                 sink.push(TypeParam { name: name.clone(), bounds, span });
@@ -932,7 +946,13 @@ impl Parser {
                 let mut path = object.path;
                 let last = path.segments.pop().unwrap();
                 path.segments.push(format!("dyn#{}", last));
-                TypeKind::Path(path, object.args)
+                // Associated type bindings follow the trait's arguments, in
+                // name order (the object type's parameter order).
+                let mut bindings = object.bindings;
+                bindings.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut args = object.args;
+                args.extend(bindings.into_iter().map(|(_, t)| t));
+                TypeKind::Path(path, args)
             }
             TokKind::Ident(_) => {
                 let path = self.path()?;

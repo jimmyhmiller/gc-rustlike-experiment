@@ -353,3 +353,44 @@ fn or_range_and_at_patterns_constants_and_char_methods() {
     let msg = compile_error("fn main() -> i64 { let 1 | 2 = 1; 0 }");
     assert!(msg.contains("or-patterns and range patterns are supported in"), "{msg}");
 }
+
+#[test]
+fn impl_trait_results_and_dyn_iterators() {
+    assert_eq!(run(r#"
+        use std::fmt::Display;
+        fn evens(limit: i64) -> impl Iterator<Item = i64> { (0..limit).filter(|x| x % 2 == 0) }
+        fn squares_of(v: Vec<i64>) -> impl Iterator<Item = i64> { v.into_iter().map(|x| x * x) }
+        fn label(n: i64) -> impl Display {
+            if n > 0 { return format!("+{}", n); }
+            format!("{}", n)
+        }
+        fn chained() -> impl Iterator<Item = i64> { evens(6).chain(squares_of(vec![3, 4])) }
+        struct Grid { w: i64 }
+        impl Grid {
+            fn cells(self) -> impl Iterator<Item = (i64, i64)> {
+                let w = self.w;
+                (0..w * w).map(move |i| (i / w, i % w))
+            }
+        }
+        fn boxed(desc: bool) -> Box<dyn Iterator<Item = i64>> {
+            if desc { Box::new((0..5).rev()) } else { Box::new(evens(10)) }
+        }
+        fn main() -> i64 {
+            assert_eq!(evens(10).collect::<Vec<_>>(), vec![0, 2, 4, 6, 8]);
+            assert_eq!(squares_of(vec![1, 2, 3]).sum::<i64>(), 14);
+            assert_eq!(format!("{} {}", label(5), label(-2)), "+5 -2");
+            assert_eq!(chained().collect::<Vec<_>>(), vec![0, 2, 4, 9, 16]);
+            assert_eq!((Grid { w: 2 }).cells().count(), 4);
+            assert_eq!(boxed(true).map(|x| x * 10).collect::<Vec<_>>(), vec![40, 30, 20, 10, 0]);
+            let mut total = 0;
+            for x in boxed(false) { total += x; }
+            let shown: Box<dyn std::fmt::Display> = Box::new(42);
+            assert_eq!(shown.to_string(), "42");
+            total
+        }
+    "#), 20);
+    let msg = compile_error("fn f() -> impl Iterator<Item = String> { 0..3 } fn main() -> i64 { f().count() }");
+    assert!(msg.contains("has `Item` = `i64`, not `String`"), "{msg}");
+    let msg = compile_error("fn f(n: i64) -> impl Iterator<Item = i64> { if n == 0 { 0..1 } else { f(n - 1) } } fn main() -> i64 { f(2).count() }");
+    assert!(msg.contains("calls itself"), "{msg}");
+}
