@@ -182,6 +182,22 @@ These follow Rust; differences come from having no references.
   impls, and enum discriminants (`enum E { A = 1, B }`, `E::B as i64`).
   Tuples compare (`==`, `<`), sort, hash (as map keys), and clone element by
   element.
+- **Operator traits.** Shaped like Rust's: `Add<Rhs = Self>` with
+  `type Output = Self` (and `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`,
+  `BitXor`), `Neg`, `Not`, and `AddAssign`-style traits (`a += b` uses
+  `add_assign` when implemented, else `a = a + b`). `PartialEq` is `Eq` (an
+  empty `impl Eq for T {}` marker is accepted); `PartialOrd` provides
+  `partial_cmp`, `Ord` types are `PartialOrd`, and `<` on a type that is
+  only `PartialOrd` uses `partial_cmp`. The numeric primitives implement the
+  arithmetic traits, so `T: Add<Output = T>` accepts `i64`. `Copy` and `Send`
+  bounds always hold.
+- **Generic defaults and several impls of one trait.** Trait parameters may
+  have defaults (`trait Add<Rhs = Self>`) and associated types defaults
+  (`type Output = Self;`). A type may implement one generic trait several
+  times (`impl Mul<f64> for V` and `impl Mul<V> for V`, `From<i64>` and
+  `From<bool>`); calls choose the impl by argument type.
+- **Associated constants.** `const MAX: i64 = 10;` in impls and traits (with
+  or without a default), used as `Type::MAX`, `Self::MAX`, or `T::MAX`.
 - **Turbofish.** `f::<i64>()`, `Vec::<i64>::new()`, and `it.sum::<i64>()`
   give type arguments explicitly (`_` leaves one inferred).
 - **Primitive constants and char methods.** `i64::MAX`, `u8::MIN`,

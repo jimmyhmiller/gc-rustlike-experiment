@@ -115,14 +115,27 @@ impl Qualifier<'_> {
         }
         Ok(())
     }
-    fn trait_ref(&self, bound: &mut TraitRef, scope: &[String]) -> Result<(), ResolveError> {
+    /// Qualify a trait reference. Omitted trailing arguments take the trait's
+    /// defaults, with `Self` meaning `self_ty` (the implementing or bounded
+    /// type): `impl Add for V` is `impl Add<V> for V`.
+    fn trait_ref(&self, bound: &mut TraitRef, scope: &[String], self_ty: &Type) -> Result<(), ResolveError> {
         let written = bound.path.segments.join("::");
         if bound.path.is_single() && scope.contains(&written) {
             return Err(ResolveError { msg: format!("type parameter `{written}` is not a trait"), span: bound.span });
         }
         let canonical = self.view().canonical_trait(&written).map_err(|msg| ResolveError { msg, span: bound.span })?;
         self.visible(&canonical, bound.span)?;
-        let arity = self.g.traits[&canonical].generics.params.len();
+        let params = &self.g.traits[&canonical].generics.params;
+        let arity = params.len();
+        if bound.args.len() < arity && params[bound.args.len()..].iter().all(|p| p.default.is_some()) {
+            for i in bound.args.len()..arity {
+                let mut map: Vec<(String, Type)> = params.iter().zip(&bound.args).map(|(p, a)| (p.name.clone(), a.clone())).collect();
+                map.push(("Self".into(), self_ty.clone()));
+                let mut t = params[i].default.clone().unwrap();
+                subst_written(&mut t, &map);
+                bound.args.push(t);
+            }
+        }
         if bound.args.len() != arity {
             return Err(ResolveError { msg: format!("trait `{canonical}` takes {arity} type argument(s), got {}", bound.args.len()), span: bound.span });
         }
@@ -141,14 +154,16 @@ impl Qualifier<'_> {
         let mut scope = outer.to_vec();
         scope.extend(g.params.iter().map(|p| p.name.clone()));
         for param in &mut g.params {
+            let me = Type { kind: TypeKind::Path(Path::single(param.name.clone(), param.span), vec![]), span: param.span };
             for bound in &mut param.bounds {
-                self.trait_ref(bound, &scope)?;
+                self.trait_ref(bound, &scope, &me)?;
             }
         }
         for clause in &mut g.where_clauses {
             self.ty(&mut clause.ty, &scope, false)?;
+            let me = clause.ty.clone();
             for bound in &mut clause.bounds {
-                self.trait_ref(bound, &scope)?;
+                self.trait_ref(bound, &scope, &me)?;
             }
         }
         Ok(scope)
@@ -428,6 +443,27 @@ impl Qualifier<'_> {
         Ok(())
     }
 }
+/// Replace `Self` and the named parameters in a written type.
+fn subst_written(t: &mut Type, map: &[(String, Type)]) {
+    match &mut t.kind {
+        TypeKind::SelfType => {
+            if let Some((_, r)) = map.iter().find(|(n, _)| n == "Self") { *t = r.clone(); }
+        }
+        TypeKind::Path(path, args) => {
+            if path.is_single() && args.is_empty() {
+                if let Some((_, r)) = map.iter().find(|(n, _)| n == path.last()) { *t = r.clone(); return; }
+            }
+            for a in args { subst_written(a, map); }
+        }
+        TypeKind::Tuple(ts) => for a in ts { subst_written(a, map); },
+        TypeKind::Array(e, _) => subst_written(e, map),
+        TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => {
+            for a in ps { subst_written(a, map); }
+            if let Some(r) = r { subst_written(r, map); }
+        }
+    }
+}
+
 fn module(name: &str) -> &str {
     name.rsplit_once("::").map_or("", |(module, _)| module)
 }
@@ -491,7 +527,8 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         let q = Qualifier { g, module: module(name), self_path: None };
         let scope = q.generics(&mut t.generics, &[])?;
         for bound in &mut t.supertraits {
-            q.trait_ref(bound, &scope)?;
+            let me = Type { kind: TypeKind::SelfType, span: bound.span };
+            q.trait_ref(bound, &scope, &me)?;
         }
         for item in &mut t.items {
             match item {
@@ -500,6 +537,10 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
                     q.signature(&mut f.params, &mut f.ret, &inner)?;
                 }
                 TraitItem::Provided(f) => q.function(f, &scope)?,
+                TraitItem::Const(c) => {
+                    q.ty(&mut c.ty, &scope, false)?;
+                    q.expr(&mut c.value, &scope)?;
+                }
                 TraitItem::AssocType(_) => {}
             }
         }
@@ -513,13 +554,29 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
             if !p.is_single() || !scope.iter().any(|g| g == p.last()) { q.self_path = Some(p.segments.clone()); }
         }
         if let Some(tr) = &mut i.trait_ref {
-            q.trait_ref(tr, &scope)?;
+            let me = i.self_ty.clone();
+            q.trait_ref(tr, &scope, &me)?;
+            // Associated types the impl leaves out take the trait's defaults.
+            if let Some(def) = g.traits.get(&tr.path.segments.join("::")) {
+                for (name, default) in &def.assoc_defaults {
+                    if i.assoc_types.iter().any(|(n, _)| n == name) { continue; }
+                    let mut map: Vec<(String, Type)> = def.generics.params.iter().zip(&tr.args).map(|(p, a)| (p.name.clone(), a.clone())).collect();
+                    map.push(("Self".into(), me.clone()));
+                    let mut t = default.clone();
+                    subst_written(&mut t, &map);
+                    i.assoc_types.push((name.clone(), t));
+                }
+            }
         }
         for method in &mut i.items {
             q.function(method, &scope)?;
         }
         for (_, ty) in &mut i.assoc_types {
             q.ty(ty, &scope, false)?;
+        }
+        for c in &mut i.consts {
+            q.ty(&mut c.ty, &scope, false)?;
+            q.expr(&mut c.value, &scope)?;
         }
     }
     for (name, c) in &mut consts {

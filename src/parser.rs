@@ -162,8 +162,12 @@ fn std_path(mut segments: Vec<String>) -> Vec<String> {
             _ => {}
         }
     }
-    if segments.len() == 2 && segments[0] == "cmp" && segments[1] == "Ordering" {
+    if segments.len() == 2 && segments[0] == "cmp" && matches!(segments[1].as_str(), "Ordering" | "PartialEq" | "PartialOrd" | "Ord" | "Eq") {
         segments.remove(0);
+    }
+    // Rust's `PartialEq` is this language's `Eq` (the `==` trait).
+    if segments.len() <= 2 && segments[0] == "PartialEq" {
+        segments[0] = "Eq".into();
     }
     segments
 }
@@ -334,7 +338,15 @@ impl Parser {
             TokKind::Keyword(Kw::Struct) => ItemKind::Struct(self.struct_def(vis, is_value)?),
             TokKind::Keyword(Kw::Enum) => ItemKind::Enum(self.enum_def(vis, is_value)?),
             TokKind::Keyword(Kw::Trait) => ItemKind::Trait(self.trait_def(vis)?),
-            TokKind::Keyword(Kw::Impl) => ItemKind::Impl(self.impl_block()?),
+            TokKind::Keyword(Kw::Impl) => {
+                let imp = self.impl_block()?;
+                // Rust's marker `impl Eq for T {}` (beside its `PartialEq`
+                // impl, which is this language's `Eq`) adds nothing.
+                if imp.items.is_empty() && imp.trait_ref.as_ref().is_some_and(|t| t.path.last() == "Eq") {
+                    return Ok(None);
+                }
+                ItemKind::Impl(imp)
+            }
             TokKind::Keyword(Kw::Type) => ItemKind::TypeAlias(self.type_alias(vis)?),
             TokKind::Keyword(Kw::Const) | TokKind::Keyword(Kw::Static) => {
                 ItemKind::Const(self.const_def(vis)?)
@@ -363,7 +375,7 @@ impl Parser {
                 // Generated code reports at the derive name that asked for it.
                 // Each derived trait has its own span, so each generated
                 // method keeps a distinct source identity.
-                let at = derives.iter().find(|(n, _)| n == trait_name || (trait_name == "Eq" && n == "PartialEq") || (trait_name == "Ord" && n == "PartialOrd"))
+                let at = derives.iter().find(|(n, _)| n == trait_name || (trait_name == "Eq" && n == "PartialEq"))
                     .map(|(_, s)| *s).unwrap_or(derives[0].1);
                 let mut tokens = crate::lexer::lex_with_source(&source, at.source)
                     .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
@@ -666,14 +678,39 @@ impl Parser {
         let generics = self.maybe_where(generics)?;
         self.expect(&TokKind::LBrace)?;
         let mut items = Vec::new();
+        let mut assoc_defaults = Vec::new();
         while !self.at(&TokKind::RBrace) {
+            // `type Output = Self;`: an associated type with a default.
+            if self.at_kw(Kw::Type) && matches!(self.peek_at(1), TokKind::Ident(_)) && matches!(self.peek_at(2), TokKind::Eq) {
+                self.bump();
+                let n = self.ident()?;
+                self.expect(&TokKind::Eq)?;
+                let t = self.ty()?;
+                self.expect(&TokKind::Semi)?;
+                assoc_defaults.push((n.clone(), t));
+                items.push(TraitItem::AssocType(n));
+                continue;
+            }
             items.push(self.trait_item()?);
         }
         self.expect(&TokKind::RBrace)?;
-        Ok(TraitDef { vis, name, generics, supertraits, items, span: start.to(self.prev_span()) })
+        Ok(TraitDef { vis, name, generics, supertraits, items, assoc_defaults, span: start.to(self.prev_span()) })
     }
 
     fn trait_item(&mut self) -> PResult<TraitItem> {
+        // `const ID: i64;` (required) or `const ID: i64 = 0;` (a default).
+        if self.at_kw(Kw::Const) {
+            let start = self.span();
+            self.bump();
+            let name = self.ident()?;
+            self.expect(&TokKind::Colon)?;
+            let ty = self.ty()?;
+            let value = if self.eat(&TokKind::Eq) { self.expr()? } else {
+                Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single("const#required".into(), start))), span: start }
+            };
+            self.expect(&TokKind::Semi)?;
+            return Ok(TraitItem::Const(ConstDef { vis: true, name, ty, value, span: start.to(self.prev_span()) }));
+        }
         if self.eat_kw(Kw::Type) {
             let n = self.ident()?;
             // Bounds on an associated type (`type Item: Display;`) are not checked.
@@ -717,8 +754,13 @@ impl Parser {
         self.expect(&TokKind::LBrace)?;
         let mut items = Vec::new();
         let mut assoc_types = Vec::new();
+        let mut consts = Vec::new();
         while !self.at(&TokKind::RBrace) {
             let vis = self.visibility()?;
+            if self.at_kw(Kw::Const) {
+                consts.push(self.const_def(vis)?);
+                continue;
+            }
             if self.eat_kw(Kw::Type) {
                 let name = self.ident()?;
                 self.expect(&TokKind::Eq)?;
@@ -730,7 +772,7 @@ impl Parser {
             items.push(self.fn_def(vis)?);
         }
         self.expect(&TokKind::RBrace)?;
-        Ok(ImplBlock { generics, trait_ref, self_ty, items, assoc_types, span: start.to(self.prev_span()) })
+        Ok(ImplBlock { generics, trait_ref, self_ty, items, assoc_types, consts, span: start.to(self.prev_span()) })
     }
 
     fn type_alias(&mut self, vis: bool) -> PResult<TypeAlias> {
@@ -869,7 +911,8 @@ impl Parser {
                     if !self.eat(&TokKind::Plus) { break; }
                 }
             }
-            g.params.push(TypeParam { name, bounds, span: pstart.to(self.prev_span()) });
+            let default = if self.eat(&TokKind::Eq) { Some(self.ty()?) } else { None };
+            g.params.push(TypeParam { name, bounds, default, span: pstart.to(self.prev_span()) });
             if !self.eat(&TokKind::Comma) { break; }
         }
         self.expect_gt()?;
@@ -1063,7 +1106,7 @@ impl Parser {
                     return Ok(Type { kind: TypeKind::Path(path, args), span });
                 };
                 let name = format!("impl#{}", sink.len());
-                sink.push(TypeParam { name: name.clone(), bounds, span });
+                sink.push(TypeParam { name: name.clone(), bounds, default: None, span });
                 TypeKind::Path(Path::single(name, start), vec![])
             }
             TokKind::Ident(w) if w == "dyn" && matches!(self.peek_at(1), TokKind::Ident(_)) => {

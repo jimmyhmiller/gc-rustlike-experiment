@@ -1706,7 +1706,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let declares = def.items.iter().any(|i| match i {
                 TraitItem::Required(f) => f.name == method,
                 TraitItem::Provided(f) => f.name == method,
-                TraitItem::AssocType(_) => false,
+                TraitItem::AssocType(_) | TraitItem::Const(_) => false,
             });
             if declares { return Some(t); }
             pending.extend(def.supertraits.iter().map(|s| s.path.segments.join("::")));
@@ -1776,6 +1776,24 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn const_def(&self, path: &Path) -> Option<(String, Rc<ConstDef>)> {
         let written = path.segments.join("::");
         if let Some(d) = self.ctx.consts.get(&written) { return Some((written, d.clone())); }
+        // `Type::NAME`, `Self::NAME`, `T::NAME`: an associated constant.
+        if path.segments.len() >= 2 {
+            let prefix = &path.segments[..path.segments.len() - 1];
+            let ty = if prefix.len() == 1 && self.subst.contains_key(&prefix[0]) {
+                self.subst.get(&prefix[0]).cloned()
+            } else {
+                let joined = prefix.join("::");
+                let span = path.span;
+                lower_type(&Type { kind: TypeKind::Path(Path { segments: prefix.to_vec(), span }, vec![]), span }, &[], self.ctx).ok()
+                    .or_else(|| self.ctx.canon(&joined).map(|name| Ty::Named { name, args: vec![] }))
+            };
+            if let Some(base) = ty.as_ref().and_then(crate::types::receiver_base) {
+                if let Some(d) = self.ctx.assoc_consts.get(&(base.clone(), path.last().to_string())) {
+                    if matches!(&*d.value.kind, ExprKind::Path(p) if p.last() == "const#required") { return None; }
+                    return Some((format!("{base}::{}", path.last()), d.clone()));
+                }
+            }
+        }
         if path.is_single() {
             if let Some(full) = self.ctx.use_aliases.get(&written) {
                 if let Some(d) = self.ctx.consts.get(full) { return Some((full.clone(), d.clone())); }
@@ -1955,6 +1973,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     UnOp::Neg => is_numeric(&ty),
                     UnOp::Not => matches!(ty, Ty::Prim(p) if is_int_prim(p) || p == Prim::Bool),
                 };
+                // `-v` / `!v` on other types call `Neg::neg` / `Not::not`.
+                if !valid && !matches!(ci.repr, Repr::Scalar(_)) {
+                    let (tn, mn, sym) = match op { UnOp::Neg => ("Neg", "neg", "unary `-`"), UnOp::Not => ("Not", "not", "`!`") };
+                    return self.trait_method_call(ci, ty, Some(inner), tn, mn, sym, &[], e.span);
+                }
                 if !valid {
                     return err(format!("invalid unary operator for `{}`", ty_display(&ty)), e.span);
                 }
@@ -2225,7 +2248,20 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let repr = self.repr_of(&ty, e.span)?;
                     if matches!(repr, Repr::Scalar(_)) { self.check_scalar_binary(*binop, &ty, e.span)?; }
                     if !matches!(repr, Repr::Scalar(_)) {
-                        // `x += v` on a non-scalar uses the operator trait.
+                        // `x += v` calls `AddAssign::add_assign` when the type
+                        // implements it; otherwise it is `x = x + v`.
+                        let assign_trait = match binop {
+                            BinOp::Add => Some(("AddAssign", "add_assign")), BinOp::Sub => Some(("SubAssign", "sub_assign")),
+                            BinOp::Mul => Some(("MulAssign", "mul_assign")), BinOp::Div => Some(("DivAssign", "div_assign")),
+                            BinOp::Rem => Some(("RemAssign", "rem_assign")), _ => None,
+                        };
+                        if let Some((tn, mn)) = assign_trait {
+                            if self.lookup_trait_method(&ty, tn, mn).is_some() {
+                                let load = CoreExpr::new(CoreExprKind::Local(id), repr);
+                                let what = format!("`{}=`", mn);
+                                return self.trait_method_call(load, ty.clone(), Some(target), tn, mn, &what, std::slice::from_ref(value), e.span);
+                            }
+                        }
                         let load = CoreExpr::new(CoreExprKind::Local(id), repr);
                         let (call, ct) = self.overloaded_binary(*binop, load, ty.clone(), target, value, e.span)?;
                         self.check_assignable(&ct, &ty, e.span)?;
@@ -4473,6 +4509,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 return err(format!("multiple traits define `{}` for `{}`; call it as `Trait::{}(x, ..)`", method, ty_display(&recv_ty), method), span);
             }
         }
+        let entry = self.pick_overload(&recv_ty, entry, args)?;
         OPERAND_TURBOFISH.with(|t| *t.borrow_mut() = turbofish);
         self.method_call_lowered(crecv, recv_ty, Some(recv), entry, args, span)
     }
@@ -4562,7 +4599,81 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
         let entry = self.required_trait_method(&recv_ty, trait_name, method, what, span)?;
+        let entry = self.pick_overload(&recv_ty, entry, args)?;
         self.method_call_lowered(crecv, recv_ty, recv, entry, args, span)
+    }
+
+    /// `Self::X` in `entry`'s signature is the associated type its own impl
+    /// defines (a type with several impls of one trait has several).
+    fn entry_projections(&self, ty: Ty, entry: &crate::types::MethodEntry, scope: &[String]) -> LResult<Ty> {
+        if entry.assoc_types.is_empty() { return Ok(ty); }
+        Ok(match ty {
+            Ty::Named { name, args } => {
+                if let (Some(assoc), Some(Ty::Var(v))) = (name.strip_prefix("proj#"), args.first()) {
+                    if v == "Self" {
+                        if let Some((_, t)) = entry.assoc_types.iter().find(|(n, _)| n == assoc) {
+                            return lower_type(t, scope, self.ctx).map_err(conv);
+                        }
+                    }
+                }
+                Ty::Named { name, args: args.into_iter().map(|a| self.entry_projections(a, entry, scope)).collect::<LResult<_>>()? }
+            }
+            Ty::Tuple(es) => Ty::Tuple(es.into_iter().map(|a| self.entry_projections(a, entry, scope)).collect::<LResult<_>>()?),
+            Ty::Array(e, n) => Ty::Array(Box::new(self.entry_projections(*e, entry, scope)?), n),
+            Ty::Fn { params, ret } => Ty::Fn {
+                params: params.into_iter().map(|a| self.entry_projections(a, entry, scope)).collect::<LResult<_>>()?,
+                ret: Box::new(self.entry_projections(*ret, entry, scope)?),
+            },
+            other => other,
+        })
+    }
+
+    /// Choose among a type's impls of one generic trait (`Add<f64>` and
+    /// `Add<V>` for `V`) by the arguments' types. With one impl, `primary`.
+    fn pick_overload(&mut self, recv_ty: &Ty, primary: crate::types::MethodEntry, args: &[Expr]) -> LResult<crate::types::MethodEntry> {
+        let Some(base) = crate::types::receiver_base(recv_ty) else { return Ok(primary) };
+        self.pick_among(&base, Some(recv_ty), primary, args)
+    }
+
+    /// `pick_overload` for an associated function (no receiver value):
+    /// `M::from(5)` with `impl From<i64> for M` and `impl From<bool> for M`.
+    fn pick_among(&mut self, base: &str, recv_ty: Option<&Ty>, primary: crate::types::MethodEntry, args: &[Expr]) -> LResult<crate::types::MethodEntry> {
+        let Some(tr) = primary.trait_name.clone() else { return Ok(primary) };
+        let candidates = match self.ctx.trait_candidates.get(&(base.to_string(), tr, primary.method.name.clone())) {
+            Some(c) if c.len() > 1 => c.clone(),
+            _ => return Ok(primary),
+        };
+        let mut arg_tys = Vec::new();
+        for a in args { arg_tys.push(self.probe_expr_type(a, None).ok()); }
+        for entry in &candidates {
+            if entry.method.params.len() != args.len() { continue; }
+            let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).map_err(conv)?;
+            let mut isubst = HashMap::new();
+            if let Some(recv_ty) = recv_ty {
+                unify_infer(&impl_self, recv_ty, &mut isubst);
+                if apply_subst(&impl_self, &isubst) != *recv_ty { continue; }
+                isubst.insert("Self".to_string(), recv_ty.clone());
+            } else {
+                isubst.insert("Self".to_string(), impl_self.clone());
+            }
+            let mut scope = entry.impl_generics.clone();
+            scope.extend(entry.method.generics.params.iter().map(|p| p.name.clone()));
+            scope.push("Self".into());
+            let mut fits = true;
+            for (p, actual) in entry.method.params.iter().zip(&arg_tys) {
+                let declared = lower_type(&p.ty, &scope, self.ctx).map_err(conv)?;
+                let declared = apply_subst(&self.entry_projections(declared, entry, &scope)?, &isubst);
+                match actual {
+                    Some(a) if has_var(&declared) || *a == declared || is_never(a) => {}
+                    // An unsuffixed literal takes the declared numeric type.
+                    Some(Ty::Prim(Prim::I64)) if matches!(declared, Ty::Prim(p) if is_int_prim(p)) => {}
+                    Some(Ty::Prim(Prim::F64)) if matches!(declared, Ty::Prim(Prim::F32)) => {}
+                    _ => { fits = false; break; }
+                }
+            }
+            if fits { return Ok(entry.clone()); }
+        }
+        Ok(primary)
     }
 
     /// The symbol part naming `entry`'s method: its bare name, or
@@ -4660,6 +4771,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let mut checks = Vec::new();
         for (a, p) in args.iter().zip(&m.params) {
             let declared = lower_type(&p.ty, &scope_params, self.ctx).map_err(conv)?;
+            let declared = self.entry_projections(declared, &entry, &scope_params)?;
             let declared = apply_subst(&declared, &signature_subst);
             let pre = apply_subst(&declared, &method_subst);
             let (ca, at, arg_span) = match a {
@@ -4700,6 +4812,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 scope_params.extend(mgparams.clone());
                 scope_params.push("Self".to_string());
                 let raw = lower_type(t, &scope_params, self.ctx).map_err(conv)?;
+                let raw = self.entry_projections(raw, &entry, &scope_params)?;
                 apply_subst(&raw, &subst)
             }
             None => Ty::unit(),
@@ -5040,12 +5153,38 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             Le => ("Ord", "cmp", "<="),
             Gt => ("Ord", "cmp", ">"),
             Ge => ("Ord", "cmp", ">="),
-            BitAnd | BitOr | BitXor | Shl | Shr => {
-                return err(format!("bitwise operator on non-scalar type `{}`", ty_display(&lt)), span);
+            BitAnd => ("BitAnd", "bitand", "&"),
+            BitOr => ("BitOr", "bitor", "|"),
+            BitXor => ("BitXor", "bitxor", "^"),
+            Shl | Shr => {
+                return err(format!("shift operator on non-scalar type `{}`", ty_display(&lt)), span);
             }
             And | Or => unreachable!("logical operators are not overloadable"),
         };
         let what = format!("`{}`", sym);
+        // A type that is only `PartialOrd` compares through `partial_cmp`;
+        // an unordered pair (`None`) makes every comparison false.
+        if trait_name == "Ord" && !matches!(lt, Ty::Tuple(_)) && self.lookup_trait_method(&lt, "Ord", "cmp").is_none()
+            && self.lookup_trait_method(&lt, "PartialOrd", "partial_cmp").is_some()
+        {
+            let (call, ret) = self.trait_method_call(cl, lt, Some(l), "PartialOrd", "partial_cmp", &what, std::slice::from_ref(r), span)?;
+            let test = match op { Lt => "is_lt", Le => "is_le", Gt => "is_gt", _ => "is_ge" };
+            let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+            let var = |n: &str| ex(ExprKind::Path(Path::single(n.into(), span)));
+            let id = self.fresh_local(call.repr.clone(), ret.clone());
+            self.push_scope();
+            self.bind("cmp#partial", id, ret.clone());
+            let some = Pattern { kind: PatternKind::Variant { path: Path { segments: vec!["Option".into(), "Some".into()], span }, payload: vec![Pattern { kind: PatternKind::Binding { is_mut: false, name: "cmp#o".into() }, span }] }, span };
+            let m = ex(ExprKind::Match { scrutinee: var("cmp#partial"), arms: vec![
+                MatchArm { pattern: some, guard: None, body: ex(ExprKind::MethodCall { recv: var("cmp#o"), method: test.into(), args: vec![], span }), span },
+                MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Bool(false)), span },
+            ] });
+            let result = self.expr(&m, None);
+            self.pop_scope();
+            let (value, ty) = result?;
+            let repr = value.repr.clone();
+            return Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, call)], tail: Some(value) })), repr), ty));
+        }
         let (call, ret) = if matches!(lt, Ty::Tuple(_)) {
             self.tuple_method(cl, lt, method, std::slice::from_ref(r), span)?
         } else {
@@ -5311,6 +5450,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let base = alias_target.as_ref().and_then(crate::types::receiver_base).unwrap_or_else(|| canonical.clone());
             if let Some(entry) = self.ctx.methods.get(&(base.clone(), name.to_string())).cloned() {
                 if !entry.method.has_self {
+                    let entry = self.pick_among(&base, alias_target.as_ref(), entry, args)?;
                     return self.assoc_call(&base, alias_target.as_ref(), alias_target.as_ref().map(|_| canonical.as_str()), &entry, args, expected, span);
                 }
                 // `Type::method(x, args)`: a method called with its receiver
@@ -5329,14 +5469,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let declared = def.items.iter().any(|item| match item {
                     TraitItem::Required(sig) => sig.name == name && sig.has_self,
                     TraitItem::Provided(f) => f.name == name && f.has_self,
-                    TraitItem::AssocType(_) => false,
+                    TraitItem::AssocType(_) | TraitItem::Const(_) => false,
                 });
                 // `Default::default()`: a function without `self`, taken from
                 // the impl for the expected type.
                 let static_fn = def.items.iter().any(|item| match item {
                     TraitItem::Required(sig) => sig.name == name && !sig.has_self,
                     TraitItem::Provided(f) => f.name == name && !f.has_self,
-                    TraitItem::AssocType(_) => false,
+                    TraitItem::AssocType(_) | TraitItem::Const(_) => false,
                 });
                 if static_fn {
                     let short = trait_name.rsplit("::").next().unwrap().to_string();
@@ -5347,6 +5487,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let entry = self.lookup_trait_method(&target, &trait_name, name)
                         .or_else(|| self.lookup_trait_method(&target, &short, name))
                         .ok_or_else(|| LowerError { msg: format!("`{}` does not implement `{}`", ty_display(&target), short), span })?;
+                    let entry = self.pick_among(&base, Some(&target), entry, args)?;
                     return self.assoc_call(&base, Some(&target), None, &entry, args, expected, span);
                 }
                 if declared && !args.is_empty() {
@@ -5358,6 +5499,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let entry = self.lookup_trait_method(&recv_ty, &trait_name, name)
                         .or_else(|| self.lookup_trait_method(&recv_ty, &short, name))
                         .ok_or_else(|| LowerError { msg: format!("`{}` does not implement `{}`", ty_display(&recv_ty), short), span })?;
+                    let entry = self.pick_overload(&recv_ty, entry, &args[1..])?;
                     return self.method_call_lowered(crecv, recv_ty, Some(&args[0]), entry, &args[1..], span);
                 }
             }

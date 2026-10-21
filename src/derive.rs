@@ -45,7 +45,10 @@ pub fn derive_impls(item: &ItemKind, derives: &[String]) -> Result<Vec<(&'static
     if has("Clone") { emit("Clone", clone(item)); }
     if has("PartialEq") || has("Eq") { emit("Eq", eq(item)); }
     if has("Hash") { emit("Hash", hash(item)); }
-    if has("PartialOrd") || has("Ord") { emit("Ord", ord(item)); }
+    if has("Ord") { emit("Ord", ord(item)); }
+    // Without `Ord`, `PartialOrd` compares field by field with `partial_cmp`
+    // (so fields may be floats); with it, `Ord` supplies `partial_cmp`.
+    if has("PartialOrd") && !has("Ord") { emit("PartialOrd", partial_ord(item)); }
     if has("Default") { emit("Default", default(item)?); }
     Ok(out)
 }
@@ -269,6 +272,50 @@ fn ord(item: &ItemKind) -> String {
         _ => unreachable!(),
     };
     format!("fn cmp(self, other: Self) -> Ordering {{ {body} }}")
+}
+
+/// Lexicographic `partial_cmp` of paired values.
+fn partial_chain(pairs: Vec<(String, String)>) -> String {
+    let mut out = String::from("{ ");
+    for (i, (a, b)) in pairs.into_iter().enumerate() {
+        out.push_str(&format!("let c{i} = {a}.partial_cmp({b}); if c{i} != Option::Some(Ordering::Equal) {{ return c{i}; }} "));
+    }
+    out.push_str("Option::Some(Ordering::Equal) }");
+    out
+}
+
+fn partial_ord(item: &ItemKind) -> String {
+    let body = match item {
+        ItemKind::Struct(s) => {
+            let shape = struct_shape(&s.body);
+            partial_chain(field_values(&shape, Some("self"), "").into_iter().zip(field_values(&shape, Some("other"), "")).collect())
+        }
+        ItemKind::Enum(e) => {
+            let index = |who: &str| {
+                let arms: Vec<String> = e.variants.iter().enumerate().map(|(i, v)| {
+                    let shape = variant_shape(&v.payload);
+                    format!("{} => {i}", variant_pattern(&e.name, &v.name, &shape, "_unused"))
+                }).collect();
+                if arms.is_empty() { format!("match {who} {{}}") } else { format!("match {who} {{ {} }}", arms.join(", ")) }
+            };
+            let mut arms: Vec<String> = e.variants.iter().map(|v| {
+                let shape = variant_shape(&v.payload);
+                format!(
+                    "({}, {}) => {}",
+                    variant_pattern(&e.name, &v.name, &shape, "a"),
+                    variant_pattern(&e.name, &v.name, &shape, "b"),
+                    partial_chain(field_values(&shape, None, "a").into_iter().zip(field_values(&shape, None, "b")).collect())
+                )
+            }).collect();
+            if e.variants.len() > 1 { arms.push("_ => Option::Some(Ordering::Equal)".into()); }
+            format!(
+                "let ia: i64 = {}; let ib: i64 = {}; if ia != ib {{ return Option::Some(ia.cmp(ib)); }} match (self, other) {{ {} }}",
+                index("self"), index("other"), arms.join(", ")
+            )
+        }
+        _ => unreachable!(),
+    };
+    format!("fn partial_cmp(self, other: Self) -> Option<Ordering> {{ {body} }}")
 }
 
 /// `T::default()` for a written field type.

@@ -485,6 +485,7 @@ pub(super) fn validate(globals: &crate::resolve::GlobalTable) -> Result<(), Type
         checker.check(name, &scope, types, definition.span, false)?;
         for item in &definition.items {
             match item {
+                TraitItem::Const(_) => {}
                 TraitItem::Provided(function) => checker.function(name, function, &scope)?,
                 TraitItem::Required(signature) => {
                     let scope = checker.scope(&scope, &signature.generics)?;

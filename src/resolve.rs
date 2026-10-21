@@ -264,6 +264,11 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
                 let (name, generics, params, has_self, self_is_mut, ret, span, required) = match item {
                     TraitItem::Required(f) => (&f.name, &f.generics, &f.params, f.has_self, f.self_is_mut, &f.ret, f.span, true),
                     TraitItem::Provided(f) => (&f.name, &f.generics, &f.params, f.has_self, f.self_is_mut, &f.ret, f.span, false),
+                    // A trait object has no value for a required constant.
+                    TraitItem::Const(c) => {
+                        if matches!(&*c.value.kind, ExprKind::Path(p) if p.last() == "const#required") { implementable = false; }
+                        continue;
+                    }
                     TraitItem::AssocType(_) => continue,
                 };
                 let converted = (has_self && generics.params.is_empty()).then(|| {
@@ -290,7 +295,7 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
         let name = format!("dyn#{}", def.name);
         let struct_path = if module.is_empty() { name.clone() } else { format!("{module}::{name}") };
         let mut params = def.generics.params.clone();
-        params.extend(assocs.iter().map(|a| TypeParam { name: format!("assoc#{a}"), bounds: vec![], span: def.span }));
+        params.extend(assocs.iter().map(|a| TypeParam { name: format!("assoc#{a}"), bounds: vec![], default: None, span: def.span }));
         let self_ty = Type {
             kind: TypeKind::Path(Path::single(name.clone(), def.span), params.iter()
                 .map(|p| Type { kind: TypeKind::Path(Path::single(p.name.clone(), def.span), vec![]), span: def.span }).collect()),
@@ -321,6 +326,7 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
                     self_ty: self_ty.clone(),
                     items,
                     assoc_types,
+                    consts: vec![],
                     span,
                 }));
             }
@@ -433,7 +439,9 @@ fn validate_methods(g: &GlobalTable) -> Result<(), ResolveError> {
     let mut seen = std::collections::HashSet::new();
     for imp in &g.impls {
         let base = crate::types::impl_receiver_base(imp, g).map_err(|error| ResolveError { msg: error.msg, span: error.span })?;
-        let tr = imp.trait_ref.as_ref().map(|t| t.path.segments.join("::"));
+        // One impl per trait *instantiation*: `Add<f64>` and `Add<V>` differ.
+        let tr = imp.trait_ref.as_ref().map(|t| format!("{}<{}>", t.path.segments.join("::"),
+            t.args.iter().map(|a| type_text(a, &HashMap::new())).collect::<Vec<_>>().join(", ")));
         for m in &imp.items {
             if !seen.insert((base.clone(), tr.clone(), m.name.clone())) {
                 return Err(ResolveError {
@@ -478,6 +486,14 @@ fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
                     ret: f.ret.clone(),
                     span: f.span,
                 }, true),
+                // A required constant must be given; a defaulted one may be.
+                TraitItem::Const(c) => {
+                    let required = matches!(&*c.value.kind, ExprKind::Path(p) if p.last() == "const#required");
+                    if required && !imp.consts.iter().any(|ic| ic.name == c.name) {
+                        return Err(ResolveError { msg: format!("`impl {} for {}` is missing constant `{}`", tname, self_name, c.name), span: imp.span });
+                    }
+                    continue;
+                }
                 TraitItem::AssocType(name) => {
                     if !imp.assoc_types.iter().any(|(n, _)| n == name) {
                         return Err(ResolveError { msg: format!("`impl {} for {}` is missing associated type `{}`", tname, self_name, name), span: imp.span });
@@ -505,7 +521,7 @@ fn validate_trait_impls(g: &GlobalTable) -> Result<(), ResolveError> {
             let declared = def.items.iter().any(|item| match item {
                 TraitItem::Required(sig) => sig.name == m.name,
                 TraitItem::Provided(f) => f.name == m.name,
-                TraitItem::AssocType(_) => false,
+                TraitItem::AssocType(_) | TraitItem::Const(_) => false,
             });
             if !declared {
                 return Err(ResolveError { msg: format!("method `{}` is not a member of trait `{}`", m.name, tname), span: m.span });
@@ -850,7 +866,7 @@ fn collect_items(
                     let parameters = match item {
                         TraitItem::Required(method) => &method.params,
                         TraitItem::Provided(method) => &method.params,
-                        TraitItem::AssocType(_) => continue,
+                        TraitItem::AssocType(_) | TraitItem::Const(_) => continue,
                     };
                     validate_parameter_names(parameters.iter().map(|p| (p.name.as_str(), p.span)))?;
                 }

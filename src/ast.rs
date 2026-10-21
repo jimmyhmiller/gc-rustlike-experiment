@@ -122,6 +122,9 @@ pub struct TraitDef {
     pub generics: Generics,
     pub supertraits: Vec<TraitRef>,
     pub items: Vec<TraitItem>,
+    /// Associated type defaults (`type Output = Self;`), used by impls that
+    /// leave the type out.
+    pub assoc_defaults: Vec<(String, Type)>,
     pub span: Span,
 }
 
@@ -133,6 +136,8 @@ pub enum TraitItem {
     Provided(FnDef),
     /// An associated type declaration.
     AssocType(String),
+    /// An associated constant: `const ID: i64;` or with a default value.
+    Const(ConstDef),
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -155,6 +160,8 @@ pub struct ImplBlock {
     pub items: Vec<FnDef>,
     /// Associated type definitions: `type Item = i64;`.
     pub assoc_types: Vec<(String, Type)>,
+    /// Associated constants: `const MAX: i64 = 10;`.
+    pub consts: Vec<ConstDef>,
     pub span: Span,
 }
 
@@ -209,6 +216,8 @@ pub struct Generics {
 pub struct TypeParam {
     pub name: String,
     pub bounds: Vec<TraitRef>,
+    /// A default (`Rhs = Self`), used when a trait reference omits it.
+    pub default: Option<Type>,
     pub span: Span,
 }
 

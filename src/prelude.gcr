@@ -29,13 +29,42 @@ enum Ordering { Less, Equal, Greater }
 // Scalars use the built-in operators. For any other type, an operator calls
 // the method of that type's impl of the matching trait.
 
-trait Eq { fn eq(self, other: Self) -> bool; }
-trait Ord { fn cmp(self, other: Self) -> Ordering; }
-trait Add { fn add(self, other: Self) -> Self; }
-trait Sub { fn sub(self, other: Self) -> Self; }
-trait Mul { fn mul(self, other: Self) -> Self; }
-trait Div { fn div(self, other: Self) -> Self; }
-trait Rem { fn rem(self, other: Self) -> Self; }
+// `Eq` is Rust's `PartialEq` (`PartialEq` names it too); an empty
+// `impl Eq for T {}` marker is accepted and adds nothing.
+trait Eq {
+    fn eq(self, other: Self) -> bool;
+    fn ne(self, other: Self) -> bool { !self.eq(other) }
+}
+// `Ord` types are also partially ordered; `<` uses `cmp`, or `partial_cmp`
+// for a type that is only `PartialOrd` (an unordered pair compares false).
+trait Ord {
+    fn cmp(self, other: Self) -> Ordering;
+    fn partial_cmp(self, other: Self) -> Option<Ordering> { Option::Some(self.cmp(other)) }
+    fn max(self, other: Self) -> Self { if self.cmp(other) == Ordering::Greater { self } else { other } }
+    fn min(self, other: Self) -> Self { if self.cmp(other) == Ordering::Greater { other } else { self } }
+    fn clamp(self, lo: Self, hi: Self) -> Self { self.max(lo).min(hi) }
+}
+trait PartialOrd { fn partial_cmp(self, other: Self) -> Option<Ordering>; }
+
+// Arithmetic and bitwise operators, shaped like Rust's: `Rhs` defaults to
+// `Self` and `Output` to `Self`, so `impl Add for V { fn add(self, o: V) -> V }`
+// works as well as `impl Add<f64> for V { type Output = V; ... }`.
+trait Add<Rhs = Self> { type Output = Self; fn add(self, rhs: Rhs) -> Self::Output; }
+trait Sub<Rhs = Self> { type Output = Self; fn sub(self, rhs: Rhs) -> Self::Output; }
+trait Mul<Rhs = Self> { type Output = Self; fn mul(self, rhs: Rhs) -> Self::Output; }
+trait Div<Rhs = Self> { type Output = Self; fn div(self, rhs: Rhs) -> Self::Output; }
+trait Rem<Rhs = Self> { type Output = Self; fn rem(self, rhs: Rhs) -> Self::Output; }
+trait BitAnd<Rhs = Self> { type Output = Self; fn bitand(self, rhs: Rhs) -> Self::Output; }
+trait BitOr<Rhs = Self> { type Output = Self; fn bitor(self, rhs: Rhs) -> Self::Output; }
+trait BitXor<Rhs = Self> { type Output = Self; fn bitxor(self, rhs: Rhs) -> Self::Output; }
+trait Neg { type Output = Self; fn neg(self) -> Self::Output; }
+trait Not { type Output = Self; fn not(self) -> Self::Output; }
+// `a += b` calls `add_assign` when the type implements it, else `a = a + b`.
+trait AddAssign<Rhs = Self> { fn add_assign(mut self, rhs: Rhs); }
+trait SubAssign<Rhs = Self> { fn sub_assign(mut self, rhs: Rhs); }
+trait MulAssign<Rhs = Self> { fn mul_assign(mut self, rhs: Rhs); }
+trait DivAssign<Rhs = Self> { fn div_assign(mut self, rhs: Rhs); }
+trait RemAssign<Rhs = Self> { fn rem_assign(mut self, rhs: Rhs); }
 
 // `x[i]` on a non-array type calls `Index::index`; `x[i] = v` calls
 // `IndexSet::index_set`. (Without references there is no `IndexMut`, so
@@ -56,6 +85,13 @@ trait ToString { fn to_string(self) -> String; }
 // Marker: values of the type may be shared between threads. Usually derived
 // from the type's fields; `impl Sync for T {}` asserts it.
 trait Sync {}
+// Bounds Rust code uses that every type here meets: values are copied or
+// shared through the GC, and thread sharing is checked through `Sync`.
+trait Copy {}
+trait Send {}
+
+// Conversions: `T::from(x)`, `let t: T = From::from(x)`.
+trait From<T> { fn from(value: T) -> Self; }
 
 // `clone` copies a collection's storage, so the copy and the original can be
 // mutated independently. Elements are not cloned.
@@ -106,6 +142,18 @@ impl Ord for u16 { fn cmp(self, other: u16) -> Ordering { if self < other { Orde
 impl Ord for u32 { fn cmp(self, other: u32) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
 impl Ord for u64 { fn cmp(self, other: u64) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
 impl Ord for bool { fn cmp(self, other: bool) -> Ordering { if self == other { Ordering::Equal } else if self { Ordering::Greater } else { Ordering::Less } } }
+impl PartialOrd for f32 {
+    fn partial_cmp(self, other: f32) -> Option<Ordering> {
+        if self < other { Option::Some(Ordering::Less) } else if self > other { Option::Some(Ordering::Greater) }
+        else if self == other { Option::Some(Ordering::Equal) } else { Option::None }
+    }
+}
+impl PartialOrd for f64 {
+    fn partial_cmp(self, other: f64) -> Option<Ordering> {
+        if self < other { Option::Some(Ordering::Less) } else if self > other { Option::Some(Ordering::Greater) }
+        else if self == other { Option::Some(Ordering::Equal) } else { Option::None }
+    }
+}
 impl Ord for char { fn cmp(self, other: char) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
 
 // SplitMix64-style finalizer: scrambles sequential integer keys so they don't
@@ -2100,3 +2148,35 @@ impl char {
         if c < 128 { 1 } else if c < 2048 { 2 } else if c < 65536 { 3 } else { 4 }
     }
 }
+
+// ---- Operator traits for the numeric primitives -------------------------------
+// Scalars use the built-in operators directly; these impls let generic code
+// bound by `T: Add<Output = T>` (and the rest) accept them.
+
+macro_rules! numeric_ops {
+    ($($t:ty)*) => { $(
+        impl Add for $t { fn add(self, rhs: $t) -> $t { self + rhs } }
+        impl Sub for $t { fn sub(self, rhs: $t) -> $t { self - rhs } }
+        impl Mul for $t { fn mul(self, rhs: $t) -> $t { self * rhs } }
+        impl Div for $t { fn div(self, rhs: $t) -> $t { self / rhs } }
+        impl Rem for $t { fn rem(self, rhs: $t) -> $t { self % rhs } }
+        impl AddAssign for $t { fn add_assign(mut self, rhs: $t) { self = self + rhs; } }
+        impl SubAssign for $t { fn sub_assign(mut self, rhs: $t) { self = self - rhs; } }
+        impl MulAssign for $t { fn mul_assign(mut self, rhs: $t) { self = self * rhs; } }
+        impl DivAssign for $t { fn div_assign(mut self, rhs: $t) { self = self / rhs; } }
+    )* };
+}
+numeric_ops!(i8 i16 i32 i64 u8 u16 u32 u64 f32 f64);
+macro_rules! signed_ops {
+    ($($t:ty)*) => { $( impl Neg for $t { fn neg(self) -> $t { 0 as $t - self } } )* };
+}
+signed_ops!(i8 i16 i32 i64 f32 f64);
+macro_rules! bit_ops {
+    ($($t:ty)*) => { $(
+        impl BitAnd for $t { fn bitand(self, rhs: $t) -> $t { self & rhs } }
+        impl BitOr for $t { fn bitor(self, rhs: $t) -> $t { self | rhs } }
+        impl BitXor for $t { fn bitxor(self, rhs: $t) -> $t { self ^ rhs } }
+    )* };
+}
+bit_ops!(i8 i16 i32 i64 u8 u16 u32 u64);
+impl Not for bool { fn not(self) -> bool { !self } }

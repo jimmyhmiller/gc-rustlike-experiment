@@ -494,7 +494,7 @@ fn range_indexing_copies_part_of_a_string_or_vec() {
 fn trait_impls_are_checked_and_default_methods_apply() {
     for (src, want) in [
         ("struct P { x: i64 } impl Ord for P { fn cmp(self, o: P) -> i64 { 0 } }", "it should return `Ordering`, found `i64`"),
-        ("struct P { x: i64 } impl Eq for P { }", "`impl Eq for P` is missing method `eq`"),
+        ("struct P { x: i64 } impl Ord for P { }", "`impl Ord for P` is missing method `cmp`"),
         ("struct P { x: i64 } impl Eq for P { fn eq(self, o: P) -> bool { true } fn extra(self) -> i64 { 1 } }", "method `extra` is not a member of trait `Eq`"),
         ("struct P { x: i64 } impl Frobnicate for P { }", "unknown trait `Frobnicate`"),
         ("struct P { x: i64 } impl Index for P { fn index(self, i: i64) -> i64 { 0 } }", "trait `Index` takes 1 type argument(s)"),

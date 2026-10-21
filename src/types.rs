@@ -71,6 +71,9 @@ pub struct TyCtx {
     /// `const` and `static` items, plus associated constants keyed
     /// `Type::NAME` (impls) and `Trait::NAME` (trait defaults).
     pub consts: HashMap<String, Rc<ConstDef>>,
+    /// Associated constants by (receiver base, name): an inherent impl's,
+    /// then a trait impl's, then the trait's default.
+    pub assoc_consts: HashMap<(String, String), Rc<ConstDef>>,
     pub traits: HashMap<String, Rc<TraitDef>>,
     /// Trait impls, grouped for method lookup.
     pub impls: Vec<Rc<ImplBlock>>,
@@ -85,6 +88,10 @@ pub struct TyCtx {
     /// defaults. `Display::fmt(x, f)` and operator desugaring look here, so
     /// two traits may define the same method name for one type.
     pub trait_methods: HashMap<(String, String, String), MethodEntry>,
+    /// Every impl's entry for (receiver base, trait, method): several when a
+    /// type implements one generic trait more than once (`Add<f64>`,
+    /// `Add<V>`). Calls choose among them by argument type.
+    pub trait_candidates: HashMap<(String, String, String), Vec<MethodEntry>>,
     /// (receiver base, method) pairs defined by more than one trait (and no
     /// inherent impl): a plain `x.m()` call is ambiguous.
     pub ambiguous_methods: std::collections::HashSet<(String, String)>,
@@ -108,6 +115,11 @@ pub struct MethodEntry {
     /// accept a method from the matching trait impl.
     pub trait_name: Option<String>,
     pub method: Rc<FnDef>,
+    /// The trait's arguments as the impl writes them (`Add<f64>` → `[f64]`).
+    pub trait_args: Vec<Type>,
+    /// The impl's associated types (`type Output = V;`), which give
+    /// `Self::Output` in this method's signature its meaning.
+    pub assoc_types: Vec<(String, Type)>,
 }
 
 /// Match generic binders consistently while preserving nominal identity and
@@ -165,6 +177,7 @@ impl TyCtx {
         // precedence over trait methods of the same name.
         let mut methods: HashMap<(String, String), MethodEntry> = HashMap::new();
         let mut trait_methods = HashMap::new();
+        let mut trait_candidates: HashMap<(String, String, String), Vec<MethodEntry>> = HashMap::new();
         let mut inherent = std::collections::HashSet::new();
         let mut ambiguous_methods = std::collections::HashSet::new();
         let mut defaults = std::collections::HashSet::new();
@@ -208,6 +221,8 @@ impl TyCtx {
                     impl_constraints: imp.generics.clone(),
                     trait_name: None,
                     method: Rc::new(m.clone()),
+                    trait_args: vec![],
+                    assoc_types: vec![],
                 }, false);
             }
         }
@@ -216,13 +231,17 @@ impl TyCtx {
             let impl_generics: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
             let tr = imp.trait_ref.as_ref().unwrap().path.segments.join("::");
             for m in &imp.items {
-                add(&mut methods, &base, MethodEntry {
+                let entry = MethodEntry {
                     self_ty: imp.self_ty.clone(),
                     impl_generics: impl_generics.clone(),
                     impl_constraints: imp.generics.clone(),
                     trait_name: Some(tr.clone()),
                     method: Rc::new(m.clone()),
-                }, false);
+                    trait_args: imp.trait_ref.as_ref().unwrap().args.clone(),
+                    assoc_types: imp.assoc_types.clone(),
+                };
+                trait_candidates.entry((base.clone(), tr.clone(), m.name.clone())).or_insert_with(Vec::new).push(entry.clone());
+                add(&mut methods, &base, entry, false);
             }
         }
         // A trait's default methods belong to every implementing type that
@@ -237,13 +256,19 @@ impl TyCtx {
             let impl_generics: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
             for item in &def.items {
                 let crate::ast::TraitItem::Provided(f) = item else { continue };
-                add(&mut methods, &base, MethodEntry {
+                let entry = MethodEntry {
                     self_ty: imp.self_ty.clone(),
                     impl_generics: impl_generics.clone(),
                     impl_constraints: imp.generics.clone(),
                     trait_name: Some(tname.clone()),
                     method: Rc::new(f.clone()),
-                }, true);
+                    trait_args: tr.args.clone(),
+                    assoc_types: imp.assoc_types.clone(),
+                };
+                if !imp.items.iter().any(|m| m.name == f.name) {
+                    trait_candidates.entry((base.clone(), tname.clone(), f.name.clone())).or_insert_with(Vec::new).push(entry.clone());
+                }
+                add(&mut methods, &base, entry, true);
             }
         }
         let mut trait_impls: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
@@ -254,7 +279,27 @@ impl TyCtx {
                     .entry(receiver).or_default().push(index);
             }
         }
+        let mut assoc_consts: HashMap<(String, String), Rc<ConstDef>> = HashMap::new();
+        let mut ordered: Vec<&ImplBlock> = g.impls.iter().filter(|i| i.trait_ref.is_none()).collect();
+        ordered.extend(g.impls.iter().filter(|i| i.trait_ref.is_some()));
+        for imp in &ordered {
+            let base = impl_receiver_base(imp, g).expect("validated impl receiver");
+            for c in &imp.consts {
+                assoc_consts.entry((base.clone(), c.name.clone())).or_insert_with(|| Rc::new(c.clone()));
+            }
+        }
+        for imp in &ordered {
+            let Some(tr) = &imp.trait_ref else { continue };
+            let Some(def) = g.traits.get(&tr.path.segments.join("::")) else { continue };
+            let base = impl_receiver_base(imp, g).expect("validated impl receiver");
+            for item in &def.items {
+                if let TraitItem::Const(c) = item {
+                    assoc_consts.entry((base.clone(), c.name.clone())).or_insert_with(|| Rc::new(c.clone()));
+                }
+            }
+        }
         TyCtx {
+            assoc_consts,
             trait_impls,
             // Tuple and unit structs are records over positional fields
             // `0`, `1`, ... from here on (the layout names them the same).
@@ -277,6 +322,7 @@ impl TyCtx {
             variants,
             methods,
             trait_methods,
+            trait_candidates,
             ambiguous_methods,
             use_aliases: g.use_aliases.clone(),
             aliases: g.resolved_aliases.clone(),

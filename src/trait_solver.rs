@@ -413,6 +413,15 @@ impl<C: ProofContext> Solver<'_, C> {
             }
             alternatives.push(conditions);
         }
+        // Every type is `Copy` and `Send` here (see the prelude).
+        if matches!(name, "Copy" | "Send") && args.is_empty() {
+            alternatives.push(vec![]);
+            return Ok(alternatives);
+        }
+        // An `Ord` type is `PartialOrd` (its `partial_cmp` comes from `cmp`).
+        if name == "PartialOrd" && args.is_empty() && self.ctx.trait_definition("Ord").is_some() {
+            alternatives.push(vec![bound_goal(ty.clone(), "Ord".into(), vec![])]);
+        }
         // Like Rust's blanket `impl<T: Display> ToString for T`.
         if name == "ToString" && args.is_empty() && self.ctx.trait_definition("Display").is_some() {
             alternatives.push(vec![bound_goal(ty.clone(), "Display".into(), vec![])]);

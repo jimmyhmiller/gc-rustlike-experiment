@@ -504,3 +504,70 @@ fn struct_forms_enums_consts_modules_tuples_and_turbofish() {
         }
     "##), 0);
 }
+
+#[test]
+fn associated_constants() {
+    assert_eq!(run(r#"
+        trait Shape {
+            const SIDES: i64;
+            const NAME: String = "shape";
+            fn describe(self) -> String { format!("{} with {} sides", Self::NAME, Self::SIDES) }
+        }
+        struct Tri;
+        struct Sq;
+        impl Shape for Tri { const SIDES: i64 = 3; }
+        impl Shape for Sq { const SIDES: i64 = 4; const NAME: String = "square"; }
+        fn sides<T: Shape>(_s: T) -> i64 { T::SIDES * 10 }
+        struct Grid;
+        impl Grid { const W: i64 = 4; const AREA: i64 = Self::W * Self::W; }
+        fn main() -> i64 {
+            assert_eq!(Tri.describe(), "shape with 3 sides");
+            assert_eq!(Sq.describe(), "square with 4 sides");
+            sides(Sq) + Grid::AREA
+        }
+    "#), 56);
+    let msg = compile_error("trait T { const X: i64; } struct A; impl T for A {} fn main() -> i64 { 0 }");
+    assert!(msg.contains("missing constant `X`"), "{msg}");
+}
+
+#[test]
+fn rust_shaped_operator_traits_and_multiple_impls() {
+    assert_eq!(run(r#"
+        use std::ops::{Add, Sub, Mul, Neg, AddAssign};
+        use std::cmp::Ordering;
+        #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+        struct V2 { x: f64, y: f64 }
+        impl Add for V2 { type Output = V2; fn add(self, o: V2) -> V2 { V2 { x: self.x + o.x, y: self.y + o.y } } }
+        impl Sub for V2 { type Output = Self; fn sub(self, o: Self) -> Self { V2 { x: self.x - o.x, y: self.y - o.y } } }
+        impl Mul<f64> for V2 { type Output = V2; fn mul(self, k: f64) -> V2 { V2 { x: self.x * k, y: self.y * k } } }
+        impl Mul<V2> for V2 { type Output = f64; fn mul(self, o: V2) -> f64 { self.x * o.x + self.y * o.y } }
+        impl Neg for V2 { type Output = V2; fn neg(self) -> V2 { V2 { x: -self.x, y: -self.y } } }
+        impl AddAssign for V2 { fn add_assign(mut self, o: V2) { self.x += o.x; self.y += o.y; } }
+        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+        enum Level { Low, Mid(i64), High }
+        struct Money(i64);
+        impl PartialEq for Money { fn eq(self, o: Money) -> bool { self.0 == o.0 } }
+        impl Eq for Money {}
+        impl PartialOrd for Money { fn partial_cmp(self, o: Money) -> Option<Ordering> { Some(self.cmp(o)) } }
+        impl Ord for Money { fn cmp(self, o: Money) -> Ordering { self.0.cmp(o.0) } }
+        struct Meters { v: i64 }
+        impl From<i64> for Meters { fn from(n: i64) -> Meters { Meters { v: n } } }
+        impl From<bool> for Meters { fn from(b: bool) -> Meters { Meters { v: if b { 1 } else { 0 } } } }
+        fn sum_all<T: Add<Output = T> + Copy>(xs: Vec<T>, zero: T) -> T { let mut acc = zero; for x in xs { acc = acc + x; } acc }
+        fn main() -> i64 {
+            let a = V2 { x: 1.0, y: 2.0 };
+            let b = V2 { x: 3.0, y: 4.0 };
+            let mut c = a + b * 2.0 - -a;
+            c += V2 { x: 0.5, y: 0.5 };
+            assert_eq!(c, V2 { x: 8.5, y: 12.5 });
+            assert_eq!(a * b, 11.0);
+            assert!(a < b && Level::Mid(3) < Level::High && Level::Mid(3) > Level::Mid(2));
+            assert!(Money(5) > Money(3) && !(Money(2) != Money(2)));
+            assert_eq!(sum_all(vec![a, b], V2 { x: 0.0, y: 0.0 }), V2 { x: 4.0, y: 6.0 });
+            assert_eq!(2.0f64.partial_cmp(3.0), Some(Ordering::Less));
+            let m1 = Meters::from(5);
+            let m2: Meters = From::from(true);
+            sum_all(vec![1, 2, 3], 0) + Money(1).max(Money(7)).0 + m1.v + m2.v
+        }
+    "#), 19);
+}
