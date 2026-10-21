@@ -108,8 +108,8 @@ fn loop_control_is_typed_and_cannot_escape_a_closure() {
             "break outside loop",
         ),
         (
-            "fn main() -> i64 { loop { break 42; } }",
-            "break values are not supported",
+            "fn main() -> i64 { while true { break 42; } 0 }",
+            "only `loop` can `break` with a value",
         ),
         ("fn main() -> i64 { loop { break; } true }", "type mismatch"),
     ] {

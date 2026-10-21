@@ -1001,7 +1001,7 @@ fn check_type(
 pub fn is_builtin_type(name: &str) -> bool {
     matches!(
         name,
-        "i8" | "i16" | "i32" | "i64"
+        "i8" | "i16" | "i32" | "i64" | "usize" | "isize"
             | "u8" | "u16" | "u32" | "u64"
             | "f32" | "f64"
             | "bool" | "char" | "String" | "Bytes" | "RawPtr"
@@ -1011,6 +1011,8 @@ pub fn is_builtin_type(name: &str) -> bool {
             | "Box" | "Rc" | "Arc"
             // a hole in `collect::<Vec<_>>()`
             | "_"
+            // explicit type arguments (parser::turbofish_marker)
+            | "turbofish#" | "typeargs#"
     )
 }
 

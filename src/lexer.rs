@@ -64,6 +64,8 @@ pub enum TokKind {
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Semi, Colon, ColonColon, Arrow, FatArrow, Dot, DotDot, DotDotEq,
     Question, At, Hash, Dollar,
+    /// `'name`: a loop label (or a lifetime, which is skipped).
+    Lifetime(String),
     Plus, Minus, Star, Slash, Percent,
     Eq, EqEq, Ne, Lt, Le, Gt, Ge,
     AndAnd, OrOr, Not,
@@ -178,6 +180,14 @@ impl<'a> Lexer<'a> {
             match c {
                 b'0'..=b'9' => self.lex_number(start)?,
                 b'"' => self.lex_string(start)?,
+                // `'name` (no closing quote after one char) is a label.
+                b'\'' if self.is_label_start() => {
+                    self.pos += 1;
+                    let s = self.pos;
+                    while self.pos < self.src.len() && is_ident_continue(self.peek()) { self.pos += 1; }
+                    let name = self.text[s..self.pos].to_string();
+                    self.push(TokKind::Lifetime(name), start);
+                }
                 b'\'' => self.lex_char(start)?,
                 c if is_ident_start(c) => self.lex_ident(start),
                 _ => self.lex_punct(start)?,
@@ -322,6 +332,8 @@ impl<'a> Lexer<'a> {
         match &self.text[start..self.pos] {
             "i8" => NumSuffix::I8, "i16" => NumSuffix::I16,
             "i32" => NumSuffix::I32, "i64" => NumSuffix::I64,
+            // `usize`/`isize` are `i64` (indices are signed 64-bit).
+            "usize" | "isize" => NumSuffix::I64,
             "u8" => NumSuffix::U8, "u16" => NumSuffix::U16,
             "u32" => NumSuffix::U32, "u64" => NumSuffix::U64,
             "f32" => NumSuffix::F32, "f64" => NumSuffix::F64,
@@ -354,6 +366,15 @@ impl<'a> Lexer<'a> {
         }
         self.push(TokKind::Str(s), start);
         Ok(())
+    }
+
+    /// At `'`: does a label or lifetime (`'outer`, `'a`) start here, rather
+    /// than a char literal (`'a'`)?
+    fn is_label_start(&self) -> bool {
+        let b = self.src;
+        let i = self.pos;
+        i + 1 < b.len() && is_ident_start(b[i + 1])
+            && !(i + 2 < b.len() && b[i + 2] == b'\'')
     }
 
     fn lex_char(&mut self, start: usize) -> Result<(), LexError> {

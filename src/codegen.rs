@@ -2377,7 +2377,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             CoreExprKind::If(cond, then_b, else_b) => {
                 self.gen_if(fcx, cond, then_b, else_b, &e.repr)}
             CoreExprKind::Block(b) => self.gen_block(fcx, b),
-            CoreExprKind::Loop(body) => self.gen_loop(fcx, body),
+            CoreExprKind::Loop(body) => self.gen_loop(fcx, body, &e.repr),
             CoreExprKind::Break(v) => {
                 let bv = match v {
                     Some(e) => self.gen_expr(fcx, e)?,
@@ -4971,14 +4971,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         &mut self,
         fcx: &mut FnCtx<'ctx>,
         body: &CoreBlock,
+        repr: &Repr,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let func = fcx.func;
         let header_bb = self.ctx.append_basic_block(func, "loop.header");
         let cont_bb = self.ctx.append_basic_block(func, "loop.cont");
+        // A `loop` that breaks with a value stores it here; the value is read
+        // right after the loop, with no safepoint in between.
+        let slot = match self.llvm_ty(repr) {
+            Some(t) => Some(self.entry_alloca(t, "loop.value")),
+            None => None,
+        };
         self.builder.build_unconditional_branch(header_bb).unwrap();
 
-        // v0 loops yield unit, so no break-value slot is needed.
-        fcx.loops.push((cont_bb, None));
+        fcx.loops.push((cont_bb, slot));
         fcx.loop_headers.push(header_bb);
         fcx.loop_ffi_bases.push((fcx.pending_ffi_buffers.len(), fcx.ffi_stack_tokens.len()));
 
@@ -4996,6 +5002,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         fcx.loop_headers.pop();
         fcx.loop_ffi_bases.pop();
         self.builder.position_at_end(cont_bb);
+        if let (Some(slot), Some(t)) = (slot, self.llvm_ty(repr)) {
+            return Ok(Some(self.builder.build_load(t, slot, "loop.result").unwrap()));
+        }
         Ok(None)
     }
 

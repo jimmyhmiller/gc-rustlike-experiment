@@ -441,6 +441,58 @@ fn bind_pattern_names(p: &Pattern, bound: &mut Vec<String>) {
 }
 
 /// A human-readable rendering of a type for diagnostics.
+/// The value of the first plain assignment `name = value` in `e`, outside
+/// closures.
+fn first_assignment(e: &Expr, name: &str) -> Option<Expr> {
+    match &*e.kind {
+        ExprKind::Assign { target, op: None, value } if matches!(&*target.kind, ExprKind::Path(p) if p.is_single() && p.last() == name) => Some(value.clone()),
+        ExprKind::Closure { .. } => None,
+        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop { body: b } => first_assignment_block(b, name),
+        ExprKind::If { cond, then_branch, else_branch } => first_assignment(cond, name)
+            .or_else(|| first_assignment_block(then_branch, name))
+            .or_else(|| else_branch.as_ref().and_then(|e| first_assignment(e, name))),
+        ExprKind::While { cond, body } => first_assignment(cond, name).or_else(|| first_assignment_block(body, name)),
+        ExprKind::For { iter, body, .. } => first_assignment(iter, name).or_else(|| first_assignment_block(body, name)),
+        ExprKind::Match { scrutinee, arms } => first_assignment(scrutinee, name)
+            .or_else(|| arms.iter().find_map(|a| first_assignment(&a.body, name))),
+        _ => None,
+    }
+}
+
+fn first_assignment_block(b: &Block, name: &str) -> Option<Expr> {
+    b.stmts.iter().find_map(|s| match s {
+        Stmt::Let { init: Some(e), .. } | Stmt::Expr(e) => first_assignment(e, name),
+        _ => None,
+    }).or_else(|| b.tail.as_ref().and_then(|t| first_assignment(t, name)))
+}
+
+/// What the lowering knows about an enclosing loop: whether a `break` leaves
+/// it, and the type of its `break value`s (a `loop` only).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LoopExit {
+    exits: bool,
+    takes_value: bool,
+    value: Option<Ty>,
+}
+
+thread_local! {
+    /// Explicit type arguments (`f::<T>()`) for the call about to be lowered:
+    /// (on the type segment, types). Taken by `call` on entry.
+    static TURBOFISH: std::cell::RefCell<Option<(bool, Vec<Ty>)>> = const { std::cell::RefCell::new(None) };
+    /// A method call's type arguments, held while its receiver is lowered,
+    /// then handed to `method_call_operands`.
+    static METHOD_TURBOFISH: std::cell::RefCell<Option<Vec<Ty>>> = const { std::cell::RefCell::new(None) };
+    static OPERAND_TURBOFISH: std::cell::RefCell<Option<Vec<Ty>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `(inner, marker, type args)` for an expression the parser tagged with
+/// explicit type arguments (`parser::turbofish_marker`).
+fn turbofish_of(e: &Expr) -> Option<(&Expr, &str, &Vec<Type>)> {
+    let ExprKind::Cast(inner, ty) = &*e.kind else { return None };
+    let TypeKind::Path(p, args) = &ty.kind else { return None };
+    (p.is_single() && matches!(p.last(), "turbofish#" | "typeargs#")).then(|| (inner, p.last(), args))
+}
+
 /// Does `ty` contain an `impl Trait` result placeholder?
 fn has_opaque(ty: &Ty) -> bool {
     match ty {
@@ -544,7 +596,7 @@ fn repr_is_blittable(repr: &Repr, values: &[ValueLayout]) -> bool {
 // same complete state, just like successful type facts.
 type ProbeLocals = (HashMap<String, Ty>, Vec<HashMap<String, (LocalId, Ty, bool)>>,
     Vec<Repr>, Vec<Option<String>>, Vec<Ty>, Ty, bool, LetInference, usize,
-    Vec<LocalId>, Vec<bool>, bool);
+    Vec<LocalId>, Vec<LoopExit>, bool);
 struct ProbeEntry {
     _node: std::sync::Arc<ExprKind>,
     span: Span,
@@ -583,7 +635,7 @@ struct FnLowerer<'a, 'r, 'm> {
     /// Lexical only: reset when checking a lifted closure or another function.
     unsafe_depth: usize,
     deferred_locals: Vec<LocalId>,
-    loop_exits: Vec<bool>,
+    loop_exits: Vec<LoopExit>,
     type_probe: bool,
     probe_cache: Rc<std::cell::RefCell<HashMap<usize, Vec<ProbeEntry>>>>,
 }
@@ -1433,18 +1485,33 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     // annotation (nothing to infer from) and `mut` (the binding
                     // will be assigned later — see docs/mutability.md). The slot
                     // is zero-initialized; a later `x = ...` fills it.
+                    // Rust's `let x;` is assigned exactly once later; here
+                    // the binding is simply mutable.
                     None => {
-                        let Some(t) = ty else {
-                            return err("`let` without an initializer needs a type annotation (`let mut x: T;`)", *span);
+                        let dty = match ty {
+                            Some(t) => ground_type(t, &self.subst.clone(), self.ctx)?,
+                            // `let mut x; ... x = e;`: the type of the first
+                            // assignment's value, when it can be typed here.
+                            None => {
+                                let rest = b.stmts.iter().skip_while(|t| !std::ptr::eq(*t, s)).skip(1);
+                                let first = rest.filter_map(|t| match t {
+                                    Stmt::Let { init: Some(e), .. } | Stmt::Expr(e) => first_assignment(e, &name),
+                                    _ => None,
+                                }).next().or_else(|| b.tail.as_ref().and_then(|t| first_assignment(t, &name)));
+                                let probed = match first {
+                                    Some(value) => self.probe_expr_type(&value, None).ok().filter(|t| !has_var(t) && !is_never(t)),
+                                    None => None,
+                                };
+                                probed.ok_or_else(|| LowerError { msg: "cannot infer the type of this `let`; add an annotation (`let mut x: T;`)".into(), span: *span })?
+                            }
                         };
-                        if !is_mut {
-                            return err("a deferred-initialization `let` must be `mut` (it is assigned later): write `let mut`", *span);
-                        }
-                        let dty = ground_type(t, &self.subst.clone(), self.ctx)?;
                         let repr = self.repr_of(&dty, *span)?;
                         let id = self.fresh_local(repr.clone(), dty.clone());
-                        self.deferred_locals.push(id);
-                        self.bind_mut(&name, id, dty.clone(), is_mut);
+                        // The result of a labeled `break 'l value` is assigned
+                        // on every path that reads it (the break flags guard
+                        // the read), which the definite-init analysis can't see.
+                        if !name.starts_with("loop#") { self.deferred_locals.push(id); }
+                        self.bind_mut(&name, id, dty.clone(), true);
                         // Zero-initialize so the slot is well-defined before the
                         // first assignment (and GC-safe for ref slots → null).
                         let zero = self.zero_value(&repr);
@@ -1704,6 +1771,107 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok(concrete)
     }
 
+    /// The `const`/`static` a value path names: by its full path, a `use`
+    /// alias, or an unambiguous final segment.
+    fn const_def(&self, path: &Path) -> Option<(String, Rc<ConstDef>)> {
+        let written = path.segments.join("::");
+        if let Some(d) = self.ctx.consts.get(&written) { return Some((written, d.clone())); }
+        if path.is_single() {
+            if let Some(full) = self.ctx.use_aliases.get(&written) {
+                if let Some(d) = self.ctx.consts.get(full) { return Some((full.clone(), d.clone())); }
+            }
+            let mut found = self.ctx.consts.iter().filter(|(k, _)| k.rsplit("::").next() == Some(written.as_str()));
+            let first = found.next()?;
+            if found.next().is_none() { return Some((first.0.clone(), first.1.clone())); }
+        }
+        None
+    }
+
+    /// A constant's value, inlined where it is used (as Rust does), checked
+    /// against its declared type. Its expression sees no local bindings.
+    fn const_value(&mut self, name: &str, def: &ConstDef, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+        if DEPTH.with(|d| d.get()) > 64 {
+            return err(format!("constant `{}` is defined in terms of itself", name), span);
+        }
+        let ty = ground_type(&def.ty, &HashMap::new(), self.ctx)?;
+        let _ = expected;
+        let saved = std::mem::replace(&mut self.scope, vec![HashMap::new()]);
+        DEPTH.with(|d| d.set(d.get() + 1));
+        let result = self.expr(&def.value, Some(&ty));
+        DEPTH.with(|d| d.set(d.get() - 1));
+        self.scope = saved;
+        let (value, actual) = result?;
+        self.check_assignable(&actual, &ty, def.value.span)?;
+        Ok((value, ty))
+    }
+
+    /// `eq`, `cmp`, `hash`, and `clone` on a tuple, element by element
+    /// (tuples have no impls; `==` and `<` on tuples come here too).
+    fn tuple_method(&mut self, recv: CoreExpr, recv_ty: Ty, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        let Ty::Tuple(elems) = &recv_ty else { unreachable!() };
+        let n = elems.len();
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let var = |name: &str| ex(ExprKind::Path(Path::single(name.to_string(), span)));
+        let elem = |name: &str, i: usize| ex(ExprKind::Field { base: var(name), field: FieldAccess::Tuple(i as u32) });
+        let call = |r: Expr, m: &str, args: Vec<Expr>| ex(ExprKind::MethodCall { recv: r, method: m.into(), args, span });
+        let ordering = |v: &str| ex(ExprKind::Path(Path { segments: vec!["Ordering".into(), v.into()], span }));
+        let arity = |k: usize| if args.len() == k { Ok(()) } else { err(format!("`{}` on a tuple takes {} argument(s)", method, k), span) };
+        let other = |stmts: &mut Vec<Stmt>| stmts.push(Stmt::Let {
+            pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: "tup#b".into() }, span },
+            ty: None, init: Some(args[0].clone()), span,
+        });
+        let mut stmts = Vec::new();
+        let body = match method {
+            "eq" | "ne" => {
+                arity(1)?;
+                other(&mut stmts);
+                let all = (0..n).map(|i| ex(ExprKind::Binary(BinOp::Eq, elem("tup#a", i), elem("tup#b", i))))
+                    .reduce(|a, b| ex(ExprKind::Binary(BinOp::And, a, b))).unwrap_or_else(|| ex(ExprKind::Bool(true)));
+                if method == "ne" { ex(ExprKind::Unary(UnOp::Not, all)) } else { all }
+            }
+            "cmp" | "lt" | "le" | "gt" | "ge" => {
+                arity(1)?;
+                other(&mut stmts);
+                let mut chain = ordering("Equal");
+                for i in (0..n).rev() {
+                    let c = format!("tup#c{i}");
+                    chain = ex(ExprKind::Block(Block {
+                        stmts: vec![Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: c.clone() }, span }, ty: None, init: Some(call(elem("tup#a", i), "cmp", vec![elem("tup#b", i)])), span }],
+                        tail: Some(ex(ExprKind::If {
+                            cond: ex(ExprKind::Binary(BinOp::Ne, var(&c), ordering("Equal"))),
+                            then_branch: Block { stmts: vec![], tail: Some(var(&c)), span },
+                            else_branch: Some(ex(ExprKind::Block(Block { stmts: vec![], tail: Some(chain), span }))),
+                        })),
+                        span,
+                    }));
+                }
+                match method {
+                    "cmp" => chain,
+                    m => call(chain, &format!("is_{m}"), vec![]),
+                }
+            }
+            "hash" => {
+                arity(0)?;
+                (0..n).fold(ex(ExprKind::Int(17, crate::lexer::NumSuffix::None)), |h, i| ex(ExprKind::Binary(BinOp::Add,
+                    ex(ExprKind::Binary(BinOp::Mul, h, ex(ExprKind::Int(31, crate::lexer::NumSuffix::None)))),
+                    call(elem("tup#a", i), "hash", vec![]))))
+            }
+            _ => {
+                arity(0)?;
+                ex(ExprKind::Tuple((0..n).map(|i| call(elem("tup#a", i), "clone", vec![])).collect()))
+            }
+        };
+        let id = self.fresh_local(recv.repr.clone(), recv_ty.clone());
+        self.push_scope();
+        self.bind("tup#a", id, recv_ty.clone());
+        let result = self.expr(&ex(ExprKind::Block(Block { stmts, tail: Some(body), span })), None);
+        self.pop_scope();
+        let (value, ty) = result?;
+        let repr = value.repr.clone();
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, recv)], tail: Some(value) })), repr), ty))
+    }
+
     /// Call `method` on a trait object: invoke the object's closure for it.
     fn dyn_method_call(&mut self, crecv: CoreExpr, recv_ty: Ty, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
         let Ty::Named { name, .. } = &recv_ty else { unreachable!() };
@@ -1756,6 +1924,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     };
                     let sid = self.mono.intern_span(e.span);
                     Ok((CoreExpr::new(CoreExprKind::Local(id), repr).at(sid), ty))
+                } else if let Some((cname, def)) = self.const_def(path) {
+                    self.const_value(&cname, &def, expected, e.span)
                 } else if self.ctx.fns.contains_key(name) {
                     self.function_value(path, expected, e.span)
                 } else if self.ctx.variants.contains_key(name) {
@@ -1794,6 +1964,34 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::Binary(op, l, r) => self.binary(*op, l, r, e.span),
 
+            // `f::<T>(..)` / `Vec::<T>::new(..)`: pass the type arguments on.
+            ExprKind::Call(callee, args) if turbofish_of(callee).is_some() => {
+                let (inner, marker, tys) = turbofish_of(callee).unwrap();
+                let tys = tys.iter().map(|t| ground_type(t, &self.subst.clone(), self.ctx)).collect::<LResult<Vec<_>>>()?;
+                let inner = inner.clone();
+                if let ExprKind::Path(path) = &*inner.kind {
+                    let key = path.segments.join("::");
+                    if self.ctx.variants.contains_key(&key) || (path.is_single() && self.ctx.variants.contains_key(path.last())) {
+                        return self.variant_ctor(path, args, expected, e.span);
+                    }
+                }
+                TURBOFISH.with(|t| *t.borrow_mut() = Some((marker == "typeargs#", tys)));
+                let result = self.call(&inner, args, expected, e.span);
+                TURBOFISH.with(|t| t.borrow_mut().take());
+                result
+            }
+            // `x.m::<T>(..)`: the method's type arguments.
+            ExprKind::Cast(inner, target) if turbofish_of(e).is_some() && matches!(&*inner.kind, ExprKind::MethodCall { .. }) => {
+                let tys = match &target.kind { TypeKind::Path(_, a) => a.clone(), _ => vec![] };
+                let tys = tys.iter().map(|t| ground_type(t, &self.subst.clone(), self.ctx)).collect::<LResult<Vec<_>>>()?;
+                let ExprKind::MethodCall { recv, method, args, span } = &*inner.kind else { unreachable!() };
+                METHOD_TURBOFISH.with(|t| *t.borrow_mut() = Some(tys));
+                let result = self.method_call(recv, method, args, *span);
+                METHOD_TURBOFISH.with(|t| t.borrow_mut().take());
+                result
+            }
+            // A path with type arguments not being called (`f::<T>` as a value).
+            ExprKind::Cast(inner, _) if turbofish_of(e).is_some() => self.expr(inner, expected),
             ExprKind::Call(callee, args) => {
                 // A variant constructor call (`Result::Err(x)`) needs `expected`
                 // to infer type params the payload doesn't pin; intercept it
@@ -1878,7 +2076,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::While { cond, body } => {
-                self.loop_exits.push(false);
+                self.loop_exits.push(LoopExit::default());
                 let result = (|| {
                     let (cc, ct) = self.expr(cond, Some(&Ty::bool()))?;
                     self.check_assignable(&ct, &Ty::bool(), cond.span)?;
@@ -1907,15 +2105,39 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::Loop { body } => {
-                self.loop_exits.push(false);
+                self.loop_exits.push(LoopExit { takes_value: true, ..LoopExit::default() });
                 let result = self.block(body);
-                let exits = self.loop_exits.pop().unwrap();
+                let exit = self.loop_exits.pop().unwrap();
                 let (cb, _) = result?;
-                // A loop with a break can fall through and yields unit. Only
-                // a loop without a break has the diverging never type.
-                Ok((CoreExpr::new(CoreExprKind::Loop(Box::new(cb)), Repr::Unit), if exits { Ty::unit() } else { never_ty() }))
+                // A loop yields its `break value`s; with plain breaks it yields
+                // unit. Only a loop without a break has the never type.
+                if let Some(ty) = exit.value {
+                    let repr = self.repr_of(&ty, e.span)?;
+                    return Ok((CoreExpr::new(CoreExprKind::Loop(Box::new(cb)), repr), ty));
+                }
+                Ok((CoreExpr::new(CoreExprKind::Loop(Box::new(cb)), Repr::Unit), if exit.exits { Ty::unit() } else { never_ty() }))
             }
 
+            // `for c in 'a'..='z'`: loop over the code points.
+            ExprKind::For { pat, iter, body } if matches!(&*iter.kind, ExprKind::Range { lo: Some(lo), .. }
+                if matches!(self.probe_expr_type(lo, None), Ok(Ty::Prim(Prim::Char)))) =>
+            {
+                let ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } = &*iter.kind else {
+                    return err("a `for` range needs both bounds", iter.span);
+                };
+                let span = e.span;
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                let ty = |n: &str| Type { kind: TypeKind::Path(Path::single(n.into(), span), vec![]), span };
+                let range = ex(ExprKind::Range {
+                    lo: Some(ex(ExprKind::Cast(lo.clone(), ty("i64")))),
+                    hi: Some(ex(ExprKind::Cast(hi.clone(), ty("i64")))),
+                    inclusive: *inclusive,
+                });
+                let code = Pattern { kind: PatternKind::Binding { is_mut: false, name: "for#code".into() }, span };
+                let bind = Stmt::Let { pattern: pat.clone(), ty: None, init: Some(ex(ExprKind::Cast(ex(ExprKind::Path(Path::single("for#code".into(), span))), ty("char")))), span };
+                let body = Block { stmts: vec![bind, Stmt::Expr(ex(ExprKind::Block(body.clone())))], tail: None, span };
+                self.expr(&ex(ExprKind::For { pat: code, iter: range, body }), None)
+            }
             ExprKind::For { pat, iter, body } => {
                 // Ranges, Vecs and arrays loop by index; anything else that
                 // implements `Iterator` is driven by `next`.
@@ -1949,10 +2171,21 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
 
             ExprKind::Break(v) => {
-                let Some(exits) = self.loop_exits.last_mut() else { return err("break outside loop", e.span); };
-                *exits = true;
-                if v.is_some() { return err("break values are not supported; assign a result before breaking", e.span); }
-                Ok((CoreExpr::new(CoreExprKind::Break(None), Repr::Unit), never_ty()))
+                let Some(exit) = self.loop_exits.last_mut() else { return err("break outside loop", e.span); };
+                exit.exits = true;
+                let Some(v) = v else {
+                    if exit.value.is_some() { return err("this `break` needs a value: the loop's other breaks give one", e.span); }
+                    return Ok((CoreExpr::new(CoreExprKind::Break(None), Repr::Unit), never_ty()));
+                };
+                if !exit.takes_value { return err("only `loop` can `break` with a value (not `while` or `for`)", e.span); }
+                let want = exit.value.clone();
+                let (cv, vt) = self.expr(v, want.as_ref())?;
+                match &want {
+                    Some(w) => self.check_assignable(&vt, w, v.span)?,
+                    None if !is_never(&vt) => { self.loop_exits.last_mut().unwrap().value = Some(vt); }
+                    None => {}
+                }
+                Ok((CoreExpr::new(CoreExprKind::Break(Some(Box::new(cv))), Repr::Unit), never_ty()))
             }
 
             ExprKind::Continue => {
@@ -2022,6 +2255,42 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             ExprKind::Cast(inner, target) => {
                 let (ci, from_ty) = self.expr(inner, None)?;
                 let to_ty = lower_type(target, &[], self.ctx).map_err(conv)?;
+                // `enum as i64`: the variant's discriminant (explicit, or one
+                // more than the previous variant's, starting at 0).
+                if let (Ty::Named { name, .. }, Ty::Prim(p)) = (&from_ty, &to_ty) {
+                    if let (Some(def), true) = (self.ctx.enums.get(name).cloned(), is_int_prim(*p)) {
+                        let span = e.span;
+                        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                        let mut next = 0i64;
+                        let arms = def.variants.iter().map(|v| {
+                            let d = v.discriminant.unwrap_or(next);
+                            next = d.wrapping_add(1);
+                            let mut path: Vec<String> = name.split("::").map(str::to_string).collect();
+                            path.push(v.name.clone());
+                            let payload = match &v.payload {
+                                VariantPayload::None => vec![],
+                                VariantPayload::Tuple(ts) => ts.iter().map(|_| Pattern { kind: PatternKind::Wildcard, span }).collect(),
+                                VariantPayload::Named(_) => vec![],
+                            };
+                            let pattern = match &v.payload {
+                                VariantPayload::Named(_) => Pattern { kind: PatternKind::Struct { path: Path { segments: path, span }, fields: vec![], rest: true }, span },
+                                _ => Pattern { kind: PatternKind::Variant { path: Path { segments: path, span }, payload }, span },
+                            };
+                            let lit = ex(ExprKind::Int(d.unsigned_abs(), crate::lexer::NumSuffix::None));
+                            let body = if d < 0 { ex(ExprKind::Unary(UnOp::Neg, lit)) } else { lit };
+                            MatchArm { pattern, guard: None, body, span }
+                        }).collect();
+                        let id = self.fresh_local(ci.repr.clone(), from_ty.clone());
+                        self.push_scope();
+                        self.bind("cast#enum", id, from_ty.clone());
+                        let m = ex(ExprKind::Match { scrutinee: ex(ExprKind::Path(Path::single("cast#enum".into(), span))), arms });
+                        let result = self.expr(&m, Some(&to_ty));
+                        self.pop_scope();
+                        let (value, ty) = result?;
+                        let repr = value.repr.clone();
+                        return Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, ci)], tail: Some(value) })), repr), ty));
+                    }
+                }
                 let from = ci.repr.clone();
                 let to = self.repr_of(&to_ty, e.span)?;
                 // A representation conversion is not a general type coercion.
@@ -2100,6 +2369,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::MakeValue { value: vid, fields: cfields }, Repr::Value(vid)), ty))
             }
 
+            ExprKind::Path(path) if !path.is_single() && self.const_def(path).is_some() => {
+                let (cname, def) = self.const_def(path).unwrap();
+                self.const_value(&cname, &def, expected, e.span)
+            }
             // `i64::MAX`, `f64::INFINITY`, `f64::consts::PI`, ...
             ExprKind::Path(path) if primitive_const(&path.segments).is_some() => {
                 let (suffix, value) = primitive_const(&path.segments).unwrap();
@@ -2309,9 +2582,32 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let Some(s) = self.ctx.structs.get(&canon).cloned() else {
             return err(format!("`{}` is not a struct", name), span);
         };
-        let StructBody::Named(def_fields) = &s.body else {
-            return err("struct literal on a non-record struct", span);
+        // Tuple and unit structs are records over their positional fields.
+        let def_fields: Vec<FieldDef> = match &s.body {
+            StructBody::Named(fs) => fs.clone(),
+            StructBody::Tuple(tys) => tys.iter().enumerate().map(|(i, t)| FieldDef { vis: true, name: i.to_string(), ty: t.clone(), span: t.span }).collect(),
+            StructBody::Unit => vec![],
         };
+        let def_fields = &def_fields;
+        // `S { a: 1, ..base }`: every field not written is read from `base`
+        // (evaluated once, before the written fields).
+        if let Some(pos) = fields.iter().position(|f| f.name == "..") {
+            let base = fields[pos].value.clone().unwrap();
+            let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+            let var = || ex(ExprKind::Path(Path::single("update#base".into(), span)));
+            let mut inits: Vec<FieldInit> = fields.iter().filter(|f| f.name != "..").cloned().collect();
+            for df in def_fields {
+                if !inits.iter().any(|f| f.name == df.name) {
+                    inits.push(FieldInit { name: df.name.clone(), value: Some(ex(ExprKind::Field { base: var(), field: FieldAccess::Named(df.name.clone()) })), span });
+                }
+            }
+            let block = ex(ExprKind::Block(Block {
+                stmts: vec![Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: "update#base".into() }, span }, ty: None, init: Some(base), span }],
+                tail: Some(ex(ExprKind::StructLit { path: path.clone(), fields: inits, span })),
+                span,
+            }));
+            return self.expr(&block, expected);
+        }
         let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
         let template = alias_template.unwrap_or_else(|| Ty::Named {
             name: canon.clone(),
@@ -2545,6 +2841,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let (cbase, bty) = self.expr(base, None)?;
         let fname = match field {
             FieldAccess::Named(n) => n,
+            // `p.0` on a tuple struct reads its positional field `0`.
+            FieldAccess::Tuple(i) if matches!(&bty, Ty::Named { .. }) => {
+                let name = i.to_string();
+                return self.field_read(cbase, &bty, &name, span);
+            }
             FieldAccess::Tuple(i) => {
                 // `t.0` — tuple element access (value aggregate).
                 let Ty::Tuple(elems) = &bty else {
@@ -2598,10 +2899,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // access path to be a `mut` binding (see docs/mutability.md).
         self.check_mutable_root(base, "field of", span)?;
         let (cbase, bty) = self.expr(base, None)?;
-        let FieldAccess::Named(fname) = field else {
+        let positional;
+        let fname = match field {
+            FieldAccess::Named(n) => n,
+            // `p.0 = v` on a tuple struct assigns its field `0`.
+            FieldAccess::Tuple(i) if matches!(&bty, Ty::Named { .. }) => { positional = i.to_string(); &positional }
             // `t.0 = v`. Tuples are value aggregates (immutable, like value
             // structs): rebuild the tuple instead of assigning an element.
-            return err("tuples are immutable value types; rebuild the tuple instead of assigning `.N` (e.g. `t = (new0, t.1)`)", span);
+            FieldAccess::Tuple(_) => return err("tuples are immutable value types; rebuild the tuple instead of assigning `.N` (e.g. `t = (new0, t.1)`)", span),
         };
         let Ty::Named { name, args: struct_args } = &bty else {
             return err("field assignment on a non-struct", span);
@@ -4123,6 +4428,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if method.starts_with("fmt#") {
             return self.format_pseudo_method(recv, method, args, span);
         }
+        // The receiver may contain calls of its own: hold this call's type
+        // arguments until its operands are lowered.
+        let turbofish = METHOD_TURBOFISH.with(|t| t.borrow_mut().take());
+        let result = self.method_call_inner(recv, method, args, span, turbofish);
+        result
+    }
+
+    fn method_call_inner(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span, turbofish: Option<Vec<Ty>>) -> LResult<(CoreExpr, Ty)> {
+
         self.infer.unresolved = None;
         let (crecv, recv_ty) = match self.expr(recv, None) {
             Ok(v) => v,
@@ -4146,6 +4460,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if let Some(elem_ty) = array_elem_ty(&recv_ty) {
             return self.array_method(crecv, elem_ty, method, args, span);
         }
+        if matches!(recv_ty, Ty::Tuple(_)) && matches!(method, "eq" | "ne" | "cmp" | "hash" | "clone" | "lt" | "le" | "gt" | "ge") {
+            return self.tuple_method(crecv, recv_ty, method, args, span);
+        }
         if dyn_trait(&recv_ty).is_some() && self.lookup_method(&recv_ty, method).is_none() {
             return self.dyn_method_call(crecv, recv_ty, method, args, span);
         }
@@ -4156,6 +4473,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 return err(format!("multiple traits define `{}` for `{}`; call it as `Trait::{}(x, ..)`", method, ty_display(&recv_ty), method), span);
             }
         }
+        OPERAND_TURBOFISH.with(|t| *t.borrow_mut() = turbofish);
         self.method_call_lowered(crecv, recv_ty, Some(recv), entry, args, span)
     }
 
@@ -4316,6 +4634,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // `Self` resolves to the concrete receiver type.
         isubst.insert("Self".to_string(), recv_ty.clone());
 
+        let turbofish = OPERAND_TURBOFISH.with(|t| t.borrow_mut().take());
         let m = entry.method.clone();
         // Method-level generics inferred from args.
         let mgparams: Vec<String> = m.generics.params.iter().map(|p| p.name.clone()).collect();
@@ -4328,6 +4647,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let mut signature_subst = isubst.clone();
         for parameter in &mgparams { signature_subst.remove(parameter); }
         let mut method_subst = HashMap::new();
+        // `x.m::<T>(..)`: explicit method type arguments.
+        if let Some(tys) = &turbofish {
+            for (g, t) in mgparams.iter().zip(tys) {
+                if !matches!(t, Ty::Var(v) if v == "_") { method_subst.insert(g.clone(), t.clone()); }
+            }
+        }
         let mut scope_params = entry.impl_generics.clone();
         scope_params.extend(mgparams.clone());
         scope_params.push("Self".into());
@@ -4721,7 +5046,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             And | Or => unreachable!("logical operators are not overloadable"),
         };
         let what = format!("`{}`", sym);
-        let (call, ret) = self.trait_method_call(cl, lt, Some(l), trait_name, method, &what, std::slice::from_ref(r), span)?;
+        let (call, ret) = if matches!(lt, Ty::Tuple(_)) {
+            self.tuple_method(cl, lt, method, std::slice::from_ref(r), span)?
+        } else {
+            self.trait_method_call(cl, lt, Some(l), trait_name, method, &what, std::slice::from_ref(r), span)?
+        };
         match op {
             Ne => Ok((CoreExpr::new(CoreExprKind::Un(UnOp::Not, Box::new(call)), Repr::Scalar(ScalarRepr::Bool)), Ty::bool())),
             Lt | Le | Gt | Ge => {
@@ -4912,6 +5241,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     fn call(&mut self, callee: &Expr, args: &[Expr], expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        // Explicit type arguments set by the caller for this call only.
+        let turbofish = TURBOFISH.with(|t| t.borrow_mut().take());
         let ExprKind::Path(path) = &*callee.kind else {
             return self.call_value(callee, args, expected, span);
         };
@@ -4955,7 +5286,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if path.segments.len() >= 2 {
             let written = path.segments[..path.segments.len() - 1].join("::");
             let canonical = self.ctx.canon(&written).unwrap_or(written);
-            let alias_target = self.ctx.aliases.get(&canonical).map(|alias| alias.target.clone());
+            let mut alias_target = self.ctx.aliases.get(&canonical).map(|alias| alias.target.clone());
+            // `Vec::<i64>::new()`: the type's arguments are given.
+            if let Some((true, tys)) = &turbofish {
+                if alias_target.is_none() && self.ctx.structs.contains_key(&canonical) || self.ctx.enums.contains_key(&canonical) {
+                    alias_target = Some(Ty::Named { name: canonical.clone(), args: tys.clone() });
+                }
+            }
             if name == "new" {
                 if let Some(target) = alias_target.as_ref().filter(|ty| matches!(ty, Ty::Named { name, .. } if name == "Array")) {
                     if args.len() != 1 { return err(format!("`{}::new` takes a length", path.segments[..path.segments.len() - 1].join("::")), span); }
@@ -5469,6 +5806,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // argument types.
         let gparams: Vec<String> = f.generics.params.iter().map(|p| p.name.clone()).collect();
         let mut targ: HashMap<String, Ty> = HashMap::new();
+        // `f::<A, B>(..)`: explicit type arguments, in declaration order.
+        if let Some((false, tys)) = &turbofish {
+            if tys.len() > gparams.len() {
+                return err(format!("`{}` takes {} type argument(s), {} given", name, gparams.len(), tys.len()), span);
+            }
+            for (g, t) in gparams.iter().zip(tys) {
+                if !matches!(t, Ty::Var(v) if v == "_") { targ.insert(g.clone(), t.clone()); }
+            }
+        }
         // Seed inference from the EXPECTED return type, if any. This lets
         // `let v: Vec<i64> = Vec::new()` infer `T=i64` from the annotation when no
         // argument constrains it (the only way to type a no-arg generic ctor).
@@ -5795,7 +6141,8 @@ fn primitive_const(segments: &[String]) -> Option<(crate::lexer::NumSuffix, Prim
         "i8" => int(S::I8, i8::MIN as i128, i8::MAX as i128),
         "i16" => int(S::I16, i16::MIN as i128, i16::MAX as i128),
         "i32" => int(S::I32, i32::MIN as i128, i32::MAX as i128),
-        "i64" => int(S::I64, i64::MIN as i128, i64::MAX as i128),
+        "i64" | "isize" => int(S::I64, i64::MIN as i128, i64::MAX as i128),
+        "usize" => int(S::I64, 0, i64::MAX as i128),
         "u8" => int(S::U8, 0, u8::MAX as i128),
         "u16" => int(S::U16, 0, u16::MAX as i128),
         "u32" => int(S::U32, 0, u32::MAX as i128),
@@ -6156,15 +6503,16 @@ mod tests {
     }
 
     #[test]
-    fn immutable_deferred_let_rejected() {
-        let m = err_msg("fn main() -> i64 { let x: i64; x = 1; x }");
-        assert!(m.contains("mut"), "{m}");
+    fn immutable_deferred_let_accepted() {
+        // Rust's `let x; ... x = v;` (the binding is assigned later).
+        assert!(lower("fn main() -> i64 { let x: i64; x = 1; x }").is_ok());
+        assert!(lower("fn main() -> i64 { let x; if true { x = 1; } else { x = 2; } x }").is_ok());
     }
 
     #[test]
-    fn deferred_let_needs_type_annotation() {
-        let m = err_msg("fn main() -> i64 { let mut x; x = 1; x }");
-        assert!(m.contains("type annotation"), "{m}");
+    fn deferred_let_needs_an_assignment_to_infer_from() {
+        let m = err_msg("fn main() -> i64 { let mut x; 0 }");
+        assert!(m.contains("annotation"), "{m}");
     }
 
     #[test]

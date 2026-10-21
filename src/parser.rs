@@ -14,7 +14,7 @@ pub struct ParseError {
 }
 
 pub fn parse_module(tokens: &[Token]) -> Result<Module, ParseError> {
-    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0 };
+    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None };
     let mut items = Vec::new();
     while !p.at(&TokKind::Eof) {
         items.extend(p.items()?);
@@ -48,11 +48,85 @@ struct Parser {
     macro_depth: u32,
     /// Numbers the bindings that range patterns introduce.
     pattern_counter: u32,
+    /// The loops being parsed, innermost last (for labels and `break value`),
+    /// and the flag checks to place after the statement that contains a loop
+    /// some inner `break 'label` or `continue 'label` jumps out of.
+    loops: Vec<LoopCtx>,
+    pending_checks: Vec<Stmt>,
+    loop_counter_next: u32,
+    /// The inline modules enclosing the cursor (for `super::` and `self::`).
+    module_path: Vec<String>,
+    /// The turbofish type arguments the last expression path carried, and
+    /// how many segments preceded them.
+    last_turbofish: Option<(usize, Vec<Type>)>,
+}
+
+/// A loop being parsed. `break value` assigns `loop#N`; a `break 'label` or
+/// `continue 'label` from a nested loop sets `brk#N` / `cnt#N` and breaks,
+/// and each loop it crosses checks the flag after the inner loop ends.
+struct LoopCtx {
+    id: u32,
+    label: Option<String>,
+    value: bool,
+    brk: bool,
+    cnt: bool,
+    /// (target loop id, is a `continue`) jumps that cross this loop.
+    propagate: Vec<(u32, bool)>,
 }
 
 /// Expansions nested deeper than this are reported (a macro that expands
 /// to itself forever).
 const MAX_MACRO_DEPTH: u32 = 64;
+
+/// The names a pattern binds, in order, with their mutability.
+fn pattern_names(p: &Pattern, out: &mut Vec<(String, bool)>) {
+    match &p.kind {
+        PatternKind::Binding { is_mut, name } => out.push((name.clone(), *is_mut)),
+        PatternKind::Variant { payload, .. } => for q in payload { pattern_names(q, out) },
+        PatternKind::Struct { fields, .. } => for (_, q) in fields { pattern_names(q, out) },
+        PatternKind::Tuple(ps) => for q in ps { pattern_names(q, out) },
+        PatternKind::Wildcard | PatternKind::Literal(_) => {}
+    }
+}
+
+/// `let PAT = e else { .. };` is
+/// `let (x, y) = match e { PAT => (x, y), _ => { .. } };`.
+fn let_else(alts: Vec<(Pattern, Vec<Expr>)>, ty: Option<Type>, scrutinee: Expr, otherwise: Block, span: Span) -> Stmt {
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+    let mut names = Vec::new();
+    pattern_names(&alts[0].0, &mut names);
+    let value = |names: &[(String, bool)]| match names {
+        [(n, _)] => ex(ExprKind::Path(Path::single(n.clone(), span))),
+        _ => ex(ExprKind::Tuple(names.iter().map(|(n, _)| ex(ExprKind::Path(Path::single(n.clone(), span)))).collect())),
+    };
+    let mut arms: Vec<MatchArm> = alts.into_iter()
+        .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, None), body: value(&names), span }).collect();
+    arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Block(otherwise)), span });
+    let binding = |(n, m): &(String, bool)| Pattern { kind: PatternKind::Binding { is_mut: *m, name: n.clone() }, span };
+    let pattern = match names.as_slice() {
+        [] => Pattern { kind: PatternKind::Wildcard, span },
+        [one] => binding(one),
+        many => Pattern { kind: PatternKind::Tuple(many.iter().map(binding).collect()), span },
+    };
+    // An annotation names the matched value's type, not the bindings'.
+    let scrutinee = match ty {
+        Some(t) => ex(ExprKind::Block(Block {
+            stmts: vec![Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: "let#else".into() }, span }, ty: Some(t), init: Some(scrutinee), span }],
+            tail: Some(ex(ExprKind::Path(Path::single("let#else".into(), span)))),
+            span,
+        })),
+        None => scrutinee,
+    };
+    Stmt::Let { pattern, ty: None, init: Some(ex(ExprKind::Match { scrutinee, arms })), span }
+}
+
+/// `e` with explicit type arguments attached: `Cast(e, marker<tys..>)`.
+/// Lowering reads `turbofish#` as a call's own type arguments and
+/// `typeargs#` as the arguments of the type an associated function is on.
+fn turbofish_marker(e: Expr, marker: &str, tys: Vec<Type>, span: Span) -> Expr {
+    let ty = Type { kind: TypeKind::Path(Path::single(marker.to_string(), span), tys), span };
+    Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, ty)), span }
+}
 
 /// The conjunction of a pattern's range guards and the arm's own guard.
 fn conjoin(guards: Vec<Expr>, user: Option<Expr>) -> Option<Expr> {
@@ -249,7 +323,7 @@ impl Parser {
         let is_value = attrs.iter().any(|a| a.name == "value");
         let skip = attrs.iter().any(|a| a.name == "test" || (a.name == "cfg" && a.args.iter().any(|(n, _)| n == "test")));
         let derives: Vec<(String, Span)> = attrs.iter().filter(|a| a.name == "derive").flat_map(|a| a.args.clone()).collect();
-        let vis = self.eat_kw(Kw::Pub);
+        let vis = self.visibility()?;
         if is_value && !matches!(self.peek(), TokKind::Keyword(Kw::Struct) | TokKind::Keyword(Kw::Enum)) {
             let span = attrs.iter().find(|a| a.name == "value").unwrap().span;
             return Err(ParseError { msg: "`#[value]` applies only to a struct or enum".into(), span });
@@ -294,7 +368,7 @@ impl Parser {
                 let mut tokens = crate::lexer::lex_with_source(&source, at.source)
                     .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
                 for t in &mut tokens { t.span = at; }
-                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0 };
+                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None };
                 while !p.at(&TokKind::Eof) {
                     let items = p.items().map_err(|e| ParseError { msg: format!("in derived `{}`: {}", trait_name, e.msg), span: at })?;
                     self.pending.extend(items);
@@ -506,6 +580,7 @@ impl Parser {
             self.bump();
             let mut tys = Vec::new();
             while !self.at(&TokKind::RParen) {
+                self.visibility()?;
                 tys.push(self.ty()?);
                 if !self.eat(&TokKind::Comma) {
                     break;
@@ -523,7 +598,7 @@ impl Parser {
 
     fn field_def(&mut self) -> PResult<FieldDef> {
         let start = self.span();
-        let vis = self.eat_kw(Kw::Pub);
+        let vis = self.visibility()?;
         let name = self.ident()?;
         self.expect(&TokKind::Colon)?;
         let ty = self.ty()?;
@@ -562,7 +637,15 @@ impl Parser {
             } else {
                 VariantPayload::None
             };
-            variants.push(VariantDef { name: vname, payload, span: vstart.to(self.prev_span()) });
+            let discriminant = if self.eat(&TokKind::Eq) {
+                let negative = self.eat(&TokKind::Minus);
+                let TokKind::Int(n, _) = self.peek().clone() else {
+                    return Err(self.error("an enum discriminant must be an integer literal"));
+                };
+                self.bump();
+                Some(if negative { (n as i64).wrapping_neg() } else { n as i64 })
+            } else { None };
+            variants.push(VariantDef { name: vname, payload, discriminant, span: vstart.to(self.prev_span()) });
             if !self.eat(&TokKind::Comma) { break; }
         }
         self.expect(&TokKind::RBrace)?;
@@ -635,7 +718,7 @@ impl Parser {
         let mut items = Vec::new();
         let mut assoc_types = Vec::new();
         while !self.at(&TokKind::RBrace) {
-            let vis = self.eat_kw(Kw::Pub);
+            let vis = self.visibility()?;
             if self.eat_kw(Kw::Type) {
                 let name = self.ident()?;
                 self.expect(&TokKind::Eq)?;
@@ -683,9 +766,14 @@ impl Parser {
         }
         self.expect(&TokKind::LBrace)?;
         let mut items = Vec::new();
+        self.module_path.push(name.clone());
         while !self.at(&TokKind::RBrace) {
-            items.extend(self.items()?);
+            match self.items() {
+                Ok(more) => items.extend(more),
+                Err(e) => { self.module_path.pop(); return Err(e); }
+            }
         }
+        self.module_path.pop();
         self.expect(&TokKind::RBrace)?;
         Ok(ModDef { vis, name, items, inline: true, span: start.to(self.prev_span()) })
     }
@@ -700,7 +788,21 @@ impl Parser {
         self.use_tree(Vec::new(), &mut out)?;
         self.expect(&TokKind::Semi)?;
         let span = start.to(self.prev_span());
-        Ok(out.into_iter()
+        // `crate::`, `super::`, and `self::` prefixes become absolute paths.
+        let module_path = self.module_path.clone();
+        let out = out.into_iter().map(|mut segments: Vec<String>| {
+            match segments[0].as_str() {
+                "crate" if segments.len() > 1 => { segments.remove(0); }
+                "super" if !module_path.is_empty() && segments.len() > 1 => {
+                    let mut base = module_path[..module_path.len() - 1].to_vec();
+                    base.extend(segments.drain(1..));
+                    segments = base;
+                }
+                _ => {}
+            }
+            segments
+        });
+        Ok(out
             .filter(|segments: &Vec<String>| !matches!(segments[0].as_str(), "std" | "core" | "alloc"))
             .map(|segments| UsePath { segments, span })
             .collect())
@@ -723,7 +825,11 @@ impl Parser {
                 break;
             }
             if self.eat_kw(Kw::SelfValue) {
-                // `use a::{self}` names `a` itself.
+                // `use a::{self}` names `a` itself; `use self::x` is relative.
+                if segments.is_empty() && self.eat(&TokKind::ColonColon) {
+                    segments.extend(self.module_path.iter().cloned());
+                    continue;
+                }
                 break;
             }
             segments.push(self.ident()?);
@@ -741,12 +847,25 @@ impl Parser {
         }
         self.bump(); // <
         while !self.at(&TokKind::Gt) {
+            // Lifetime parameters (`'a`, `'a: 'b`) mean nothing without
+            // references.
+            if let TokKind::Lifetime(_) = self.peek() {
+                self.bump();
+                if self.eat(&TokKind::Colon) {
+                    while matches!(self.peek(), TokKind::Lifetime(_)) {
+                        self.bump();
+                        if !self.eat(&TokKind::Plus) { break; }
+                    }
+                }
+                if !self.eat(&TokKind::Comma) { break; }
+                continue;
+            }
             let pstart = self.span();
             let name = self.ident()?;
             let mut bounds = Vec::new();
             if self.eat(&TokKind::Colon) {
                 loop {
-                    bounds.push(self.trait_ref()?);
+                    if let Some(b) = self.bound()? { bounds.push(b); }
                     if !self.eat(&TokKind::Plus) { break; }
                 }
             }
@@ -764,10 +883,10 @@ impl Parser {
                 self.expect(&TokKind::Colon)?;
                 let mut bounds = Vec::new();
                 loop {
-                    bounds.push(self.trait_ref()?);
+                    if let Some(b) = self.bound()? { bounds.push(b); }
                     if !self.eat(&TokKind::Plus) { break; }
                 }
-                g.where_clauses.push(WherePredicate { ty, bounds });
+                if !bounds.is_empty() { g.where_clauses.push(WherePredicate { ty, bounds }); }
                 if !self.eat(&TokKind::Comma) { break; }
                 // A `{` ends the where clause.
                 if self.at(&TokKind::LBrace) { break; }
@@ -790,6 +909,11 @@ impl Parser {
         let mut bindings = Vec::new();
         if self.eat(&TokKind::Lt) {
             while !self.at(&TokKind::Gt) && !self.at(&TokKind::Shr) {
+                if let TokKind::Lifetime(_) = self.peek() {
+                    self.bump();
+                    if !self.eat(&TokKind::Comma) { break; }
+                    continue;
+                }
                 if let (TokKind::Ident(name), TokKind::Eq) = (self.peek().clone(), self.peek_at(1).clone()) {
                     self.bump();
                     self.bump();
@@ -818,10 +942,22 @@ impl Parser {
     }
 
     /// `impl A + B` / `dyn A + B` bounds after the keyword.
+    /// One `+`-separated bound. Lifetimes, `Sized`, and `?Sized` constrain
+    /// nothing here and are dropped.
+    fn bound(&mut self) -> PResult<Option<TraitRef>> {
+        if let TokKind::Lifetime(_) = self.peek() {
+            self.bump();
+            return Ok(None);
+        }
+        let relaxed = self.eat(&TokKind::Question);
+        let b = self.trait_ref()?;
+        Ok((!relaxed && b.path.last() != "Sized").then_some(b))
+    }
+
     fn bound_list(&mut self) -> PResult<Vec<TraitRef>> {
         let mut bounds = Vec::new();
         loop {
-            bounds.push(self.trait_ref()?);
+            if let Some(b) = self.bound()? { bounds.push(b); }
             if !self.eat(&TokKind::Plus) { break; }
         }
         Ok(bounds)
@@ -971,6 +1107,11 @@ impl Parser {
         self.bump();
         let mut args = Vec::new();
         while !self.at(&TokKind::Gt) && !self.at(&TokKind::Shr) {
+            if let TokKind::Lifetime(_) = self.peek() {
+                self.bump();
+                if !self.eat(&TokKind::Comma) { break; }
+                continue;
+            }
             args.push(self.ty()?);
             if !self.eat(&TokKind::Comma) { break; }
         }
@@ -1006,16 +1147,42 @@ impl Parser {
                 self.bump();
                 segments.push(self.path_seg()?);
             } else if self.at(&TokKind::ColonColon) && matches!(self.peek_at(1), TokKind::Lt) {
-                // A turbofish in an expression path (`Vec::<i64>::new()`):
-                // the type arguments are inferred instead.
+                // A turbofish in an expression path: `f::<i64>()` gives the
+                // function's type arguments, `Vec::<i64>::new()` the type's.
                 self.bump();
-                self.opt_type_args()?;
+                let tys = self.opt_type_args()?;
+                self.last_turbofish = Some((segments.len(), tys));
             } else {
                 break;
             }
         }
+        // `crate::x` is the root module's `x`; `super::x` and `self::x` are
+        // relative to the inline module being parsed.
+        if segments.len() > 1 {
+            match segments[0].as_str() {
+                "crate" => { segments.remove(0); }
+                "super" if !self.module_path.is_empty() => {
+                    let mut base = self.module_path[..self.module_path.len() - 1].to_vec();
+                    let mut rest = segments.split_off(1);
+                    while rest.len() > 1 && rest[0] == "super" && !base.is_empty() { base.pop(); rest.remove(0); }
+                    base.extend(rest);
+                    segments = base;
+                }
+                _ => {}
+            }
+        }
         Ok(Path { segments: std_path(segments), span: start.to(self.prev_span()) })
     }
+    /// `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`: all are `pub`.
+    fn visibility(&mut self) -> PResult<bool> {
+        if !self.eat_kw(Kw::Pub) { return Ok(false); }
+        if self.at(&TokKind::LParen) && matches!(self.peek_at(1), TokKind::Ident(_) | TokKind::Keyword(Kw::SelfValue | Kw::In)) {
+            let end = crate::macros::tree_end(&self.toks, self.pos).ok_or_else(|| self.error("unclosed `pub(`"))?;
+            self.pos = end;
+        }
+        Ok(true)
+    }
+
     fn path_seg(&mut self) -> PResult<String> {
         match self.peek().clone() {
             TokKind::Ident(s) => { self.bump(); Ok(s) }
@@ -1048,12 +1215,17 @@ impl Parser {
         let mut stmts = Vec::new();
         let mut tail = None;
         while !self.at(&TokKind::RBrace) {
+            // Flag checks for labeled jumps out of a loop in the last statement.
+            stmts.append(&mut self.pending_checks);
             if self.at_kw(Kw::Let) {
                 stmts.push(self.let_stmt()?);
                 continue;
             }
+            // A nested item (`fn helper() {}` inside a function) is hoisted
+            // beside the enclosing item; like Rust's, it captures nothing.
             if self.is_item_start() {
-                stmts.extend(self.items()?.into_iter().map(Stmt::Item));
+                let items = self.items()?;
+                self.pending.extend(items);
                 continue;
             }
             // A statement that STARTS with a block-like keyword (`if`/`while`/
@@ -1085,6 +1257,10 @@ impl Parser {
                 return Err(self.error("expected `;` or `}` after expression"));
             }
         }
+        if !self.pending_checks.is_empty() {
+            if let Some(t) = tail.take() { stmts.push(Stmt::Expr(t)); }
+            stmts.append(&mut self.pending_checks);
+        }
         self.expect(&TokKind::RBrace)?;
         Ok(Block { stmts, tail, span: start.to(self.prev_span()) })
     }
@@ -1093,19 +1269,26 @@ impl Parser {
         matches!(
             self.peek(),
             TokKind::Keyword(Kw::If | Kw::While | Kw::Loop | Kw::Match | Kw::For | Kw::Unsafe) | TokKind::LBrace
-        )
+        ) || matches!((self.peek(), self.peek_at(1)), (TokKind::Lifetime(_), TokKind::Colon))
     }
 
     /// Parse a single block-like expression in statement position WITHOUT
     /// postfix continuation (no trailing call/index/field/cast). Used so a
     /// `(`/`[` after the block starts a new statement.
     fn block_like_stmt(&mut self) -> PResult<Expr> {
+        if let TokKind::Lifetime(label) = self.peek().clone() {
+            let start = self.span();
+            self.bump();
+            self.expect(&TokKind::Colon)?;
+            let _ = start;
+            return self.labeled_loop(Some(label));
+        }
         match self.peek() {
             TokKind::Keyword(Kw::If) => self.if_expr(),
-            TokKind::Keyword(Kw::While) => self.while_expr(),
-            TokKind::Keyword(Kw::Loop) => self.loop_expr(),
+            TokKind::Keyword(Kw::While) => self.labeled_loop(None),
+            TokKind::Keyword(Kw::Loop) => self.labeled_loop(None),
             TokKind::Keyword(Kw::Match) => self.match_expr(),
-            TokKind::Keyword(Kw::For) => self.for_expr(),
+            TokKind::Keyword(Kw::For) => self.labeled_loop(None),
             TokKind::Keyword(Kw::Unsafe) => self.unsafe_expr(),
             TokKind::LBrace => self.block_expr(),
             _ => unreachable!("block_like_stmt called on non-block-like start"),
@@ -1124,9 +1307,25 @@ impl Parser {
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
         let start = self.expect_kw(Kw::Let)?;
-        let pattern = self.pattern()?;
+        let pstart = self.span();
+        let mut alts = self.pattern_alts()?;
         let ty = if self.eat(&TokKind::Colon) { Some(self.ty()?) } else { None };
         let init = if self.eat(&TokKind::Eq) { Some(self.expr()?) } else { None };
+        // `let PAT = EXPR else { diverge };`
+        if let (Some(scrutinee), true) = (init.clone(), self.at_kw(Kw::Else)) {
+            self.bump();
+            let otherwise = self.block()?;
+            self.expect(&TokKind::Semi)?;
+            let span = start.to(self.prev_span());
+            return Ok(let_else(alts, ty, scrutinee, otherwise, span));
+        }
+        if alts.len() != 1 || !alts[0].1.is_empty() {
+            return Err(ParseError {
+                msg: "or-patterns and range patterns are supported in `match`, `if let`, `while let`, and `let ... else`".into(),
+                span: pstart.to(self.prev_span()),
+            });
+        }
+        let pattern = alts.pop().unwrap().0;
         self.expect(&TokKind::Semi)?;
         Ok(Stmt::Let { pattern, ty, init, span: start.to(self.prev_span()) })
     }
@@ -1299,6 +1498,8 @@ impl Parser {
                                 };
                                 if let Some(target) = collect_target {
                                     e = Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, target)), span };
+                                } else if let Some(tys) = turbofish {
+                                    e = turbofish_marker(e, "turbofish#", tys, span);
                                 }
                             } else {
                                 let span = start.to(self.prev_span());
@@ -1361,6 +1562,52 @@ impl Parser {
         Ok(args)
     }
 
+    /// A path in expression position: a variable, constant, function, unit
+    /// variant, or struct literal. `Err(e)` is a finished expression (one
+    /// carrying turbofish type arguments). Kept out of `primary` so deep
+    /// nesting stays within the stack budget.
+    #[inline(never)]
+    fn path_expr(&mut self, start: Span) -> PResult<Result<ExprKind, Expr>> {
+        self.last_turbofish = None;
+        let path = self.path_or_self()?;
+        if let Some((after, tys)) = self.last_turbofish.take() {
+            let span = start.to(self.prev_span());
+            let e = Expr { kind: std::sync::Arc::new(ExprKind::Path(path.clone())), span };
+            // On the last segment: the function's (or variant's) type
+            // arguments. On the one before: the type's.
+            let marker = if after == path.segments.len() { "turbofish#" } else { "typeargs#" };
+            return Ok(Err(turbofish_marker(e, marker, tys, span)));
+        }
+        // Struct literal: `Path { ... }` — but only when a struct lit is
+        // allowed here (it always is in primary position in v0).
+        if self.at(&TokKind::LBrace) && self.looks_like_struct_lit() {
+            self.bump();
+            let mut fields = Vec::new();
+            while !self.at(&TokKind::RBrace) {
+                let fstart = self.span();
+                // `..base`: the remaining fields come from `base`.
+                if self.eat(&TokKind::DotDot) {
+                    let base = self.expr()?;
+                    fields.push(FieldInit { name: "..".into(), value: Some(base), span: fstart.to(self.prev_span()) });
+                    break;
+                }
+                // `P { 0: a, 1: b }` names a tuple struct's fields.
+                let name = match self.peek().clone() {
+                    TokKind::Int(n, _) => { self.bump(); n.to_string() }
+                    _ => self.ident()?,
+                };
+                let value = if self.eat(&TokKind::Colon) { Some(self.expr()?) } else { None };
+                fields.push(FieldInit { name, value, span: fstart.to(self.prev_span()) });
+                if !self.eat(&TokKind::Comma) { break; }
+            }
+            self.expect(&TokKind::RBrace)?;
+            let span = start.to(self.prev_span());
+            Ok(Ok(ExprKind::StructLit { path, fields, span }))
+        } else {
+            Ok(Ok(ExprKind::Path(path)))
+        }
+    }
+
     fn primary(&mut self) -> PResult<Expr> {
         let start = self.span();
         let kind = match self.peek().clone() {
@@ -1372,9 +1619,7 @@ impl Parser {
             TokKind::Keyword(Kw::False) => { self.bump(); ExprKind::Bool(false) }
             TokKind::Keyword(Kw::If) => return self.if_expr(),
             TokKind::Keyword(Kw::Match) => return self.match_expr(),
-            TokKind::Keyword(Kw::While) => return self.while_expr(),
-            TokKind::Keyword(Kw::Loop) => return self.loop_expr(),
-            TokKind::Keyword(Kw::For) => return self.for_expr(),
+            TokKind::Keyword(Kw::While | Kw::Loop | Kw::For) => return self.labeled_loop(None),
             TokKind::Keyword(Kw::Unsafe) => return self.unsafe_expr(),
             TokKind::LBrace => return Ok(self.block_expr()?),
             TokKind::Keyword(Kw::Return) => {
@@ -1384,10 +1629,24 @@ impl Parser {
             }
             TokKind::Keyword(Kw::Break) => {
                 self.bump();
+                let label = if let TokKind::Lifetime(l) = self.peek().clone() { self.bump(); Some(l) } else { None };
                 let v = if self.starts_expr() { Some(self.expr()?) } else { None };
-                ExprKind::Break(v)
+                return self.jump(label, v, false, start);
             }
-            TokKind::Keyword(Kw::Continue) => { self.bump(); ExprKind::Continue }
+            TokKind::Keyword(Kw::Continue) => {
+                self.bump();
+                let label = if let TokKind::Lifetime(l) = self.peek().clone() { self.bump(); Some(l) } else { None };
+                return self.jump(label, None, true, start);
+            }
+            // `'label: loop/while/for`
+            TokKind::Lifetime(label) if matches!(self.peek_at(1), TokKind::Colon) => {
+                self.bump();
+                self.bump();
+                return match self.peek() {
+                    TokKind::Keyword(Kw::Loop | Kw::While | Kw::For) => self.labeled_loop(Some(label)),
+                    _ => Err(self.error("a label must be followed by `loop`, `while`, or `for`")),
+                };
+            }
             TokKind::Pipe | TokKind::OrOr => return self.closure(),
             // `move` closures: captures are always shared GC values or copies.
             TokKind::Ident(w) if w == "move" && matches!(self.peek_at(1), TokKind::Pipe | TokKind::OrOr) => {
@@ -1441,27 +1700,10 @@ impl Parser {
             {
                 return self.macro_call(start);
             }
-            TokKind::Ident(_) | TokKind::Keyword(Kw::SelfValue) | TokKind::Keyword(Kw::SelfType) => {
-                let path = self.path_or_self()?;
-                // Struct literal: `Path { ... }` — but only when a struct lit is
-                // allowed here (it always is in primary position in v0).
-                if self.at(&TokKind::LBrace) && self.looks_like_struct_lit() {
-                    self.bump();
-                    let mut fields = Vec::new();
-                    while !self.at(&TokKind::RBrace) {
-                        let fstart = self.span();
-                        let name = self.ident()?;
-                        let value = if self.eat(&TokKind::Colon) { Some(self.expr()?) } else { None };
-                        fields.push(FieldInit { name, value, span: fstart.to(self.prev_span()) });
-                        if !self.eat(&TokKind::Comma) { break; }
-                    }
-                    self.expect(&TokKind::RBrace)?;
-                    let span = start.to(self.prev_span());
-                    ExprKind::StructLit { path, fields, span }
-                } else {
-                    ExprKind::Path(path)
-                }
-            }
+            TokKind::Ident(_) | TokKind::Keyword(Kw::SelfValue) | TokKind::Keyword(Kw::SelfType) => match self.path_expr(start)? {
+                Ok(kind) => kind,
+                Err(done) => return Ok(done),
+            },
             other => return Err(self.error(format!("expected expression, found {:?}", other))),
         };
         Ok(Expr { kind: std::sync::Arc::new(kind), span: start.to(self.prev_span()) })
@@ -1547,6 +1789,21 @@ impl Parser {
                 };
                 Ok(ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".to_string(), span))), vec![message])))
             }
+            // `matches!(e, PAT [if guard])`
+            "matches" => {
+                let scrutinee = self.delimited_expr()?;
+                self.expect(&TokKind::Comma)?;
+                let alts = self.pattern_alts()?;
+                let guard = if self.eat_kw(Kw::If) { Some(self.delimited_expr()?) } else { None };
+                self.eat(&TokKind::Comma);
+                self.expect(&close)?;
+                let span = start.to(self.prev_span());
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                let mut arms: Vec<MatchArm> = alts.into_iter()
+                    .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, guard.clone()), body: ex(ExprKind::Bool(true)), span }).collect();
+                arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Bool(false)), span });
+                Ok(ex(ExprKind::Match { scrutinee, arms }))
+            }
             "assert" | "assert_eq" | "assert_ne" => self.assert_macro(start, &name, &close),
             _ => Err(ParseError { msg: format!("unknown macro `{}!`", name), span: start }),
         }
@@ -1603,7 +1860,7 @@ impl Parser {
             let mut all = toks.to_vec();
             let eof_span = toks.last().map(|t| t.span).unwrap_or(at);
             all.push(Token { kind: TokKind::Eof, span: eof_span });
-            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0 };
+            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None };
             let ok = match kind {
                 "expr" => p.delimited_expr().is_ok(),
                 "ty" => p.ty().is_ok(),
@@ -1622,7 +1879,7 @@ impl Parser {
     fn sub_parser(&self, mut tokens: Vec<Token>, at: Span) -> Parser {
         let eof_span = tokens.last().map(|t| t.span).unwrap_or(at);
         tokens.push(Token { kind: TokKind::Eof, span: eof_span });
-        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0 }
+        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None }
     }
 
     /// An expansion in expression position: its tokens as the body of a block,
@@ -1633,6 +1890,7 @@ impl Parser {
         wrapped.push(Token { kind: TokKind::RBrace, span: at });
         let mut p = self.sub_parser(wrapped, at);
         let block = p.block()?;
+        self.pending.append(&mut p.pending);
         if !matches!(p.peek(), TokKind::Eof) {
             return Err(p.error("unexpected tokens after the macro expansion"));
         }
@@ -1774,6 +2032,16 @@ impl Parser {
     }
 
     fn path_or_self(&mut self) -> PResult<Path> {
+        // `self::x`: the current inline module's `x`.
+        if self.at_kw(Kw::SelfValue) && matches!(self.peek_at(1), TokKind::ColonColon) {
+            self.bump();
+            self.bump();
+            let mut path = self.path()?;
+            let mut segments = self.module_path.clone();
+            segments.append(&mut path.segments);
+            path.segments = segments;
+            return Ok(path);
+        }
         if self.at_kw(Kw::SelfValue) {
             let s = self.span();
             self.bump();
@@ -1794,8 +2062,8 @@ impl Parser {
         // `{ }`. This distinguishes from a following block in statement
         // position, which the block parser handles before reaching here.
         match self.peek_at(1) {
-            TokKind::RBrace => true,
-            TokKind::Ident(_) => matches!(self.peek_at(2), TokKind::Colon | TokKind::Comma | TokKind::RBrace),
+            TokKind::RBrace | TokKind::DotDot => true,
+            TokKind::Ident(_) | TokKind::Int(..) => matches!(self.peek_at(2), TokKind::Colon | TokKind::Comma | TokKind::RBrace),
             _ => false,
         }
     }
@@ -1926,6 +2194,98 @@ impl Parser {
         let body = self.block()?;
         let span = start.to(self.prev_span());
         Ok(Expr { kind: std::sync::Arc::new(ExprKind::While { cond, body }), span })
+    }
+
+    /// A `loop`, `while`, or `for`, with its label. Labeled jumps and
+    /// `break value` are rewritten here into flags and a result variable.
+    fn labeled_loop(&mut self, label: Option<String>) -> PResult<Expr> {
+        let start = self.span();
+        self.loop_counter_next += 1;
+        let id = self.loop_counter_next;
+        self.loops.push(LoopCtx { id, label, value: false, brk: false, cnt: false, propagate: Vec::new() });
+        let parsed = match self.peek() {
+            TokKind::Keyword(Kw::Loop) => self.loop_expr(),
+            TokKind::Keyword(Kw::While) => self.while_expr(),
+            _ => self.for_expr(),
+        };
+        let ctx = self.loops.pop().unwrap();
+        let lp = parsed?;
+        let span = start.to(self.prev_span());
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let var = |n: String| ex(ExprKind::Path(Path::single(n, span)));
+        // Checks the enclosing statement needs for jumps that cross this loop.
+        let mut propagate = ctx.propagate.clone();
+        propagate.sort();
+        propagate.dedup();
+        for (target, is_continue) in propagate {
+            let flag = if is_continue { format!("cnt#{target}") } else { format!("brk#{target}") };
+            let here = self.loops.last().is_some_and(|l| l.id == target);
+            let action = if here && is_continue {
+                Block { stmts: vec![Stmt::Expr(ex(ExprKind::Assign { target: var(flag.clone()), op: None, value: ex(ExprKind::Bool(false)) })), Stmt::Expr(ex(ExprKind::Continue))], tail: None, span }
+            } else {
+                Block { stmts: vec![Stmt::Expr(ex(ExprKind::Break(None)))], tail: None, span }
+            };
+            if !here {
+                if let Some(outer) = self.loops.last_mut() { outer.propagate.push((target, is_continue)); }
+            }
+            self.pending_checks.push(Stmt::Expr(ex(ExprKind::If { cond: var(flag), then_branch: action, else_branch: None })));
+        }
+        if !ctx.value && !ctx.brk && !ctx.cnt { return Ok(lp); }
+        let let_ = |name: String, init: Option<Expr>| Stmt::Let {
+            pattern: Pattern { kind: PatternKind::Binding { is_mut: true, name }, span },
+            ty: None,
+            init,
+            span,
+        };
+        let mut stmts = Vec::new();
+        // A labeled `break 'l value` from an inner loop stores the value
+        // here; its type comes from that assignment.
+        if ctx.value { stmts.push(let_(format!("loop#{id}"), None)); }
+        if ctx.brk { stmts.push(let_(format!("brk#{id}"), Some(ex(ExprKind::Bool(false))))); }
+        if ctx.cnt { stmts.push(let_(format!("cnt#{id}"), Some(ex(ExprKind::Bool(false))))); }
+        stmts.push(Stmt::Expr(lp));
+        let tail = ctx.value.then(|| var(format!("loop#{id}")));
+        Ok(ex(ExprKind::Block(Block { stmts, tail, span })))
+    }
+
+    /// `break ['label] [value]` / `continue ['label]`.
+    fn jump(&mut self, label: Option<String>, value: Option<Expr>, is_continue: bool, start: Span) -> PResult<Expr> {
+        let span = start.to(self.prev_span());
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let var = |n: String| ex(ExprKind::Path(Path::single(n, span)));
+        let target = match &label {
+            Some(l) => match self.loops.iter().rposition(|c| c.label.as_deref() == Some(l.as_str())) {
+                Some(i) => i,
+                None => return Err(ParseError { msg: format!("no enclosing loop is labeled `'{l}`"), span }),
+            },
+            None if self.loops.is_empty() => {
+                // Reported by lowering ("break outside loop").
+                return Ok(ex(if is_continue { ExprKind::Continue } else { ExprKind::Break(value) }));
+            }
+            None => self.loops.len() - 1,
+        };
+        let innermost = target == self.loops.len() - 1;
+        let tid = self.loops[target].id;
+        // The innermost loop takes `break value` directly.
+        if innermost {
+            return Ok(ex(if is_continue { ExprKind::Continue } else { ExprKind::Break(value) }));
+        }
+        let mut stmts = Vec::new();
+        if let Some(v) = value {
+            self.loops[target].value = true;
+            stmts.push(Stmt::Expr(ex(ExprKind::Assign { target: var(format!("loop#{tid}")), op: None, value: v })));
+        }
+        {
+            let flag = if is_continue { self.loops[target].cnt = true; format!("cnt#{tid}") } else { self.loops[target].brk = true; format!("brk#{tid}") };
+            stmts.push(Stmt::Expr(ex(ExprKind::Assign { target: var(flag), op: None, value: ex(ExprKind::Bool(true)) })));
+            stmts.push(Stmt::Expr(ex(ExprKind::Break(None))));
+            self.loops.last_mut().unwrap().propagate.push((tid, is_continue));
+        }
+        if stmts.len() == 1 {
+            if let Stmt::Expr(e) = stmts.pop().unwrap() { return Ok(e); }
+            unreachable!()
+        }
+        Ok(ex(ExprKind::Block(Block { stmts, tail: None, span })))
     }
 
     fn loop_expr(&mut self) -> PResult<Expr> {
@@ -2134,7 +2494,7 @@ impl Parser {
                 return Ok(Self::product(parts).into_iter()
                     .map(|(pats, g)| (Pattern { kind: PatternKind::Tuple(pats), span }, g)).collect());
             }
-            TokKind::Ident(_) => {
+            TokKind::Ident(_) | TokKind::Keyword(Kw::SelfType) => {
                 let path = self.path()?;
                 if self.at(&TokKind::LParen) {
                     self.bump();

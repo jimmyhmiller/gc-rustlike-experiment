@@ -166,6 +166,24 @@ These follow Rust; differences come from having no references.
   `Range` iterator when used as a value, and `v.iter()` iterates a Vec. Vec's
   own `map`, `filter`, and `fold` remain eager and return Vecs; `chars()`
   returns a `Vec<char>`.
+- **Control flow.** `break value` out of a `loop`; labeled loops
+  (`'outer: for ..` with `break 'outer [value]` and `continue 'outer`);
+  `let PAT = e else { .. };`; `matches!(e, PAT [if guard])`; `let x;`
+  assigned later (its type comes from the first assignment, and the binding
+  may be reassigned); `for c in 'a'..='z'`.
+- **Items and paths.** `const` and `static` items (a `static` is a constant);
+  nested `fn`s and other items inside functions (hoisted beside the enclosing
+  item; like Rust's, they capture nothing); `pub(crate)`/`pub(super)` (all
+  `pub`); `crate::`, `super::`, and `self::` paths; lifetime parameters,
+  `T: 'a`, `Sized`, and `?Sized` are accepted and mean nothing.
+- **Types.** `usize` and `isize` are `i64`. Tuple structs (`struct M(f64)`,
+  `M(1.0)`, `m.0`, `let M(x) = m`), unit structs (`struct U;`, `U`), struct
+  update (`P { x: 1, ..p }`), `Self(..)`/`Self::Variant`/`Self { .. }` in
+  impls, and enum discriminants (`enum E { A = 1, B }`, `E::B as i64`).
+  Tuples compare (`==`, `<`), sort, hash (as map keys), and clone element by
+  element.
+- **Turbofish.** `f::<i64>()`, `Vec::<i64>::new()`, and `it.sum::<i64>()`
+  give type arguments explicitly (`_` leaves one inferred).
 - **Primitive constants and char methods.** `i64::MAX`, `u8::MIN`,
   `i32::BITS`, `f64::INFINITY`, `f64::NAN`, `f64::EPSILON`,
   `f64::consts::PI`, and so on; `char` has `is_ascii_digit`, `is_alphabetic`,

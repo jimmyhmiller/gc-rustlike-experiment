@@ -68,6 +68,9 @@ pub struct TyCtx {
     pub structs: HashMap<String, Rc<StructDef>>,
     pub enums: HashMap<String, Rc<EnumDef>>,
     pub fns: HashMap<String, Rc<FnDef>>,
+    /// `const` and `static` items, plus associated constants keyed
+    /// `Type::NAME` (impls) and `Trait::NAME` (trait defaults).
+    pub consts: HashMap<String, Rc<ConstDef>>,
     pub traits: HashMap<String, Rc<TraitDef>>,
     /// Trait impls, grouped for method lookup.
     pub impls: Vec<Rc<ImplBlock>>,
@@ -253,9 +256,22 @@ impl TyCtx {
         }
         TyCtx {
             trait_impls,
-            structs: g.structs.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
+            // Tuple and unit structs are records over positional fields
+            // `0`, `1`, ... from here on (the layout names them the same).
+            structs: g.structs.iter().map(|(k, v)| {
+                let mut v = v.clone();
+                match &v.body {
+                    StructBody::Tuple(tys) => {
+                        v.body = StructBody::Named(tys.iter().enumerate().map(|(i, t)| FieldDef { vis: true, name: i.to_string(), ty: t.clone(), span: t.span }).collect());
+                    }
+                    StructBody::Unit => v.body = StructBody::Named(vec![]),
+                    StructBody::Named(_) => {}
+                }
+                (k.clone(), Rc::new(v))
+            }).collect(),
             enums: g.enums.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             fns: g.fns.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
+            consts: g.consts.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             traits: g.traits.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             impls: g.impls.iter().map(|i| Rc::new(i.clone())).collect(),
             variants,
@@ -542,6 +558,8 @@ pub(crate) fn intrinsic_type_arity(name: &str) -> Option<usize> {
 fn prim_of(name: &str) -> Option<Prim> {
     Some(match name {
         "i8" => Prim::I8, "i16" => Prim::I16, "i32" => Prim::I32, "i64" => Prim::I64,
+        // Rust's pointer-sized integers: indices and lengths are `i64`.
+        "usize" | "isize" => Prim::I64,
         "u8" => Prim::U8, "u16" => Prim::U16, "u32" => Prim::U32, "u64" => Prim::U64,
         "f32" => Prim::F32, "f64" => Prim::F64,
         "bool" => Prim::Bool, "char" => Prim::Char, "String" => Prim::Str,

@@ -394,3 +394,113 @@ fn impl_trait_results_and_dyn_iterators() {
     let msg = compile_error("fn f(n: i64) -> impl Iterator<Item = i64> { if n == 0 { 0..1 } else { f(n - 1) } } fn main() -> i64 { f(2).count() }");
     assert!(msg.contains("calls itself"), "{msg}");
 }
+
+#[test]
+fn loops_labels_let_else_and_matches() {
+    assert_eq!(run(r#"
+        fn find(grid: Vec<Vec<i64>>, target: i64) -> Option<(i64, i64)> {
+            let mut found = None;
+            'rows: for (r, row) in grid.iter().enumerate() {
+                for (c, v) in row.iter().enumerate() {
+                    if v == target { found = Some((r, c)); break 'rows; }
+                    if v < 0 { continue 'rows; }
+                }
+            }
+            found
+        }
+        fn first_even(v: Vec<i64>) -> i64 {
+            let Some(x) = v.iter().find(|x| x % 2 == 0) else { return -1; };
+            x
+        }
+        fn lifetimes<'a, T: 'a + Clone>(x: T) -> T where T: Sized { x }
+        fn main() -> i64 {
+            assert_eq!(find(vec![vec![1, -1, 9], vec![4, 9, 6]], 9), Some((1, 1)));
+            let mut count = 0;
+            let r = 'outer: loop {
+                let mut i = 0;
+                while i < 10 {
+                    i += 1;
+                    count += 1;
+                    if count == 25 { break 'outer count * 2; }
+                    if i == 5 { continue 'outer; }
+                }
+            };
+            assert_eq!((r, count), (50, 25));
+            let mut i = 0;
+            let x = loop { i += 1; if i == 3 { break i * 2; } };
+            assert_eq!(x, 6);
+            let y;
+            if x > 5 { y = "big"; } else { y = "small"; }
+            assert_eq!(y, "big");
+            assert_eq!(first_even(vec![1, 3, 8]) + first_even(vec![1]), 7);
+            assert!(matches!(Some(3), Some(1..=5)) && !matches!(Some(9), Some(n) if n < 5));
+            let n: usize = 2;
+            let letters: Vec<char> = vec!['x', 'y', 'z'];
+            assert_eq!(letters[n], 'z');
+            let mut abc = "".to_string();
+            for c in 'a'..='c' { abc = abc + c.to_string(); }
+            assert_eq!(abc, "abc");
+            lifetimes(0)
+        }
+    "#), 0);
+}
+
+#[test]
+fn struct_forms_enums_consts_modules_tuples_and_turbofish() {
+    assert_eq!(run(r##"
+        #[derive(Debug, Clone, PartialEq)]
+        struct Meters(f64);
+        struct Pair(i64, String);
+        #[derive(Debug)]
+        struct Marker;
+        #[derive(Debug, Clone)]
+        struct P { x: i64, y: i64 }
+        enum Shape { Unit, Circle(Meters) }
+        enum Color { R = 10, G, B = -1 }
+        const BASE: i64 = 5;
+        static DOUBLE: i64 = BASE * 2;
+        impl Pair {
+            fn new(n: i64) -> Self { Self(n, format!("#{}", n)) }
+            fn swap(self) -> (String, i64) { let Self(a, b) = self; (b, a) }
+        }
+        impl Shape { fn r(self) -> f64 { match self { Self::Circle(Meters(m)) => m, Self::Unit => 0.0 } } }
+        mod geo {
+            pub(crate) const SCALE: i64 = 10;
+            pub mod shapes {
+                use super::SCALE;
+                pub struct Sq(pub i64);
+                impl Sq { pub fn area(self) -> i64 { self.0 * self.0 * SCALE + super::bonus() } }
+            }
+            fn bonus() -> i64 { crate::base() }
+        }
+        fn base() -> i64 { 100 }
+        fn zero<T: Default>() -> T { T::default() }
+        fn main() -> i64 {
+            fn twice(x: i64) -> i64 { x * 2 }
+            let Meters(inner) = Meters(2.5);
+            assert_eq!(inner, 2.5);
+            assert_eq!(Pair::new(3).swap(), ("#3", 3));
+            assert_eq!(format!("{:?} {}", Marker, Shape::Circle(Meters(1.5)).r()), "Marker 1.5");
+            let a = P { x: 1, y: 2 };
+            let b = P { x: 9, ..a };
+            assert_eq!((b.x, b.y), (9, 2));
+            let mut m = Meters(1.0);
+            m.0 += 1.0;
+            assert_eq!(m, Meters(2.0));
+            assert_eq!((Color::R as i64, Color::G as i64, Color::B as i64), (10, 11, -1));
+            assert_eq!(DOUBLE, 10);
+            assert_eq!(twice(geo::shapes::Sq(2).area()), 280);
+            let mut v = vec![(3, "c"), (1, "z"), (1, "a")];
+            v.sort();
+            assert_eq!(v[0], (1, "a"));
+            assert!((1, "b") < (1, "c") && (2, 0) > (1, 9));
+            let mut hm: HashMap<(i64, i64), i64> = HashMap::new();
+            hm.insert((1, 2), 3);
+            assert_eq!(hm.get((1, 2)), Some(3));
+            let e = Vec::<i64>::new();
+            assert_eq!(vec![1, 2, 3].iter().sum::<i64>() + e.len(), 6);
+            assert_eq!(zero::<i64>(), 0);
+            0
+        }
+    "##), 0);
+}

@@ -10,6 +10,8 @@ use crate::{
 struct Qualifier<'a> {
     g: &'a GlobalTable,
     module: &'a str,
+    /// Inside an impl: the path `Self` stands for in expressions and patterns.
+    self_path: Option<Vec<String>>,
 }
 impl Qualifier<'_> {
     fn view(&self) -> AliasView<'_> {
@@ -195,7 +197,33 @@ impl Qualifier<'_> {
             self.prefix(path)
         }
     }
+    /// `Self::X` / `Self` in an impl names the impl's type.
+    fn expand_self(&self, path: &mut Path) {
+        if let (Some(sp), Some("Self")) = (&self.self_path, path.segments.first().map(String::as_str)) {
+            let mut segments = sp.clone();
+            segments.extend(path.segments.drain(1..));
+            path.segments = segments;
+        }
+    }
+    /// The canonical struct a constructor path names, with its body.
+    fn struct_named(&self, path: &Path) -> Option<(String, &StructBody)> {
+        let canon = self.view().canonical_name(&path.segments.join("::"))?;
+        self.g.structs.get(&canon).map(|s| (canon, &s.body))
+    }
     fn pattern(&self, pattern: &mut Pattern) -> Result<(), ResolveError> {
+        // A tuple struct (`P(a, b)`) or unit struct (`U`) pattern is a record
+        // pattern over its positional fields `0`, `1`, ...
+        if let PatternKind::Variant { path, payload } = &mut pattern.kind {
+            self.expand_self(path);
+            if let Some((canon, body)) = self.struct_named(path) {
+                if matches!(body, StructBody::Tuple(_) | StructBody::Unit) {
+                    let fields = std::mem::take(payload).into_iter().enumerate().map(|(i, p)| (i.to_string(), p)).collect();
+                    let path = Path { segments: canon.split("::").map(str::to_string).collect(), span: path.span };
+                    pattern.kind = PatternKind::Struct { path, fields, rest: false };
+                }
+            }
+        }
+        if let PatternKind::Struct { path, .. } = &mut pattern.kind { self.expand_self(path); }
         match &mut pattern.kind {
             PatternKind::Variant { path, payload } => {
                 self.prefix(path)?;
@@ -242,8 +270,47 @@ impl Qualifier<'_> {
         Ok(())
     }
     fn expr(&self, e: &mut Expr, scope: &[String]) -> Result<(), ResolveError> {
+        // `P(a, b)` builds a tuple struct and `U` a unit struct: record
+        // literals over the positional fields.
+        let span = e.span;
+        let rewritten = match &*e.kind {
+            ExprKind::Call(callee, args) => match &*callee.kind {
+                ExprKind::Path(path) => {
+                    let mut path = path.clone();
+                    self.expand_self(&mut path);
+                    match self.struct_named(&path) {
+                        Some((canon, StructBody::Tuple(_))) if !self.g.fns.contains_key(&canon) => Some(ExprKind::StructLit {
+                            path: Path { segments: canon.split("::").map(str::to_string).collect(), span: path.span },
+                            fields: args.iter().enumerate().map(|(i, a)| FieldInit { name: i.to_string(), value: Some(a.clone()), span: a.span }).collect(),
+                            span,
+                        }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            ExprKind::Path(path) if path.segments.len() <= 2 => {
+                let mut path = path.clone();
+                self.expand_self(&mut path);
+                match self.struct_named(&path) {
+                    Some((canon, StructBody::Unit)) => Some(ExprKind::StructLit {
+                        path: Path { segments: canon.split("::").map(str::to_string).collect(), span: path.span },
+                        fields: vec![],
+                        span,
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(kind) = rewritten { e.kind = std::sync::Arc::new(kind); }
         match std::sync::Arc::make_mut(&mut e.kind) {
-            ExprKind::Path(path) => self.prefix(path)?,
+            ExprKind::Path(path) => { self.expand_self(path); self.prefix(path)? }
+            ExprKind::Call(callee, _) if matches!(&*callee.kind, ExprKind::Path(_)) => {}
+            _ => {}
+        }
+        match std::sync::Arc::make_mut(&mut e.kind) {
+            ExprKind::Path(_) => {}
             ExprKind::Call(callee, args) => {
                 self.expr(callee, scope)?;
                 for arg in args {
@@ -275,6 +342,7 @@ impl Qualifier<'_> {
                 self.ty(ty, scope, false)?;
             }
             ExprKind::StructLit { path, fields, .. } => {
+                self.expand_self(path);
                 self.constructor(path)?;
                 for field in fields {
                     if let Some(value) = &mut field.value {
@@ -375,22 +443,16 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
     let mut consts = g.consts.clone();
     let mut aliases = g.aliases.clone();
     for (name, f) in &mut fns {
-        Qualifier {
-            g,
-            module: module(name),
-        }
+        Qualifier { g, module: module(name), self_path: None }
         .function(f, &[])?;
     }
     for (name, alias) in &mut aliases {
-        let q = Qualifier { g, module: module(name) };
+        let q = Qualifier { g, module: module(name), self_path: None };
         let scope = q.generics(&mut alias.generics, &[])?;
         q.ty(&mut alias.ty, &scope, false)?;
     }
     for (name, s) in &mut structs {
-        let q = Qualifier {
-            g,
-            module: module(name),
-        };
+        let q = Qualifier { g, module: module(name), self_path: None };
         let scope = q.generics(&mut s.generics, &[])?;
         match &mut s.body {
             StructBody::Named(fields) => {
@@ -407,10 +469,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, e) in &mut enums {
-        let q = Qualifier {
-            g,
-            module: module(name),
-        };
+        let q = Qualifier { g, module: module(name), self_path: None };
         let scope = q.generics(&mut e.generics, &[])?;
         for variant in &mut e.variants {
             match &mut variant.payload {
@@ -429,10 +488,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, t) in &mut traits {
-        let q = Qualifier {
-            g,
-            module: module(name),
-        };
+        let q = Qualifier { g, module: module(name), self_path: None };
         let scope = q.generics(&mut t.generics, &[])?;
         for bound in &mut t.supertraits {
             q.trait_ref(bound, &scope)?;
@@ -449,12 +505,13 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (index, i) in impls.iter_mut().enumerate() {
-        let q = Qualifier {
-            g,
-            module: g.impl_modules.get(index).map_or("", String::as_str),
-        };
+        let q = Qualifier { g, module: g.impl_modules.get(index).map_or("", String::as_str), self_path: None };
         let scope = q.generics(&mut i.generics, &[])?;
         q.ty(&mut i.self_ty, &scope, i.trait_ref.is_none())?;
+        let mut q = q;
+        if let TypeKind::Path(p, _) = &i.self_ty.kind {
+            if !p.is_single() || !scope.iter().any(|g| g == p.last()) { q.self_path = Some(p.segments.clone()); }
+        }
         if let Some(tr) = &mut i.trait_ref {
             q.trait_ref(tr, &scope)?;
         }
@@ -466,10 +523,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, c) in &mut consts {
-        let q = Qualifier {
-            g,
-            module: module(name),
-        };
+        let q = Qualifier { g, module: module(name), self_path: None };
         q.ty(&mut c.ty, &[], false)?;
         q.expr(&mut c.value, &[])?;
     }

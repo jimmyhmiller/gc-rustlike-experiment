@@ -103,6 +103,8 @@ pub struct EnumDef {
 pub struct VariantDef {
     pub name: String,
     pub payload: VariantPayload,
+    /// An explicit discriminant: `A = 5`, the value of `E::A as i64`.
+    pub discriminant: Option<i64>,
     pub span: Span,
 }
 

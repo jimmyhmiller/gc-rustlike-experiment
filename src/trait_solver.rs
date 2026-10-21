@@ -295,6 +295,20 @@ impl<C: ProofContext> Solver<'_, C> {
     }
     fn trait_rules(&self, ty: &Ty, name: &str, args: &[Ty]) -> Result<Vec<Vec<Goal>>, TypeError> {
         let mut alternatives = Vec::new();
+        // Tuples compare, hash, and clone element by element.
+        if matches!(name, "Eq" | "Ord" | "Hash" | "Clone") && args.is_empty() {
+            match ty {
+                Ty::Tuple(elems) => {
+                    alternatives.push(elems.iter().map(|e| bound_goal(e.clone(), name.into(), vec![])).collect());
+                    return Ok(alternatives);
+                }
+                Ty::Prim(crate::types::Prim::Unit) => {
+                    alternatives.push(vec![]);
+                    return Ok(alternatives);
+                }
+                _ => {}
+            }
+        }
         // Structural types get `Debug` from their parts (format!'s `{:?}`
         // renders them directly).
         if name == "Debug" && args.is_empty() {
