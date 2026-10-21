@@ -571,3 +571,37 @@ fn rust_shaped_operator_traits_and_multiple_impls() {
         }
     "#), 19);
 }
+
+#[test]
+fn blanket_impls_into_and_question_mark_conversion() {
+    assert_eq!(run(r#"
+        use std::fmt;
+        #[derive(Debug)]
+        enum AppError { Parse(String), Neg(i64) }
+        impl From<String> for AppError { fn from(s: String) -> AppError { AppError::Parse(s) } }
+        impl From<i64> for AppError { fn from(n: i64) -> AppError { AppError::Neg(n) } }
+        fn parse(s: String) -> Result<i64, String> { match s.parse_i64() { Some(n) => Ok(n), None => Err(format!("bad {}", s)) } }
+        fn check(n: i64) -> Result<i64, i64> { if n < 0 { Err(n) } else { Ok(n) } }
+        fn run(s: String) -> Result<i64, AppError> {
+            let n = parse(s)?;
+            let m = check(n)?;
+            Ok(m * 2)
+        }
+        struct Celsius(f64);
+        struct Fahrenheit(f64);
+        impl From<Celsius> for Fahrenheit { fn from(c: Celsius) -> Fahrenheit { Fahrenheit(c.0 * 9.0 / 5.0 + 32.0) } }
+        fn show<S: Into<String>>(s: S) -> String { let t: String = s.into(); format!("[{}]", t) }
+        trait Describe { fn describe(self) -> String; }
+        impl<T: fmt::Debug> Describe for T { fn describe(self) -> String { format!("<{:?}>", self) } }
+        trait Shout { fn shout(self) -> String; }
+        impl<T: ToString> Shout for T { fn shout(self) -> String { self.to_string() + "!" } }
+        fn main() -> i64 {
+            assert_eq!(format!("{:?} {:?} {:?}", run("21"), run("x"), run("-4")), "Ok(42) Err(Parse(\"bad x\")) Err(Neg(-4))");
+            let f: Fahrenheit = Celsius(100.0).into();
+            assert_eq!(f.0, 212.0);
+            assert_eq!(show("hi"), "[hi]");
+            assert_eq!(vec![1, 2].describe() + 5.shout(), "<[1, 2]>5!");
+            0
+        }
+    "#), 0);
+}

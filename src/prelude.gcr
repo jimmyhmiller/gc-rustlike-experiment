@@ -92,6 +92,9 @@ trait Send {}
 
 // Conversions: `T::from(x)`, `let t: T = From::from(x)`.
 trait From<T> { fn from(value: T) -> Self; }
+// `x.into()` is `From::from(x)` into the expected type; `T: Into<U>` holds
+// when `U: From<T>`, and every type converts into itself.
+trait Into<T> { fn into(self) -> T; }
 
 // `clone` copies a collection's storage, so the copy and the original can be
 // mutated independently. Elements are not cloned.

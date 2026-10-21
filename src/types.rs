@@ -158,6 +158,9 @@ pub(crate) fn impl_receiver_base(imp: &crate::ast::ImplBlock, g: &crate::resolve
     let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
     let params = imp.generics.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
     let ty = lower_type_with(&imp.self_ty, &params, &env)?;
+    // A blanket impl (`impl<T: Display> Shout for T`) applies to every type
+    // meeting its bounds; its methods are indexed under `*`.
+    if matches!(ty, Ty::Var(_)) && imp.trait_ref.is_some() { return Ok("*".into()); }
     receiver_base(&ty).ok_or_else(|| TypeError { msg: "impl receiver must be a nominal or primitive type".into(), span: imp.self_ty.span })
 }
 

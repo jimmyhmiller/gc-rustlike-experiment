@@ -350,9 +350,12 @@ impl<C: ProofContext> Solver<'_, C> {
         let receiver = match ty {
             Ty::Named { name, .. } => name.as_str(),
             Ty::Prim(primitive) => crate::types::prim_name(*primitive),
-            _ => return Ok(alternatives),
+            _ => "*",
         };
-        for &index in self.ctx.candidates(name, receiver) {
+        // The type's own impls, then blanket impls (`impl<T: X> Y for T`).
+        let mut indices: Vec<usize> = if receiver == "*" { vec![] } else { self.ctx.candidates(name, receiver).to_vec() };
+        indices.extend_from_slice(self.ctx.candidates(name, "*"));
+        for index in indices {
             let imp = self.ctx.implementation(index);
             let Some(tr) = &imp.trait_ref else {
                 unreachable!("trait impl index")
@@ -412,6 +415,15 @@ impl<C: ProofContext> Solver<'_, C> {
                 )?;
             }
             alternatives.push(conditions);
+        }
+        // `From<T> for T`, and `T: Into<U>` exactly when `U: From<T>`.
+        if name == "From" && args.len() == 1 && args[0] == *ty {
+            alternatives.push(vec![]);
+            return Ok(alternatives);
+        }
+        if name == "Into" && args.len() == 1 {
+            alternatives.push(vec![bound_goal(args[0].clone(), "From".into(), vec![ty.clone()])]);
+            return Ok(alternatives);
         }
         // Every type is `Copy` and `Send` here (see the prelude).
         if matches!(name, "Copy" | "Send") && args.is_empty() {

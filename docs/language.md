@@ -196,6 +196,12 @@ These follow Rust; differences come from having no references.
   (`type Output = Self;`). A type may implement one generic trait several
   times (`impl Mul<f64> for V` and `impl Mul<V> for V`, `From<i64>` and
   `From<bool>`); calls choose the impl by argument type.
+- **Blanket impls and conversions.** `impl<T: Display> Shout for T` applies
+  to every type meeting the bounds (a type's own impls take precedence).
+  `From<T>` converts (`T::from(x)`, `From::from(x)`, and every type converts
+  into itself); `x.into()` converts into the expected type, and `T: Into<U>`
+  holds when `U: From<T>`. `?` converts an error to the function's error type
+  through `From`.
 - **Associated constants.** `const MAX: i64 = 10;` in impls and traits (with
   or without a default), used as `Type::MAX`, `Self::MAX`, or `T::MAX`.
 - **Turbofish.** `f::<i64>()`, `Vec::<i64>::new()`, and `it.sum::<i64>()`

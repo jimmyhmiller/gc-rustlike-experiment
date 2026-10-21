@@ -2442,6 +2442,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::Try(inner) => self.try_op(inner, e.span),
 
+            // `x.into()`: `From::from(x)` into the expected type.
+            ExprKind::MethodCall { recv, method, args, span } if method == "into" && args.is_empty()
+                && expected.is_some_and(|t| !has_var(t)) =>
+            {
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: *span };
+                let from = ex(ExprKind::Path(Path { segments: vec!["From".into(), "from".into()], span: *span }));
+                self.expr(&ex(ExprKind::Call(from, vec![recv.clone()])), expected)
+            }
             ExprKind::MethodCall { recv, method, args, span } if method == "collect" && args.is_empty() => {
                 self.collect_call(recv, expected, *span)
             }
@@ -4580,8 +4588,35 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// The impl method `method` for a receiver of type `recv_ty`, if any.
     fn lookup_method(&self, recv_ty: &Ty, method: &str) -> Option<crate::types::MethodEntry> {
-        let base = crate::types::receiver_base(recv_ty)?;
-        self.ctx.methods.get(&(base, method.to_string())).cloned()
+        if let Some(base) = crate::types::receiver_base(recv_ty) {
+            if let Some(e) = self.ctx.methods.get(&(base, method.to_string())) { return Some(e.clone()); }
+        }
+        self.blanket_method(recv_ty, None, method)
+    }
+
+    /// A method from a blanket impl (`impl<T: Display> Shout for T`) whose
+    /// bounds `recv_ty` meets, optionally of a given trait.
+    fn blanket_method(&self, recv_ty: &Ty, trait_name: Option<&str>, method: &str) -> Option<crate::types::MethodEntry> {
+        let mut found: Vec<&crate::types::MethodEntry> = self.ctx.trait_candidates.iter()
+            .filter(|((base, tr, m), _)| base == "*" && m == method && trait_name.is_none_or(|t| t == tr))
+            .flat_map(|(_, entries)| entries.iter()).collect();
+        found.sort_by(|a, b| a.trait_name.cmp(&b.trait_name));
+        found.into_iter().find(|e| {
+            let tr = e.trait_name.as_deref().unwrap_or_default();
+            // Trait arguments that are not the receiver parameter itself
+            // would need inference; such impls apply when the trait holds.
+            let receiver = match &e.self_ty.kind { TypeKind::Path(p, _) => p.last().to_string(), _ => return false };
+            let at_receiver: HashMap<String, Ty> = [(receiver, recv_ty.clone())].into_iter().collect();
+            let args: Option<Vec<Ty>> = e.trait_args.iter().map(|a| {
+                let t = lower_type(a, &e.impl_generics, self.ctx).ok()?;
+                let t = apply_subst(&t, &at_receiver);
+                (!has_var(&t)).then_some(t)
+            }).collect();
+            match args {
+                Some(args) => self.ctx.type_implements_trait_args(recv_ty, tr, &args),
+                None => false,
+            }
+        }).cloned()
     }
 
     /// Call the method `method` of `impl trait_name for <recv_ty>` on an
@@ -4692,8 +4727,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     /// The method `method` of `impl trait_name for <recv_ty>`, if any.
     fn lookup_trait_method(&self, recv_ty: &Ty, trait_name: &str, method: &str) -> Option<crate::types::MethodEntry> {
-        let base = crate::types::receiver_base(recv_ty)?;
-        self.ctx.trait_methods.get(&(base, trait_name.to_string(), method.to_string())).cloned()
+        if let Some(base) = crate::types::receiver_base(recv_ty) {
+            if let Some(e) = self.ctx.trait_methods.get(&(base, trait_name.to_string(), method.to_string())) { return Some(e.clone()); }
+        }
+        self.blanket_method(recv_ty, Some(trait_name), method)
     }
 
     fn required_trait_method(&self, recv_ty: &Ty, trait_name: &str, method: &str, what: &str, span: Span) -> LResult<crate::types::MethodEntry> {
@@ -4999,8 +5036,29 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         } else {
             let ety = err_payload[0].clone();
             let erepr = self.repr_of(&ety, span)?;
-            let elocal = self.fresh_local(erepr.clone(), ety);
-            (vec![elocal], vec![CoreExpr::new(CoreExprKind::Local(elocal), erepr)])
+            let elocal = self.fresh_local(erepr.clone(), ety.clone());
+            // A different error type converts through `From` (as Rust's `?`).
+            let field = match rargs.get(1) {
+                Some(want) if kind == "Result" && *want != ety && !has_var(want) => {
+                    self.push_scope();
+                    self.bind("try#err", elocal, ety.clone());
+                    let ex = |k: ExprKind| Expr { kind: std::sync::Arc::new(k), span };
+                    let call = ex(ExprKind::Call(
+                        ex(ExprKind::Path(Path { segments: vec!["From".into(), "from".into()], span })),
+                        vec![ex(ExprKind::Path(Path::single("try#err".into(), span)))],
+                    ));
+                    let converted = self.expr(&call, Some(want));
+                    self.pop_scope();
+                    let (value, vt) = converted.map_err(|e| LowerError {
+                        msg: format!("`?` cannot convert the error `{}` into `{}` (it needs `impl From<{}> for {}`): {}", ty_display(&ety), ty_display(want), ty_display(&ety), ty_display(want), e.msg),
+                        span,
+                    })?;
+                    self.check_assignable(&vt, want, span)?;
+                    value
+                }
+                _ => CoreExpr::new(CoreExprKind::Local(elocal), erepr),
+            };
+            (vec![elocal], vec![field])
         };
         // Build the return value: the fn's return enum, err_tag. For a
         // reference enum this is a heap alloc — span it with the `?` location so
@@ -5483,6 +5541,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let Some(target) = expected.filter(|t| !has_var(t)).cloned() else {
                         return err(format!("cannot tell which type's `{}::{}` to call; annotate the expected type", short, name), span);
                     };
+                    // `From<T> for T`: converting a value to its own type.
+                    if short == "From" && name == "from" && args.len() == 1 {
+                        if let Ok(t) = self.probe_expr_type(&args[0], Some(&target)) {
+                            if t == target { return self.expr(&args[0], Some(&target)); }
+                        }
+                    }
                     let base = crate::types::receiver_base(&target).ok_or_else(|| LowerError { msg: format!("`{}` does not implement `{}`", ty_display(&target), short), span })?;
                     let entry = self.lookup_trait_method(&target, &trait_name, name)
                         .or_else(|| self.lookup_trait_method(&target, &short, name))
