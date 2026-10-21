@@ -14,7 +14,7 @@ pub struct ParseError {
 }
 
 pub fn parse_module(tokens: &[Token]) -> Result<Module, ParseError> {
-    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None };
+    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() };
     let mut items = Vec::new();
     while !p.at(&TokKind::Eof) {
         items.extend(p.items()?);
@@ -59,6 +59,10 @@ struct Parser {
     /// The turbofish type arguments the last expression path carried, and
     /// how many segments preceded them.
     last_turbofish: Option<(usize, Vec<Type>)>,
+    /// The element bindings of each slice pattern (`[a, .., z]`), keyed by
+    /// the `slice#..` name binding the whole value; arms built from the
+    /// pattern run them before the guard and body.
+    slice_lets: std::collections::HashMap<String, Vec<Stmt>>,
 }
 
 /// A loop being parsed. `break value` assigns `loop#N`; a `break 'label` or
@@ -89,18 +93,27 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(String, bool)>) {
     }
 }
 
+impl Parser {
 /// `let PAT = e else { .. };` is
 /// `let (x, y) = match e { PAT => (x, y), _ => { .. } };`.
-fn let_else(alts: Vec<(Pattern, Vec<Expr>)>, ty: Option<Type>, scrutinee: Expr, otherwise: Block, span: Span) -> Stmt {
+fn let_else(&self, alts: Vec<(Pattern, Vec<Expr>)>, ty: Option<Type>, scrutinee: Expr, otherwise: Block, span: Span) -> Stmt {
     let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
     let mut names = Vec::new();
     pattern_names(&alts[0].0, &mut names);
+    // A slice pattern's element bindings are the names it introduces.
+    let slice_names: Vec<String> = names.iter().filter(|(n, _)| n.starts_with("slice#")).map(|(n, _)| n.clone()).collect();
+    names.retain(|(n, _)| !n.starts_with("slice#"));
+    for s in &slice_names {
+        for st in self.slice_lets.get(s).into_iter().flatten() {
+            if let Stmt::Let { pattern, .. } = st { pattern_names(pattern, &mut names); }
+        }
+    }
     let value = |names: &[(String, bool)]| match names {
         [(n, _)] => ex(ExprKind::Path(Path::single(n.clone(), span))),
         _ => ex(ExprKind::Tuple(names.iter().map(|(n, _)| ex(ExprKind::Path(Path::single(n.clone(), span)))).collect())),
     };
     let mut arms: Vec<MatchArm> = alts.into_iter()
-        .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, None), body: value(&names), span }).collect();
+        .map(|(pattern, guards)| self.arm(pattern, guards, None, value(&names), span)).collect();
     arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Block(otherwise)), span });
     let binding = |(n, m): &(String, bool)| Pattern { kind: PatternKind::Binding { is_mut: *m, name: n.clone() }, span };
     let pattern = match names.as_slice() {
@@ -118,6 +131,32 @@ fn let_else(alts: Vec<(Pattern, Vec<Expr>)>, ty: Option<Type>, scrutinee: Expr, 
         None => scrutinee,
     };
     Stmt::Let { pattern, ty: None, init: Some(ex(ExprKind::Match { scrutinee, arms })), span }
+}
+}
+
+/// Slice arms that cover every length make a match exhaustive without a
+/// `_` arm: `[] => .., [x] => .., [x, rest @ ..] => ..`. When unguarded,
+/// test-free arms give every length below that of a `..` arm (also unguarded
+/// and test-free), a final `_` arm that cannot be reached is added.
+fn slice_coverage(arms: Vec<(MatchArm, bool)>) -> Vec<MatchArm> {
+    let info = |a: &MatchArm, guarded: bool| -> Option<(usize, bool)> {
+        if guarded { return None; }
+        let PatternKind::Binding { name, .. } = &a.pattern.kind else { return None };
+        let parts: Vec<&str> = name.split('#').collect();
+        if parts.len() != 5 || parts[0] != "slice" || parts[4] != "0" { return None; }
+        Some((parts[2].parse().ok()?, parts[3] == "1"))
+    };
+    let shapes: Vec<(usize, bool)> = arms.iter().filter_map(|(a, g)| info(a, *g)).collect();
+    let exact: std::collections::HashSet<usize> = shapes.iter().filter(|(_, r)| !r).map(|(k, _)| *k).collect();
+    let covered = shapes.iter().any(|(k, r)| *r && (0..*k).all(|n| exact.contains(&n)));
+    let span = arms.last().map(|(a, _)| a.span);
+    let mut out: Vec<MatchArm> = arms.into_iter().map(|(a, _)| a).collect();
+    if let (true, Some(span)) = (covered, span) {
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let panic = ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".into(), span))), vec![ex(ExprKind::Str("unreachable slice pattern".into()))]));
+        out.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: panic, span });
+    }
+    out
 }
 
 /// `e` with explicit type arguments attached: `Cast(e, marker<tys..>)`.
@@ -380,7 +419,7 @@ impl Parser {
                 let mut tokens = crate::lexer::lex_with_source(&source, at.source)
                     .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
                 for t in &mut tokens { t.span = at; }
-                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None };
+                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() };
                 while !p.at(&TokKind::Eof) {
                     let items = p.items().map_err(|e| ParseError { msg: format!("in derived `{}`: {}", trait_name, e.msg), span: at })?;
                     self.pending.extend(items);
@@ -903,6 +942,16 @@ impl Parser {
                 continue;
             }
             let pstart = self.span();
+            // `const N: usize`: a const parameter, instantiated with a
+            // type-level number.
+            if self.eat_kw(Kw::Const) {
+                let name = self.ident()?;
+                self.expect(&TokKind::Colon)?;
+                self.ty()?;
+                g.params.push(TypeParam { name, bounds: vec![], default: None, span: pstart.to(self.prev_span()) });
+                if !self.eat(&TokKind::Comma) { break; }
+                continue;
+            }
             let name = self.ident()?;
             let mut bounds = Vec::new();
             if self.eat(&TokKind::Colon) {
@@ -1057,6 +1106,12 @@ impl Parser {
                 self.expect(&TokKind::RParen)?;
                 let ret = if self.eat(&TokKind::Arrow) { Some(Box::new(self.ty()?)) } else { None };
                 TypeKind::ExternFn(params, ret)
+            }
+            // A const generic argument: `Matrix<2, 3>`.
+            TokKind::Int(n, _) => {
+                let n = *n;
+                self.bump();
+                TypeKind::Path(Path::single(format!("const#{n}"), start), vec![])
             }
             TokKind::Keyword(Kw::SelfType) if !matches!(self.peek_at(1), TokKind::ColonColon) => {
                 self.bump();
@@ -1360,7 +1415,7 @@ impl Parser {
             let otherwise = self.block()?;
             self.expect(&TokKind::Semi)?;
             let span = start.to(self.prev_span());
-            return Ok(let_else(alts, ty, scrutinee, otherwise, span));
+            return Ok(self.let_else(alts, ty, scrutinee, otherwise, span));
         }
         if alts.len() != 1 || !alts[0].1.is_empty() {
             return Err(ParseError {
@@ -1843,7 +1898,7 @@ impl Parser {
                 let span = start.to(self.prev_span());
                 let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
                 let mut arms: Vec<MatchArm> = alts.into_iter()
-                    .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, guard.clone()), body: ex(ExprKind::Bool(true)), span }).collect();
+                    .map(|(pattern, guards)| self.arm(pattern, guards, guard.clone(), ex(ExprKind::Bool(true)), span)).collect();
                 arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Bool(false)), span });
                 Ok(ex(ExprKind::Match { scrutinee, arms }))
             }
@@ -1903,7 +1958,7 @@ impl Parser {
             let mut all = toks.to_vec();
             let eof_span = toks.last().map(|t| t.span).unwrap_or(at);
             all.push(Token { kind: TokKind::Eof, span: eof_span });
-            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None };
+            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() };
             let ok = match kind {
                 "expr" => p.delimited_expr().is_ok(),
                 "ty" => p.ty().is_ok(),
@@ -1922,7 +1977,7 @@ impl Parser {
     fn sub_parser(&self, mut tokens: Vec<Token>, at: Span) -> Parser {
         let eof_span = tokens.last().map(|t| t.span).unwrap_or(at);
         tokens.push(Token { kind: TokKind::Eof, span: eof_span });
-        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None }
+        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default() }
     }
 
     /// An expansion in expression position: its tokens as the body of a block,
@@ -2180,7 +2235,7 @@ impl Parser {
         let otherwise = else_branch.unwrap_or(Expr { kind: std::sync::Arc::new(ExprKind::Unit), span });
         let then = Expr { kind: std::sync::Arc::new(ExprKind::Block(then_branch)), span: then_span };
         let mut arms: Vec<MatchArm> = alts.into_iter()
-            .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, None), body: then.clone(), span }).collect();
+            .map(|(pattern, guards)| self.arm(pattern, guards, None, then.clone(), span)).collect();
         arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: otherwise, span });
         Ok(Expr { kind: std::sync::Arc::new(ExprKind::Match { scrutinee, arms }), span })
     }
@@ -2199,12 +2254,13 @@ impl Parser {
             self.eat(&TokKind::Comma);
             // Each alternative is its own arm with the same body.
             for (pattern, guards) in alts {
-                arms.push(MatchArm { pattern, guard: conjoin(guards, guard.clone()), body: body.clone(), span: astart.to(self.prev_span()) });
+                let a = self.arm(pattern, guards, guard.clone(), body.clone(), astart.to(self.prev_span()));
+                arms.push((a, guard.is_some()));
             }
         }
         self.expect(&TokKind::RBrace)?;
         let span = start.to(self.prev_span());
-        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Match { scrutinee, arms }), span })
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Match { scrutinee, arms: slice_coverage(arms) }), span })
     }
 
     fn while_expr(&mut self) -> PResult<Expr> {
@@ -2220,7 +2276,7 @@ impl Parser {
             let body_span = body.span;
             let body = Expr { kind: std::sync::Arc::new(ExprKind::Block(body)), span: body_span };
             let mut arms: Vec<MatchArm> = alts.into_iter()
-                .map(|(pattern, guards)| MatchArm { pattern, guard: conjoin(guards, None), body: body.clone(), span }).collect();
+                .map(|(pattern, guards)| self.arm(pattern, guards, None, body.clone(), span)).collect();
             arms.extend([
                 MatchArm {
                     pattern: Pattern { kind: PatternKind::Wildcard, span },
@@ -2498,8 +2554,115 @@ impl Parser {
         Ok(parts)
     }
 
+    /// A match arm for one pattern alternative: its range/slice guards and
+    /// the user's guard, with any slice element bindings in scope for the
+    /// user's guard and the body.
+    fn arm(&self, pattern: Pattern, guards: Vec<Expr>, user_guard: Option<Expr>, body: Expr, span: Span) -> MatchArm {
+        let mut names = Vec::new();
+        pattern_names(&pattern, &mut names);
+        let prelude: Vec<Stmt> = names.iter().filter(|(n, _)| n.starts_with("slice#"))
+            .flat_map(|(n, _)| self.slice_lets.get(n).cloned().unwrap_or_default()).collect();
+        let wrap = |e: Expr| if prelude.is_empty() { e } else {
+            let span = e.span;
+            Expr { kind: std::sync::Arc::new(ExprKind::Block(Block { stmts: prelude.clone(), tail: Some(e), span })), span }
+        };
+        MatchArm { pattern, guard: conjoin(guards, user_guard.map(wrap)), body: wrap(body), span }
+    }
+
+    /// `[a, b, .., z]`, `[x, rest @ ..]`, `[]`: the value is bound to a
+    /// `slice#..` name, its length and literal/range elements become guards,
+    /// and named elements become bindings (see `arm`). Elements may be names,
+    /// `_`, literals, and ranges; `..` or `name @ ..` takes the rest.
+    fn slice_pattern(&mut self) -> PResult<Vec<(Pattern, Vec<Expr>)>> {
+        enum Elem { Bind(String, bool), Wild, Eq(Expr), Range(Expr, Expr, bool), Pat(Pattern) }
+        let start = self.expect(&TokKind::LBracket)?;
+        let mut before: Vec<Elem> = Vec::new();
+        let mut after: Vec<Elem> = Vec::new();
+        let mut rest: Option<Option<String>> = None;
+        while !self.at(&TokKind::RBracket) {
+            if self.eat(&TokKind::DotDot) {
+                if rest.is_some() { return Err(self.error("a slice pattern has at most one `..`")); }
+                rest = Some(None);
+            } else if let (TokKind::Ident(n), TokKind::At, TokKind::DotDot) = (self.peek().clone(), self.peek_at(1).clone(), self.peek_at(2).clone()) {
+                self.bump(); self.bump(); self.bump();
+                if rest.is_some() { return Err(self.error("a slice pattern has at most one `..`")); }
+                rest = Some(Some(n));
+            } else {
+                let estart = self.span();
+                let elem = match self.literal_pattern_expr()? {
+                    Some(lo) => {
+                        if self.at(&TokKind::DotDotEq) || self.at(&TokKind::DotDot) {
+                            let inclusive = self.at(&TokKind::DotDotEq);
+                            self.bump();
+                            let hi = self.literal_pattern_expr()?.ok_or_else(|| self.error("expected the end of the range pattern"))?;
+                            Elem::Range(lo, hi, inclusive)
+                        } else { Elem::Eq(lo) }
+                    }
+                    None => match self.peek().clone() {
+                        TokKind::Ident(n) if n == "_" => { self.bump(); Elem::Wild }
+                        TokKind::Keyword(Kw::Mut) => { self.bump(); Elem::Bind(self.ident()?, true) }
+                        TokKind::Ident(n) if !n.chars().next().is_some_and(|c| c.is_uppercase()) && !matches!(self.peek_at(1), TokKind::ColonColon | TokKind::LParen | TokKind::LBrace) => {
+                            self.bump();
+                            Elem::Bind(n, false)
+                        }
+                        TokKind::Str(t) => { self.bump(); Elem::Eq(Expr { kind: std::sync::Arc::new(ExprKind::Str(t)), span: estart }) }
+                        TokKind::Keyword(Kw::True) => { self.bump(); Elem::Eq(Expr { kind: std::sync::Arc::new(ExprKind::Bool(true)), span: estart }) }
+                        TokKind::Keyword(Kw::False) => { self.bump(); Elem::Eq(Expr { kind: std::sync::Arc::new(ExprKind::Bool(false)), span: estart }) }
+                        // A destructuring element (`(x, y)`, `P { x, .. }`)
+                        // binds through a `let`, so it must be irrefutable.
+                        _ => {
+                            let mut alts = self.pattern_alts()?;
+                            if alts.len() != 1 || !alts[0].1.is_empty() {
+                                return Err(ParseError { msg: "a slice pattern element cannot use `|` or ranges inside it".into(), span: estart.to(self.prev_span()) });
+                            }
+                            Elem::Pat(alts.pop().unwrap().0)
+                        }
+                    },
+                };
+                if rest.is_some() { after.push(elem) } else { before.push(elem) }
+            }
+            if !self.eat(&TokKind::Comma) { break; }
+        }
+        self.expect(&TokKind::RBracket)?;
+        let span = start.to(self.prev_span());
+        self.pattern_counter += 1;
+        let tests = before.iter().chain(&after).any(|e| matches!(e, Elem::Eq(_) | Elem::Range(..)));
+        let k = before.len() + after.len();
+        let name = format!("slice#{}#{}#{}#{}", self.pattern_counter, k, rest.is_some() as u8, tests as u8);
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let var = || ex(ExprKind::Path(Path::single(name.clone(), span)));
+        let int = |n: usize| ex(ExprKind::Int(n as u64, crate::lexer::NumSuffix::None));
+        let len = || ex(ExprKind::MethodCall { recv: var(), method: "len".into(), args: vec![], span });
+        let mut guards = vec![ex(ExprKind::Binary(if rest.is_some() { BinOp::Ge } else { BinOp::Eq }, len(), int(k)))];
+        let mut lets = Vec::new();
+        let n_after = after.len();
+        let positions = before.into_iter().enumerate().map(|(i, e)| (int(i), e))
+            .chain(after.into_iter().enumerate().map(|(j, e)| (ex(ExprKind::Binary(BinOp::Sub, len(), int(n_after - j))), e)));
+        for (index, e) in positions {
+            let at = ex(ExprKind::Index { base: var(), index });
+            match e {
+                Elem::Wild => {}
+                Elem::Bind(n, m) => lets.push(Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: m, name: n }, span }, ty: None, init: Some(at), span }),
+                Elem::Pat(p) => lets.push(Stmt::Let { pattern: p, ty: None, init: Some(at), span }),
+                Elem::Eq(v) => guards.push(ex(ExprKind::Binary(BinOp::Eq, at, v))),
+                Elem::Range(lo, hi, inclusive) => guards.push(ex(ExprKind::Binary(BinOp::And,
+                    ex(ExprKind::Binary(BinOp::Ge, at.clone(), lo)),
+                    ex(ExprKind::Binary(if inclusive { BinOp::Le } else { BinOp::Lt }, at, hi))))),
+            }
+        }
+        if let Some(Some(r)) = rest {
+            let lo = int(k - n_after);
+            let hi = ex(ExprKind::Binary(BinOp::Sub, len(), int(n_after)));
+            let range = ex(ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive: false });
+            lets.push(Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: r }, span }, ty: None, init: Some(ex(ExprKind::Index { base: var(), index: range })), span });
+        }
+        self.slice_lets.insert(name.clone(), lets);
+        Ok(vec![(Pattern { kind: PatternKind::Binding { is_mut: false, name }, span }, guards)])
+    }
+
     fn pattern_one(&mut self) -> PResult<Vec<(Pattern, Vec<Expr>)>> {
         let start = self.span();
+        if self.at(&TokKind::LBracket) { return self.slice_pattern(); }
         if let Some(alt) = self.guarded_literal_pattern(None)? {
             return Ok(vec![alt]);
         }

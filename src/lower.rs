@@ -1771,6 +1771,18 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok(concrete)
     }
 
+    /// The length a path names in `[x; N]`: a const generic parameter's
+    /// value, or a `const` defined as an integer literal.
+    fn const_len(&self, p: &Path) -> Option<u64> {
+        if p.is_single() {
+            if let Some(Ty::Named { name, .. }) = self.subst.get(p.last()) {
+                if let Some(n) = name.strip_prefix("const#") { return n.parse().ok(); }
+            }
+        }
+        let (_, def) = self.const_def(p)?;
+        match &*def.value.kind { ExprKind::Int(n, _) => Some(*n), _ => None }
+    }
+
     /// The `const`/`static` a value path names: by its full path, a `use`
     /// alias, or an unambiguous final segment.
     fn const_def(&self, path: &Path) -> Option<(String, Rc<ConstDef>)> {
@@ -1890,6 +1902,41 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, recv)], tail: Some(value) })), repr), ty))
     }
 
+    /// `a == b` on arrays: equal lengths and equal elements.
+    fn array_eq(&mut self, left: CoreExpr, ty: Ty, right: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let var = |n: &str| ex(ExprKind::Path(Path::single(n.into(), span)));
+        let int = |n: u64| ex(ExprKind::Int(n, crate::lexer::NumSuffix::None));
+        let len = |n: &str| ex(ExprKind::MethodCall { recv: var(n), method: "len".into(), args: vec![], span });
+        let let_ = |n: &str, m: bool, init: Expr| Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: m, name: n.into() }, span }, ty: None, init: Some(init), span };
+        let assign = |n: &str, v: Expr| Stmt::Expr(ex(ExprKind::Assign { target: var(n), op: None, value: v }));
+        let at = |n: &str| ex(ExprKind::Index { base: var(n), index: var("arr#i") });
+        let body = ex(ExprKind::Block(Block {
+            stmts: vec![
+                let_("arr#b", false, right.clone()),
+                let_("arr#same", true, ex(ExprKind::Binary(BinOp::Eq, len("arr#a"), len("arr#b")))),
+                let_("arr#i", true, int(0)),
+                Stmt::Expr(ex(ExprKind::While {
+                    cond: ex(ExprKind::Binary(BinOp::And, var("arr#same"), ex(ExprKind::Binary(BinOp::Lt, var("arr#i"), len("arr#a"))))),
+                    body: Block { stmts: vec![
+                        assign("arr#same", ex(ExprKind::Binary(BinOp::Eq, at("arr#a"), at("arr#b")))),
+                        assign("arr#i", ex(ExprKind::Binary(BinOp::Add, var("arr#i"), int(1)))),
+                    ], tail: None, span },
+                })),
+            ],
+            tail: Some(var("arr#same")),
+            span,
+        }));
+        let id = self.fresh_local(left.repr.clone(), ty.clone());
+        self.push_scope();
+        self.bind("arr#a", id, ty);
+        let result = self.expr(&body, None);
+        self.pop_scope();
+        let (value, vty) = result?;
+        let repr = value.repr.clone();
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, left)], tail: Some(value) })), repr), vty))
+    }
+
     /// Call `method` on a trait object: invoke the object's closure for it.
     fn dyn_method_call(&mut self, crecv: CoreExpr, recv_ty: Ty, method: &str, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
         let Ty::Named { name, .. } = &recv_ty else { unreachable!() };
@@ -1942,6 +1989,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     };
                     let sid = self.mono.intern_span(e.span);
                     Ok((CoreExpr::new(CoreExprKind::Local(id), repr).at(sid), ty))
+                } else if let Some(Ty::Named { name: c, .. }) = self.subst.get(name).filter(|t| matches!(t, Ty::Named { name, .. } if name.starts_with("const#"))) {
+                    // A const generic parameter used as a value.
+                    let n: u64 = c.trim_start_matches("const#").parse().unwrap_or(0);
+                    let lit = Expr { kind: std::sync::Arc::new(ExprKind::Int(n, crate::lexer::NumSuffix::None)), span: e.span };
+                    self.expr(&lit, expected)
                 } else if let Some((cname, def)) = self.const_def(path) {
                     self.const_value(&cname, &def, expected, e.span)
                 } else if self.ctx.fns.contains_key(name) {
@@ -2521,6 +2573,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 ArrayLit::Elems(es) => es.len() as u64,
                 ArrayLit::Repeat(_, count) => match &*count.kind {
                     ExprKind::Int(n, _) => *n,
+                    // A const generic parameter, or a `const` with a literal value.
+                    ExprKind::Path(p) if self.const_len(p).is_some() => self.const_len(p).unwrap(),
                     _ => return err("the length in `[x; n]` must be an integer literal (or the literal must initialize an `Array<T>`)", count.span),
                 },
             };
@@ -5245,6 +5299,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         let (call, ret) = if matches!(lt, Ty::Tuple(_)) {
             self.tuple_method(cl, lt, method, std::slice::from_ref(r), span)?
+        } else if method == "eq" && array_elem_ty(&lt).is_some() {
+            self.array_eq(cl, lt, r, span)?
         } else {
             self.trait_method_call(cl, lt, Some(l), trait_name, method, &what, std::slice::from_ref(r), span)?
         };
@@ -6206,6 +6262,11 @@ fn unify_infer(declared: &Ty, actual: &Ty, out: &mut HashMap<String, Ty>) {
             for (d, a) in de.iter().zip(ae) { unify_infer(d, a, out); }
         }
         (Ty::Array(de, _), Ty::Array(ae, _)) => unify_infer(de, ae, out),
+        // `[T; N]` (const `N`) against a concrete array binds both.
+        (Ty::Named { name, args }, Ty::Array(ae, n)) if name == "array#" && args.len() == 2 => {
+            unify_infer(&args[0], ae, out);
+            unify_infer(&args[1], &Ty::Named { name: format!("const#{n}"), args: vec![] }, out);
+        }
         (Ty::Fn { params: dp, ret: dr }, Ty::Fn { params: ap, ret: ar }) => {
             for (d, a) in dp.iter().zip(ap) { unify_infer(d, a, out); }
             unify_infer(dr, ar, out);

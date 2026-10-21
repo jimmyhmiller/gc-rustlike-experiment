@@ -1015,6 +1015,8 @@ fn check_type(
 }
 
 pub fn is_builtin_type(name: &str) -> bool {
+    // A const generic argument (`Matrix<2, 3>`).
+    if name.starts_with("const#") { return true; }
     matches!(
         name,
         "i8" | "i16" | "i32" | "i64" | "usize" | "isize"

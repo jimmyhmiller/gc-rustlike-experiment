@@ -204,6 +204,10 @@ These follow Rust; differences come from having no references.
   through `From`.
 - **Associated constants.** `const MAX: i64 = 10;` in impls and traits (with
   or without a default), used as `Type::MAX`, `Self::MAX`, or `T::MAX`.
+- **Const generics.** `fn f<const N: usize>(a: [i64; N])`,
+  `struct Matrix<const R: usize, const C: usize>`, `Matrix<2, 3>`,
+  `first_n::<2>(..)`; `N` is usable as a value and in `[x; N]`. Array
+  lengths may also name an integer `const`. Arrays compare with `==`.
 - **Turbofish.** `f::<i64>()`, `Vec::<i64>::new()`, and `it.sum::<i64>()`
   give type arguments explicitly (`_` leaves one inferred).
 - **Primitive constants and char methods.** `i64::MAX`, `u8::MIN`,
@@ -258,6 +262,13 @@ range patterns over integers and chars (`1..=9`, `'a'..='z'`, `10..100`,
 `if let` and `while let`, not in `let`. An or-pattern repeats its arm for each
 alternative, and a range is a guard, so a range does not count toward
 exhaustiveness.
+
+Slice patterns match a `Vec` or array: `[]`, `[x]`, `[first, .., last]`,
+`[x, rest @ ..]` (`rest` is a copy of the remaining elements), with names,
+`_`, literals, ranges, and destructuring patterns as elements. A slice
+pattern is a length guard, so a match over slices needs a `_` arm unless its
+unguarded arms cover every length (`[] / [x] / [x, rest @ ..]`).
+`v.as_slice()` is `v`.
 
 A `match` must be exhaustive. The check covers nested enum variants, `bool`,
 tuples, and structs; integers and strings need a catch-all arm. Guarded arms

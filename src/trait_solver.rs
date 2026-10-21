@@ -295,6 +295,18 @@ impl<C: ProofContext> Solver<'_, C> {
     }
     fn trait_rules(&self, ty: &Ty, name: &str, args: &[Ty]) -> Result<Vec<Vec<Goal>>, TypeError> {
         let mut alternatives = Vec::new();
+        // Arrays compare equal element by element.
+        if name == "Eq" && args.is_empty() {
+            let elem = match ty {
+                Ty::Array(e, _) => Some((**e).clone()),
+                Ty::Named { name: n, args: a } if n == "Array" && a.len() == 1 => Some(a[0].clone()),
+                _ => None,
+            };
+            if let Some(e) = elem {
+                alternatives.push(vec![bound_goal(e, "Eq".into(), vec![])]);
+                return Ok(alternatives);
+            }
+        }
         // Tuples compare, hash, and clone element by element.
         if matches!(name, "Eq" | "Ord" | "Hash" | "Clone") && args.is_empty() {
             match ty {

@@ -446,11 +446,21 @@ pub fn lower_type(t: &Type, generics: &[String], ctx: &TyCtx) -> TResult<Ty> {
 }
 
 pub(crate) trait TypeEnvironment {
+    /// A `const` defined as an integer literal (an array length).
+    fn const_int(&self, _name: &str) -> Option<u64> { None }
     fn canonical(&self, name: &str) -> Option<String>;
     fn alias(&self, name: &str) -> Option<&crate::type_alias::ResolvedAlias>;
     fn declared_nominal(&self, name: &str) -> bool;
 }
 impl TypeEnvironment for TyCtx {
+    fn const_int(&self, name: &str) -> Option<u64> {
+        let def = self.consts.get(name).or_else(|| {
+            let mut found = self.consts.iter().filter(|(k, _)| k.rsplit("::").next() == Some(name));
+            let first = found.next()?;
+            found.next().is_none().then_some(first.1)
+        })?;
+        match &*def.value.kind { ExprKind::Int(n, _) => Some(*n), _ => None }
+    }
     fn canonical(&self, name: &str) -> Option<String> { self.canon(name) }
     fn alias(&self, name: &str) -> Option<&crate::type_alias::ResolvedAlias> { self.aliases.get(name).map(Rc::as_ref) }
     fn declared_nominal(&self, name: &str) -> bool { self.structs.contains_key(name) || self.enums.contains_key(name) }
@@ -470,6 +480,10 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
             if path.is_single() && generics.iter().any(|g| g == name) {
                 if !args.is_empty() { return Err(TypeError { msg: format!("type parameter `{name}` takes no type arguments"), span: t.span }); }
                 return Ok(Ty::Var(name.to_string()));
+            }
+            // A const generic argument (`Matrix<2, 3>`): a type-level number.
+            if name.starts_with("const#") && args.is_empty() {
+                return Ok(Ty::Named { name: name.to_string(), args: vec![] });
             }
             // An `impl Trait` result, resolved per instantiation (lower.rs).
             if name.starts_with("impl#") {
@@ -522,6 +536,16 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
         }
         TypeKind::Array(elem, count) => {
             let e = lower_type_with(elem, generics, ctx)?;
+            // `[T; SIZE]` with `const SIZE: usize = 4;`.
+            if let ExprKind::Path(p) = &*count.kind {
+                if let Some(n) = ctx.const_int(&p.segments.join("::")) { return Ok(Ty::Array(Box::new(e), n)); }
+            }
+            // `[T; N]` with a const parameter `N`: an array once `N` is known.
+            if let ExprKind::Path(p) = &*count.kind {
+                if p.is_single() && generics.iter().any(|g| g == p.last()) {
+                    return Ok(Ty::Named { name: "array#".into(), args: vec![e, Ty::Var(p.last().to_string())] });
+                }
+            }
             let n = const_usize(count)?;
             Ok(Ty::Array(Box::new(e), n))
         }
@@ -567,8 +591,18 @@ pub(crate) fn enter_normalizer(ctx: &TyCtx) -> NormalizerGuard {
     NormalizerGuard(NORMALIZER.with(|n| n.replace(ctx as *const TyCtx)))
 }
 
+/// The array a `[T; N]` with a now-known const parameter stands for.
+pub(crate) fn normalize_const_array(ty: &Ty) -> Option<Ty> {
+    let Ty::Named { name, args } = ty else { return None };
+    if name != "array#" { return None; }
+    let Some(Ty::Named { name: n, .. }) = args.get(1) else { return None };
+    let len: u64 = n.strip_prefix("const#")?.parse().ok()?;
+    Some(Ty::Array(Box::new(args[0].clone()), len))
+}
+
 /// If `ty` is a projection on a ground type, the associated type it names.
 pub(crate) fn normalize_projection(ty: &Ty) -> Option<Ty> {
+    if let Some(t) = normalize_const_array(ty) { return Some(t); }
     let Ty::Named { name, args } = ty else { return None };
     let assoc = name.strip_prefix("proj#")?;
     let base = args.first()?;

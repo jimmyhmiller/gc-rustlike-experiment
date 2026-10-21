@@ -605,3 +605,53 @@ fn blanket_impls_into_and_question_mark_conversion() {
         }
     "#), 0);
 }
+
+#[test]
+fn slice_patterns_and_const_generics() {
+    assert_eq!(run(r#"
+        fn sum(v: Vec<i64>) -> i64 {
+            match v.as_slice() {
+                [] => 0,
+                [x] => x,
+                [x, rest @ ..] => x + sum(rest),
+            }
+        }
+        fn describe(v: Vec<i64>) -> String {
+            match v {
+                [] => "empty".to_string(),
+                [0, ..] => "zero".to_string(),
+                [first, .., last] if first == last => format!("same {}", first),
+                [first, .., last] => format!("{}..{}", first, last),
+                [only] => format!("one {}", only),
+            }
+        }
+        #[derive(Debug)]
+        struct Matrix<const R: usize, const C: usize> { data: [[f64; C]; R] }
+        impl<const R: usize, const C: usize> Matrix<R, C> {
+            fn dims(self) -> (i64, i64) { (R, C) }
+            fn trace(self) -> f64 { let mut t = 0.0; for i in 0..R { t += self.data[i][i]; } t }
+        }
+        fn first_n<const N: usize>(v: Vec<i64>) -> [i64; N] {
+            let mut out = [0; N];
+            for i in 0..N { out[i] = v[i]; }
+            out
+        }
+        const SIZE: usize = 3;
+        fn main() -> i64 {
+            assert_eq!(sum(vec![1, 2, 3, 4]), 10);
+            let d: Vec<String> = vec![vec![], vec![0, 5], vec![3, 9, 3], vec![1, 2, 7], vec![8]].iter().map(|v| describe(v)).collect();
+            assert_eq!(d.join("|"), "empty|zero|same 3|1..7|one 8");
+            let [a, b, c] = [10, 20, 30] else { return 1; };
+            let pts = vec![(1, 2), (3, 4)];
+            let [(x0, y0), ..] = pts else { return 2; };
+            let m: Matrix<2, 2> = Matrix { data: [[1.0, 2.0], [3.0, 4.0]] };
+            assert_eq!(m.dims(), (2, 2));
+            assert_eq!(m.trace(), 5.0);
+            let f: [i64; 3] = first_n(vec![9, 8, 7, 6]);
+            assert_eq!(f, [9, 8, 7]);
+            assert_eq!(first_n::<2>(vec![5, 4, 3]), [5, 4]);
+            let s: [i64; SIZE] = [7; SIZE];
+            a + b + c + x0 + y0 + s.len() - 63
+        }
+    "#), 3);
+}

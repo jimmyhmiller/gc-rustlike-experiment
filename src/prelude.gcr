@@ -1912,6 +1912,9 @@ impl<T> Vec<T> {
     fn skip_while(self, p: fn(T) -> bool) -> SkipWhile<VecIter<T>, T> { self.iter().skip_while(p) }
     fn cloned(self) -> Vec<T> { self }
     fn copied(self) -> Vec<T> { self }
+    // A Vec is its own slice (`match v.as_slice() { [first, ..] => .. }`).
+    fn as_slice(self) -> Vec<T> { self }
+    fn to_vec(self) -> Vec<T> { self.clone() }
 
     fn drain(mut self) -> VecIter<T> {
         let copy = self.clone();
