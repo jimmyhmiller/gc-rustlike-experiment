@@ -31,9 +31,9 @@ enum Ordering { Less, Equal, Greater }
 
 // `Eq` is Rust's `PartialEq` (`PartialEq` names it too); an empty
 // `impl Eq for T {}` marker is accepted and adds nothing.
-trait Eq {
-    fn eq(self, other: Self) -> bool;
-    fn ne(self, other: Self) -> bool { !self.eq(other) }
+trait Eq<Rhs = Self> {
+    fn eq(self, other: Rhs) -> bool;
+    fn ne(self, other: Rhs) -> bool { !self.eq(other) }
 }
 // `Ord` types are also partially ordered; `<` uses `cmp`, or `partial_cmp`
 // for a type that is only `PartialOrd` (an unordered pair compares false).
@@ -44,7 +44,7 @@ trait Ord {
     fn min(self, other: Self) -> Self { if self.cmp(other) == Ordering::Greater { other } else { self } }
     fn clamp(self, lo: Self, hi: Self) -> Self { self.max(lo).min(hi) }
 }
-trait PartialOrd { fn partial_cmp(self, other: Self) -> Option<Ordering>; }
+trait PartialOrd<Rhs = Self> { fn partial_cmp(self, other: Rhs) -> Option<Ordering>; }
 
 // Arithmetic and bitwise operators, shaped like Rust's: `Rhs` defaults to
 // `Self` and `Output` to `Self`, so `impl Add for V { fn add(self, o: V) -> V }`
@@ -2187,3 +2187,28 @@ macro_rules! bit_ops {
 }
 bit_ops!(i8 i16 i32 i64 u8 u16 u32 u64);
 impl Not for bool { fn not(self) -> bool { !self } }
+
+// ---- IntoIterator -----------------------------------------------------------------
+// What a `for` loop (or `I: IntoIterator<Item = T>`) accepts: collections and
+// every iterator.
+
+trait IntoIterator {
+    type Item;
+    type IntoIter;
+    fn into_iter(self) -> Self::IntoIter;
+}
+impl<T> IntoIterator for Vec<T> {
+    type Item = T;
+    type IntoIter = VecIter<T>;
+    fn into_iter(self) -> VecIter<T> { VecIter { v: self, i: 0, end: self.len } }
+}
+impl<K: Eq + Hash, V> IntoIterator for HashMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = VecIter<(K, V)>;
+    fn into_iter(self) -> VecIter<(K, V)> { self.iter() }
+}
+impl<I: Iterator> IntoIterator for I {
+    type Item = I::Item;
+    type IntoIter = I;
+    fn into_iter(self) -> I { self }
+}

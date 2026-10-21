@@ -242,14 +242,19 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
         let own_args: Vec<Type> = def.generics.params.iter()
             .map(|p| Type { kind: TypeKind::Path(Path::single(p.name.clone(), p.span), vec![]), span: p.span }).collect();
         let mut pending = vec![(path.clone(), def, own_args)];
+        let mut too_deep = false;
         while let Some((tpath, t, args)) = pending.pop() {
             if hierarchy.iter().any(|(p, _, _)| *p == tpath) { continue; }
+            // A trait object is not made for an absurdly deep hierarchy
+            // (synthesis would be quadratic in its depth).
+            if hierarchy.len() >= 64 { too_deep = true; break; }
             let tmodule = tpath.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
             for sup in &t.supertraits {
                 if let Some((sp, sd)) = find_trait(g, &tmodule, &sup.path) { pending.push((sp, sd, sup.args.clone())); }
             }
             hierarchy.push((tpath, t, args));
         }
+        if too_deep { continue; }
         let mut assocs: Vec<String> = hierarchy.iter()
             .flat_map(|(_, t, _)| t.items.iter().filter_map(|i| match i { TraitItem::AssocType(n) => Some(n.clone()), _ => None }))
             .collect();
@@ -258,8 +263,11 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
         let mut fields: Vec<FieldDef> = Vec::new();
         let mut implementable = true;
         let mut per_trait: Vec<Vec<Method>> = Vec::new();
-        for (_, t, _) in &hierarchy {
+        for (index, (_, t, _)) in hierarchy.iter().enumerate() {
             let mut methods = Vec::new();
+            // A supertrait's own type parameters have no place in the object
+            // type; methods mentioning them are not available on it.
+            let foreign: Vec<String> = if index == 0 { vec![] } else { t.generics.params.iter().map(|p| p.name.clone()).collect() };
             for item in &t.items {
                 let (name, generics, params, has_self, self_is_mut, ret, span, required) = match item {
                     TraitItem::Required(f) => (&f.name, &f.generics, &f.params, f.has_self, f.self_is_mut, &f.ret, f.span, true),
@@ -271,7 +279,20 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
                     }
                     TraitItem::AssocType(_) => continue,
                 };
-                let converted = (has_self && generics.params.is_empty()).then(|| {
+                let mentions_foreign = |ty: &Type| -> bool {
+                    fn walk(t: &Type, names: &[String]) -> bool {
+                        match &t.kind {
+                            TypeKind::Path(p, args) => (p.is_single() && names.iter().any(|n| n == p.last())) || args.iter().any(|a| walk(a, names)),
+                            TypeKind::Tuple(ts) => ts.iter().any(|a| walk(a, names)),
+                            TypeKind::Array(e, _) => walk(e, names),
+                            TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => ps.iter().any(|a| walk(a, names)) || r.as_deref().is_some_and(|r| walk(r, names)),
+                            TypeKind::SelfType => false,
+                        }
+                    }
+                    walk(ty, &foreign)
+                };
+                let uses_foreign = params.iter().any(|p| mentions_foreign(&p.ty)) || ret.as_ref().is_some_and(&mentions_foreign);
+                let converted = (has_self && generics.params.is_empty() && !uses_foreign).then(|| {
                     let ps: Option<Vec<Param>> = params.iter().map(|p| Some(Param { ty: object_type(&p.ty, &assocs)?, ..p.clone() })).collect();
                     let r = match ret { Some(r) => Some(Some(object_type(r, &assocs)?)), None => Some(None) };
                     Some((ps?, r?))
@@ -440,8 +461,9 @@ fn validate_methods(g: &GlobalTable) -> Result<(), ResolveError> {
     for imp in &g.impls {
         let base = crate::types::impl_receiver_base(imp, g).map_err(|error| ResolveError { msg: error.msg, span: error.span })?;
         // One impl per trait *instantiation*: `Add<f64>` and `Add<V>` differ.
-        let tr = imp.trait_ref.as_ref().map(|t| format!("{}<{}>", t.path.segments.join("::"),
-            t.args.iter().map(|a| type_text(a, &HashMap::new())).collect::<Vec<_>>().join(", ")));
+        let tr = imp.trait_ref.as_ref().map(|t| format!("{}<{}> for {}", t.path.segments.join("::"),
+            t.args.iter().map(|a| type_text(a, &HashMap::new())).collect::<Vec<_>>().join(", "),
+            type_text(&imp.self_ty, &HashMap::new())));
         for m in &imp.items {
             if !seen.insert((base.clone(), tr.clone(), m.name.clone())) {
                 return Err(ResolveError {
@@ -987,7 +1009,7 @@ fn check_type(
             for a in args { check_type(a, generics, is_known)?; }
         }
         // `Self::Item` / `I::Item`: an associated type of a type parameter.
-        TypeKind::Path(path, args) if path.segments.len() == 2 && args.is_empty()
+        TypeKind::Path(path, args) if path.segments.len() == 2 && crate::types::is_projection_args(args)
             && (path.segments[0] == "Self" || generics.iter().any(|g| *g == path.segments[0])) => {}
         TypeKind::Path(path, args) => {
             let name = path.last();
@@ -1017,6 +1039,8 @@ fn check_type(
 pub fn is_builtin_type(name: &str) -> bool {
     // A const generic argument (`Matrix<2, 3>`).
     if name.starts_with("const#") { return true; }
+    // The trait of a qualified projection (`<T as Mul<f64>>::Output`).
+    if name.starts_with("trait#") { return true; }
     matches!(
         name,
         "i8" | "i16" | "i32" | "i64" | "usize" | "isize"

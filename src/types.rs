@@ -135,6 +135,9 @@ pub(crate) fn type_pattern_bindings(pattern: &Ty, actual: &Ty) -> Option<HashMap
                 pn == an && pa.len() == aa.len() && pa.iter().zip(aa).all(|(p, a)| matches(p, a, bindings)),
             (Ty::Tuple(pa), Ty::Tuple(aa)) => pa.len() == aa.len() && pa.iter().zip(aa).all(|(p, a)| matches(p, a, bindings)),
             (Ty::Array(p, pn), Ty::Array(a, an)) => pn == an && matches(p, a, bindings),
+            // `[T; N]` with a const parameter `N` matches any length.
+            (Ty::Named { name, args }, Ty::Array(a, n)) if name == "array#" && args.len() == 2 =>
+                matches(&args[0], a, bindings) && matches(&args[1], &Ty::Named { name: format!("const#{n}"), args: vec![] }, bindings),
             (Ty::Fn { params: pp, ret: pr }, Ty::Fn { params: ap, ret: ar })
             | (Ty::ExternFn { params: pp, ret: pr }, Ty::ExternFn { params: ap, ret: ar }) =>
                 pp.len() == ap.len() && pp.iter().zip(ap).all(|(p, a)| matches(p, a, bindings)) && matches(pr, ar, bindings),
@@ -148,8 +151,14 @@ pub(crate) fn type_pattern_bindings(pattern: &Ty, actual: &Ty) -> Option<HashMap
 /// The canonical receiver identity used by both duplicate checking and lookup.
 pub(crate) fn receiver_base(ty: &Ty) -> Option<String> {
     match ty {
+        Ty::Named { name, .. } if name == "array#" => Some("(array)".into()),
         Ty::Named { name, .. } => Some(name.clone()),
         Ty::Prim(p) => Some(prim_name(*p).to_string()),
+        // Structural types group their impls by shape; an impl's own self
+        // type pattern picks the instance (`(i64, i64)` vs `(f64, f64)`).
+        Ty::Tuple(_) => Some("(tuple)".into()),
+        Ty::Array(..) => Some("(array)".into()),
+        Ty::Fn { .. } => Some("(fn)".into()),
         _ => None,
     }
 }
@@ -470,10 +479,18 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
     match &t.kind {
         // `Self::Item` / `I::Item`: an associated type of a type parameter,
         // resolved once the parameter is known (see `normalize_projection`).
-        TypeKind::Path(path, args) if path.segments.len() == 2 && args.is_empty()
+        // A trait marker argument (`<I as Iterator>::Item`) says which trait.
+        TypeKind::Path(path, args) if path.segments.len() == 2 && is_projection_args(args)
             && (path.segments[0] == "Self" || generics.iter().any(|g| *g == path.segments[0])) =>
         {
-            Ok(projection(&path.segments[1], Ty::Var(path.segments[0].clone())))
+            let base = Ty::Var(path.segments[0].clone());
+            match args.first() {
+                Some(Type { kind: TypeKind::Path(tp, targs), .. }) => {
+                    let targs = targs.iter().map(|a| lower_type_with(a, generics, ctx)).collect::<Result<Vec<_>, _>>()?;
+                    Ok(Ty::Named { name: format!("proj#{}", path.segments[1]), args: vec![base, Ty::Named { name: tp.last().to_string(), args: targs }] })
+                }
+                _ => Ok(projection(&path.segments[1], base)),
+            }
         }
         TypeKind::Path(path, args) => {
             let name = path.last();
@@ -569,6 +586,16 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
     }
 }
 
+/// Whether a projection path's arguments are empty or a single trait marker
+/// (`trait#Mul<f64>`), as `<T as Mul<f64>>::Output` is written.
+pub(crate) fn is_projection_args(args: &[Type]) -> bool {
+    match args {
+        [] => true,
+        [Type { kind: TypeKind::Path(p, _), .. }] => p.is_single() && p.last().starts_with("trait#"),
+        _ => false,
+    }
+}
+
 /// The associated type `name` of `base` (`<base as Trait>::name`), as a
 /// placeholder named type until `base` is known.
 pub(crate) fn projection(name: &str, base: Ty) -> Ty {
@@ -607,6 +634,17 @@ pub(crate) fn normalize_projection(ty: &Ty) -> Option<Ty> {
     let assoc = name.strip_prefix("proj#")?;
     let base = args.first()?;
     if crate::lower::has_var(base) { return None; }
+    // `<T as Trait<A>>::X`: that trait instance's impl.
+    if let Some(Ty::Named { name: tm, args: targs }) = args.get(1) {
+        if let Some(t) = tm.strip_prefix("trait#") {
+            if targs.iter().any(crate::lower::has_var) { return None; }
+            let ptr = NORMALIZER.with(|n| n.get());
+            if ptr.is_null() { return None; }
+            // SAFETY: as below.
+            let ctx = unsafe { &*ptr };
+            return ctx.associated_type_of(base, t, targs, assoc);
+        }
+    }
     let ptr = NORMALIZER.with(|n| n.get());
     if ptr.is_null() { return None; }
     // SAFETY: the guard keeps the pointer valid for the lowering pass that
@@ -617,20 +655,46 @@ pub(crate) fn normalize_projection(ty: &Ty) -> Option<Ty> {
 
 impl TyCtx {
     /// `<base as Trait>::assoc` for the trait impl of `base` defining `assoc`.
-    pub(crate) fn associated_type(&self, base: &Ty, assoc: &str) -> Option<Ty> {
-        for imp in &self.impls {
-            if imp.trait_ref.is_none() { continue; }
-            let Some((_, written)) = imp.assoc_types.iter().find(|(n, _)| n == assoc) else { continue };
-            let params: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
-            let Ok(pattern) = lower_type(&imp.self_ty, &params, self) else { continue };
-            let Some(mut bindings) = type_pattern_bindings(&pattern, base) else { continue };
-            bindings.insert("Self".into(), base.clone());
-            let mut scope = params.clone();
-            scope.push("Self".into());
-            let Ok(raw) = lower_type(written, &scope, self) else { continue };
-            return Some(subst_ty(&raw, &bindings));
+    /// `<base as Trait<args>>::assoc`: the associated type of the impl of
+    /// that exact trait instance (a type may implement `Mul<f64>` and
+    /// `Mul<V>` with different `Output`s). Falls back to any impl defining
+    /// `assoc` when the trait arguments are not known.
+    pub(crate) fn associated_type_of(&self, base: &Ty, trait_name: &str, args: &[Ty], assoc: &str) -> Option<Ty> {
+        // A type's own impls first; a blanket impl (`impl<I: Iterator>
+        // IntoIterator for I`) only when the type meets its bounds.
+        for blanket in [false, true] {
+            for imp in &self.impls {
+                let Some(tr) = &imp.trait_ref else { continue };
+                let tname = tr.path.segments.join("::");
+                if !trait_name.is_empty() && tname != trait_name && tname.rsplit("::").next() != trait_name.rsplit("::").next() { continue; }
+                let Some((_, written)) = imp.assoc_types.iter().find(|(n, _)| n == assoc) else { continue };
+                let params: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();
+                let Ok(self_pat) = lower_type(&imp.self_ty, &params, self) else { continue };
+                if matches!(self_pat, Ty::Var(_)) != blanket { continue; }
+                let mut pattern = vec![self_pat];
+                let mut actual = vec![base.clone()];
+                if args.len() == tr.args.len() && !args.is_empty() && !args.iter().any(crate::lower::has_var) {
+                    let Ok(targs) = tr.args.iter().map(|a| lower_type(a, &params, self)).collect::<Result<Vec<_>, _>>() else { continue };
+                    pattern.extend(targs);
+                    actual.extend_from_slice(args);
+                }
+                let Some(mut bindings) = type_pattern_bindings(&Ty::Tuple(pattern), &Ty::Tuple(actual)) else { continue };
+                if blanket {
+                    let targs: Vec<Ty> = tr.args.iter().filter_map(|a| lower_type(a, &params, self).ok()).map(|t| subst_ty(&t, &bindings)).collect();
+                    if !self.type_implements_trait_args(base, &tname, &targs) { continue; }
+                }
+                bindings.insert("Self".into(), base.clone());
+                let mut scope = params.clone();
+                scope.push("Self".into());
+                let Ok(raw) = lower_type(written, &scope, self) else { continue };
+                return Some(subst_ty(&raw, &bindings));
+            }
         }
         None
+    }
+
+    pub(crate) fn associated_type(&self, base: &Ty, assoc: &str) -> Option<Ty> {
+        self.associated_type_of(base, "", &[], assoc)
     }
 }
 

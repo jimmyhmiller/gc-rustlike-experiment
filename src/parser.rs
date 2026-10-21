@@ -837,11 +837,16 @@ impl Parser {
             items.push(self.fn_def(vis)?);
         }
         self.expect(&TokKind::RBrace)?;
+        let mut self_ty = self_ty;
+        let mut trait_ref = trait_ref;
         if !closures.is_empty() {
             for f in &mut items {
                 for p in &mut f.params { subst_type(&mut p.ty, &closures); }
                 if let Some(r) = &mut f.ret { subst_type(r, &closures); }
             }
+            // `impl<F: Fn(i64) -> i64> Op for F`: an impl for that closure type.
+            subst_type(&mut self_ty, &closures);
+            if let Some(tr) = &mut trait_ref { for a in &mut tr.args { subst_type(a, &closures); } }
         }
         Ok(ImplBlock { generics, trait_ref, self_ty, items, assoc_types, consts, span: start.to(self.prev_span()) })
     }
@@ -1155,7 +1160,7 @@ impl Parser {
                 self.bump();
                 let base = self.ty()?;
                 self.expect_kw(Kw::As)?;
-                self.trait_ref()?;
+                let tr = self.trait_ref()?;
                 self.expect_gt()?;
                 self.expect(&TokKind::ColonColon)?;
                 let name = self.ident()?;
@@ -1164,7 +1169,10 @@ impl Parser {
                     TypeKind::SelfType => "Self".to_string(),
                     _ => return Err(ParseError { msg: "`<T as Trait>::Name` needs a type parameter or `Self` for `T`".into(), span: start.to(self.prev_span()) }),
                 };
-                TypeKind::Path(Path { segments: vec![first, name], span: start.to(self.prev_span()) }, vec![])
+                // The trait rides along as a marker argument: `trait#Mul<f64>`.
+                let span = start.to(self.prev_span());
+                let marker = Type { kind: TypeKind::Path(Path::single(format!("trait#{}", tr.path.segments.join("::")), span), tr.args), span };
+                TypeKind::Path(Path { segments: vec![first, name], span }, vec![marker])
             }
             // `impl Fn(A) -> R` and `dyn Fn(A) -> R` are closure types. An
             // argument's `impl Trait` is an anonymous type parameter.
@@ -1741,6 +1749,28 @@ impl Parser {
         }
     }
 
+    /// `<T as Trait>::name` and `<T>::name` in an expression: the item
+    /// `name` of `T` (the trait only names where it comes from).
+    #[inline(never)]
+    fn qualified_path_expr(&mut self, start: Span) -> PResult<Expr> {
+        self.expect(&TokKind::Lt)?;
+        let ty = self.ty()?;
+        if self.eat_kw(Kw::As) { self.trait_ref()?; }
+        self.expect_gt()?;
+        let mut rest = Vec::new();
+        while self.eat(&TokKind::ColonColon) { rest.push(self.path_seg()?); }
+        if rest.is_empty() { return Err(self.error("expected `::name` after `<..>`")); }
+        let span = start.to(self.prev_span());
+        let (mut segments, args) = match ty.kind {
+            TypeKind::Path(p, args) => (p.segments, args),
+            TypeKind::SelfType => (vec!["Self".to_string()], vec![]),
+            _ => return Err(ParseError { msg: "`<T>::name` needs a named type".into(), span }),
+        };
+        segments.extend(rest);
+        let e = Expr { kind: std::sync::Arc::new(ExprKind::Path(Path { segments, span })), span };
+        Ok(if args.is_empty() { e } else { turbofish_marker(e, "typeargs#", args, span) })
+    }
+
     fn primary(&mut self) -> PResult<Expr> {
         let start = self.span();
         let kind = match self.peek().clone() {
@@ -1750,6 +1780,8 @@ impl Parser {
             TokKind::Char(c) => { self.bump(); ExprKind::Char(c) }
             TokKind::Keyword(Kw::True) => { self.bump(); ExprKind::Bool(true) }
             TokKind::Keyword(Kw::False) => { self.bump(); ExprKind::Bool(false) }
+            // `<T as Trait>::f`, `<T>::f`: an item of type `T`.
+            TokKind::Lt => return self.qualified_path_expr(start),
             TokKind::Keyword(Kw::If) => return self.if_expr(),
             TokKind::Keyword(Kw::Match) => return self.match_expr(),
             TokKind::Keyword(Kw::While | Kw::Loop | Kw::For) => return self.labeled_loop(None),

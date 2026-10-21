@@ -296,22 +296,24 @@ impl<C: ProofContext> Solver<'_, C> {
     fn trait_rules(&self, ty: &Ty, name: &str, args: &[Ty]) -> Result<Vec<Vec<Goal>>, TypeError> {
         let mut alternatives = Vec::new();
         // Arrays compare equal element by element.
-        if name == "Eq" && args.is_empty() {
+        // `Eq` and `PartialOrd` take `Rhs = Self`: a bound names it or not.
+        let self_rhs = args.is_empty() || (args.len() == 1 && args[0] == *ty);
+        if name == "Eq" && self_rhs {
             let elem = match ty {
                 Ty::Array(e, _) => Some((**e).clone()),
                 Ty::Named { name: n, args: a } if n == "Array" && a.len() == 1 => Some(a[0].clone()),
                 _ => None,
             };
             if let Some(e) = elem {
-                alternatives.push(vec![bound_goal(e, "Eq".into(), vec![])]);
+                alternatives.push(vec![bound_goal(e.clone(), "Eq".into(), vec![e])]);
                 return Ok(alternatives);
             }
         }
         // Tuples compare, hash, and clone element by element.
-        if matches!(name, "Eq" | "Ord" | "Hash" | "Clone") && args.is_empty() {
+        if matches!(name, "Eq" | "Ord" | "Hash" | "Clone") && (args.is_empty() || (name == "Eq" && self_rhs)) {
             match ty {
                 Ty::Tuple(elems) => {
-                    alternatives.push(elems.iter().map(|e| bound_goal(e.clone(), name.into(), vec![])).collect());
+                    alternatives.push(elems.iter().map(|e| bound_goal(e.clone(), name.into(), if name == "Eq" { vec![e.clone()] } else { vec![] })).collect());
                     return Ok(alternatives);
                 }
                 Ty::Prim(crate::types::Prim::Unit) => {
@@ -359,13 +361,9 @@ impl<C: ProofContext> Solver<'_, C> {
                 }
             }
         }
-        let receiver = match ty {
-            Ty::Named { name, .. } => name.as_str(),
-            Ty::Prim(primitive) => crate::types::prim_name(*primitive),
-            _ => "*",
-        };
+        let receiver = crate::types::receiver_base(ty).unwrap_or_else(|| "*".into());
         // The type's own impls, then blanket impls (`impl<T: X> Y for T`).
-        let mut indices: Vec<usize> = if receiver == "*" { vec![] } else { self.ctx.candidates(name, receiver).to_vec() };
+        let mut indices: Vec<usize> = if receiver == "*" { vec![] } else { self.ctx.candidates(name, &receiver).to_vec() };
         indices.extend_from_slice(self.ctx.candidates(name, "*"));
         for index in indices {
             let imp = self.ctx.implementation(index);
@@ -443,7 +441,7 @@ impl<C: ProofContext> Solver<'_, C> {
             return Ok(alternatives);
         }
         // An `Ord` type is `PartialOrd` (its `partial_cmp` comes from `cmp`).
-        if name == "PartialOrd" && args.is_empty() && self.ctx.trait_definition("Ord").is_some() {
+        if name == "PartialOrd" && self_rhs && self.ctx.trait_definition("Ord").is_some() {
             alternatives.push(vec![bound_goal(ty.clone(), "Ord".into(), vec![])]);
         }
         // Like Rust's blanket `impl<T: Display> ToString for T`.

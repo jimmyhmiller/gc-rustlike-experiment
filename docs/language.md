@@ -205,6 +205,17 @@ These follow Rust; differences come from having no references.
   into itself); `x.into()` converts into the expected type, and `T: Into<U>`
   holds when `U: From<T>`. `?` converts an error to the function's error type
   through `From`.
+- **Impl receivers and trait objects.** Traits may be implemented for
+  tuples (`impl Area for (i64, i64)`), arrays (`impl<const N: usize> T for
+  [i64; N]`), and closure types (`impl<F: Fn(i64) -> i64> Op for F`).
+  `Eq<Rhs = Self>` and `PartialOrd<Rhs = Self>` take a right-hand type
+  (`impl PartialEq<i64> for M`). `<T as Trait>::f(..)` and `<T>::f(..)` call
+  items of a type. `Box<dyn Derived>` converts to `Box<dyn Base>` for a
+  supertrait `Base`. `IntoIterator` (for Vecs, HashMaps, and iterators) bounds
+  and `for` loops accept any iterable.
+- **Projections.** `T::Output` resolves through the bound on `T` that
+  declares `Output` (`T: Mul<f64>`), and `<T as Mul<V>>::Output` names the
+  trait instance; a type's own impls take precedence over blanket impls.
 - **Associated constants.** `const MAX: i64 = 10;` in impls and traits (with
   or without a default), used as `Type::MAX`, `Self::MAX`, or `T::MAX`.
 - **Const generics.** `fn f<const N: usize>(a: [i64; N])`,

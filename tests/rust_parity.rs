@@ -693,3 +693,64 @@ fn index_trait_closure_struct_params_assoc_inference_and_let_chains() {
         }
     "#.replace("&classify", "classify").as_str()), 4);
 }
+
+#[test]
+fn complete_trait_support() {
+    assert_eq!(run(r#"
+        use std::ops::{Add, Mul};
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct V(f64);
+        impl Mul<f64> for V { type Output = V; fn mul(self, k: f64) -> V { V(self.0 * k) } }
+        impl Mul<V> for V { type Output = f64; fn mul(self, o: V) -> f64 { self.0 * o.0 } }
+        fn scale<T: Mul<f64>>(x: T) -> T::Output { x * 2.0 }
+        fn dot<T: Mul<T, Output = f64>>(a: T, b: T) -> f64 { a * b }
+        fn sq<T: Mul<T> + Copy>(a: T) -> <T as Mul<T>>::Output { a * a }
+        trait Area { fn area(self) -> i64; }
+        impl Area for (i64, i64) { fn area(self) -> i64 { self.0 * self.1 } }
+        trait Total { fn total(self) -> i64; }
+        impl<const N: usize> Total for [i64; N] { fn total(self) -> i64 { let mut s = 0; for i in 0..N { s += self[i]; } s } }
+        trait Op { fn run(self, x: i64) -> i64; }
+        impl<F: Fn(i64) -> i64> Op for F { fn run(self, x: i64) -> i64 { self(x) * 10 } }
+        struct M(i64);
+        impl PartialEq<i64> for M { fn eq(self, o: i64) -> bool { self.0 == o } }
+        impl PartialEq for M { fn eq(self, o: M) -> bool { self.0 == o.0 } }
+        trait Named { fn name() -> String; fn id(self) -> i64; }
+        struct A;
+        impl Named for A { fn name() -> String { "A".to_string() } fn id(self) -> i64 { 7 } }
+        trait Base { fn b(self) -> i64; }
+        trait Derived: Base { fn d(self) -> i64; }
+        struct S;
+        impl Base for S { fn b(self) -> i64 { 1 } }
+        impl Derived for S { fn d(self) -> i64 { 2 } }
+        fn take(x: Box<dyn Base>) -> i64 { x.b() }
+        trait Num: Add<Output = Self> + Mul<Output = Self> + Copy {}
+        impl<T: Add<Output = T> + Mul<Output = T> + Copy> Num for T {}
+        fn sq_sum<T: Num>(a: T, b: T) -> T { a * a + b * b }
+        fn total_of<I: IntoIterator<Item = i64>>(xs: I) -> i64 { let mut s = 0; for x in xs { s += x; } s }
+        trait Handler<E> { fn handle(self, e: E) -> String; }
+        struct H;
+        impl Handler<i64> for H { fn handle(self, e: i64) -> String { format!("int {}", e) } }
+        impl Handler<String> for H { fn handle(self, e: String) -> String { format!("str {}", e) } }
+        fn main() -> i64 {
+            assert_eq!(scale(V(1.5)), V(3.0));
+            assert_eq!(dot(V(2.0), V(3.0)) + sq(V(3.0)), 15.0);
+            let f = |x: i64| x + 1;
+            assert_eq!((3, 4).area() + [1, 2, 3].total() + f.run(2), 48);
+            assert!(M(3) == 3 && !(M(3) == M(4)));
+            assert_eq!(<A as Named>::name(), "A");
+            assert_eq!(<A as Named>::id(A), 7);
+            let d: Box<dyn Derived> = Box::new(S);
+            assert_eq!(d.d() + take(d), 3);
+            assert_eq!(sq_sum(2, 3), 13);
+            assert_eq!(total_of(vec![1, 2, 3]) + total_of(0..4), 12);
+            let a: Box<dyn Handler<i64>> = Box::new(H);
+            let b: Box<dyn Handler<String>> = Box::new(H);
+            assert_eq!(a.handle(1) + " " + b.handle("x".to_string()), "int 1 str x");
+            let mut m: HashMap<i64, i64> = HashMap::new();
+            m.insert(1, 2);
+            let mut n = 0;
+            for (k, v) in m { n += k + v; }
+            n
+        }
+    "#), 3);
+}

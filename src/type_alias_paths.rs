@@ -12,6 +12,9 @@ struct Qualifier<'a> {
     module: &'a str,
     /// Inside an impl: the path `Self` stands for in expressions and patterns.
     self_path: Option<Vec<String>>,
+    /// The trait bounds on type parameters in scope, which say which trait a
+    /// bare `T::Output` projects through.
+    proj_bounds: std::cell::RefCell<Vec<(String, TraitRef)>>,
 }
 impl Qualifier<'_> {
     fn view(&self) -> AliasView<'_> {
@@ -42,9 +45,21 @@ impl Qualifier<'_> {
                     return Ok(());
                 }
                 // `Self::Item` / `I::Item`: an associated type of a type parameter.
-                if path.segments.len() == 2 && args.is_empty()
+                if path.segments.len() == 2 && crate::types::is_projection_args(args)
                     && (path.segments[0] == "Self" || generics.iter().any(|name| *name == path.segments[0]))
                 {
+                    // `T::Output` with `T: Mul<f64>`: project through that bound.
+                    if args.is_empty() && path.segments[0] != "Self" {
+                        let bounds = self.proj_bounds.borrow();
+                        let mut through = bounds.iter().filter(|(p, b)| *p == path.segments[0]
+                            && self.g.traits.get(&b.path.segments.join("::")).is_some_and(|t| t.items.iter().any(|i| matches!(i, TraitItem::AssocType(n) if *n == path.segments[1]))));
+                        if let (Some((_, b)), None) = (through.next(), through.next()) {
+                            let marker = Type { kind: TypeKind::Path(Path::single(format!("trait#{}", b.path.segments.join("::")), b.span), b.args.clone()), span: b.span };
+                            args.push(marker);
+                        }
+                    } else if let Some(Type { kind: TypeKind::Path(_, targs), .. }) = args.first_mut() {
+                        for a in targs { self.ty(a, generics, false)?; }
+                    }
                     return Ok(());
                 }
                 if path.is_single() && generics.iter().any(|name| name == path.last()) {
@@ -184,8 +199,24 @@ impl Qualifier<'_> {
     }
     fn function(&self, f: &mut FnDef, outer: &[String]) -> Result<(), ResolveError> {
         let scope = self.generics(&mut f.generics, outer)?;
-        self.signature(&mut f.params, &mut f.ret, &scope)?;
-        self.block(&mut f.body, &scope)
+        let mark = self.proj_bounds.borrow().len();
+        self.push_bounds(&f.generics);
+        let result = self.signature(&mut f.params, &mut f.ret, &scope).and_then(|_| self.block(&mut f.body, &scope));
+        self.proj_bounds.borrow_mut().truncate(mark);
+        result
+    }
+    fn push_bounds(&self, g: &Generics) {
+        let mut bounds = self.proj_bounds.borrow_mut();
+        for p in &g.params {
+            for b in &p.bounds { bounds.push((p.name.clone(), b.clone())); }
+        }
+        for w in &g.where_clauses {
+            if let TypeKind::Path(p, a) = &w.ty.kind {
+                if p.is_single() && a.is_empty() {
+                    for b in &w.bounds { bounds.push((p.last().to_string(), b.clone())); }
+                }
+            }
+        }
     }
     fn prefix(&self, path: &mut Path) -> Result<(), ResolveError> {
         // A value suffix is a variant or associated function. Keep an alias
@@ -500,16 +531,16 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
     let mut consts = g.consts.clone();
     let mut aliases = g.aliases.clone();
     for (name, f) in &mut fns {
-        Qualifier { g, module: module(name), self_path: None }
+        Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() }
         .function(f, &[])?;
     }
     for (name, alias) in &mut aliases {
-        let q = Qualifier { g, module: module(name), self_path: None };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
         let scope = q.generics(&mut alias.generics, &[])?;
         q.ty(&mut alias.ty, &scope, false)?;
     }
     for (name, s) in &mut structs {
-        let q = Qualifier { g, module: module(name), self_path: None };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
         let scope = q.generics(&mut s.generics, &[])?;
         match &mut s.body {
             StructBody::Named(fields) => {
@@ -526,7 +557,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, e) in &mut enums {
-        let q = Qualifier { g, module: module(name), self_path: None };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
         let scope = q.generics(&mut e.generics, &[])?;
         for variant in &mut e.variants {
             match &mut variant.payload {
@@ -545,7 +576,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, t) in &mut traits {
-        let q = Qualifier { g, module: module(name), self_path: None };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
         let scope = q.generics(&mut t.generics, &[])?;
         for bound in &mut t.supertraits {
             let me = Type { kind: TypeKind::SelfType, span: bound.span };
@@ -567,8 +598,9 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (index, i) in impls.iter_mut().enumerate() {
-        let q = Qualifier { g, module: g.impl_modules.get(index).map_or("", String::as_str), self_path: None };
+        let q = Qualifier { g, module: g.impl_modules.get(index).map_or("", String::as_str), self_path: None, proj_bounds: Default::default() };
         let scope = q.generics(&mut i.generics, &[])?;
+        q.push_bounds(&i.generics);
         q.ty(&mut i.self_ty, &scope, i.trait_ref.is_none())?;
         let mut q = q;
         if let TypeKind::Path(p, _) = &i.self_ty.kind {
@@ -618,7 +650,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, c) in &mut consts {
-        let q = Qualifier { g, module: module(name), self_path: None };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
         q.ty(&mut c.ty, &[], false)?;
         q.expr(&mut c.value, &[])?;
     }

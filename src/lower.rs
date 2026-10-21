@@ -1101,7 +1101,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 for (assoc, written) in &bound.bindings {
                     let want = instantiate(written)?;
                     if has_var(&want) || has_var(ty) { continue; }
-                    let got = self.ctx.associated_type(ty, assoc);
+                    let got = self.ctx.associated_type_of(ty, &name, &arguments, assoc);
                     if got.as_ref() != Some(&want) {
                         return err(format!(
                             "expected `{}::{}` to be `{}`, found `{}` (required by `{required_by}`)",
@@ -1143,9 +1143,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         for (ty, bound) in bounded {
             if has_var(&ty) { continue; }
+            let args: Vec<Ty> = bound.args.iter().filter_map(|a| lower_type(a, scope, self.ctx).ok()).map(|t| apply_subst(&t, subst)).collect();
             for (assoc, written) in &bound.bindings {
                 let declared = lower_type(written, scope, self.ctx).map_err(conv)?;
-                if let Some(actual) = self.ctx.associated_type(&ty, assoc) {
+                if let Some(actual) = self.ctx.associated_type_of(&ty, &bound.path.segments.join("::"), &args, assoc) {
                     unify_infer(&declared, &actual, subst);
                 }
             }
@@ -1568,7 +1569,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let inner_expected = if to_dyn.is_some() && !passes_on { None } else { expected };
         let (value, ty) = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.expr_inner(e, inner_expected))?;
         if let Some(target) = to_dyn {
-            if dyn_trait(&ty).is_none() && !is_never(&ty) && !has_var(&ty) && !has_var(target) {
+            // A value, or another trait object (upcasting `dyn Derived` to
+            // `dyn Base`), becomes the expected object.
+            if dyn_trait(&ty) != dyn_trait(target) && !is_never(&ty) && !has_var(&ty) && !has_var(target) {
                 return self.coerce_to_dyn(value, ty, target, e.span);
             }
         }
@@ -1630,7 +1633,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             FieldInit { name: f.name.clone(), value: Some(closure), span }
         }).collect();
         let lit = ex(ExprKind::StructLit { path: Path { segments: object.split("::").map(str::to_string).collect(), span }, fields: inits, span });
-        let result = self.expr(&lit, Some(target));
+        // The object's own literal is built at the target type (not coerced).
+        let result = self.expr_inner(&lit, Some(target));
         self.pop_scope();
         let (object_value, object_ty) = result?;
         let repr = object_value.repr.clone();
@@ -2221,6 +2225,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     let indexed = array_elem_ty(&ty).is_some() || matches!(&ty, Ty::Named { name, .. } if name == "Vec");
                     if !indexed && self.ctx.type_implements_trait(&ty, "Iterator") {
                         let desugared = desugar_for_iterator(pat, iter, body, e.span);
+                        return self.expr(&desugared, None);
+                    }
+                    // Anything else iterable: loop over `iter.into_iter()`.
+                    if !indexed && self.ctx.type_implements_trait(&ty, "IntoIterator") {
+                        let into = Expr { kind: std::sync::Arc::new(ExprKind::MethodCall { recv: iter.clone(), method: "into_iter".into(), args: vec![], span: iter.span }), span: iter.span };
+                        let desugared = desugar_for_iterator(pat, &into, body, e.span);
                         return self.expr(&desugared, None);
                     }
                 }
@@ -4555,10 +4565,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let none = Expr { kind: std::sync::Arc::new(ExprKind::Unary(UnOp::Neg, Expr { kind: std::sync::Arc::new(ExprKind::Int(1, crate::lexer::NumSuffix::None)), span })), span };
             return self.format_pseudo_method(recv, pseudo, &[none], span);
         }
-        if let Some(elem_ty) = array_elem_ty(&recv_ty) {
+        // A user trait implemented for an array or tuple type comes before the
+        // built-in array methods and structural tuple operations.
+        let user_impl = self.lookup_method(&recv_ty, method).is_some();
+        if let Some(elem_ty) = array_elem_ty(&recv_ty).filter(|_| !user_impl) {
             return self.array_method(crecv, elem_ty, method, args, span);
         }
-        if matches!(recv_ty, Ty::Tuple(_)) && matches!(method, "eq" | "ne" | "cmp" | "hash" | "clone" | "lt" | "le" | "gt" | "ge") {
+        if !user_impl && matches!(recv_ty, Ty::Tuple(_)) && matches!(method, "eq" | "ne" | "cmp" | "hash" | "clone" | "lt" | "le" | "gt" | "ge") {
             return self.tuple_method(crecv, recv_ty, method, args, span);
         }
         if dyn_trait(&recv_ty).is_some() && self.lookup_method(&recv_ty, method).is_none() {
@@ -4988,7 +5001,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             for b in &p.bounds {
                 for (assoc, written) in &b.bindings {
                     let declared = normalize(written)?;
-                    if let Some(actual) = self.ctx.associated_type(&t, assoc) {
+                    let args: Vec<Ty> = b.args.iter().filter_map(|a| normalize(a).ok()).map(|t| apply_subst(&t, &inferred)).collect();
+                    if let Some(actual) = self.ctx.associated_type_of(&t, &b.path.segments.join("::"), &args, assoc) {
                         unify_infer(&declared, &actual, &mut inferred);
                     }
                 }
