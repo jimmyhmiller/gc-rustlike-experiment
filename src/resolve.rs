@@ -1044,7 +1044,7 @@ pub fn is_builtin_type(name: &str) -> bool {
     matches!(
         name,
         "i8" | "i16" | "i32" | "i64" | "usize" | "isize"
-            | "u8" | "u16" | "u32" | "u64"
+            | "u8" | "u16" | "u32" | "u64" | "i128" | "u128"
             | "f32" | "f64"
             | "bool" | "char" | "String" | "Bytes" | "RawPtr"
             // generic builtins resolved structurally later

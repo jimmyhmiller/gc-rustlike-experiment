@@ -191,6 +191,46 @@ impl ToString for f64 { fn to_string(self) -> String { to_string(self) } }
 impl ToString for bool { fn to_string(self) -> String { if self { "true" } else { "false" } } }
 impl ToString for char { fn to_string(self) -> String { char_to_str(self as i64) } }
 
+// ---- 128-bit integers ---------------------------------------------------------
+
+// Decimal digits, 18 at a time so most of the work is in i64.
+fn u128_to_string(v: u128) -> String {
+    if v == 0 { return "0"; }
+    let mut u = v;
+    let mut out: Vec<String> = Vec::new();
+    while u > 0 {
+        let chunk = (u % 1000000000000000000) as i64;
+        u = u / 1000000000000000000;
+        let digits = to_string(chunk);
+        out.push(if u > 0 { "0".repeat(18 - digits.len()) + digits } else { digits });
+    }
+    out.reverse();
+    out.join("")
+}
+// `i128::MIN` negates to itself, whose `u128` reading is its magnitude.
+fn i128_to_string(v: i128) -> String {
+    if v < 0 { "-" + u128_to_string((0 - v) as u128) } else { u128_to_string(v as u128) }
+}
+
+impl Eq for i128 { fn eq(self, other: i128) -> bool { self == other } }
+impl Eq for u128 { fn eq(self, other: u128) -> bool { self == other } }
+impl Ord for i128 { fn cmp(self, other: i128) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u128 { fn cmp(self, other: u128) -> Ordering { if self < other { Ordering::Less } else if self > other { Ordering::Greater } else { Ordering::Equal } } }
+impl Hash for i128 { fn hash(self) -> i64 { ((self as i64) ^ ((self >> 64) as i64).hash()).hash() } }
+impl Hash for u128 { fn hash(self) -> i64 { (self as i128).hash() } }
+impl ToString for i128 { fn to_string(self) -> String { i128_to_string(self) } }
+impl ToString for u128 { fn to_string(self) -> String { u128_to_string(self) } }
+impl Display for i128 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(i128_to_string(self)) } }
+impl Display for u128 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(u128_to_string(self)) } }
+impl Debug for i128 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(i128_to_string(self)) } }
+impl Debug for u128 { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(u128_to_string(self)) } }
+impl Default for i128 { fn default() -> i128 { 0 } }
+impl Default for u128 { fn default() -> u128 { 0 } }
+impl Clone for i128 { fn clone(self) -> i128 { self } }
+impl Clone for u128 { fn clone(self) -> u128 { self } }
+impl Sum for i128 { fn zero() -> i128 { 0 } fn one() -> i128 { 1 } }
+impl Sum for u128 { fn zero() -> u128 { 0 } fn one() -> u128 { 1 } }
+
 // ---- Integer and float methods -----------------------------------------------
 
 impl i64 {
@@ -298,6 +338,15 @@ impl<T: Eq> Eq for Option<T> {
         match self {
             Option::Some(a) => match other { Option::Some(b) => a == b, Option::None => false },
             Option::None => other.is_none(),
+        }
+    }
+}
+
+impl<T: Eq, E: Eq> Eq for Result<T, E> {
+    fn eq(self, other: Result<T, E>) -> bool {
+        match self {
+            Result::Ok(a) => match other { Result::Ok(b) => a == b, Result::Err(_e) => false },
+            Result::Err(a) => match other { Result::Ok(_x) => false, Result::Err(b) => a == b },
         }
     }
 }
@@ -1447,6 +1496,22 @@ fn fmt_radix(v: i64, radix: i64, upper: bool, bits: i64) -> String {
     out.join("")
 }
 
+// `v` in base `radix` (128-bit integers; `fmt_radix` covers the rest).
+fn fmt_radix128(v: u128, radix: i64, upper: bool) -> String {
+    if v == 0 { return "0"; }
+    let mut u = v;
+    let r = radix as u128;
+    let digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" };
+    let mut out: Vec<String> = Vec::new();
+    while u > 0 {
+        let d = (u % r) as i64;
+        out.push(digits[d..d + 1]);
+        u = u / r;
+    }
+    out.reverse();
+    out.join("")
+}
+
 fn fmt_debug_list(open: String, close: String, parts: Vec<String>, pretty: bool, single_comma: bool) -> String {
     if parts.len() == 0 { return open + close; }
     if pretty {
@@ -1837,40 +1902,57 @@ impl<K: Eq + Hash, V> FromIterator<(K, V)> for HashMap<K, V> {
     }
 }
 
+// What a range counts over: the integer types.
+trait Step {
+    fn forward(self) -> Self;
+    fn backward(self) -> Self;
+    fn steps_between(start: Self, end: Self) -> i64;
+}
+macro_rules! step_ints {
+    ($($t:ty)*) => { $(
+        impl Step for $t {
+            fn forward(self) -> $t { self + 1 }
+            fn backward(self) -> $t { self - 1 }
+            fn steps_between(start: $t, end: $t) -> i64 { if end > start { (end - start) as i64 } else { 0 } }
+        }
+    )* };
+}
+step_ints!(i8 i16 i32 i64 i128 u8 u16 u32 u64 u128);
+
 // `lo..hi` used as a value; `lo..=hi` ends one later.
-struct Range { start: i64, end: i64 }
-impl Iterator for Range {
-    type Item = i64;
-    fn next(mut self) -> Option<i64> {
+struct Range<T> { start: T, end: T }
+impl<T: Step> Iterator for Range<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
         if self.start < self.end {
             let x = self.start;
-            self.start = x + 1;
+            self.start = x.forward();
             Option::Some(x)
         } else { Option::None }
     }
 }
-impl Range {
-    fn rev(self) -> RangeRev { RangeRev { start: self.start, end: self.end } }
-    fn len(self) -> i64 { if self.end > self.start { self.end - self.start } else { 0 } }
-    fn contains(self, x: i64) -> bool { x >= self.start && x < self.end }
+impl<T: Step> Range<T> {
+    fn rev(self) -> RangeRev<T> { RangeRev { start: self.start, end: self.end } }
+    fn len(self) -> i64 { T::steps_between(self.start, self.end) }
+    fn contains(self, x: T) -> bool { x >= self.start && x < self.end }
     fn is_empty(self) -> bool { self.start >= self.end }
 }
 // `lo..` used as a value: counts up without end.
-struct RangeFrom { start: i64 }
-impl Iterator for RangeFrom {
-    type Item = i64;
-    fn next(mut self) -> Option<i64> {
+struct RangeFrom<T> { start: T }
+impl<T: Step> Iterator for RangeFrom<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
         let x = self.start;
-        self.start = x + 1;
+        self.start = x.forward();
         Option::Some(x)
     }
 }
-struct RangeRev { start: i64, end: i64 }
-impl Iterator for RangeRev {
-    type Item = i64;
-    fn next(mut self) -> Option<i64> {
+struct RangeRev<T> { start: T, end: T }
+impl<T: Step> Iterator for RangeRev<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
         if self.start < self.end {
-            self.end = self.end - 1;
+            self.end = self.end.backward();
             Option::Some(self.end)
         } else { Option::None }
     }
@@ -2183,11 +2265,11 @@ macro_rules! numeric_ops {
         impl DivAssign for $t { fn div_assign(mut self, rhs: $t) { self = self / rhs; } }
     )* };
 }
-numeric_ops!(i8 i16 i32 i64 u8 u16 u32 u64 f32 f64);
+numeric_ops!(i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64);
 macro_rules! signed_ops {
     ($($t:ty)*) => { $( impl Neg for $t { fn neg(self) -> $t { 0 as $t - self } } )* };
 }
-signed_ops!(i8 i16 i32 i64 f32 f64);
+signed_ops!(i8 i16 i32 i64 i128 f32 f64);
 macro_rules! bit_ops {
     ($($t:ty)*) => { $(
         impl BitAnd for $t { fn bitand(self, rhs: $t) -> $t { self & rhs } }
@@ -2195,8 +2277,28 @@ macro_rules! bit_ops {
         impl BitXor for $t { fn bitxor(self, rhs: $t) -> $t { self ^ rhs } }
     )* };
 }
-bit_ops!(i8 i16 i32 i64 u8 u16 u32 u64);
+bit_ops!(i8 i16 i32 i64 i128 u8 u16 u32 u64 u128);
 impl Not for bool { fn not(self) -> bool { !self } }
+
+// ---- async / await -------------------------------------------------------------
+// Futures are lazy and synchronous: an `async` function or block builds an
+// `Async` holding its body, and `.await` (`Future::wait`) runs it to completion
+// on the awaiting thread. There is no executor and no interleaving at
+// `.await`; use `Thread::spawn` for concurrency.
+
+trait Future {
+    type Output;
+    fn wait(self) -> Self::Output;
+}
+struct Async<T> { body: fn() -> T }
+impl<T> Future for Async<T> {
+    type Output = T;
+    fn wait(self) -> T { (self.body)() }
+}
+// A future that is already complete (`std::future::ready`).
+fn ready<T>(value: T) -> Async<T> { Async { body: move || value } }
+// Run a future to completion (`futures::executor::block_on`).
+fn block_on<F: Future>(future: F) -> F::Output { future.wait() }
 
 // ---- IntoIterator -----------------------------------------------------------------
 // What a `for` loop (or `I: IntoIterator<Item = T>`) accepts: collections and

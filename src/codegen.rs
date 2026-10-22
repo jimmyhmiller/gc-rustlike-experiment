@@ -249,6 +249,8 @@ fn scalar_kind_di(s: crate::gc::ScalarKind) -> Option<(&'static str, u32, u64)> 
         U16 => ("u16", 7, 16),
         U32 => ("u32", 7, 32),
         U64 => ("u64", 7, 64),
+        I128 => ("i128", 5, 128),
+        U128 => ("u128", 7, 128),
         F32 => ("f32", 4, 32),
         F64 => ("f64", 4, 64),
         Bool => ("bool", 2, 8),
@@ -843,6 +845,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 self.ctx.i32_type().as_basic_type_enum()
             }
             ScalarRepr::I64 | ScalarRepr::U64 => self.ctx.i64_type().as_basic_type_enum(),
+            ScalarRepr::I128 | ScalarRepr::U128 => self.ctx.i128_type().as_basic_type_enum(),
             ScalarRepr::F32 => self.ctx.f32_type().as_basic_type_enum(),
             ScalarRepr::F64 => self.ctx.f64_type().as_basic_type_enum(),
             ScalarRepr::Bool => self.ctx.bool_type().as_basic_type_enum(),
@@ -906,6 +909,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     fn managed_load(&self, fcx: &FnCtx<'ctx>, object: PointerValue<'ctx>, offset: IntValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        // A 128-bit scalar is two 64-bit slots, low half first.
+        if let Repr::Scalar(scalar) = repr { if scalar.bits() == 128 {
+            let half = Repr::Scalar(ScalarRepr::U64);
+            let high_offset = self.builder.build_int_add(offset, offset.get_type().const_int(8, false), "slot.high").unwrap();
+            let low = self.managed_load(fcx, object, offset, &half, "slot.low", owner)?.into_int_value();
+            let high = self.managed_load(fcx, object, high_offset, &half, "slot.high", owner)?.into_int_value();
+            let wide = self.ctx.i128_type();
+            let low = self.builder.build_int_z_extend(low, wide, "slot.low.wide").unwrap();
+            let high = self.builder.build_int_z_extend(high, wide, "slot.high.wide").unwrap();
+            let high = self.builder.build_left_shift(high, wide.const_int(64, false), "slot.high.shifted").unwrap();
+            return Ok(self.builder.build_or(high, low, name).unwrap().into());
+        } }
         let width = match repr { Repr::Scalar(s) => s.bits().max(8), Repr::Ref(_) => 64,
             _ => return Err(CodegenError("aggregate must use a managed snapshot".into())) };
         let (idle, copying, merge) = self.managed_access_blocks(fcx);
@@ -930,6 +945,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     fn managed_store(&self, fcx: &FnCtx<'ctx>, object: PointerValue<'ctx>, offset: IntValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, traced: bool, owner: &CoreExpr) -> Result<(), CodegenError> {
+        if let Repr::Scalar(scalar) = repr { if scalar.bits() == 128 {
+            let half = Repr::Scalar(ScalarRepr::U64);
+            let value = value.into_int_value();
+            let i64t = self.ctx.i64_type();
+            let low = self.builder.build_int_truncate(value, i64t, "slot.low").unwrap();
+            let high = self.builder.build_right_shift(value, value.get_type().const_int(64, false), false, "slot.high.shifted").unwrap();
+            let high = self.builder.build_int_truncate(high, i64t, "slot.high").unwrap();
+            let high_offset = self.builder.build_int_add(offset, offset.get_type().const_int(8, false), "slot.high.offset").unwrap();
+            self.managed_store(fcx, object, offset, low.into(), &half, false, owner)?;
+            return self.managed_store(fcx, object, high_offset, high.into(), &half, false, owner);
+        } }
         let width = match repr { Repr::Scalar(s) => s.bits().max(8), Repr::Ref(_) => 64,
             _ => return Err(CodegenError("aggregate must use a managed snapshot".into())) };
         let (idle, copying, merge) = self.managed_access_blocks(fcx);
@@ -1209,6 +1235,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             U16 => ("u16", 7, 16),
             U32 => ("u32", 7, 32),
             U64 => ("u64", 7, 64),
+            I128 => ("i128", 5, 128),
+            U128 => ("u128", 7, 128),
             F32 => ("f32", 4, 32),
             F64 => ("f64", 4, 64),
             // `bool` lowers to `i1` but occupies a byte in its alloca; describe it
@@ -1911,7 +1939,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         match &*e.kind {
             CoreExprKind::ConstInt(n, sr) => {
                 let t = self.scalar_ty(*sr).into_int_type();
-                Ok(Some(t.const_int(*n, sr.is_signed()).into()))
+                if sr.bits() == 128 {
+                    return Ok(Some(t.const_int_arbitrary_precision(&[*n as u64, (*n >> 64) as u64]).into()));
+                }
+                Ok(Some(t.const_int(*n as u64, sr.is_signed()).into()))
             }
             CoreExprKind::ConstFloat(f, sr) => {
                 let t = self.scalar_ty(*sr).into_float_type();
@@ -4461,7 +4492,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // emitting LLVM division so neither instruction ever receives poison
         // operands, even if later optimization speculates the calculation.
         let rhs = if signed {
-            let minimum = ty.const_int(1u64 << (ty.get_bit_width() - 1), false);
+            let minimum = match ty.get_bit_width() {
+                128 => ty.const_int_arbitrary_precision(&[0, 1u64 << 63]),
+                bits => ty.const_int(1u64 << (bits - 1), false),
+            };
             let is_min = self.builder.build_int_compare(IntPredicate::EQ, lhs, minimum, "div.min").unwrap();
             let is_minus_one = self.builder.build_int_compare(IntPredicate::EQ, rhs, ty.const_all_ones(), "div.minus1").unwrap();
             let overflow = self.builder.build_and(is_min, is_minus_one, "div.overflow").unwrap();

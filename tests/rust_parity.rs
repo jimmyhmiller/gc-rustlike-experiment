@@ -876,3 +876,81 @@ fn statics_and_constant_patterns() {
     assert!(compile_error("static A: i64 = B; static B: i64 = A; fn main() -> i64 { 0 }").contains("in terms of itself"));
     assert!(compile_error("static mut X: i64 = 1; fn main() -> i64 { let X = 5; X }").contains("cannot shadow statics"));
 }
+
+#[test]
+fn i128_u128_inference_and_cast_precedence() {
+    assert_eq!(run(r#"
+        struct Acc { total: u128, tag: i64 }
+        fn fact(n: u128) -> u128 { if n == 0 { 1 } else { n * fact(n - 1) } }
+        fn main() -> i64 {
+            let mut acc = Acc { total: 0, tag: 7 };
+            for i in 0..10u128 { acc.total += i << 100; }
+            let v: Vec<i128> = (0..5i128).map(|i| i * -(1i128 << 90)).collect();
+            assert_eq!(fact(30).to_string(), "265252859812191058636308480000000");
+            assert_eq!(format!("{} {} {:x}", u128::MAX, i128::MIN, u128::MAX),
+                "340282366920938463463374607431768211455 -170141183460469231731687303715884105728 ffffffffffffffffffffffffffffffff");
+            assert_eq!(acc.total, 45u128 << 100);
+            assert_eq!(v[4], -4 * (1i128 << 90));
+            assert_eq!(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128, u128::MAX);
+            assert_eq!((1.0e40 as i128, -1.0e40 as i128), (i128::MAX, i128::MIN));
+            assert_eq!((i128::MIN / -1, i128::MIN % -1), (i128::MIN, 0));
+            assert_eq!(i128::BITS + u8::BITS + i8::BITS, 144);
+            // Expected types flow into arithmetic and ranges; `as` binds
+            // looser than unary minus.
+            let small: u8 = 1 + 2;
+            let shifted: u64 = 1 << 40;
+            let x = 5.0;
+            assert_eq!(-x as u8, 0);
+            assert_eq!(-5.0 as u8, 0);
+            let total: i128 = vec![1i128 << 80, -5].iter().sum();
+            assert_eq!(total, (1i128 << 80) - 5);
+            let count = (3u8..7).len();
+            if 1 == small - 2 && shifted >> 40 == 1 && acc.tag == 7 { count } else { 0 }
+        }
+    "#), 4);
+}
+
+#[test]
+fn async_await_is_lazy_and_synchronous() {
+    assert_eq!(run(r#"
+        use std::future::Future;
+        struct Client { base: i64 }
+        impl Client {
+            async fn fetch(self, id: i64) -> Result<i64, String> {
+                if id < 0 { return Err(format!("bad id {}", id)); }
+                Ok(self.base + id)
+            }
+        }
+        trait Store { async fn load(self, key: i64) -> i64; async fn twice(self, key: i64) -> i64 { self.load(key).await * 2 } }
+        impl Store for Client { async fn load(self, key: i64) -> i64 { self.base * key } }
+        async fn total(c: Client, mut ids: Vec<i64>) -> Result<i64, String> {
+            ids.push(3);
+            let mut sum = 0;
+            for id in ids { sum += c.fetch(id).await?; }
+            Ok(sum)
+        }
+        async fn fib(n: i64) -> i64 { if n < 2 { n } else { fib(n - 1).await + fib(n - 2).await } }
+        fn make() -> impl Future<Output = i64> { async { 5 } }
+        fn boxed(n: i64) -> Box<dyn Future<Output = i64>> { Box::new(async move { n * 3 }) }
+        async fn apply<F: Future<Output = i64>>(f: F) -> i64 { f.await + 1 }
+        #[tokio::main]
+        async fn main() -> i64 {
+            let mut log: Vec<String> = Vec::new();
+            let mut steps = 0;
+            let lazy = async { steps += 1; 7 };
+            log.push(format!("steps before await: {}", steps));
+            let seven = lazy.await;
+            log.push(format!("steps after await: {}", steps));
+            let c = Client { base: 100 };
+            let add = async |x: i64| x + 1;
+            let (a, b) = join!(make(), add(9));
+            let mut boxed_total = 0;
+            for f in vec![boxed(1), boxed(2)] { boxed_total += f.await; }
+            assert_eq!(log, vec!["steps before await: 0".to_string(), "steps after await: 1".to_string()]);
+            assert_eq!(total(Client { base: 10 }, vec![1, 2]).await, Ok(36));
+            assert_eq!(c.fetch(-4).await, Err("bad id -4".to_string()));
+            assert_eq!((a, b, c.twice(3).await, block_on(ready(4)), apply(make()).await), (5, 10, 600, 4, 6));
+            seven + fib(10).await + boxed_total
+        }
+    "#), 7 + 55 + 9);
+}

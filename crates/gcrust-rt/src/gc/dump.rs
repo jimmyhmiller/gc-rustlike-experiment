@@ -645,6 +645,8 @@ unsafe fn render_scalar(at: *const u8, k: ScalarKind) -> String {
             ScalarKind::U16 => format!("{}", (at as *const u16).read_unaligned()),
             ScalarKind::U32 => format!("{}", (at as *const u32).read_unaligned()),
             ScalarKind::U64 => format!("{}", (at as *const u64).read_unaligned()),
+            ScalarKind::I128 => format!("{}", (at as *const i128).read_unaligned()),
+            ScalarKind::U128 => format!("{}", (at as *const u128).read_unaligned()),
             ScalarKind::F32 => format!("{}", (at as *const f32).read_unaligned()),
             ScalarKind::F64 => format!("{}", (at as *const f64).read_unaligned()),
             ScalarKind::Bool => format!("{}", at.read_unaligned() != 0),

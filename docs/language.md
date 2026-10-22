@@ -187,6 +187,24 @@ These follow Rust; differences come from having no references.
   item; like Rust's, they capture nothing); `pub(crate)`/`pub(super)` (all
   `pub`); `crate::`, `super::`, and `self::` paths; lifetime parameters,
   `T: 'a`, `Sized`, and `?Sized` are accepted and mean nothing.
+- **async / await.** `async fn`, `async { .. }`, `async move { .. }`,
+  `async |x| ..`, and `e.await`, including `async fn` in traits and impls.
+  Futures are lazy and synchronous: an `async fn` returns an `Async<R>`
+  (which implements `Future<Output = R>`), nothing runs until it is awaited,
+  and `.await` runs it to completion on the current thread, so `?`, `return`,
+  and recursion work as written. `block_on(f)`, `ready(v)`, and `join!(a, b)`
+  are in the prelude; `#[tokio::main]`, `#[tokio::test]`, and `#[async_trait]`
+  are accepted. There is no executor: concurrency comes from `Thread::spawn`.
+- **128-bit integers.** `i128` and `u128` (suffixes `5i128`, `7u128`;
+  literals up to `u128::MAX`), with the usual operators, casts, `MIN`/`MAX`/
+  `BITS`, formatting (`{}`, `{:?}`, `{:x}`, `{:b}`), hashing, and `sum`. In
+  heap objects a 128-bit field is two 64-bit slots, so a racing reader can see
+  halves of different writes. `Atom<i128>` is rejected.
+- **Numeric inference.** An arithmetic expression's expected type reaches its
+  operands (`let x: u8 = 1 + 2;`), a bare literal takes the other operand's
+  type (`1 == x`, `0..n`), a shift count may be any integer type
+  (`x << 3u32`), and `as` binds looser than unary minus (`-x as u8` is
+  `(-x) as u8`). Ranges are `Range<T>` over any integer type.
 - **Types.** `usize` and `isize` are `i64`. Tuple structs (`struct M(f64)`,
   `M(1.0)`, `m.0`, `let M(x) = m`), unit structs (`struct U;`, `U`), struct
   update (`P { x: 1, ..p }`), `Self(..)`/`Self::Variant`/`Self { .. }` in

@@ -1211,7 +1211,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
     fn integer_literal(
         &self,
-        magnitude: u64,
+        magnitude: u128,
         suffix: crate::lexer::NumSuffix,
         expected: Option<&Ty>,
         negative: bool,
@@ -1224,11 +1224,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let repr = scalar_of(prim).unwrap();
         let bits = repr.bits();
         let maximum = if repr.is_signed() {
-            (1u64 << (bits - 1)) - u64::from(!negative)
-        } else if bits == 64 {
-            u64::MAX
+            (1u128 << (bits - 1)) - u128::from(!negative)
+        } else if bits == 128 {
+            u128::MAX
         } else {
-            (1u64 << bits) - 1
+            (1u128 << bits) - 1
         };
         if magnitude > maximum {
             return err(
@@ -1239,11 +1239,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 span,
             );
         }
+        // Narrower constants keep the 64-bit two's complement form.
         let value = if negative {
-            0u64.wrapping_sub(magnitude)
+            0u128.wrapping_sub(magnitude)
         } else {
             magnitude
         };
+        let value = if bits <= 64 { value as u64 as u128 } else { value };
         Ok((
             CoreExpr::new(CoreExprKind::ConstInt(value, repr), Repr::Scalar(repr)),
             Ty::Prim(prim),
@@ -1818,7 +1820,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
         }
         let (_, def) = self.const_def(p)?;
-        match &*def.value.kind { ExprKind::Int(n, _) => Some(*n), _ => None }
+        match &*def.value.kind { ExprKind::Int(n, _) => u64::try_from(*n).ok(), _ => None }
     }
 
     /// The `const`/`static` a value path names: by its full path, a `use`
@@ -1881,7 +1883,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let cell = self.repr_of(&cell_ty, span)?;
         let (_, layout, _) = self.statics_table(span)?;
         let table = CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_statics_table", args: vec![], ret: Repr::Ref(layout) }, Repr::Ref(layout));
-        let index = CoreExpr::new(CoreExprKind::ConstInt(index as u64, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+        let index = CoreExpr::new(CoreExprKind::ConstInt(index as u128, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
         let get = CoreExprKind::ArrayGetChecked { array: Box::new(table), index: Box::new(index), elem: cell.clone() };
         Ok((CoreExpr::new(get, cell), cell_ty))
     }
@@ -1892,7 +1894,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let (table_ty, layout, elem) = self.statics_table(span)?;
         let table = self.fresh_local(Repr::Ref(layout), table_ty);
         let local = || CoreExpr::new(CoreExprKind::Local(table), Repr::Ref(layout));
-        let int = |n: usize| CoreExpr::new(CoreExprKind::ConstInt(n as u64, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+        let int = |n: usize| CoreExpr::new(CoreExprKind::ConstInt(n as u128, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
         let len = Box::new(int(self.ctx.statics.len()));
         let mut stmts = vec![
             CoreStmt::Let(table, CoreExpr::new(CoreExprKind::ArrayNew { layout, len, elem: elem.clone() }, Repr::Ref(layout))),
@@ -1978,10 +1980,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let call = |r: Expr, m: &str, args: Vec<Expr>| ex(ExprKind::MethodCall { recv: r, method: m.into(), args, span });
         let ordering = |v: &str| ex(ExprKind::Path(Path { segments: vec!["Ordering".into(), v.into()], span }));
         let arity = |k: usize| if args.len() == k { Ok(()) } else { err(format!("`{}` on a tuple takes {} argument(s)", method, k), span) };
-        let other = |stmts: &mut Vec<Stmt>| stmts.push(Stmt::Let {
-            pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: "tup#b".into() }, span },
-            ty: None, init: Some(args[0].clone()), span,
-        });
+        // The other tuple is bound as `tup#b`, typed like this one.
+        let mut takes_other = false;
+        let mut other = |_: &mut Vec<Stmt>| takes_other = true;
         let mut stmts = Vec::new();
         let body = match method {
             "eq" | "ne" => {
@@ -2024,20 +2025,30 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
         };
         let id = self.fresh_local(recv.repr.clone(), recv_ty.clone());
-        self.push_scope();
+        let mut lets = vec![CoreStmt::Let(id, recv)];
+        if takes_other {
+            let (cother, other_ty) = self.expr(&args[0], Some(&recv_ty))?;
+            self.check_assignable(&other_ty, &recv_ty, args[0].span)?;
+            let other_id = self.fresh_local(cother.repr.clone(), recv_ty.clone());
+            lets.push(CoreStmt::Let(other_id, cother));
+            self.push_scope();
+            self.bind("tup#b", other_id, recv_ty.clone());
+        } else {
+            self.push_scope();
+        }
         self.bind("tup#a", id, recv_ty.clone());
         let result = self.expr(&ex(ExprKind::Block(Block { stmts, tail: Some(body), span })), None);
         self.pop_scope();
         let (value, ty) = result?;
         let repr = value.repr.clone();
-        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, recv)], tail: Some(value) })), repr), ty))
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: lets, tail: Some(value) })), repr), ty))
     }
 
     /// `a == b` on arrays: equal lengths and equal elements.
     fn array_eq(&mut self, left: CoreExpr, ty: Ty, right: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
         let var = |n: &str| ex(ExprKind::Path(Path::single(n.into(), span)));
-        let int = |n: u64| ex(ExprKind::Int(n, crate::lexer::NumSuffix::None));
+        let int = |n: u64| ex(ExprKind::Int(n as u128, crate::lexer::NumSuffix::None));
         let len = |n: &str| ex(ExprKind::MethodCall { recv: var(n), method: "len".into(), args: vec![], span });
         let let_ = |n: &str, m: bool, init: Expr| Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: m, name: n.into() }, span }, ty: None, init: Some(init), span };
         let assign = |n: &str, v: Expr| Stmt::Expr(ex(ExprKind::Assign { target: var(n), op: None, value: v }));
@@ -2126,7 +2137,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 } else if let Some(Ty::Named { name: c, .. }) = self.subst.get(name).filter(|t| matches!(t, Ty::Named { name, .. } if name.starts_with("const#"))) {
                     // A const generic parameter used as a value.
                     let n: u64 = c.trim_start_matches("const#").parse().unwrap_or(0);
-                    let lit = Expr { kind: std::sync::Arc::new(ExprKind::Int(n, crate::lexer::NumSuffix::None)), span: e.span };
+                    let lit = Expr { kind: std::sync::Arc::new(ExprKind::Int(n as u128, crate::lexer::NumSuffix::None)), span: e.span };
                     self.expr(&lit, expected)
                 } else if let Some((cname, def)) = self.const_def(path) {
                     self.const_value(&cname, &def, expected, e.span)
@@ -2171,7 +2182,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::Un(*op, Box::new(ci)), repr), ty))
             }
 
-            ExprKind::Binary(op, l, r) => self.binary(*op, l, r, e.span),
+            ExprKind::Binary(op, l, r) => self.binary(*op, l, r, expected, e.span),
 
             // `f::<T>(..)` / `Vec::<T>::new(..)`: pass the type arguments on.
             ExprKind::Call(callee, args) if turbofish_of(callee).is_some() => {
@@ -2367,7 +2378,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                         return self.expr(&desugared, None);
                     }
                 }
-                let desugared = desugar_for(pat, iter, body, e.span)?;
+                let iter = self.typed_range(iter);
+                let desugared = desugar_for(pat, &iter, body, e.span)?;
                 self.expr(&desugared, None)
             }
 
@@ -2382,7 +2394,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.expr(&lit, None)
             }
             // `lo..hi` / `lo..=hi` as a value is a `Range` iterator.
-            ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } if self.ctx.structs.contains_key("Range") => {
+            ExprKind::Range { lo: Some(_), hi: Some(_), .. } if self.ctx.structs.contains_key("Range") => {
+                let typed = self.typed_range(e);
+                let ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } = &*typed.kind else { unreachable!() };
                 let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: e.span };
                 let end = if *inclusive {
                     ex(ExprKind::Binary(BinOp::Add, hi.clone(), ex(ExprKind::Int(1, crate::lexer::NumSuffix::None))))
@@ -2433,7 +2447,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let mut stmts = vec![Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: tmp.clone() }, span }, ty: None, init: Some(value.clone()), span }];
                 let parts: Vec<(Expr, Expr)> = match &*target.kind {
                     ExprKind::Tuple(ts) => ts.iter().enumerate().map(|(i, t)| (t.clone(), ex(ExprKind::Field { base: var(), field: FieldAccess::Tuple(i as u32) }))).collect(),
-                    ExprKind::Array(ArrayLit::Elems(ts)) => ts.iter().enumerate().map(|(i, t)| (t.clone(), ex(ExprKind::Index { base: var(), index: ex(ExprKind::Int(i as u64, crate::lexer::NumSuffix::None)) }))).collect(),
+                    ExprKind::Array(ArrayLit::Elems(ts)) => ts.iter().enumerate().map(|(i, t)| (t.clone(), ex(ExprKind::Index { base: var(), index: ex(ExprKind::Int(i as u128, crate::lexer::NumSuffix::None)) }))).collect(),
                     _ => unreachable!(),
                 };
                 for (t, v) in parts {
@@ -2548,7 +2562,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                                 VariantPayload::Named(_) => Pattern { kind: PatternKind::Struct { path: Path { segments: path, span }, fields: vec![], rest: true }, span },
                                 _ => Pattern { kind: PatternKind::Variant { path: Path { segments: path, span }, payload }, span },
                             };
-                            let lit = ex(ExprKind::Int(d.unsigned_abs(), crate::lexer::NumSuffix::None));
+                            let lit = ex(ExprKind::Int(d.unsigned_abs() as u128, crate::lexer::NumSuffix::None));
                             let body = if d < 0 { ex(ExprKind::Unary(UnOp::Neg, lit)) } else { lit };
                             MatchArm { pattern, guard: None, body, span }
                         }).collect();
@@ -2650,12 +2664,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let (suffix, value) = primitive_const(&path.segments).unwrap();
                 let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: e.span };
                 let lit = match value {
-                    PrimConst::Int(n) if n < 0 => ex(ExprKind::Binary(
-                        BinOp::Sub,
-                        ex(ExprKind::Unary(UnOp::Neg, ex(ExprKind::Int((n + 1).unsigned_abs() as u64, suffix)))),
-                        ex(ExprKind::Int(1, suffix)),
-                    )),
-                    PrimConst::Int(n) => ex(ExprKind::Int(n as u64, suffix)),
+                    PrimConst::Int { negative: true, magnitude } => ex(ExprKind::Unary(UnOp::Neg, ex(ExprKind::Int(magnitude, suffix)))),
+                    PrimConst::Int { magnitude, .. } => ex(ExprKind::Int(magnitude, suffix)),
                     // Non-finite values have no literal: `1.0 / 0.0` and so on.
                     PrimConst::Float(f) if !f.is_finite() => ex(ExprKind::Binary(
                         BinOp::Div,
@@ -2714,7 +2724,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             None => (None, false),
         };
         let i64_repr = Repr::Scalar(ScalarRepr::I64);
-        let int = |n: u64| CoreExpr::new(CoreExprKind::ConstInt(n, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+        let int = |n: u64| CoreExpr::new(CoreExprKind::ConstInt(n as u128, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
         // Preserve the container context while inferring its element variables.
         let mut inferred = HashMap::new();
         if let (Some(pattern), ArrayLit::Elems(elements)) = (want_elem.as_ref().filter(|ty| has_var(ty)), lit) {
@@ -2756,7 +2766,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let n = match lit {
                 ArrayLit::Elems(es) => es.len() as u64,
                 ArrayLit::Repeat(_, count) => match &*count.kind {
-                    ExprKind::Int(n, _) => *n,
+                    ExprKind::Int(n, _) => u64::try_from(*n).map_err(|_| LowerError { msg: "array length out of range".into(), span: count.span })?,
                     // A const generic parameter, or a `const` with a literal value.
                     ExprKind::Path(p) if self.const_len(p).is_some() => self.const_len(p).unwrap(),
                     _ => return err("the length in `[x; n]` must be an integer literal (or the literal must initialize an `Array<T>`)", count.span),
@@ -3686,7 +3696,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     ) -> LResult<(Option<CoreExpr>, Vec<(LocalId, CoreExpr)>, bool)> {
         let bool_repr = Repr::Scalar(ScalarRepr::Bool);
         let tag_read = CoreExpr::new(CoreExprKind::EnumTag(Box::new(scrut.clone())), Repr::Scalar(ScalarRepr::I32));
-        let tag_const = CoreExpr::new(CoreExprKind::ConstInt(tag as u64, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
+        let tag_const = CoreExpr::new(CoreExprKind::ConstInt(tag as u128, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
         let mut cond = CoreExpr::new(CoreExprKind::Bin(BinOp::Eq, Box::new(tag_read), Box::new(tag_const)), bool_repr.clone());
         // The physical slot of each payload field depends on the whole list.
         let payload_reprs: Vec<Repr> = fields.iter().map(|t| self.repr_of(t, span)).collect::<LResult<_>>()?;
@@ -4247,7 +4257,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     ints.push(ci);
                 }
                 let layout = self.string_layout_id(span)?;
-                let tid = CoreExpr::new(CoreExprKind::ConstInt(layout as u64, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+                let tid = CoreExpr::new(CoreExprKind::ConstInt(layout as u128, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
                 let mode = ints.pop().unwrap();
                 let prec = ints.pop().unwrap();
                 Ok((
@@ -4368,7 +4378,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let layout = self.string_layout_id(span)?;
                 // ai_reflect_field_name(thread, i64 str_type_id, ptr obj, i64 i)
                 let str_tid = CoreExpr::new(
-                    CoreExprKind::ConstInt(layout as u64, ScalarRepr::I64),
+                    CoreExprKind::ConstInt(layout as u128, ScalarRepr::I64),
                     Repr::Scalar(ScalarRepr::I64),
                 );
                 Ok((
@@ -4723,7 +4733,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
         let call = |f: &str, args: Vec<Expr>| ex(ExprKind::Call(ex(ExprKind::Path(Path::single(f.to_string(), span))), args));
         let method_on = |r: Expr, m: &str, args: Vec<Expr>| ex(ExprKind::MethodCall { recv: r, method: m.into(), args, span });
-        let int = |n: i64| ex(ExprKind::Int(n as u64, crate::lexer::NumSuffix::None));
+        let int = |n: i64| ex(ExprKind::Int(n as u64 as u128, crate::lexer::NumSuffix::None));
         let cast = |e: Expr, p: &str| ex(ExprKind::Cast(e, Type { kind: TypeKind::Path(Path::single(p.to_string(), span), vec![]), span }));
         let is_float = matches!(ty, Ty::Prim(Prim::F32 | Prim::F64));
         let int_bits = match ty {
@@ -4731,6 +4741,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             Ty::Prim(Prim::I16 | Prim::U16) => Some(16),
             Ty::Prim(Prim::I32 | Prim::U32) => Some(32),
             Ty::Prim(Prim::I64 | Prim::U64) => Some(64),
+            Ty::Prim(Prim::I128 | Prim::U128) => Some(128),
             _ => None,
         };
         let expr = match method {
@@ -4747,7 +4758,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let Some(bits) = int_bits else {
                     return err(format!("`{{:x}}`, `{{:o}}`, and `{{:b}}` need an integer, not `{}`", ty_display(&ty)), span);
                 };
-                call("fmt_radix", vec![cast(recv.clone(), "i64"), args[0].clone(), args[1].clone(), int(bits)])
+                if bits == 128 {
+                    call("fmt_radix128", vec![cast(recv.clone(), "u128"), args[0].clone(), args[1].clone()])
+                } else {
+                    call("fmt_radix", vec![cast(recv.clone(), "i64"), args[0].clone(), args[1].clone(), int(bits)])
+                }
             }
             "fmt#debug" | "fmt#debug_pretty" => {
                 let pretty = method == "fmt#debug_pretty";
@@ -5447,16 +5462,34 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         err(format!("unknown variant `{}` of `{}`", vlast, enum_name), span)
     }
 
-    fn binary(&mut self, op: BinOp, l: &Expr, r: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+    fn binary(&mut self, op: BinOp, l: &Expr, r: &Expr, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
         use BinOp::*;
-        let (cl, lt) = self.expr(l, None)?;
+        // An arithmetic result's expected numeric type is its left operand's
+        // (`let x: u8 = 1 + 2`).
+        let numeric = expected.filter(|t| is_numeric(t) && matches!(op, Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr));
+        // A bare literal on the left takes the right side's type (`1 == x`).
+        let (cl, lt, right) = if numeric.is_none() && is_bare_int_literal(l) && !is_bare_int_literal(r) && !matches!(op, Shl | Shr | And | Or) {
+            let (cr, rt) = self.expr(r, None)?;
+            let (cl, lt) = self.expr(l, Some(&rt))?;
+            (cl, lt, Some((cr, rt)))
+        } else {
+            let (cl, lt) = self.expr(l, numeric)?;
+            (cl, lt, None)
+        };
         if !matches!(cl.repr, Repr::Scalar(_)) && !matches!(op, And | Or) {
             return self.overloaded_binary(op, cl, lt, l, r, span);
         }
         // Right side expects the left's type for arithmetic/compare.
-        let (cr, rt) = self.expr(r, Some(&lt))?;
+        let (mut cr, rt) = match right { Some(done) => done, None => self.expr(r, Some(&lt))? };
         if matches!(cl.repr, Repr::Scalar(_)) { self.check_scalar_binary(op, &lt, span)?; }
         match op {
+            // A shift count may be any integer type.
+            Shl | Shr if rt != lt && matches!(&rt, Ty::Prim(p) if is_int_prim(*p)) && is_numeric(&lt) => {
+                let to = cl.repr.clone();
+                cr = CoreExpr::new(CoreExprKind::Cast { value: Box::new(cr.clone()), from: cr.repr.clone(), to: to.clone() }, to);
+                let repr = cl.repr.clone();
+                Ok((CoreExpr::new(CoreExprKind::Bin(op, Box::new(cl), Box::new(cr)), repr), lt))
+            }
             Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr => {
                 self.check_assignable(&rt, &lt, span)?;
                 if !is_numeric(&lt) {
@@ -5487,6 +5520,22 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 ))
             }
         }
+    }
+
+    /// A range whose bare-literal bound takes the other bound's integer type
+    /// (`0..n` with `n: u128`), as Rust infers it.
+    fn typed_range(&mut self, range: &Expr) -> Expr {
+        let ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } = &*range.kind else { return range.clone() };
+        let (literal_lo, literal_hi) = (is_bare_int_literal(lo), is_bare_int_literal(hi));
+        if literal_lo == literal_hi { return range.clone(); }
+        let typed = if literal_lo { hi } else { lo };
+        let Ok(Ty::Prim(p)) = self.probe_expr_type(typed, None) else { return range.clone() };
+        if !is_int_prim(p) || p == Prim::I64 { return range.clone(); }
+        let span = range.span;
+        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+        let cast = |e: &Expr| ex(ExprKind::Cast(e.clone(), Type { kind: TypeKind::Path(Path::single(crate::types::prim_name(p).into(), span), vec![]), span }));
+        let (lo, hi) = if literal_lo { (cast(lo), hi.clone()) } else { (lo.clone(), cast(hi)) };
+        ex(ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive: *inclusive })
     }
 
     fn check_scalar_binary(&self, op: BinOp, ty: &Ty, span: Span) -> LResult<()> {
@@ -6019,6 +6068,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             if !matches!(elem, Repr::Scalar(_) | Repr::Ref(_)) {
                 return err("Atom operations require a scalar or managed reference; inline aggregates have no CAS equality contract", span);
             }
+            if matches!(elem, Repr::Scalar(s) if s.bits() == 128) {
+                return err("Atom operations support scalars up to 64 bits; a 128-bit value has no atomic slot", span);
+            }
             if name == "atom_load" {
                 return Ok((
                     CoreExpr::new(CoreExprKind::AtomLoad { atom: Box::new(catom), elem: elem.clone() }, elem),
@@ -6051,7 +6103,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let message_ty = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
             let message_repr = self.repr_of(&message_ty, span)?;
             let Repr::Ref(layout) = message_repr else { return err("channel intrinsic requires a reference message box", span); };
-            let layout_expr = CoreExpr::new(CoreExprKind::ConstInt(layout as u64, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
+            let layout_expr = CoreExpr::new(CoreExprKind::ConstInt(layout as u128, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
             return Ok((
                 CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_chan_new", args: vec![ccap, buffer, layout_expr], ret: Repr::Scalar(ScalarRepr::Ptr) }, Repr::Scalar(ScalarRepr::Ptr)),
                 Ty::Prim(Prim::RawPtr),
@@ -6583,7 +6635,7 @@ const RANGE_BASE: &str = "range#base";
 fn desugar_for(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> LResult<Expr> {
     let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: sp };
     let var = |name: &str| ex(ExprKind::Path(Path::single(name.to_string(), sp)));
-    let int = |n: u64| ex(ExprKind::Int(n, crate::lexer::NumSuffix::None));
+    let int = |n: u64| ex(ExprKind::Int(n as u128, crate::lexer::NumSuffix::None));
     let let_ = |name: &str, is_mut: bool, init: Expr| Stmt::Let {
         pattern: Pattern { kind: PatternKind::Binding { is_mut, name: name.to_string() }, span: sp },
         ty: None,
@@ -6651,7 +6703,7 @@ fn desugar_for(pat: &Pattern, iter: &Expr, body: &Block, sp: Span) -> LResult<Ex
     Ok(ex(ExprKind::Block(block(stmts))))
 }
 
-enum PrimConst { Int(i128), Float(f64) }
+enum PrimConst { Int { negative: bool, magnitude: u128 }, Float(f64) }
 
 /// The associated constants of the primitive types (`i64::MAX`,
 /// `u8::MIN`, `f64::EPSILON`, `f64::consts::PI`), with the literal suffix
@@ -6663,19 +6715,27 @@ fn primitive_const(segments: &[String]) -> Option<(crate::lexer::NumSuffix, Prim
         [ty, consts, name] if consts == "consts" => (ty.as_str(), name.as_str()),
         _ => return None,
     };
-    let int = |suffix: S, min: i128, max: i128| -> Option<(S, PrimConst)> {
-        Some((suffix, PrimConst::Int(match name { "MIN" => min, "MAX" => max, "BITS" => return Some((S::U32, PrimConst::Int((max - min + 1).ilog2() as i128))), _ => return None })))
+    // `min` is the magnitude of the (zero or negative) minimum.
+    let int = |suffix: S, min: u128, max: u128| -> Option<(S, PrimConst)> {
+        Some((suffix, match name {
+            "MIN" => PrimConst::Int { negative: min != 0, magnitude: min },
+            "MAX" => PrimConst::Int { negative: false, magnitude: max },
+            "BITS" => return Some((S::U32, PrimConst::Int { negative: false, magnitude: (max.ilog2() + 1 + u32::from(min != 0)) as u128 })),
+            _ => return None,
+        }))
     };
     match ty {
-        "i8" => int(S::I8, i8::MIN as i128, i8::MAX as i128),
-        "i16" => int(S::I16, i16::MIN as i128, i16::MAX as i128),
-        "i32" => int(S::I32, i32::MIN as i128, i32::MAX as i128),
-        "i64" | "isize" => int(S::I64, i64::MIN as i128, i64::MAX as i128),
-        "usize" => int(S::I64, 0, i64::MAX as i128),
-        "u8" => int(S::U8, 0, u8::MAX as i128),
-        "u16" => int(S::U16, 0, u16::MAX as i128),
-        "u32" => int(S::U32, 0, u32::MAX as i128),
-        "u64" => int(S::U64, 0, u64::MAX as i128),
+        "i8" => int(S::I8, i8::MIN.unsigned_abs() as u128, i8::MAX as u128),
+        "i16" => int(S::I16, i16::MIN.unsigned_abs() as u128, i16::MAX as u128),
+        "i32" => int(S::I32, i32::MIN.unsigned_abs() as u128, i32::MAX as u128),
+        "i64" | "isize" => int(S::I64, i64::MIN.unsigned_abs() as u128, i64::MAX as u128),
+        "i128" => int(S::I128, i128::MIN.unsigned_abs(), i128::MAX as u128),
+        "usize" => int(S::I64, 0, i64::MAX as u128),
+        "u8" => int(S::U8, 0, u8::MAX as u128),
+        "u16" => int(S::U16, 0, u16::MAX as u128),
+        "u32" => int(S::U32, 0, u32::MAX as u128),
+        "u64" => int(S::U64, 0, u64::MAX as u128),
+        "u128" => int(S::U128, 0, u128::MAX),
         "f32" | "f64" => {
             let suffix = if ty == "f32" { S::F32 } else { S::F64 };
             let wide = ty == "f64";
@@ -6751,12 +6811,22 @@ fn scalar_of(p: Prim) -> Option<ScalarRepr> {
         Prim::F32 => ScalarRepr::F32, Prim::F64 => ScalarRepr::F64,
         Prim::Bool => ScalarRepr::Bool, Prim::Char => ScalarRepr::Char,
         Prim::RawPtr => ScalarRepr::Ptr,
+        Prim::I128 => ScalarRepr::I128, Prim::U128 => ScalarRepr::U128,
         Prim::Str | Prim::Unit => return None,
     })
 }
 
+/// An unsuffixed integer literal, possibly negated or parenthesized.
+fn is_bare_int_literal(e: &Expr) -> bool {
+    match &*e.kind {
+        ExprKind::Int(_, crate::lexer::NumSuffix::None) => true,
+        ExprKind::Unary(UnOp::Neg, inner) => is_bare_int_literal(inner),
+        _ => false,
+    }
+}
+
 fn is_int_prim(p: Prim) -> bool {
-    matches!(p, Prim::I8 | Prim::I16 | Prim::I32 | Prim::I64 | Prim::U8 | Prim::U16 | Prim::U32 | Prim::U64)
+    matches!(p, Prim::I8 | Prim::I16 | Prim::I32 | Prim::I64 | Prim::I128 | Prim::U8 | Prim::U16 | Prim::U32 | Prim::U64 | Prim::U128)
 }
 fn is_numeric(ty: &Ty) -> bool {
     matches!(ty, Ty::Prim(p) if is_int_prim(*p) || matches!(p, Prim::F32 | Prim::F64))

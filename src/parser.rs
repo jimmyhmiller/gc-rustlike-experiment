@@ -321,11 +321,54 @@ fn tokens_text(toks: &[Token]) -> String {
     out
 }
 
+/// `e.await`: `Future::wait(e)`.
+#[inline(never)]
+fn await_expr(e: Expr, span: Span) -> Expr {
+    let wait = Expr { kind: std::sync::Arc::new(ExprKind::Path(Path { segments: vec!["Future".into(), "wait".into()], span })), span };
+    Expr { kind: std::sync::Arc::new(ExprKind::Call(wait, vec![e])), span }
+}
+
+/// `Async<R>`, the future an `async` function or block produces.
+fn async_type(ret: Option<Type>, span: Span) -> Type {
+    let r = ret.unwrap_or(Type { kind: TypeKind::Tuple(vec![]), span });
+    Type { kind: TypeKind::Path(Path::single("Async".into(), span), vec![r]), span }
+}
+
+/// `Async { body: move || -> R { .. } }`: runs `body` when awaited.
+fn async_block(body: Expr, ret: Option<Type>, span: Span) -> Expr {
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+    let closure = ex(ExprKind::Closure { params: vec![], ret, body });
+    ex(ExprKind::StructLit {
+        path: Path::single("Async".into(), span),
+        fields: vec![FieldInit { name: "body".into(), value: Some(closure), span }],
+        span,
+    })
+}
+
+/// An `async fn`'s result type and body: the body becomes a future that
+/// runs when awaited. Its `mut` parameters are rebound inside.
+fn async_body(ret: Option<Type>, body: Block, params: &[Param], has_self: bool, span: Span) -> (Type, Block) {
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+    let mut inner = body;
+    let _ = has_self;
+    let rebinds: Vec<Stmt> = params.iter().filter(|p| p.is_mut).map(|p| Stmt::Let {
+        pattern: Pattern { kind: PatternKind::Binding { is_mut: true, name: p.name.clone() }, span },
+        ty: None,
+        init: Some(ex(ExprKind::Path(Path::single(p.name.clone(), span)))),
+        span,
+    }).collect();
+    inner.stmts.splice(0..0, rebinds);
+    let ret_inner = ret.clone().unwrap_or(Type { kind: TypeKind::Tuple(vec![]), span });
+    let future = async_block(ex(ExprKind::Block(inner)), Some(ret_inner), span);
+    (async_type(ret, span), Block { stmts: vec![], tail: Some(future), span })
+}
+
 fn suffix_text(s: crate::lexer::NumSuffix) -> &'static str {
     use crate::lexer::NumSuffix as S;
     match s {
         S::None => "", S::I8 => "i8", S::I16 => "i16", S::I32 => "i32", S::I64 => "i64",
         S::U8 => "u8", S::U16 => "u16", S::U32 => "u32", S::U64 => "u64", S::F32 => "f32", S::F64 => "f64",
+        S::I128 => "i128", S::U128 => "u128",
     }
 }
 
@@ -487,8 +530,7 @@ impl Parser {
             TokKind::Keyword(Kw::Fn) => ItemKind::Fn(self.fn_def(vis)?),
             // `const fn` and `unsafe fn` (and `unsafe impl` / `unsafe trait`,
             // whose `unsafe` only asserts what the programmer checked).
-            TokKind::Keyword(Kw::Const) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Unsafe)) => ItemKind::Fn(self.qualified_fn(vis)?),
-            TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Const)) => ItemKind::Fn(self.qualified_fn(vis)?),
+            _ if self.fn_qualified_ahead(0) => ItemKind::Fn(self.qualified_fn(vis)?),
             TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Impl)) => { self.bump(); ItemKind::Impl(self.impl_block()?) }
             TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Trait)) => { self.bump(); ItemKind::Trait(self.trait_def(vis)?) }
             TokKind::Keyword(Kw::Struct) => ItemKind::Struct(self.struct_def(vis, is_value)?),
@@ -559,9 +601,19 @@ impl Parser {
             self.bump(); // `#`
             self.expect(&TokKind::LBracket)?;
             let name_span = self.span();
-            let name = self.ident()?;
+            let mut name = self.ident()?;
+            // Async runtime and async-trait attributes: with synchronous
+            // futures, `#[tokio::main]` and `#[async_trait]` change nothing,
+            // and `#[tokio::test]` marks a test like `#[test]`.
+            if matches!((name.as_str(), self.peek(), self.peek_at(1)), ("tokio" | "async_std" | "async_trait", TokKind::ColonColon, TokKind::Ident(_))) {
+                self.bump();
+                let inner = self.ident()?;
+                name = if inner == "test" { inner } else { "async_trait".into() };
+                self.skip_attr_args()?;
+            }
             let mut args = Vec::new();
             match name.as_str() {
+                "async_trait" => self.skip_attr_args()?,
                 "value" | "test" => {
                     if self.at(&TokKind::LParen) {
                         return Err(self.error(format!("`#[{}]` takes no arguments", name)));
@@ -657,6 +709,7 @@ impl Parser {
         }
         matches!(self.peek_at(i), TokKind::Keyword(Kw::Fn | Kw::Struct | Kw::Enum | Kw::Trait | Kw::Impl | Kw::Type | Kw::Const | Kw::Static | Kw::Mod | Kw::Use | Kw::Pub | Kw::Unsafe))
             || matches!(self.peek_at(i), TokKind::Ident(n) if n == "macro_rules")
+            || self.fn_qualified_ahead(i)
     }
 
     /// Outer attributes on a statement, field, variant, parameter, or arm:
@@ -682,23 +735,47 @@ impl Parser {
         }
     }
 
-    /// `const`, `unsafe`, and `async` before `fn`; returns whether `unsafe`.
-    /// A `const fn` is an ordinary function here.
-    fn fn_qualifiers(&mut self) -> bool {
-        let mut is_unsafe = false;
+    /// Do `const`/`async`/`unsafe` qualifiers starting `i` tokens ahead lead
+    /// to `fn`?
+    fn fn_qualified_ahead(&self, mut i: usize) -> bool {
+        let mut any = false;
         loop {
-            match self.peek() {
-                TokKind::Keyword(Kw::Const) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Unsafe)) => { self.bump(); }
-                TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Const)) => { self.bump(); is_unsafe = true; }
-                _ => return is_unsafe,
+            match self.peek_at(i) {
+                TokKind::Keyword(Kw::Const | Kw::Unsafe) => {}
+                TokKind::Ident(n) if n == "async" => {}
+                TokKind::Keyword(Kw::Fn) => return any,
+                _ => return false,
             }
+            any = true;
+            i += 1;
         }
     }
 
+    /// `const`, `async`, and `unsafe` before `fn`; returns whether `unsafe`
+    /// and whether `async`. A `const fn` is an ordinary function here.
+    fn fn_qualifiers(&mut self) -> (bool, bool) {
+        let (mut is_unsafe, mut is_async) = (false, false);
+        if !self.fn_qualified_ahead(0) { return (false, false); }
+        while !self.at_kw(Kw::Fn) {
+            match self.peek() {
+                TokKind::Keyword(Kw::Unsafe) => is_unsafe = true,
+                TokKind::Ident(_) => is_async = true,
+                _ => {}
+            }
+            self.bump();
+        }
+        (is_unsafe, is_async)
+    }
+
     fn qualified_fn(&mut self, vis: bool) -> PResult<FnDef> {
-        let is_unsafe = self.fn_qualifiers();
+        let (is_unsafe, is_async) = self.fn_qualifiers();
         let mut f = self.fn_def(vis)?;
         f.is_unsafe = is_unsafe;
+        if is_async && !(f.name == "main" && self.module_path.is_empty()) {
+            let (ret, body) = async_body(f.ret.take(), std::mem::replace(&mut f.body, Block { stmts: vec![], tail: None, span: f.span }), &f.params, f.has_self, f.span);
+            f.ret = Some(ret);
+            f.body = body;
+        }
         Ok(f)
     }
 
@@ -1013,11 +1090,14 @@ impl Parser {
             return Ok(TraitItem::AssocType(n));
         }
         // A method: parse the signature, then either `;` (required) or a body.
-        let is_unsafe = self.fn_qualifiers();
+        let (is_unsafe, is_async) = self.fn_qualifiers();
         let start = self.expect_kw(Kw::Fn)?;
         let name = self.ident()?;
-        let (generics, params, has_self, self_is_mut, ret) = self.fn_signature()?;
+        let (generics, params, has_self, self_is_mut, mut ret) = self.fn_signature()?;
         let lets = std::mem::take(&mut self.param_lets);
+        if is_async && self.at(&TokKind::Semi) {
+            ret = Some(async_type(ret, start));
+        }
         if self.eat(&TokKind::Semi) {
             Ok(TraitItem::Required(FnSig {
                 name, generics, params, has_self, self_is_mut, ret, span: start.to(self.prev_span()),
@@ -1026,6 +1106,9 @@ impl Parser {
             let mut body = self.block()?;
             if !lets.is_empty() { body.stmts.splice(0..0, lets); }
             crate::capture::share_mutated_captures(&mut body);
+            if is_async {
+                (ret, body) = { let (r, b) = async_body(ret, body, &params, has_self, start); (Some(r), b) };
+            }
             Ok(TraitItem::Provided(FnDef {
                 vis: false, name, generics, params, has_self, self_is_mut, ret, body,
                 is_extern: false, is_unsafe,
@@ -1695,6 +1778,7 @@ impl Parser {
             )
         ) || matches!((self.peek(), self.peek_at(1)), (TokKind::Ident(n), TokKind::Not) if n == "macro_rules")
           || matches!((self.peek(), self.peek_at(1)), (TokKind::Keyword(Kw::Unsafe), TokKind::Keyword(Kw::Fn | Kw::Impl | Kw::Trait | Kw::Const)))
+          || self.fn_qualified_ahead(0)
     }
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
@@ -1762,7 +1846,14 @@ impl Parser {
             let span = start.to(self.prev_span());
             return Ok(Expr { kind: std::sync::Arc::new(ExprKind::Range { lo: None, hi, inclusive }), span });
         }
+        // `e as T` binds tighter than the binary operators and looser than
+        // the unary ones (`-x as u8` is `(-x) as u8`).
         let mut lhs = self.unary()?;
+        while self.eat_kw(Kw::As) {
+            let t = self.ty()?;
+            let span = start.to(self.prev_span());
+            lhs = Expr { kind: std::sync::Arc::new(ExprKind::Cast(lhs, t)), span };
+        }
 
         loop {
             // assignment (right-assoc, lowest)
@@ -1850,6 +1941,69 @@ impl Parser {
         self.postfix()
     }
 
+    /// After `e.`: a method call, a named field, or a tuple field. Kept out
+    /// of `postfix` so the nested-expression recursion stays shallow.
+    #[inline(never)]
+    fn dot_suffix(&mut self, mut e: Expr, start: Span) -> PResult<Expr> {
+        match self.peek().clone() {
+            TokKind::Ident(name) => {
+                self.bump();
+                // A turbofish: `.collect::<Vec<_>>()` names the
+                // result type, which becomes `collect`'s target.
+                // Other methods infer their type arguments.
+                let mut turbofish = None;
+                if self.at(&TokKind::ColonColon) && matches!(self.peek_at(1), TokKind::Lt) {
+                    self.bump();
+                    turbofish = Some(self.opt_type_args()?);
+                }
+                if self.at(&TokKind::LParen) {
+                    self.bump();
+                    let args = self.call_args()?;
+                    let span = start.to(self.prev_span());
+                    let collect_target = match &turbofish {
+                        Some(tys) if name == "collect" && tys.len() == 1 => Some(tys[0].clone()),
+                        _ => None,
+                    };
+                    e = Expr {
+                        kind: std::sync::Arc::new(ExprKind::MethodCall {
+                            recv: e, method: name, args, span,
+                        }),
+                        span,
+                    };
+                    if let Some(target) = collect_target {
+                        e = Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, target)), span };
+                    } else if let Some(tys) = turbofish {
+                        e = turbofish_marker(e, "turbofish#", tys, span);
+                    }
+                } else {
+                    let span = start.to(self.prev_span());
+                    e = Expr {
+                        kind: std::sync::Arc::new(ExprKind::Field {
+                            base: e, field: FieldAccess::Named(name),
+                        }),
+                        span,
+                    };
+                }
+            }
+            TokKind::Int(n, suffix) => {
+                if suffix != crate::lexer::NumSuffix::None {
+                    return Err(self.error("a tuple field index cannot have a numeric suffix"));
+                }
+                let index = u32::try_from(n).map_err(|_| self.error("tuple field index is out of range"))?;
+                self.bump();
+                let span = start.to(self.prev_span());
+                e = Expr {
+                    kind: std::sync::Arc::new(ExprKind::Field {
+                        base: e, field: FieldAccess::Tuple(index),
+                    }),
+                    span,
+                };
+            }
+            other => return Err(self.error(format!("expected field, found {:?}", other))),
+        }
+        Ok(e)
+    }
+
     fn postfix(&mut self) -> PResult<Expr> {
         let start = self.span();
         let mut e = self.primary()?;
@@ -1861,64 +2015,14 @@ impl Parser {
                     let span = start.to(self.prev_span());
                     e = Expr { kind: std::sync::Arc::new(ExprKind::Call(e, args)), span };
                 }
+                TokKind::Dot if matches!(self.peek_at(1), TokKind::Ident(n) if n == "await") => {
+                    self.bump();
+                    self.bump();
+                    e = await_expr(e, start.to(self.prev_span()));
+                }
                 TokKind::Dot => {
                     self.bump();
-                    match self.peek().clone() {
-                        TokKind::Ident(name) => {
-                            self.bump();
-                            // A turbofish: `.collect::<Vec<_>>()` names the
-                            // result type, which becomes `collect`'s target.
-                            // Other methods infer their type arguments.
-                            let mut turbofish = None;
-                            if self.at(&TokKind::ColonColon) && matches!(self.peek_at(1), TokKind::Lt) {
-                                self.bump();
-                                turbofish = Some(self.opt_type_args()?);
-                            }
-                            if self.at(&TokKind::LParen) {
-                                self.bump();
-                                let args = self.call_args()?;
-                                let span = start.to(self.prev_span());
-                                let collect_target = match &turbofish {
-                                    Some(tys) if name == "collect" && tys.len() == 1 => Some(tys[0].clone()),
-                                    _ => None,
-                                };
-                                e = Expr {
-                                    kind: std::sync::Arc::new(ExprKind::MethodCall {
-                                        recv: e, method: name, args, span,
-                                    }),
-                                    span,
-                                };
-                                if let Some(target) = collect_target {
-                                    e = Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, target)), span };
-                                } else if let Some(tys) = turbofish {
-                                    e = turbofish_marker(e, "turbofish#", tys, span);
-                                }
-                            } else {
-                                let span = start.to(self.prev_span());
-                                e = Expr {
-                                    kind: std::sync::Arc::new(ExprKind::Field {
-                                        base: e, field: FieldAccess::Named(name),
-                                    }),
-                                    span,
-                                };
-                            }
-                        }
-                        TokKind::Int(n, suffix) => {
-                            if suffix != crate::lexer::NumSuffix::None {
-                                return Err(self.error("a tuple field index cannot have a numeric suffix"));
-                            }
-                            let index = u32::try_from(n).map_err(|_| self.error("tuple field index is out of range"))?;
-                            self.bump();
-                            let span = start.to(self.prev_span());
-                            e = Expr {
-                                kind: std::sync::Arc::new(ExprKind::Field {
-                                    base: e, field: FieldAccess::Tuple(index),
-                                }),
-                                span,
-                            };
-                        }
-                        other => return Err(self.error(format!("expected field, found {:?}", other))),
-                    }
+                    e = self.dot_suffix(e, start)?;
                 }
                 TokKind::LBracket => {
                     self.bump();
@@ -1931,12 +2035,6 @@ impl Parser {
                     self.bump();
                     let span = start.to(self.prev_span());
                     e = Expr { kind: std::sync::Arc::new(ExprKind::Try(e)), span };
-                }
-                TokKind::Keyword(Kw::As) => {
-                    self.bump();
-                    let t = self.ty()?;
-                    let span = start.to(self.prev_span());
-                    e = Expr { kind: std::sync::Arc::new(ExprKind::Cast(e, t)), span };
                 }
                 _ => break,
             }
@@ -2032,7 +2130,7 @@ impl Parser {
             TokKind::ByteStr(bytes) => {
                 self.bump();
                 ExprKind::Array(ArrayLit::Elems(bytes.into_iter().map(|b| Expr {
-                    kind: std::sync::Arc::new(ExprKind::Int(b as u64, crate::lexer::NumSuffix::U8)), span: start,
+                    kind: std::sync::Arc::new(ExprKind::Int(b as u128, crate::lexer::NumSuffix::U8)), span: start,
                 }).collect()))
             }
             TokKind::Char(c) => { self.bump(); ExprKind::Char(c) }
@@ -2071,6 +2169,7 @@ impl Parser {
                 };
             }
             TokKind::Pipe | TokKind::OrOr => return self.closure(),
+            TokKind::Ident(w) if w == "async" && self.async_expr_ahead() => return self.async_expr(),
             // `move` closures: captures are always shared GC values or copies.
             TokKind::Ident(w) if w == "move" && matches!(self.peek_at(1), TokKind::Pipe | TokKind::OrOr) => {
                 self.bump();
@@ -2218,7 +2317,7 @@ impl Parser {
                 self.expect(close)?;
                 let (line, column) = crate::lexer::source_position(start);
                 let n = if name == "line" { line } else { column };
-                Ok(lit(ExprKind::Int(n as u64, crate::lexer::NumSuffix::U32), start.to(self.prev_span())))
+                Ok(lit(ExprKind::Int(n as u128, crate::lexer::NumSuffix::U32), start.to(self.prev_span())))
             }
             "file" => {
                 self.expect(close)?;
@@ -2427,6 +2526,32 @@ impl Parser {
             TokKind::Ident(_) | TokKind::Int(..) => matches!(self.peek_at(2), TokKind::Colon | TokKind::Comma | TokKind::RBrace),
             _ => false,
         }
+    }
+
+    /// `async { .. }`, `async move { .. }`, or `async [move] |..| ..`.
+    fn async_expr_ahead(&self) -> bool {
+        let i = if matches!(self.peek_at(1), TokKind::Ident(m) if m == "move") { 2 } else { 1 };
+        matches!(self.peek_at(i), TokKind::LBrace | TokKind::Pipe | TokKind::OrOr)
+    }
+
+    /// An async block is a future of the block's value; an async closure
+    /// returns one. Kept out of `primary` so its frame stays small.
+    #[inline(never)]
+    fn async_expr(&mut self) -> PResult<Expr> {
+        let start = self.span();
+        self.bump();
+        if matches!(self.peek(), TokKind::Ident(m) if m == "move") { self.bump(); }
+        if self.at(&TokKind::LBrace) {
+            let block = self.block()?;
+            let span = start.to(self.prev_span());
+            return Ok(async_block(Expr { kind: std::sync::Arc::new(ExprKind::Block(block)), span }, None, span));
+        }
+        let closure = self.closure()?;
+        let ExprKind::Closure { params, ret, body } = &*closure.kind else { unreachable!() };
+        let span = closure.span;
+        let future = async_block(body.clone(), ret.clone(), span);
+        let ret = ret.clone().map(|r| async_type(Some(r), span));
+        Ok(Expr { kind: std::sync::Arc::new(ExprKind::Closure { params: params.clone(), ret, body: future }), span })
     }
 
     fn closure(&mut self) -> PResult<Expr> {
@@ -3059,7 +3184,7 @@ impl Parser {
         let name = format!("slice#{}#{}#{}#{}", self.pattern_counter, k, rest.is_some() as u8, tests as u8);
         let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
         let var = || ex(ExprKind::Path(Path::single(name.clone(), span)));
-        let int = |n: usize| ex(ExprKind::Int(n as u64, crate::lexer::NumSuffix::None));
+        let int = |n: usize| ex(ExprKind::Int(n as u128, crate::lexer::NumSuffix::None));
         let len = || ex(ExprKind::MethodCall { recv: var(), method: "len".into(), args: vec![], span });
         let mut guards = vec![ex(ExprKind::Binary(if rest.is_some() { BinOp::Ge } else { BinOp::Eq }, len(), int(k)))];
         let mut lets = Vec::new();
@@ -3299,7 +3424,7 @@ fn expand_format(fmt: &str, args: Vec<Expr>, span: Span) -> PResult<Expr> {
     let var = |n: String| ex(ExprKind::Path(Path::single(n, span)));
     let method = |e: Expr, m: &str, args: Vec<Expr>| ex(ExprKind::MethodCall { recv: e, method: m.into(), args, span });
     let int = |n: i64| {
-        let lit = ex(ExprKind::Int(n.unsigned_abs(), crate::lexer::NumSuffix::None));
+        let lit = ex(ExprKind::Int(n.unsigned_abs() as u128, crate::lexer::NumSuffix::None));
         if n < 0 { ex(ExprKind::Unary(UnOp::Neg, lit)) } else { lit }
     };
     let text = |t: &str| ex(ExprKind::Str(t.to_string()));

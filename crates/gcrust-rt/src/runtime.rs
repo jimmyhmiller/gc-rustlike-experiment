@@ -2255,6 +2255,8 @@ pub unsafe extern "C" fn ai_reflect_field_i64(thread: *mut Thread, obj: *const u
                 ScalarKind::U16 => load!(AtomicU16) as i64,
                 ScalarKind::U32 | ScalarKind::Char | ScalarKind::F32 => load!(AtomicU32) as i64,
                 ScalarKind::U64 | ScalarKind::Ptr | ScalarKind::F64 => load!(AtomicU64) as i64,
+                // The low half, as an `as i64` cast keeps.
+                ScalarKind::I128 | ScalarKind::U128 => load!(AtomicU64) as i64,
             },
         }
     }

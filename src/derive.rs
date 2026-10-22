@@ -136,7 +136,7 @@ fn match_arms(e: &EnumDef, arm: impl Fn(&VariantDef, &Shape) -> String) -> Strin
 fn copied(ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::Path(p, args) => args.is_empty() && p.is_single() && matches!(p.last(),
-            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "bool" | "char" | "RawPtr"),
+            "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128" | "f32" | "f64" | "bool" | "char" | "RawPtr"),
         TypeKind::Tuple(_) | TypeKind::Fn(..) | TypeKind::ExternFn(..) | TypeKind::Array(..) => true,
         TypeKind::SelfType => false,
     }

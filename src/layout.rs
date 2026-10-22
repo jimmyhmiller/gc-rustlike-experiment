@@ -30,6 +30,8 @@ pub(crate) fn scalar_kind(s: ScalarRepr) -> ScalarKind {
         ScalarRepr::U16 => ScalarKind::U16,
         ScalarRepr::U32 => ScalarKind::U32,
         ScalarRepr::U64 => ScalarKind::U64,
+        ScalarRepr::I128 => ScalarKind::I128,
+        ScalarRepr::U128 => ScalarKind::U128,
         ScalarRepr::F32 => ScalarKind::F32,
         ScalarRepr::F64 => ScalarKind::F64,
         ScalarRepr::Bool => ScalarKind::Bool,
@@ -936,6 +938,7 @@ fn scalar_of(p: Prim) -> Option<ScalarRepr> {
         Prim::F32 => ScalarRepr::F32, Prim::F64 => ScalarRepr::F64,
         Prim::Bool => ScalarRepr::Bool, Prim::Char => ScalarRepr::Char,
         Prim::RawPtr => ScalarRepr::Ptr,
+        Prim::I128 => ScalarRepr::I128, Prim::U128 => ScalarRepr::U128,
         Prim::Str | Prim::Unit => return None,
     })
 }

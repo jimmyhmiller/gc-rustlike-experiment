@@ -115,3 +115,8 @@ macro_rules! dbg {
     };
     ($($val:expr),+ $(,)?) => { ($(dbg!($val)),+,) };
 }
+
+// Await each future in turn, giving a tuple of their results.
+macro_rules! join {
+    ($($future:expr),+ $(,)?) => { ($($future.await,)+) };
+}

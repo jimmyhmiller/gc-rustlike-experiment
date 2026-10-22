@@ -186,8 +186,10 @@ impl<'p> Analysis<'p> {
                 }
             }
             ConstInt(value, scalar) => {
-                if let Some(result) = result {
+                if let Some(result) = result.filter(|_| scalar.bits() <= 64) {
                     let bits = scalar.bits();
+                    let value = *value as u64;
+                    let value = &value;
                     let value = if bits < 64 && scalar.is_signed() {
                         (((*value << (64 - bits)) as i64) >> (64 - bits)) as u64
                     } else if bits < 64 {

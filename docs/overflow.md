@@ -1,6 +1,7 @@
 # Arithmetic behavior
 
-Integer addition, subtraction, and multiplication wrap at the operand width.
+Integer addition, subtraction, and multiplication wrap at the operand width
+(8 through 128 bits).
 The prelude supplies `i64::checked_add`, `checked_sub`, and `checked_mul`,
 returning Option.
 Checked multiplication rejects signed minimum times minus one in either order.

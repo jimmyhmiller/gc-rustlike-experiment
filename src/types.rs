@@ -40,6 +40,7 @@ pub enum Ty {
 pub enum Prim {
     I8, I16, I32, I64, U8, U16, U32, U64, F32, F64,
     Bool, Char, Str, Unit,
+    I128, U128,
     /// An opaque, non-GC, pointer-sized value. Only meaningful at the FFI
     /// boundary: an `extern "C"` function may name `RawPtr` as a parameter or
     /// return type, and the `as_c_bytes` intrinsic produces one. It is not a
@@ -418,6 +419,7 @@ pub fn prim_name(p: Prim) -> &'static str {
         Prim::F32 => "f32", Prim::F64 => "f64",
         Prim::Bool => "bool", Prim::Char => "char", Prim::Str => "String", Prim::Unit => "()",
         Prim::RawPtr => "RawPtr",
+        Prim::I128 => "i128", Prim::U128 => "u128",
     }
 }
 
@@ -476,7 +478,7 @@ impl TypeEnvironment for TyCtx {
             let first = found.next()?;
             found.next().is_none().then_some(first.1)
         })?;
-        match &*def.value.kind { ExprKind::Int(n, _) => Some(*n), _ => None }
+        match &*def.value.kind { ExprKind::Int(n, _) => u64::try_from(*n).ok(), _ => None }
     }
     fn canonical(&self, name: &str) -> Option<String> { self.canon(name) }
     fn alias(&self, name: &str) -> Option<&crate::type_alias::ResolvedAlias> { self.aliases.get(name).map(Rc::as_ref) }
@@ -720,6 +722,7 @@ fn prim_of(name: &str) -> Option<Prim> {
         // Rust's pointer-sized integers: indices and lengths are `i64`.
         "usize" | "isize" => Prim::I64,
         "u8" => Prim::U8, "u16" => Prim::U16, "u32" => Prim::U32, "u64" => Prim::U64,
+        "i128" => Prim::I128, "u128" => Prim::U128,
         "f32" => Prim::F32, "f64" => Prim::F64,
         "bool" => Prim::Bool, "char" => Prim::Char, "String" => Prim::Str,
         "RawPtr" => Prim::RawPtr,
@@ -729,7 +732,7 @@ fn prim_of(name: &str) -> Option<Prim> {
 
 fn const_usize(e: &Expr) -> TResult<u64> {
     match &*e.kind {
-        ExprKind::Int(n, _) => Ok(*n),
+        ExprKind::Int(n, _) => u64::try_from(*n).map_err(|_| TypeError { msg: "array length out of range".into(), span: e.span }),
         _ => Err(TypeError { msg: "array length must be an integer literal".into(), span: e.span }),
     }
 }
@@ -741,6 +744,7 @@ pub fn suffix_prim(s: NumSuffix, is_float: bool) -> Prim {
         NumSuffix::I32 => Prim::I32, NumSuffix::I64 => Prim::I64,
         NumSuffix::U8 => Prim::U8, NumSuffix::U16 => Prim::U16,
         NumSuffix::U32 => Prim::U32, NumSuffix::U64 => Prim::U64,
+        NumSuffix::I128 => Prim::I128, NumSuffix::U128 => Prim::U128,
         NumSuffix::F32 => Prim::F32, NumSuffix::F64 => Prim::F64,
         NumSuffix::None => if is_float { Prim::F64 } else { Prim::I64 },
     }

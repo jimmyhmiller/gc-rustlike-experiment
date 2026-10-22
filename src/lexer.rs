@@ -45,15 +45,15 @@ impl fmt::Debug for Span {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum NumSuffix {
     None,
-    I8, I16, I32, I64,
-    U8, U16, U32, U64,
+    I8, I16, I32, I64, I128,
+    U8, U16, U32, U64, U128,
     F32, F64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum TokKind {
     // literals
-    Int(u64, NumSuffix),
+    Int(u128, NumSuffix),
     Float(f64, NumSuffix),
     Str(String),
     Char(char),
@@ -231,7 +231,7 @@ impl<'a> Lexer<'a> {
                     self.lex_char(start)?;
                     let Some(Token { kind: TokKind::Char(c), .. }) = self.toks.pop() else { unreachable!() };
                     if (c as u32) > 255 { return Err(self.err("a byte literal must be ASCII or `\\xNN`", start)); }
-                    self.push(TokKind::Int(c as u64, NumSuffix::U8), start);
+                    self.push(TokKind::Int(c as u128, NumSuffix::U8), start);
                 }
                 // `'name` (no closing quote after one char) is a label.
                 b'\'' if self.is_label_start() => {
@@ -340,7 +340,7 @@ impl<'a> Lexer<'a> {
             if raw.is_empty() {
                 return Err(self.err("missing digits after radix prefix", start));
             }
-            let v = u64::from_str_radix(&raw, radix)
+            let v = u128::from_str_radix(&raw, radix)
                 .map_err(|_| self.err("integer literal out of range", start))?;
             let suffix = self.lex_num_suffix();
             if matches!(suffix, NumSuffix::F32 | NumSuffix::F64) {
@@ -398,7 +398,7 @@ impl<'a> Lexer<'a> {
                 .map_err(|_| self.err("invalid float literal", start))?;
             self.push(TokKind::Float(v, suffix), start);
         } else {
-            let v: u64 = body
+            let v: u128 = body
                 .parse()
                 .map_err(|_| self.err("integer literal out of range", start))?;
             self.push(TokKind::Int(v, suffix), start);
@@ -421,6 +421,7 @@ impl<'a> Lexer<'a> {
             "usize" | "isize" => NumSuffix::I64,
             "u8" => NumSuffix::U8, "u16" => NumSuffix::U16,
             "u32" => NumSuffix::U32, "u64" => NumSuffix::U64,
+            "i128" => NumSuffix::I128, "u128" => NumSuffix::U128,
             "f32" => NumSuffix::F32, "f64" => NumSuffix::F64,
             // Unknown suffix: rewind so it lexes as a separate token (will be
             // a parse error in context, which is the right place to report it).
@@ -611,7 +612,7 @@ mod tests {
 
     #[test]
     fn lexer_errors_preserve_source_identity() {
-        for src in ["é", "\"\\", "/* unfinished", "18446744073709551616"] {
+        for src in ["é", "\"\\", "/* unfinished", "340282366920938463463374607431768211456"] {
             let error = lex_with_source(src, 17).unwrap_err();
             assert_eq!(error.span.source, 17, "{src:?}");
         }

@@ -217,8 +217,11 @@ impl Analysis<'_> {
                 });
                 (env[*local as usize].or(constant), Some(1))
             }
+            ConstInt(_, scalar) if scalar.bits() > 64 => (None, Some(1)),
             ConstInt(value, scalar) => {
                 let bits = scalar.bits();
+                let value = *value as u64;
+                let value = &value;
                 let value = if scalar.is_signed() {
                     (((*value << (64 - bits)) as i64) >> (64 - bits)) as i128
                 } else if bits < 64 {
@@ -250,7 +253,8 @@ impl Analysis<'_> {
                         _ => None,
                     })
                     .filter(|range| {
-                        if let Repr::Scalar(s) = e.repr {
+                        if let Repr::Scalar(s) = e.repr.clone() {
+                            if s.bits() > 64 { return false; }
                             let (low, high) = if s.is_signed() {
                                 (-(1_i128 << (s.bits() - 1)), (1_i128 << (s.bits() - 1)) - 1)
                             } else {
@@ -367,7 +371,7 @@ impl Analysis<'_> {
         };
         let right = resolve(right, &definitions);
         let bound = match right.kind.as_ref() {
-            ConstInt(n, _) => Some(*n),
+            ConstInt(n, _) => u64::try_from(*n).ok(),
             _ => self.constants.integer(right),
         }?;
         if bound > MAX_ITERATIONS as u64 {

@@ -138,6 +138,8 @@ pub enum ScalarKind {
     F64,
     Bool,
     Char,
+    I128,
+    U128,
     /// FFI raw pointer (`RawPtr`).
     Ptr,
 }
@@ -153,6 +155,7 @@ impl ScalarKind {
             | ScalarKind::U64
             | ScalarKind::F64
             | ScalarKind::Ptr => 8,
+            ScalarKind::I128 | ScalarKind::U128 => 16,
         }
     }
 
@@ -172,6 +175,8 @@ impl ScalarKind {
             ScalarKind::Bool => 10,
             ScalarKind::Char => 11,
             ScalarKind::Ptr => 12,
+            ScalarKind::I128 => 13,
+            ScalarKind::U128 => 14,
         }
     }
 
@@ -190,6 +195,8 @@ impl ScalarKind {
             10 => ScalarKind::Bool,
             11 => ScalarKind::Char,
             12 => ScalarKind::Ptr,
+            13 => ScalarKind::I128,
+            14 => ScalarKind::U128,
             other => panic!("reflect::decode: invalid ScalarKind tag {other}"),
         }
     }
@@ -210,6 +217,8 @@ impl ScalarKind {
             ScalarKind::Bool => "bool",
             ScalarKind::Char => "char",
             ScalarKind::Ptr => "ptr",
+            ScalarKind::I128 => "i128",
+            ScalarKind::U128 => "u128",
         }
     }
 }

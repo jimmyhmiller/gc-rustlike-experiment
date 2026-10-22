@@ -28,6 +28,9 @@ pub enum ScalarRepr {
     U8, U16, U32, U64,
     F32, F64,
     Bool, Char,
+    /// 128-bit integers. In heap slots they are two 64-bit halves (low
+    /// first), each accessed like a 64-bit scalar.
+    I128, U128,
     /// An opaque pointer-sized non-GC value (FFI `RawPtr`). Lowers to LLVM
     /// `ptr`. Never participates in arithmetic — only crosses the FFI boundary.
     Ptr,
@@ -42,6 +45,7 @@ impl ScalarRepr {
             ScalarRepr::I32 | ScalarRepr::U32 | ScalarRepr::F32 | ScalarRepr::Char => 32,
             ScalarRepr::I64 | ScalarRepr::U64 | ScalarRepr::F64 | ScalarRepr::Ptr => 64,
             ScalarRepr::Bool => 1,
+            ScalarRepr::I128 | ScalarRepr::U128 => 128,
         }
     }
     pub fn is_float(self) -> bool {
@@ -49,7 +53,7 @@ impl ScalarRepr {
     }
     /// Signed integer? (`char`/`bool` are unsigned; floats are neither.)
     pub fn is_signed(self) -> bool {
-        matches!(self, ScalarRepr::I8 | ScalarRepr::I16 | ScalarRepr::I32 | ScalarRepr::I64)
+        matches!(self, ScalarRepr::I8 | ScalarRepr::I16 | ScalarRepr::I32 | ScalarRepr::I64 | ScalarRepr::I128)
     }
     pub fn is_int(self) -> bool {
         !self.is_float() && !matches!(self, ScalarRepr::Bool | ScalarRepr::Ptr)
@@ -311,7 +315,7 @@ pub struct CoreExpr {
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum CoreExprKind {
-    ConstInt(u64, ScalarRepr),
+    ConstInt(#[serde(serialize_with = "serialize_u128")] u128, ScalarRepr),
     ConstFloat(f64, ScalarRepr),
     ConstBool(bool),
     ConstChar(char),
@@ -512,6 +516,14 @@ pub struct CoreArm {
     /// Locals bound to the payload fields (in field order).
     pub binds: Vec<LocalId>,
     pub body: CoreExpr,
+}
+
+/// JSON numbers stop at 64 bits: a wider constant is written as a string.
+fn serialize_u128<S: serde::Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+    match u64::try_from(*value) {
+        Ok(small) => serializer.serialize_u64(small),
+        Err(_) => serializer.serialize_str(&value.to_string()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

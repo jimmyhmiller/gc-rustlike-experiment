@@ -301,7 +301,7 @@ pub struct Expr {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum ExprKind {
     // literals
-    Int(u64, NumSuffix),
+    Int(u128, NumSuffix),
     Float(f64, NumSuffix),
     Str(String),
     Char(char),
@@ -457,7 +457,7 @@ pub enum PatternKind {
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum LitPattern {
-    Int(u64),
+    Int(u128),
     Bool(bool),
     Char(char),
     Str(String),
