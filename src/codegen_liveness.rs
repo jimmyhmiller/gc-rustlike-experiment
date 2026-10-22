@@ -69,7 +69,7 @@ impl Analysis<'_> {
                 let live = self.expr(b, live); self.expr(a, live)
             }
             Un(_, e) | FloatIntrinsic(_, e) | FloatBits(e) | Print(e) | PrintStr(e)
-            | PrintStrRaw(e) | StrLen(e) | StrToFloat(e) | StrHash(e) | TypeIdOf(e)
+            | PrintStrRaw(e) | StrLen(e) | StrEqLit(e, _) | StrToFloat(e) | StrHash(e) | TypeIdOf(e)
             | PtrReadI64(e) | Panic(e) | ThreadSpawn(e) | ThreadJoin(e) | ThreadSleep(e)
             | EnumTag(e) | ArrayLen(e) | TypeNameOf { obj: e, .. } | Cast { value: e, .. }
             | StrFromNum { v: e, .. } | StrFromChar { cp: e, .. } | ReadFile { path: e, .. }

@@ -1,0 +1,14 @@
+[package]
+name = "funct-reference"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The real funct, for comparison with the gc-rust port.
+[dependencies]
+funct = { path = "../../../../../funct" }
+
+[workspace]
+
+[profile.release]
+debug = false

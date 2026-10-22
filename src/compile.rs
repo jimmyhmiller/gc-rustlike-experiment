@@ -84,8 +84,9 @@ fn load_file_modules(items: &mut Vec<Item>, dir: &Path, sources: &mut SourceMap)
                 // Each module is its own source: register it + lex with its id so
                 // its spans resolve against its own text, not the user file.
                 let sid = add_source(sources, file.display().to_string(), src.clone());
-                let toks = lex_with_source(&src, sid).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
+                let toks = lex_with_source(&src, sid);
                 crate::lexer::register_source_path(sid, &file);
+                let toks = toks.map_err(|e| ParseError { msg: e.msg, span: e.span })?;
                 let mut parsed = parse_module(&toks)?;
                 // Recurse into this file's own `mod foo;` declarations.
                 load_file_modules(&mut parsed.items, &subdir, sources)?;

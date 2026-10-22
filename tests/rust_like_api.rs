@@ -256,7 +256,7 @@ fn string_methods() {
             if parts.len() == 4 && parts[2] == "" && parts[3] == "three" { ok = ok + 1; }
             if s.find("two") == Some(6) && s.find("four").is_none() && s.contains(",,") { ok = ok + 2; }
             if "a-b-c".replace("-", "+") == "a+b+c" && "ab".repeat(3) == "ababab" { ok = ok + 4; }
-            if "Héllo".to_uppercase() == "HéLLO" && "Héllo".chars().len() == 5 { ok = ok + 8; }
+            if "Héllo".to_uppercase() == "HéLLO" && "Héllo".chars().count() == 5 { ok = ok + 8; }
             if "12".parse_i64() == Some(12) && "1e3".parse_f64() == Some(1000.0) && "1e".parse_f64().is_none() && "".parse_f64().is_none() { ok = ok + 16; }
             if "abc".starts_with("ab") && "abc".ends_with("bc") && !"abc".ends_with("abcd") { ok = ok + 32; }
             if 'x'.to_string() == "x" && true.to_string() == "true" && (0 - 3).abs() == 3 { ok = ok + 64; }

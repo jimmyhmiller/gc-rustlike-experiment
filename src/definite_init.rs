@@ -144,6 +144,7 @@ impl Checker {
             | PrintStr(value)
             | PrintStrRaw(value)
             | StrLen(value)
+            | StrEqLit(value, _)
             | StrToFloat(value)
             | FloatBits(value)
             | StrHash(value)

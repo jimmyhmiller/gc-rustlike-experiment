@@ -93,7 +93,7 @@ fn string_formatting_helpers() {
             let rep = "ab".repeat(3);            // "ababab" len 6
             let pl = "42".pad_left(5, "0");      // "00042" len 5
             let pr = "x".pad_right(4, ".");      // "x..." len 4
-            let mut cs = "abcdef".chars();
+            let mut cs: Vec<char> = "abcdef".chars().collect();
             cs.reverse();
             let rev = String::from_chars(cs);         // "fedcba"
             let rev_ok = if rev == "fedcba" { 1 } else { 0 };
@@ -141,11 +141,11 @@ fn unicode_codepoint_api() {
         fn main() -> i64 {
             let s = "café";
             let bytes = s.len();                                            // 5
-            let chars = s.chars().len();                                      // 4
-            let rt = if String::from_chars(s.chars()) == s { 1 } else { 0 };  // 1
-            let cp = s.chars()[3] as i64;                                     // 233
+            let chars = s.chars().count();                                      // 4
+            let rt = if s.chars().collect::<String>() == s { 1 } else { 0 };  // 1
+            let cp = s.chars().nth(3).unwrap() as i64;                                     // 233
             let byte = s.byte_at(3);                                          // 195
-            let sub_ok = if String::from_chars(s.chars()[0..4]) == s { 1 } else { 0 };    // 1 (é intact)
+            let sub_ok = if s.chars().take(4).collect::<String>() == s { 1 } else { 0 };    // 1 (é intact)
             let emoji_bytes = (128512 as char).to_string().len();          // 4 (😀)
             bytes + chars + rt + cp + byte + sub_ok + emoji_bytes
             // 5 + 4 + 1 + 233 + 195 + 1 + 4 = 443

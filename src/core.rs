@@ -344,6 +344,9 @@ pub enum CoreExprKind {
     StrLen(Box<CoreExpr>),
     /// `str_eq(a, b)` → bool.
     StrEq(Box<CoreExpr>, Box<CoreExpr>),
+    /// `s == "literal"` → bool, comparing against the literal's bytes
+    /// without allocating a `String` for it.
+    StrEqLit(Box<CoreExpr>, String),
     /// `str_concat(a, b)` → a fresh `String`. `layout` is the String layout id
     /// (passed to the allocating runtime call).
     StrConcat { layout: LayoutId, a: Box<CoreExpr>, b: Box<CoreExpr> },

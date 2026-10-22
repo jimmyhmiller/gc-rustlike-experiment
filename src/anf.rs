@@ -178,6 +178,7 @@ impl<'a> Anf<'a> {
             CoreExprKind::PrintStr(a) => CoreExprKind::PrintStr(self.boxed(a, pending)),
             CoreExprKind::PrintStrRaw(a) => CoreExprKind::PrintStrRaw(self.boxed(a, pending)),
             CoreExprKind::StrLen(a) => CoreExprKind::StrLen(self.boxed(a, pending)),
+            CoreExprKind::StrEqLit(a, lit) => CoreExprKind::StrEqLit(self.boxed(a, pending), lit),
             CoreExprKind::StrToFloat(a) => CoreExprKind::StrToFloat(self.boxed(a, pending)),
             CoreExprKind::FloatBits(a) => CoreExprKind::FloatBits(self.boxed(a, pending)),
             CoreExprKind::StrHash(a) => CoreExprKind::StrHash(self.boxed(a, pending)),

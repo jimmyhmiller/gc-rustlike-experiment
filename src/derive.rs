@@ -185,21 +185,20 @@ fn eq(item: &ItemKind) -> String {
                 .map(|(a, b)| format!("{a} == {b}")).collect();
             if pairs.is_empty() { "true".into() } else { pairs.join(" && ") }
         }
+        // A switch on `self`, then on `other` for that variant: both are
+        // tag switches, so comparing is constant-time in the variant count.
         ItemKind::Enum(e) => {
-            let mut arms: Vec<String> = e.variants.iter().map(|v| {
+            let arms: Vec<String> = e.variants.iter().map(|v| {
                 let shape = variant_shape(&v.payload);
                 let pairs: Vec<String> = field_values(&shape, None, "a").into_iter()
                     .zip(field_values(&shape, None, "b"))
                     .map(|(a, b)| format!("{a} == {b}")).collect();
-                format!(
-                    "({}, {}) => {}",
-                    variant_pattern(&e.name, &v.name, &shape, "a"),
-                    variant_pattern(&e.name, &v.name, &shape, "b"),
-                    if pairs.is_empty() { "true".into() } else { pairs.join(" && ") }
-                )
+                let same = if pairs.is_empty() { "true".into() } else { pairs.join(" && ") };
+                let other_arms = if e.variants.len() > 1 { format!("{} => {same}, _ => false", variant_pattern(&e.name, &v.name, &shape, "b")) }
+                    else { format!("{} => {same}", variant_pattern(&e.name, &v.name, &shape, "b")) };
+                format!("{} => match other {{ {other_arms} }}", variant_pattern(&e.name, &v.name, &shape, "a"))
             }).collect();
-            if e.variants.len() > 1 { arms.push("_ => false".into()); }
-            format!("match (self, other) {{ {} }}", arms.join(", "))
+            if arms.is_empty() { "true".into() } else { format!("match self {{ {} }}", arms.join(", ")) }
         }
         _ => unreachable!(),
     };

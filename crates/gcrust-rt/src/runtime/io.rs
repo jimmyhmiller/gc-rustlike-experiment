@@ -20,6 +20,8 @@ pub const STDERR: u32 = 6;
 pub const STDOUT: u32 = 7;
 /// Write to stderr without a trailing newline (`eprint!`).
 pub const STDERR_RAW: u32 = 8;
+/// End the process with status `limit`, after flushing stdout and stderr.
+pub const EXIT: u32 = 9;
 
 #[derive(Debug, Default)]
 struct Outcome {
@@ -174,6 +176,11 @@ fn perform(op: u32, path: &str, text: &str, limit: i64) -> io::Result<Outcome> {
             let mut stderr = io::stderr().lock();
             stderr.write_all(text.as_bytes())?;
             stderr.write_all(b"\n")?;
+        }
+        EXIT => {
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            std::process::exit(limit as i32);
         }
         STDERR_RAW => {
             let mut stderr = io::stderr().lock();

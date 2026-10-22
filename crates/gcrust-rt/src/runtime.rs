@@ -3036,6 +3036,15 @@ pub unsafe extern "C" fn ai_str_eq_v2(thread: *mut Thread, a: *const u8, b: *con
     unsafe { string_scan::equal(thread, a, b) }
 }
 
+/// Does String `s` hold exactly the `len` bytes at `bytes` (a literal)?
+/// The scan is bounded by the literal, so it never parks.
+/// # Safety
+/// `s` is a valid immutable String; `bytes..bytes+len` is readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_str_eq_bytes(_thread: *mut Thread, s: *const u8, bytes: *const u8, len: i64) -> i64 {
+    unsafe { (str_bytes(s) == std::slice::from_raw_parts(bytes, len as usize)) as i64 }
+}
+
 /// Legacy noncollecting equality ABI. New generated code calls this only for
 /// bounded small inputs and uses `ai_str_eq_v2` for potentially large scans.
 /// # Safety
@@ -3217,6 +3226,42 @@ pub unsafe extern "C" fn ai_str_substring(
             abort_with_diagnostic(thread, message)
         });
         alloc_string_from_text(thread, type_id, &text)
+    }
+}
+
+/// `str_from_bytes(array, len)`: a fresh `String` holding the first `len`
+/// bytes of a `u8` array. Invalid UTF-8 aborts; `String::from_utf8` checks
+/// the bytes first.
+///
+/// # Safety
+/// `array` is a live `Array<u8>` with at least `len` elements; `thread` and
+/// `type_id` as `ai_str_concat`. May collect.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_str_from_bytes(thread: *mut Thread, type_id: i64, array: *const u8, len: i64) -> *mut u8 {
+    unsafe {
+        let len = len.max(0);
+        let mut bytes = vec![0u8; len as usize];
+        if len > 0 { ffi_copy::scalar(thread, array, bytes.as_mut_ptr(), len, 8, false); }
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => alloc_string_from_text(thread, type_id as u32, text),
+            Err(_) => abort_with_diagnostic(thread, b"gc-rust: invalid UTF-8 bytes for a String"),
+        }
+    }
+}
+
+/// `str_copy_bytes(s, array)`: copy the bytes of `s` into the first
+/// `s.len()` elements of a `u8` array.
+///
+/// # Safety
+/// `s` is a live `String` and `array` a live `Array<u8>` with at least
+/// `s.len()` elements; `thread` is the RUNNING mutator. May collect.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_str_copy_bytes(thread: *mut Thread, s: *const u8, array: *mut u8) {
+    unsafe {
+        let text = string_owned::text(thread, s).unwrap_or_default();
+        if !text.is_empty() {
+            ffi_copy::scalar(thread, array, text.as_ptr().cast_mut(), text.len() as i64, 8, true);
+        }
     }
 }
 

@@ -68,6 +68,12 @@ const PRELUDE_SRC: &str = include_str!("prelude.gcr");
 /// Render a diagnostic for `span` in `src` (named `file`) with `msg`. The span's
 /// `start..end` is underlined with carets (clamped to a single line).
 pub fn render(file: &str, src: &str, span: Span, msg: &str) -> String {
+    // A span from a `mod` file renders against that file's text.
+    if span.source != 0 {
+        if let (Some(text), Some(path)) = (crate::lexer::source_text(span.source), crate::lexer::source_path(span.source)) {
+            return render_in(&path.display().to_string(), &text, span, msg);
+        }
+    }
     // A span may point outside `src` — most commonly into the injected prelude,
     // whose text is lexed separately. Re-render against the prelude source so the
     // user still sees the offending stdlib line with carets.

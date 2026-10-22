@@ -71,3 +71,15 @@ fn json_quote(text: String) -> String {
     parts.push("\"");
     parts.join("")
 }
+
+// `std::fs::read_to_string`.
+fn read_to_string(path: String) -> Result<String, IoError> { fs_read_text(path, 1 << 40) }
+// `std::process::exit`: end the program with `code`.
+fn exit(code: i32) -> ! {
+    host_io(9, "", "", code as i64);
+    loop {}
+}
+// `std::env::args`: the program name, then its arguments.
+fn args() -> Vec<String> {
+    match process_args() { Ok(a) => Vec::from_array(a), Err(_e) => Vec::new() }
+}

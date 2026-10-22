@@ -191,6 +191,274 @@ impl ToString for f64 { fn to_string(self) -> String { to_string(self) } }
 impl ToString for bool { fn to_string(self) -> String { if self { "true" } else { "false" } } }
 impl ToString for char { fn to_string(self) -> String { char_to_str(self as i64) } }
 
+// ---- Chars: a string's chars, decoded lazily --------------------------------------
+
+struct Chars { s: String, i: i64, end: i64 }
+// The width of the UTF-8 sequence that starts with byte `b0`.
+fn utf8_width(b0: i64) -> i64 { if b0 < 128 { 1 } else if b0 < 224 { 2 } else if b0 < 240 { 3 } else { 4 } }
+// The char whose UTF-8 sequence starts at byte `i` of `s`.
+fn utf8_char_at(s: String, i: i64) -> char {
+    let b0 = str_get(s, i);
+    if b0 < 128 { b0 as char }
+    else if b0 < 224 { (((b0 & 31) << 6) | (str_get(s, i + 1) & 63)) as char }
+    else if b0 < 240 { (((b0 & 15) << 12) | ((str_get(s, i + 1) & 63) << 6) | (str_get(s, i + 2) & 63)) as char }
+    else { (((b0 & 7) << 18) | ((str_get(s, i + 1) & 63) << 12) | ((str_get(s, i + 2) & 63) << 6) | (str_get(s, i + 3) & 63)) as char }
+}
+impl Iterator for Chars {
+    type Item = char;
+    fn next(mut self) -> Option<char> {
+        if self.i >= self.end { return Option::None; }
+        let c = utf8_char_at(self.s, self.i);
+        self.i = self.i + utf8_width(str_get(self.s, self.i));
+        Option::Some(c)
+    }
+}
+impl Chars {
+    // Back to front.
+    fn rev(self) -> CharsRev { CharsRev { s: self.s, i: self.i, end: self.end } }
+    // The part not yet taken (`Chars::as_str`).
+    fn as_str(self) -> String { str_substring(self.s, self.i, self.end) }
+}
+struct CharsRev { s: String, i: i64, end: i64 }
+impl Iterator for CharsRev {
+    type Item = char;
+    fn next(mut self) -> Option<char> {
+        if self.end <= self.i { return Option::None; }
+        // Step back over continuation bytes (10xxxxxx) to the sequence start.
+        let mut j = self.end - 1;
+        while j > self.i && (str_get(self.s, j) & 192) == 128 { j -= 1; }
+        self.end = j;
+        Option::Some(utf8_char_at(self.s, j))
+    }
+}
+
+// ---- Bytes and UTF-8 ------------------------------------------------------------
+
+// `String::from_utf8`'s error: the bytes, and how many of them are valid.
+#[derive(Debug, Clone, PartialEq)]
+struct FromUtf8Error { bytes: Vec<u8>, valid_up_to: i64 }
+impl FromUtf8Error {
+    fn into_bytes(self) -> Vec<u8> { self.bytes }
+    fn valid_up_to(self) -> i64 { self.valid_up_to }
+}
+impl Display for FromUtf8Error {
+    fn fmt(self, f: Formatter) -> FmtResult { f.write_str(format!("invalid utf-8 sequence at byte {}", self.valid_up_to)) }
+}
+
+// The length of the longest valid UTF-8 prefix of `bytes[..len]`.
+fn utf8_valid_up_to(bytes: Vec<u8>) -> i64 {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        let b = bytes[i] as i64;
+        let (width, low, high) = if b < 128 { (1, 128, 191) }
+            else if b >= 194 && b <= 223 { (2, 128, 191) }
+            else if b == 224 { (3, 160, 191) }
+            else if b >= 225 && b <= 239 && b != 237 { (3, 128, 191) }
+            else if b == 237 { (3, 128, 159) }
+            else if b == 240 { (4, 144, 191) }
+            else if b >= 241 && b <= 243 { (4, 128, 191) }
+            else if b == 244 { (4, 128, 143) }
+            else { return i };
+        if i + width > n { return i; }
+        let mut k = 1;
+        while k < width {
+            let c = bytes[i + k] as i64;
+            let (lo, hi) = if k == 1 { (low, high) } else { (128, 191) };
+            if c < lo || c > hi { return i; }
+            k += 1;
+        }
+        i += width;
+    }
+    n
+}
+
+impl String {
+    // A copy of the string's bytes (strings are immutable, so a copy is the
+    // only way to hand them out).
+    fn as_bytes(self) -> Vec<u8> {
+        let n = str_len(self);
+        let bytes: Array<u8> = Array::new(n);
+        str_copy_bytes(self, bytes);
+        Vec::from_array(bytes)
+    }
+    fn into_bytes(self) -> Vec<u8> { self.as_bytes() }
+    fn bytes(self) -> VecIter<u8> { self.as_bytes().into_iter() }
+    fn as_str(self) -> String { self }
+    fn from_utf8(bytes: Vec<u8>) -> Result<String, FromUtf8Error> {
+        let valid = utf8_valid_up_to(bytes);
+        if valid == bytes.len() { Ok(str_from_bytes(bytes.data, bytes.len())) }
+        else { Err(FromUtf8Error { bytes: bytes, valid_up_to: valid }) }
+    }
+}
+
+impl u8 {
+    fn is_ascii(self) -> bool { self < 128 }
+    fn is_ascii_digit(self) -> bool { self >= b'0' && self <= b'9' }
+    fn is_ascii_hexdigit(self) -> bool { self.is_ascii_digit() || (self >= b'a' && self <= b'f') || (self >= b'A' && self <= b'F') }
+    fn is_ascii_lowercase(self) -> bool { self >= b'a' && self <= b'z' }
+    fn is_ascii_uppercase(self) -> bool { self >= b'A' && self <= b'Z' }
+    fn is_ascii_alphabetic(self) -> bool { self.is_ascii_lowercase() || self.is_ascii_uppercase() }
+    fn is_ascii_alphanumeric(self) -> bool { self.is_ascii_alphabetic() || self.is_ascii_digit() }
+    fn is_ascii_whitespace(self) -> bool { self == b' ' || self == b'\t' || self == b'\n' || self == 12 || self == b'\r' }
+    fn is_ascii_punctuation(self) -> bool { (self >= 33 && self <= 47) || (self >= 58 && self <= 64) || (self >= 91 && self <= 96) || (self >= 123 && self <= 126) }
+    fn to_ascii_lowercase(self) -> u8 { if self.is_ascii_uppercase() { self + 32 } else { self } }
+    fn to_ascii_uppercase(self) -> u8 { if self.is_ascii_lowercase() { self - 32 } else { self } }
+}
+
+impl<T> Vec<T> {
+    // Keep the elements `keep` accepts, in order.
+    fn retain(mut self, keep: fn(T) -> bool) {
+        let mut j = 0;
+        let mut i = 0;
+        while i < self.len {
+            let x = self.data[i];
+            if keep(x) { self.data[j] = x; j += 1; }
+            i += 1;
+        }
+        self.len = j;
+    }
+}
+
+// ---- Parsing: `s.parse::<T>()` -----------------------------------------------
+
+trait FromStr {
+    type Err;
+    fn from_str(s: String) -> Result<Self, Self::Err>;
+}
+impl String {
+    fn parse<F: FromStr>(self) -> Result<F, F::Err> { F::from_str(self) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IntErrorKind { Empty, InvalidDigit, PosOverflow, NegOverflow, Zero }
+#[derive(Debug, Clone, PartialEq)]
+struct ParseIntError { kind: IntErrorKind }
+impl ParseIntError {
+    fn kind(self) -> IntErrorKind { self.kind }
+}
+impl Display for ParseIntError {
+    fn fmt(self, f: Formatter) -> FmtResult {
+        f.write_str(match self.kind {
+            IntErrorKind::Empty => "cannot parse integer from empty string",
+            IntErrorKind::InvalidDigit => "invalid digit found in string",
+            IntErrorKind::PosOverflow => "number too large to fit in target type",
+            IntErrorKind::NegOverflow => "number too small to fit in target type",
+            IntErrorKind::Zero => "number would be zero for non-zero type",
+        })
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+struct ParseFloatError { empty: bool }
+impl Display for ParseFloatError {
+    fn fmt(self, f: Formatter) -> FmtResult {
+        f.write_str(if self.empty { "cannot parse float from empty string" } else { "invalid float literal" })
+    }
+}
+
+// An i64 in [min, max], or why not.
+fn parse_int_in(s: String, min: i64, max: i64) -> Result<i64, ParseIntError> {
+    let n = str_len(s);
+    if n == 0 { return Err(ParseIntError { kind: IntErrorKind::Empty }); }
+    let first = str_get(s, 0);
+    let neg = first == 45;
+    let start = if neg || first == 43 { 1 } else { 0 };
+    if start == n { return Err(ParseIntError { kind: IntErrorKind::InvalidDigit }); }
+    if neg && min == 0 { return Err(ParseIntError { kind: IntErrorKind::InvalidDigit }); }
+    let mut i = start;
+    while i < n {
+        let c = str_get(s, i);
+        if c < 48 || c > 57 { return Err(ParseIntError { kind: IntErrorKind::InvalidDigit }); }
+        i += 1;
+    }
+    match s.parse_i64() {
+        Some(v) => if v > max { Err(ParseIntError { kind: IntErrorKind::PosOverflow }) } else if v < min { Err(ParseIntError { kind: IntErrorKind::NegOverflow }) } else { Ok(v) },
+        None => Err(ParseIntError { kind: if neg { IntErrorKind::NegOverflow } else { IntErrorKind::PosOverflow } }),
+    }
+}
+macro_rules! from_str_ints {
+    ($($t:ty)*) => { $(
+        impl FromStr for $t {
+            type Err = ParseIntError;
+            fn from_str(s: String) -> Result<$t, ParseIntError> {
+                parse_int_in(s, <$t>::MIN as i64, <$t>::MAX as i64).map(|v| v as $t)
+            }
+        }
+    )* };
+}
+from_str_ints!(i8 i16 i32 i64 u8 u16 u32);
+impl FromStr for u64 {
+    type Err = ParseIntError;
+    fn from_str(s: String) -> Result<u64, ParseIntError> {
+        // Through u128, so the upper half of u64 parses.
+        match u128::from_str(s) {
+            Ok(v) => if v > u64::MAX as u128 { Err(ParseIntError { kind: IntErrorKind::PosOverflow }) } else { Ok(v as u64) },
+            Err(e) => Err(e),
+        }
+    }
+}
+impl FromStr for u128 {
+    type Err = ParseIntError;
+    fn from_str(s: String) -> Result<u128, ParseIntError> {
+        let n = str_len(s);
+        if n == 0 { return Err(ParseIntError { kind: IntErrorKind::Empty }); }
+        let start = if str_get(s, 0) == 43 { 1 } else { 0 };
+        if start == n { return Err(ParseIntError { kind: IntErrorKind::InvalidDigit }); }
+        let mut acc: u128 = 0;
+        let mut i = start;
+        while i < n {
+            let c = str_get(s, i);
+            if c < 48 || c > 57 { return Err(ParseIntError { kind: IntErrorKind::InvalidDigit }); }
+            let d = (c - 48) as u128;
+            if acc > (u128::MAX - d) / 10 { return Err(ParseIntError { kind: IntErrorKind::PosOverflow }); }
+            acc = acc * 10 + d;
+            i += 1;
+        }
+        Ok(acc)
+    }
+}
+impl FromStr for i128 {
+    type Err = ParseIntError;
+    fn from_str(s: String) -> Result<i128, ParseIntError> {
+        let neg = str_len(s) > 0 && str_get(s, 0) == 45;
+        let digits = if neg { str_substring(s, 1, str_len(s)) } else { s };
+        if neg && str_len(digits) > 0 && str_get(digits, 0) == 43 { return Err(ParseIntError { kind: IntErrorKind::InvalidDigit }); }
+        match u128::from_str(digits) {
+            Ok(v) => if neg {
+                if v > (1u128 << 127) { Err(ParseIntError { kind: IntErrorKind::NegOverflow }) } else { Ok((0u128 - v) as i128) }
+            } else if v > i128::MAX as u128 { Err(ParseIntError { kind: IntErrorKind::PosOverflow }) } else { Ok(v as i128) },
+            Err(e) => Err(if neg && e.kind == IntErrorKind::PosOverflow { ParseIntError { kind: IntErrorKind::NegOverflow } } else { e }),
+        }
+    }
+}
+impl FromStr for f64 {
+    type Err = ParseFloatError;
+    fn from_str(s: String) -> Result<f64, ParseFloatError> {
+        match s.parse_f64() { Some(v) => Ok(v), None => Err(ParseFloatError { empty: str_len(s) == 0 }) }
+    }
+}
+impl FromStr for f32 {
+    type Err = ParseFloatError;
+    fn from_str(s: String) -> Result<f32, ParseFloatError> { f64::from_str(s).map(|v| v as f32) }
+}
+impl FromStr for bool {
+    type Err = String;
+    fn from_str(s: String) -> Result<bool, String> {
+        if s == "true" { Ok(true) } else if s == "false" { Ok(false) } else { Err("provided string was not `true` or `false`") }
+    }
+}
+impl FromStr for char {
+    type Err = String;
+    fn from_str(s: String) -> Result<char, String> {
+        let cs = s.char_vec();
+        if cs.len() == 1 { Ok(cs[0]) } else if cs.len() == 0 { Err("cannot parse char from empty string") } else { Err("too many characters in string") }
+    }
+}
+impl FromStr for String {
+    type Err = String;
+    fn from_str(s: String) -> Result<String, String> { Ok(s) }
+}
+
 // ---- 128-bit integers ---------------------------------------------------------
 
 // Decimal digits, 18 at a time so most of the work is in i64.
@@ -454,6 +722,32 @@ impl<T> Vec<T> {
         if n < self.len { self.len = n; }
     }
     fn clear(mut self) { self.len = 0; }
+
+    // Put `x` at index `i`, shifting the rest up.
+    fn insert(mut self, i: i64, x: T) {
+        if i < 0 || i > self.len { panic!("insertion index (is {}) should be <= len (is {})", i, self.len); }
+        self.push(x);
+        let mut j = self.len - 1;
+        while j > i { self.data[j] = self.data[j - 1]; j -= 1; }
+        self.data[i] = x;
+    }
+    // Take out the element at `i`, shifting the rest down.
+    fn remove(mut self, i: i64) -> T {
+        if i < 0 || i >= self.len { panic!("removal index (is {}) should be < len (is {})", i, self.len); }
+        let x = self.data[i];
+        let mut j = i;
+        while j + 1 < self.len { self.data[j] = self.data[j + 1]; j += 1; }
+        self.len = self.len - 1;
+        x
+    }
+    // Take out the element at `i`, moving the last element into its place.
+    fn swap_remove(mut self, i: i64) -> T {
+        if i < 0 || i >= self.len { panic!("swap_remove index (is {}) should be < len (is {})", i, self.len); }
+        let x = self.data[i];
+        self.data[i] = self.data[self.len - 1];
+        self.len = self.len - 1;
+        x
+    }
 
     fn swap(mut self, i: i64, j: i64) {
         let tmp = self[i];
@@ -899,7 +1193,7 @@ impl String {
 
     // ASCII-only case mapping; other characters are unchanged.
     fn to_uppercase(self) -> String {
-        let mut cs = self.chars();
+        let mut cs = self.char_vec();
         let mut i = 0;
         while i < cs.len() {
             let c = cs[i];
@@ -909,7 +1203,7 @@ impl String {
         String::from_chars(cs)
     }
     fn to_lowercase(self) -> String {
-        let mut cs = self.chars();
+        let mut cs = self.char_vec();
         let mut i = 0;
         while i < cs.len() {
             let c = cs[i];
@@ -919,9 +1213,12 @@ impl String {
         String::from_chars(cs)
     }
 
+    // The chars, front to back, decoded as they are taken (as in Rust).
+    fn chars(self) -> Chars { Chars { s: self, i: 0, end: str_len(self) } }
+
     // Decode the UTF-8 bytes into Unicode code points. Assumes well-formed
     // UTF-8 (true of literals, concatenations, and checked file reads).
-    fn chars(self) -> Vec<char> {
+    fn char_vec(self) -> Vec<char> {
         let n = str_len(self);
         let mut out: Vec<char> = Vec::new();
         let mut i = 0;
@@ -1557,7 +1854,7 @@ fn fmt_escape(s: String, quote: char) -> String {
 impl String {
     // The first `n` chars (`{:.N}` on a string).
     fn fmt_truncate(self, n: i64) -> String {
-        let cs = self.chars();
+        let cs = self.char_vec();
         if cs.len() <= n { self } else { String::from_chars(cs[..n]) }
     }
 }

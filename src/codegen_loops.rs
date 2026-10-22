@@ -101,6 +101,7 @@ fn children(e: &CoreExpr) -> Vec<&CoreExpr> {
         | PrintStr(v)
         | PrintStrRaw(v)
         | StrLen(v)
+        | StrEqLit(v, _)
         | StrToFloat(v)
         | StrHash(v)
         | TypeIdOf(v)

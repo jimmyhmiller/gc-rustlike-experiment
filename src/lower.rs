@@ -226,7 +226,7 @@ fn wrap_entry(ctx: &mut TyCtx) -> LResult<()> {
     // The wrapper reports at the user's body; it needs its own span (a
     // function's span is its instantiation identity).
     let at = main_f.body.span;
-    let mut tokens = crate::lexer::lex_with_source(&source, at.source).expect("entry wrapper lexes");
+    let mut tokens = crate::lexer::lex_synthetic(&source, at.source).expect("entry wrapper lexes");
     for t in &mut tokens { t.span = at; }
     let module = crate::parser::parse_module(&tokens).expect("entry wrapper parses");
     let Some(ItemKind::Fn(wrapper)) = module.items.into_iter().next().map(|i| i.kind) else { unreachable!() };
@@ -509,7 +509,12 @@ thread_local! {
     /// A method call's type arguments, held while its receiver is lowered,
     /// then handed to `method_call_operands`.
     static METHOD_TURBOFISH: std::cell::RefCell<Option<Vec<Ty>>> = const { std::cell::RefCell::new(None) };
+    /// The module of the function being lowered (`a::b` for `a::b::f`).
+    static CURRENT_MODULE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The type expected of the method call being lowered.
+    static METHOD_EXPECTED: std::cell::RefCell<Option<Ty>> = const { std::cell::RefCell::new(None) };
     static OPERAND_TURBOFISH: std::cell::RefCell<Option<Vec<Ty>>> = const { std::cell::RefCell::new(None) };
+    static OPERAND_EXPECTED: std::cell::RefCell<Option<Ty>> = const { std::cell::RefCell::new(None) };
 }
 
 /// `(inner, marker, type args)` for an expression the parser tagged with
@@ -771,6 +776,24 @@ fn placeholder_template(t: &Ty, ids: &mut HashMap<String, u32>, next: &mut u32) 
 }
 
 fn lower_fn<'a>(
+    job: &Job,
+    ctx: &'a TyCtx,
+    reg: &mut LayoutRegistry<'a>,
+    mono: &mut Mono,
+    count: &mut u32,
+) -> LResult<CoreFn> {
+    let f = &job.f;
+    // Bare function names resolve first in this function's own module.
+    let module = ctx.fns.iter().find(|(_, d)| Rc::ptr_eq(d, f))
+        .and_then(|(k, _)| k.rsplit_once("::").map(|(m, _)| m.to_string()))
+        .unwrap_or_default();
+    let outer_module = CURRENT_MODULE.with(|m| std::mem::replace(&mut *m.borrow_mut(), module));
+    let result = lower_fn_body(job, ctx, reg, mono, count);
+    CURRENT_MODULE.with(|m| *m.borrow_mut() = outer_module);
+    result
+}
+
+fn lower_fn_body<'a>(
     job: &Job,
     ctx: &'a TyCtx,
     reg: &mut LayoutRegistry<'a>,
@@ -2141,8 +2164,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     self.expr(&lit, expected)
                 } else if let Some((cname, def)) = self.const_def(path) {
                     self.const_value(&cname, &def, expected, e.span)
-                } else if self.ctx.fns.contains_key(name) {
-                    self.function_value(path, expected, e.span)
+                } else if let Some(fq) = self.resolve_fn_path(path) {
+                    let path = Path { segments: fq.split("::").map(str::to_string).collect(), span: path.span };
+                    self.function_value(&path, expected, e.span)
                 } else if self.ctx.variants.contains_key(name) {
                     // An unqualified unit variant brought into scope (`None`).
                     self.variant_ctor(path, &[], expected, e.span)
@@ -2232,7 +2256,18 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             ExprKind::If { cond, then_branch, else_branch } => {
                 let (cc, ct) = self.expr(cond, Some(&Ty::bool()))?;
                 self.check_assignable(&ct, &Ty::bool(), cond.span)?;
-                let (tb, tt) = self.block_expected(then_branch, expected)?;
+                // `if c { None } else { Some(x) }`: when the then branch
+                // leaves type parameters open, the else branch's type settles them.
+                let (tb, tt) = match self.block_expected(then_branch, expected) {
+                    Err(error) if expected.is_none() && else_branch.is_some() && error.msg.contains("cannot infer") => {
+                        let other = self.probe_expr_type(else_branch.as_ref().unwrap(), None).ok().filter(|t| !has_var(t) && !is_never(t));
+                        match other {
+                            Some(t) => self.block_expected(then_branch, Some(&t))?,
+                            None => return Err(error),
+                        }
+                    }
+                    result => result?,
+                };
                 // The else branch is checked against the then branch's type (or
                 // the outer expectation if the then branch was itself inferred).
                 let else_exp = expected.or_else(|| if is_never(&tt) { None } else { Some(&tt) });
@@ -2686,7 +2721,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
             ExprKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, expected, e.span),
 
-            ExprKind::Try(inner) => self.try_op(inner, e.span),
+            ExprKind::Try(inner) => self.try_op(inner, expected, e.span),
 
             // `x.into()`: `From::from(x)` into the expected type.
             ExprKind::MethodCall { recv, method, args, span } if method == "into" && args.is_empty()
@@ -2700,6 +2735,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.collect_call(recv, expected, *span)
             }
             ExprKind::MethodCall { recv, method, args, span } => {
+                METHOD_EXPECTED.with(|t| *t.borrow_mut() = expected.cloned());
                 self.method_call(recv, method, args, *span)
             }
 
@@ -3339,7 +3375,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             if arm.guard.is_some() {
                 return err("match guards not yet supported in v0", arm.span);
             }
-            let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
+            let want = expected.cloned().or_else(|| result_ty.clone().filter(|ty| !is_never(ty)));
+            let (body, bty) = self.arm_body(arm, arms, &sty, want.as_ref())?;
             match &result_ty {
                 Some(rt) if !is_never(rt) => self.check_assignable(&bty, rt, arm.span)?,
                 _ => result_ty = Some(bty),
@@ -3445,6 +3482,27 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// string scrutinees, literal patterns, bare-binding catch-alls, and guards
     /// — anything the fast enum tag-switch can't. Built entirely from existing
     /// core primitives (`Let`, `If`, `Bin(Eq)`, `StrEq`), so no codegen changes.
+    /// Lower an arm's body. When it leaves type parameters open
+    /// (`Some(None)`) and nothing is expected yet, a later arm's type is.
+    fn arm_body(&mut self, arm: &MatchArm, arms: &[MatchArm], sty: &Ty, want: Option<&Ty>) -> LResult<(CoreExpr, Ty)> {
+        match self.expr(&arm.body, want) {
+            Err(error) if want.is_none() && error.msg.contains("cannot infer") => {
+                let index = arms.iter().position(|a| std::ptr::eq(a, arm)).unwrap_or(arms.len());
+                for later in arms.iter().skip(index + 1) {
+                    self.push_scope();
+                    self.bind_probe_pattern(&later.pattern, sty);
+                    let found = self.probe_expr_type(&later.body, None);
+                    self.pop_scope();
+                    if let Some(t) = found.ok().filter(|t| !has_var(t) && !is_never(t)) {
+                        return self.expr(&arm.body, Some(&t));
+                    }
+                }
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
     fn match_chain(
         &mut self,
         cscrut: CoreExpr,
@@ -3485,7 +3543,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     None => guarded,
                 });
             }
-            let (body, bty) = self.expr(&arm.body, expected.or_else(|| result_ty.as_ref().filter(|ty| !is_never(ty))))?;
+            let want = expected.cloned().or_else(|| result_ty.clone().filter(|ty| !is_never(ty)));
+            let (body, bty) = self.arm_body(arm, arms, &sty, want.as_ref())?;
             match &result_ty {
                 Some(rt) if !is_never(rt) => self.check_assignable(&bty, rt, arm.span)?,
                 _ => result_ty = Some(bty),
@@ -3969,9 +4028,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let lid = match self.repr_of(&Ty::Prim(Prim::Str), span)? { Repr::Ref(l) => l, _ => return err("internal: String repr", span) };
                 // This ConstStr is a real varlen heap alloc at codegen — span it so
                 // string-literal match patterns get file:line:col like every other.
-                let sid = self.mono.intern_span(span);
-                let k = CoreExpr::new(CoreExprKind::ConstStr(s.clone()), Repr::Ref(lid)).at(sid);
-                Ok(CoreExpr::new(CoreExprKind::StrEq(Box::new(scrut.clone()), Box::new(k)), bool_repr))
+                let _ = (lid, span);
+                Ok(CoreExpr::new(CoreExprKind::StrEqLit(Box::new(scrut.clone()), s.clone()), bool_repr))
             }
         }
     }
@@ -4236,6 +4294,28 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let (f, ft) = self.expr(&args[0], Some(&Ty::Prim(Prim::F64)))?;
                 self.check_assignable(&ft, &Ty::Prim(Prim::F64), args[0].span)?;
                 Ok((CoreExpr::new(CoreExprKind::FloatBits(Box::new(f)), Repr::Scalar(ScalarRepr::I64)), Ty::i64()))
+            }
+            "str_copy_bytes" => {
+                if args.len() != 2 { return err("`str_copy_bytes` takes a String and a `u8` array", span); }
+                let s = str_arg(self, &args[0])?;
+                let bytes_ty = Ty::Named { name: "Array".into(), args: vec![Ty::Prim(Prim::U8)] };
+                let (array, at) = self.expr(&args[1], Some(&bytes_ty))?;
+                self.check_assignable(&at, &bytes_ty, args[1].span)?;
+                Ok((CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_str_copy_bytes", args: vec![s, array], ret: Repr::Unit }, Repr::Unit), Ty::unit()))
+            }
+            "str_from_bytes" => {
+                if args.len() != 2 { return err("`str_from_bytes` takes a `u8` array and a length", span); }
+                let bytes_ty = Ty::Named { name: "Array".into(), args: vec![Ty::Prim(Prim::U8)] };
+                let (array, at) = self.expr(&args[0], Some(&bytes_ty))?;
+                self.check_assignable(&at, &bytes_ty, args[0].span)?;
+                let (len, lt) = self.expr(&args[1], Some(&Ty::i64()))?;
+                self.check_assignable(&lt, &Ty::i64(), args[1].span)?;
+                let layout = self.string_layout_id(span)?;
+                let tid = CoreExpr::new(CoreExprKind::ConstInt(layout as u128, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+                Ok((
+                    CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_str_from_bytes", args: vec![tid, array, len], ret: Repr::Ref(layout) }, Repr::Ref(layout)),
+                    str_ty,
+                ))
             }
             "read_file" => {
                 if args.len() != 1 { return err("`read_file` takes 1 argument", span); }
@@ -4793,20 +4873,28 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // The receiver may contain calls of its own: hold this call's type
         // arguments until its operands are lowered.
         let turbofish = METHOD_TURBOFISH.with(|t| t.borrow_mut().take());
-        let result = self.method_call_inner(recv, method, args, span, turbofish);
+        let expected = METHOD_EXPECTED.with(|t| t.borrow_mut().take());
+        let result = self.method_call_inner(recv, method, args, span, turbofish, expected);
         result
     }
 
-    fn method_call_inner(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span, turbofish: Option<Vec<Ty>>) -> LResult<(CoreExpr, Ty)> {
+    fn method_call_inner(&mut self, recv: &Expr, method: &str, args: &[Expr], span: Span, turbofish: Option<Vec<Ty>>, expected: Option<Ty>) -> LResult<(CoreExpr, Ty)> {
 
         self.infer.unresolved = None;
         let (crecv, recv_ty) = match self.expr(recv, None) {
             Ok(v) => v,
             Err(error) => {
                 // A receiver whose type parameters are open (`None.unwrap_or(7)`):
-                // take them from the arguments, then lower it with that type.
+                // take them from the arguments, or from the type this call's
+                // result must have (`let x: f64 = s.parse().unwrap()`), then
+                // lower it with that type.
                 let Some(partial) = self.infer.unresolved.take().filter(|_| error.span == recv.span) else { return Err(error) };
-                let Some(expected) = self.receiver_type_from_args(&partial, method, args)? else { return Err(error) };
+                let from_args = self.receiver_type_from_args(&partial, method, args)?;
+                let from_result = match (&from_args, &expected) {
+                    (None, Some(want)) => self.receiver_type_from_expected(&partial, method, want)?,
+                    _ => None,
+                };
+                let Some(expected) = from_args.or(from_result) else { return Err(error) };
                 self.expr(recv, Some(&expected))?
             }
         };
@@ -4840,6 +4928,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         let entry = self.pick_overload(&recv_ty, entry, args)?;
         OPERAND_TURBOFISH.with(|t| *t.borrow_mut() = turbofish);
+        OPERAND_EXPECTED.with(|t| *t.borrow_mut() = expected);
         self.method_call_lowered(crecv, recv_ty, Some(recv), entry, args, span)
     }
 
@@ -4905,6 +4994,51 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         let receiver = apply_subst(&impl_self, &subst);
         Ok(if has_var(&receiver) { None } else { Some(receiver) })
+    }
+
+    /// The receiver type that makes `method` return `want`: the method's
+    /// declared result, unified with `want`, fills the open parts of the
+    /// receiver's `partial` type.
+    fn receiver_type_from_expected(&mut self, partial: &Ty, method: &str, want: &Ty) -> LResult<Option<Ty>> {
+        let Some(entry) = self.lookup_method(partial, method) else { return Ok(None) };
+        let Some(ret) = entry.method.ret.clone() else { return Ok(None) };
+        let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).map_err(conv)?;
+        let mut scope_params = entry.impl_generics.clone();
+        scope_params.extend(entry.method.generics.params.iter().map(|p| p.name.clone()));
+        scope_params.push("Self".to_string());
+        let mut method_binders: HashMap<String, Ty> = entry.method.generics.params.iter().enumerate()
+            .map(|(index, parameter)| (parameter.name.clone(), Ty::Var(format!("$receiver_method{index}")))).collect();
+        method_binders.insert("Self".into(), impl_self.clone());
+        let declared = apply_subst(&lower_type(&ret, &scope_params, self.ctx).map_err(conv)?, &method_binders);
+        let mut from_want = HashMap::new();
+        unify_infer(&declared, want, &mut from_want);
+        let known = apply_subst(&impl_self, &from_want);
+        let mut fill = HashMap::new();
+        unify_infer(partial, &known, &mut fill);
+        fill.retain(|_, t| !has_var(t));
+        let receiver = apply_subst(partial, &fill);
+        Ok(if has_var(&receiver) { None } else { Some(receiver) })
+    }
+
+    /// The function a path names: by its full path, a `use` alias, the
+    /// current function's own module, or an unambiguous final segment.
+    fn resolve_fn_path(&self, path: &Path) -> Option<String> {
+        let name = path.last();
+        if !path.is_single() {
+            let qualified = path.segments.join("::");
+            return self.ctx.fns.contains_key(&qualified).then_some(qualified);
+        }
+        if let Some(fq) = self.ctx.use_aliases.get(name).filter(|fq| self.ctx.fns.contains_key(*fq)) {
+            return Some(fq.clone());
+        }
+        let local = CURRENT_MODULE.with(|m| {
+            let m = m.borrow();
+            if m.is_empty() { name.to_string() } else { format!("{m}::{name}") }
+        });
+        if self.ctx.fns.contains_key(&local) { return Some(local); }
+        let mut matches = self.ctx.fns.keys().filter(|k| k.rsplit("::").next() == Some(name));
+        let first = matches.next()?.clone();
+        matches.next().is_none().then_some(first)
     }
 
     /// The impl method `method` for a receiver of type `recv_ty`, if any.
@@ -5089,6 +5223,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // receiver to be rooted in a `mut` binding (see docs/mutability.md).
         if entry.method.self_is_mut {
             match recv {
+                // A temporary (`s.chars().next()`) may be mutated, as in Rust:
+                // nothing else can see it.
+                Some(recv) if Self::path_root_name(recv).is_none() => {}
                 Some(recv) => self.check_mutable_root(recv, "the receiver of a `mut self` method through", span)?,
                 None => return err(format!("cannot call `mut self` method `{}` on a temporary value", method), span),
             }
@@ -5104,6 +5241,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         isubst.insert("Self".to_string(), recv_ty.clone());
 
         let turbofish = OPERAND_TURBOFISH.with(|t| t.borrow_mut().take());
+        let expected = OPERAND_EXPECTED.with(|t| t.borrow_mut().take());
         let m = entry.method.clone();
         if m.is_unsafe {
             self.require_unsafe(&format!("calling `unsafe fn {}`", m.name), span)?;
@@ -5156,6 +5294,26 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         for (declared, actual, arg_span) in &checks {
             self.check_assignable(actual, &apply_subst(declared, &method_subst), *arg_span)?;
+        }
+        // A method binder only the result mentions (`s.parse::<F>()`) comes
+        // from the type the call must have; without one, record the open
+        // result so an enclosing call can supply it.
+        if mgparams.iter().any(|g| !method_subst.contains_key(g)) {
+            if let Some(ret) = &m.ret {
+                let declared = lower_type(ret, &scope_params, self.ctx).map_err(conv)?;
+                let declared = self.entry_projections(declared, &entry, &scope_params)?;
+                let declared = apply_subst(&apply_subst(&declared, &signature_subst), &method_subst);
+                if let Some(want) = &expected {
+                    let mut found = HashMap::new();
+                    unify_infer(&declared, want, &mut found);
+                    for g in &mgparams {
+                        if let Some(t) = found.get(g).filter(|t| !has_var(t)) { method_subst.entry(g.clone()).or_insert_with(|| t.clone()); }
+                    }
+                }
+                if mgparams.iter().any(|g| !method_subst.contains_key(g)) && has_var(&declared) {
+                    self.infer.unresolved = Some(declared);
+                }
+            }
         }
         self.check_generic_bounds(&entry.impl_constraints, &entry.impl_generics, &isubst, method, span)?;
         let mut subst = isubst;
@@ -5316,8 +5474,29 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// The `?` operator. `inner` evaluates to a `Result<T,E>` or `Option<T>`;
     /// `Ok(v)`/`Some(v)` yields `v`, `Err(e)`/`None` early-returns the value
     /// re-wrapped in the enclosing function's return type.
-    fn try_op(&mut self, inner: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
-        let (cinner, ity) = self.expr(inner, None)?;
+    fn try_op(&mut self, inner: &Expr, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
+        // `s.parse().map_err(..)?` where an `i64` is wanted: the call must
+        // give `Result<i64, _>` (or `Option<i64>`), which can settle the
+        // method's open type parameters.
+        let hint = match (expected, &*inner.kind, &self.ret_ty) {
+            (Some(want), ExprKind::MethodCall { method, .. }, Ty::Named { name, .. })
+                if !has_var(want) && !is_never(want) && method != "collect" && method != "into" =>
+            {
+                match name.rsplit("::").next() {
+                    Some("Result") => Some(Ty::Named { name: name.clone(), args: vec![want.clone(), Ty::Var("$try_error".into())] }),
+                    Some("Option") => Some(Ty::Named { name: name.clone(), args: vec![want.clone()] }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let (cinner, ity) = match (hint, &*inner.kind) {
+            (Some(hint), ExprKind::MethodCall { recv, method, args, span: call_span }) => {
+                METHOD_EXPECTED.with(|t| *t.borrow_mut() = Some(hint));
+                self.method_call(recv, method, args, *call_span)?
+            }
+            _ => self.expr(inner, None)?,
+        };
         let Ty::Named { name, args } = &ity else {
             return err("`?` operand must be a Result or Option", span);
         };
@@ -5476,6 +5655,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let (cl, lt) = self.expr(l, numeric)?;
             (cl, lt, None)
         };
+        // `s == "lit"`: compare against the literal's bytes, allocating nothing.
+        if lt == Ty::Prim(Prim::Str) && matches!(op, Eq | Ne) {
+            if let ExprKind::Str(lit) = &*r.kind {
+                let eq = CoreExpr::new(CoreExprKind::StrEqLit(Box::new(cl), lit.clone()), Repr::Scalar(ScalarRepr::Bool));
+                let result = if op == Ne { CoreExpr::new(CoreExprKind::Un(UnOp::Not, Box::new(eq)), Repr::Scalar(ScalarRepr::Bool)) } else { eq };
+                return Ok((result, Ty::bool()));
+            }
+        }
         if !matches!(cl.repr, Repr::Scalar(_)) && !matches!(op, And | Or) {
             return self.overloaded_binary(op, cl, lt, l, r, span);
         }
@@ -5974,7 +6161,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 return err("host_io operation must be a literal integer", span);
             };
             let op = u32::try_from(*op).map_err(|_| LowerError { msg: "invalid host operation".into(), span })?;
-            if op > crate::runtime::io::STDERR_RAW { return err("unknown host operation", span); }
+            if op > crate::runtime::io::EXIT { return err("unknown host operation", span); }
             let str_ty = Ty::Prim(Prim::Str);
             let array_ty = Ty::Named { name: "Array".into(), args: vec![str_ty.clone()] };
             let response_ty = Ty::Named { name: "IoResponse".into(), args: vec![] };
@@ -6006,7 +6193,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             match name {
                 "print_str" | "print" | "str_len" | "str_eq" | "str_concat"
                 | "str_get" | "str_substring" | "to_string" | "str_to_float" | "str_hash"
-                | "read_file" | "float_bits" | "char_to_str" | "fmt_f64" => {
+                | "read_file" | "float_bits" | "char_to_str" | "fmt_f64" | "str_from_bytes" | "str_copy_bytes" => {
                     return self.str_intrinsic(name, args, span);
                 }
                 "type_id_of" | "type_name_of" | "field_count" | "field_name" | "field_kind"
@@ -6344,19 +6531,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Resolution order: a `use` alias for this name wins (it disambiguates
         // same-named items across modules); otherwise fall back to the unique
         // last-segment match.
-        let fq = if !path.is_single() {
-            let qualified = path.segments.join("::");
-            self.ctx.fns.contains_key(&qualified).then_some(qualified)
-        } else {
-            self.ctx.use_aliases.get(name)
-                .filter(|fq| self.ctx.fns.contains_key(*fq))
-                .cloned()
-                .or_else(|| {
-                    let mut matches = self.ctx.fns.keys().filter(|k| k.rsplit("::").next() == Some(name));
-                    let first = matches.next()?.clone();
-                    matches.next().is_none().then_some(first)
-                })
-        };
+        let fq = self.resolve_fn_path(path);
         let Some(fq) = fq else {
             let names: Vec<&str> = self.ctx.fns.keys().map(|k| k.rsplit("::").next().unwrap()).collect();
             let hint = closest(name, names.into_iter())

@@ -893,13 +893,32 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     /// Select the non-safepointing scoped path while concurrent copying is active.
-    fn managed_access_blocks(&self, fcx: &FnCtx<'ctx>) -> (inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>) {
+    /// Read the heap's copying phase. A plain load: copying can only start
+    /// in a pause, so an idle phase stays idle until the next safepoint. A
+    /// stale "active" only takes the slow path, correct in either phase.
+    fn load_copy_phase(&self, fcx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
         let address = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::COPYING_PHASE as u64);
         let flag = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), address, "copy.phase.ptr").unwrap().into_pointer_value();
         let phase = self.builder.build_load(self.ctx.i8_type(), flag, "copy.phase").unwrap();
-        let instruction = phase.as_instruction_value().unwrap();
-        instruction.set_alignment(1).unwrap();
-        instruction.set_atomic_ordering(AtomicOrdering::Monotonic).unwrap();
+        phase.as_instruction_value().unwrap().set_alignment(1).unwrap();
+        phase
+    }
+
+    /// After a call that may safepoint, the copying phase may have changed.
+    fn refresh_copy_phase(&self, fcx: &FnCtx<'ctx>) {
+        if let Some(slot) = fcx.phase {
+            if self.builder.get_insert_block().is_some_and(|b| b.get_terminator().is_none()) {
+                let current = self.load_copy_phase(fcx);
+                self.builder.build_store(slot, current).unwrap();
+            }
+        }
+    }
+
+    fn managed_access_blocks(&self, fcx: &FnCtx<'ctx>) -> (inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>) {
+        let phase = match fcx.phase {
+            Some(slot) => self.builder.build_load(self.ctx.i8_type(), slot, "copy.phase.cached").unwrap(),
+            None => self.load_copy_phase(fcx),
+        };
         let active = self.builder.build_int_compare(IntPredicate::NE, phase.into_int_value(), self.ctx.i8_type().const_zero(), "copy.active").unwrap();
         let idle = self.ctx.append_basic_block(fcx.func, "access.idle");
         let copying = self.ctx.append_basic_block(fcx.func, "access.copying");
@@ -1638,8 +1657,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             unlink,
             pending_copy_outs: Vec::new(),
             pending_ffi_buffers: Vec::new(),
+            phase: None,
             subprogram,
         };
+        let phase = self.entry_alloca(self.ctx.i8_type().as_basic_type_enum(), "copy.phase.local");
+        let current = self.load_copy_phase(&fcx);
+        self.builder.build_store(phase, current).unwrap();
+        fcx.phase = Some(phase);
         if entry_roots_only { self.emit_entry_only_poll(&mut fcx); }
         else if self.bounded_loops.entry_poll(id as usize) { self.emit_safepoint_poll(&fcx); }
         let val = self.gen_block(&mut fcx, &f.body)?;
@@ -1806,6 +1830,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.prepare_root_reload(fcx)
         } else { None };
         let call = self.builder.build_call(callee, args, name)?;
+        if !no_relocation { self.refresh_copy_phase(fcx); }
         if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active); }
         else if has_roots && symbol == "ai_ffi_leave" { self.reload_active_root_mirrors(fcx); }
         Ok(call)
@@ -2025,6 +2050,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let f = self.module.get_function("ai_str_len").unwrap();
                 let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), sv.into()], "strlen").unwrap());
                 Ok(Some(r))
+            }
+            CoreExprKind::StrEqLit(a, lit) => {
+                let av = self.gen_expr(fcx, a)?.unwrap().into_pointer_value();
+                let bytes = self.ctx.const_string(lit.as_bytes(), false);
+                let global = self.module.add_global(bytes.get_type(), None, "str.lit");
+                global.set_initializer(&bytes);
+                global.set_constant(true);
+                global.set_linkage(inkwell::module::Linkage::Private);
+                global.set_unnamed_addr(true);
+                let len = self.ctx.i64_type().const_int(lit.len() as u64, false);
+                let f = self.module.get_function("ai_str_eq_bytes").unwrap();
+                let r = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), av.into(), global.as_pointer_value().into(), len.into()], "streqlit").unwrap());
+                let b1 = self.builder.build_int_truncate(r.into_int_value(), self.ctx.bool_type(), "streqlitb").unwrap();
+                Ok(Some(b1.into()))
             }
             CoreExprKind::StrEq(a, b) => {
                 let av = self.gen_expr(fcx, a)?.unwrap().into_pointer_value();
@@ -2954,6 +2993,24 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // ptr ai_reflect_field_name(ptr thread, i64 str_type_id, ptr obj, i64 i)
         self.module.add_function(
             "ai_reflect_field_name",
+            ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        // void ai_str_copy_bytes(ptr thread, ptr s, ptr array)
+        self.module.add_function(
+            "ai_str_copy_bytes",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        // i64 ai_str_eq_bytes(ptr thread, ptr s, ptr bytes, i64 len)
+        self.module.add_function(
+            "ai_str_eq_bytes",
+            i64t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        // ptr ai_str_from_bytes(ptr thread, i64 str_type_id, ptr array, i64 len)
+        self.module.add_function(
+            "ai_str_from_bytes",
             ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
             Some(inkwell::module::Linkage::External),
         );
@@ -4026,6 +4083,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         };
         let before = self.prepare_root_reload(fcx);
         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
+        self.refresh_copy_phase(fcx);
         if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active); }
         Ok(match cs.try_as_basic_value() {
             inkwell::values::ValueKind::Basic(v) => Some(v),
@@ -5002,6 +5060,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
         let poll = self.module.get_function("ai_gc_pollcheck_slow").unwrap();
         self.builder.build_call(poll, &[fcx.thread.into()], "").unwrap();
+        self.refresh_copy_phase(fcx);
         self.reload_root_mirrors(fcx);
         self.emit_unlink(fcx);
         self.builder.build_unconditional_branch(ready).unwrap();
@@ -5160,6 +5219,10 @@ struct FnCtx<'ctx> {
     pending_copy_outs: Vec<(CoreExpr, PointerValue<'ctx>, IntValue<'ctx>, u32)>,
     /// Opaque native ownership tokens for enclosing foreign calls, including nested arguments.
     pending_ffi_buffers: Vec<PointerValue<'ctx>>,
+    /// The copying phase as of the last safepoint, in a local. Copying can
+    /// only start in a pause, so it is refreshed after each call that may
+    /// safepoint; between them, one test settles every managed access.
+    phase: Option<PointerValue<'ctx>>,
     /// This function's DWARF `DISubprogram` scope (debugger P2) — `Some` only when
     /// emitting debug info. Debug locations for the function's nodes use it as
     /// their scope (one function = one source, so scope/file stay consistent).
@@ -5469,6 +5532,9 @@ fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::
         ("ai_str_from_int", runtime::ai_str_from_int as *const () as usize),
         ("ai_str_from_float", runtime::ai_str_from_float as *const () as usize),
         ("ai_fmt_f64", runtime::ai_fmt_f64 as *const () as usize),
+        ("ai_str_from_bytes", runtime::ai_str_from_bytes as *const () as usize),
+        ("ai_str_copy_bytes", runtime::ai_str_copy_bytes as *const () as usize),
+        ("ai_str_eq_bytes", runtime::ai_str_eq_bytes as *const () as usize),
         ("ai_char_to_str", runtime::ai_char_to_str as *const () as usize),
         ("ai_type_name", runtime::ai_type_name as *const () as usize),
         ("ai_heap_snapshot", runtime::ai_heap_snapshot as *const () as usize),

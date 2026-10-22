@@ -35,7 +35,7 @@ fn substrings_validate_utf8_and_clamp_before_ordering_bounds() {
         fn main() -> i64 {
             let s = "é🦀";
             if s[0..2] != "é" || s[2..6] != "🦀" { return 1; }
-            if s.chars().len() != 2 { return 2; }
+            if s.chars().count() != 2 { return 2; }
             if str_substring(s, 9223372036854775807, 0) != "" { return 3; }
             if str_substring(s, -9223372036854775808, 6) != s { return 4; }
             if str_substring("abc", 2, 1) != "" { return 5; }

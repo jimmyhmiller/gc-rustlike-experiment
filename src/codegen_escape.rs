@@ -374,7 +374,7 @@ impl<'p> Analysis<'p> {
             // Everything else is conservative. Keep the match exhaustive so a
             // future IR operation must explicitly state its escape behavior.
             ConstStr(_) => self.unknown(result),
-            PrintStr(v) | PrintStrRaw(v) | StrLen(v) | StrToFloat(v) | StrHash(v) | TypeIdOf(v)
+            PrintStr(v) | PrintStrRaw(v) | StrLen(v) | StrEqLit(v, _) | StrToFloat(v) | StrHash(v) | TypeIdOf(v)
             | PtrReadI64(v) | Panic(v) | ThreadSpawn(v) | ThreadJoin(v) | ThreadSleep(v)
             | EnumTag(v) => self.unknown_use(id, result, [v.as_ref()]),
             StrEq(a, b) | StrGet(a, b) => self.unknown_use(id, result, [a.as_ref(), b.as_ref()]),

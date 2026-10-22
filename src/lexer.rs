@@ -149,6 +149,11 @@ pub fn source_position(span: Span) -> (u32, u32) {
 }
 
 /// The path of the file a source came from, if any.
+/// The text lexed as `source`, if any.
+pub fn source_text(source: SourceId) -> Option<std::rc::Rc<str>> {
+    SOURCES.with(|s| s.borrow().get(&source).map(|e| e.0.clone()))
+}
+
 pub fn source_path(source: SourceId) -> Option<std::path::PathBuf> {
     SOURCES.with(|s| s.borrow().get(&source).and_then(|e| e.1.clone()))
 }
@@ -158,6 +163,13 @@ pub fn source_path(source: SourceId) -> Option<std::path::PathBuf> {
 /// spaces) so their spans resolve against the right text. `lex` is `source = 0`.
 pub fn lex_with_source(src: &str, source: SourceId) -> Result<Vec<Token>, LexError> {
     SOURCES.with(|s| { s.borrow_mut().insert(source, (std::rc::Rc::from(src), None)); });
+    lex_synthetic(src, source)
+}
+
+/// Lex compiler-generated text (a derive, the entry wrapper) whose tokens
+/// report at `source`'s spans. Unlike [`lex_with_source`], `source`'s
+/// registered text is left alone.
+pub fn lex_synthetic(src: &str, source: SourceId) -> Result<Vec<Token>, LexError> {
     let mut toks = Lexer::new(src).run().map_err(|mut error| {
         error.span.source = source;
         error
@@ -439,6 +451,11 @@ impl<'a> Lexer<'a> {
             let c = self.bump();
             match c {
                 b'"' => break,
+                // `\` at the end of a line continues the string: the newline
+                // and the next line's leading whitespace are skipped.
+                b'\\' if matches!(self.peek(), b'\n' | b'\r') => {
+                    while matches!(self.peek(), b' ' | b'\t' | b'\n' | b'\r') { self.pos += 1; }
+                }
                 b'\\' => s.push(self.lex_escape(start)?),
                 _ => {
                     // Reconstruct the UTF-8 char from the source slice.

@@ -1,0 +1,52 @@
+// Comparison driver for the funct port (not part of funct itself).
+//   lex <file>                 print each token with {:?}
+//   lexbench <file> <iters>    lex the file `iters` times; print ns per pass
+//   parse <file>               print the program with {:#?}
+//   parsebench <file> <iters>  lex + parse the file `iters` times
+mod ast;
+mod lexer;
+mod parser;
+
+use lexer::lex;
+use parser::parse;
+
+extern "C" fn clock_gettime_nsec_np(clock: i32) -> u64;
+const CLOCK_UPTIME_RAW: i32 = 8;
+
+fn now_ns() -> u64 { unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) } }
+
+fn main() {
+    let args: Vec<String> = std::env::args();
+    if args.len() < 3 {
+        eprintln!("usage: funct-port (lex|lexbench|parse|parsebench) <file> [iters]");
+        std::process::exit(2);
+    }
+    let src = std::fs::read_to_string(args[2]).expect("read source");
+    match args[1].as_str() {
+        "lex" => match lex(src) {
+            Ok(toks) => { for t in toks { println!("{:?}", t); } }
+            Err(e) => println!("error: {}", e),
+        },
+        "lexbench" => {
+            let iters: i64 = args[3].parse().unwrap();
+            let mut count = 0;
+            let start = now_ns();
+            for _ in 0..iters { count += lex(src).unwrap().len(); }
+            let elapsed = now_ns() - start;
+            println!("tokens={} ns_per_pass={}", count / iters, elapsed / iters as u64);
+        }
+        "parse" => match parse(src) {
+            Ok(program) => println!("{:#?}", program),
+            Err(e) => println!("error: {}", e),
+        },
+        "parsebench" => {
+            let iters: i64 = args[3].parse().unwrap();
+            let mut count = 0;
+            let start = now_ns();
+            for _ in 0..iters { count += parse(src).unwrap().items.len(); }
+            let elapsed = now_ns() - start;
+            println!("items={} ns_per_pass={}", count / iters, elapsed / iters as u64);
+        }
+        other => println!("unknown mode {}", other),
+    }
+}

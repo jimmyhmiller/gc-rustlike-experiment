@@ -194,7 +194,8 @@ fn std_path(mut segments: Vec<String>) -> Vec<String> {
     const MODULES: &[&str] = &[
         "collections", "fmt", "cmp", "ops", "string", "vec", "iter", "hash", "convert", "sync",
         "thread", "mem", "result", "option", "boxed", "rc", "default", "marker", "clone", "prelude",
-        "v1", "rust_2021", "rust_2024", "hash_map", "borrow",
+        "v1", "rust_2021", "rust_2024", "hash_map", "borrow", "env", "fs", "io", "process", "str",
+        "num", "char", "future", "time", "primitive",
     ];
     if segments.len() > 1 && matches!(segments[0].as_str(), "std" | "core" | "alloc") {
         segments.remove(0);
@@ -575,7 +576,7 @@ impl Parser {
                 // method keeps a distinct source identity.
                 let at = derives.iter().find(|(n, _)| n == trait_name || (trait_name == "Eq" && n == "PartialEq"))
                     .map(|(_, s)| *s).unwrap_or(derives[0].1);
-                let mut tokens = crate::lexer::lex_with_source(&source, at.source)
+                let mut tokens = crate::lexer::lex_synthetic(&source, at.source)
                     .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
                 for t in &mut tokens { t.span = at; }
                 let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default(), param_lets: Vec::new() };
@@ -3012,9 +3013,15 @@ impl Parser {
             }
             TokKind::Int(n, sfx) => { self.bump(); ex(ExprKind::Int(n, sfx), start) }
             TokKind::Char(c) => { self.bump(); ex(ExprKind::Char(c), start) }
-            // A constant path ending a range: `0..=i64::MAX`.
+            // A constant path ending a range: `0..=i64::MAX`. A variant or
+            // struct pattern (`E::V(..)`, `E::V { .. }`) is not a literal.
             TokKind::Ident(_) if matches!(self.peek_at(1), TokKind::ColonColon) => {
+                let save = self.pos;
                 let path = self.path()?;
+                if matches!(self.peek(), TokKind::LParen | TokKind::LBrace) {
+                    self.pos = save;
+                    return Ok(None);
+                }
                 ex(ExprKind::Path(path), start.to(self.prev_span()))
             }
             _ => return Ok(None),
@@ -3161,8 +3168,9 @@ impl Parser {
                         TokKind::Str(t) => { self.bump(); Elem::Eq(Expr { kind: std::sync::Arc::new(ExprKind::Str(t)), span: estart }) }
                         TokKind::Keyword(Kw::True) => { self.bump(); Elem::Eq(Expr { kind: std::sync::Arc::new(ExprKind::Bool(true)), span: estart }) }
                         TokKind::Keyword(Kw::False) => { self.bump(); Elem::Eq(Expr { kind: std::sync::Arc::new(ExprKind::Bool(false)), span: estart }) }
-                        // A destructuring element (`(x, y)`, `P { x, .. }`)
-                        // binds through a `let`, so it must be irrefutable.
+                        // A destructuring element (`(x, y)`, `Some(x)`): its
+                        // test is a guard and its names bind through a
+                        // let-else (unreachable once the guard held).
                         _ => {
                             let mut alts = self.pattern_alts()?;
                             if alts.len() != 1 || !alts[0].1.is_empty() {
@@ -3196,7 +3204,16 @@ impl Parser {
             match e {
                 Elem::Wild => {}
                 Elem::Bind(n, m) => lets.push(Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: m, name: n }, span }, ty: None, init: Some(at), span }),
-                Elem::Pat(p) => lets.push(Stmt::Let { pattern: p, ty: None, init: Some(at), span }),
+                Elem::Pat(p) => {
+                    let test = ex(ExprKind::Match { scrutinee: at.clone(), arms: vec![
+                        MatchArm { pattern: p.clone(), guard: None, body: ex(ExprKind::Bool(true)), span },
+                        MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Bool(false)), span },
+                    ] });
+                    guards.push(test);
+                    let unreachable = ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".into(), span))), vec![ex(ExprKind::Str("unreachable slice element".into()))]));
+                    let otherwise = Block { stmts: vec![Stmt::Expr(unreachable)], tail: None, span };
+                    lets.push(self.let_else(vec![(p, Vec::new())], None, at, otherwise, span));
+                }
                 Elem::Eq(v) => guards.push(ex(ExprKind::Binary(BinOp::Eq, at, v))),
                 Elem::Range(lo, hi, inclusive) => guards.push(ex(ExprKind::Binary(BinOp::And,
                     ex(ExprKind::Binary(BinOp::Ge, at.clone(), lo)),
@@ -3277,12 +3294,15 @@ impl Parser {
                     let mut rest = false;
                     while !self.at(&TokKind::RBrace) {
                         if self.eat(&TokKind::DotDot) { rest = true; break; }
+                        // Shorthand may be `mut x`, `ref x`, or `ref mut x`.
+                        if matches!(self.peek(), TokKind::Ident(r) if r == "ref") && matches!(self.peek_at(1), TokKind::Ident(_) | TokKind::Keyword(Kw::Mut)) { self.bump(); }
+                        let is_mut = self.eat_kw(Kw::Mut);
                         let fname = self.ident()?;
-                        let fpat = if self.eat(&TokKind::Colon) {
+                        let fpat = if !is_mut && self.eat(&TokKind::Colon) {
                             self.pattern_alts()?
                         } else {
                             vec![(Pattern {
-                                kind: PatternKind::Binding { is_mut: false, name: fname.clone() },
+                                kind: PatternKind::Binding { is_mut, name: fname.clone() },
                                 span: self.prev_span(),
                             }, Vec::new())]
                         };
