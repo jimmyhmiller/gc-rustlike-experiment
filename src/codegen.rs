@@ -1019,7 +1019,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(idle);
         let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
         self.managed_store_idle(addr, value, repr, owner)?;
-        if traced { self.emit_write_barrier(fcx, object, value); }
+        if traced { self.emit_write_barrier(fcx, object, addr, value); }
         self.builder.build_unconditional_branch(merge).unwrap();
         self.builder.position_at_end(copying);
         if traced {
@@ -1388,7 +1388,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let crossing = (requires_roots && !full_debug)
             .then(|| {
                 let foreign: Vec<bool> = self.prog.funcs.iter().map(|g| g.is_extern).collect();
-                crate::codegen_liveness::safepoint_crossing(f, &self.nonrelocating, &self.bounded_loops, &foreign)
+                let traced = |r: &Repr| match r {
+                    Repr::Ref(_) => true,
+                    Repr::Value(v) => value_has_ref(&self.prog.values, *v),
+                    _ => false,
+                };
+                crate::codegen_liveness::safepoint_crossing(f, traced, &self.nonrelocating, &self.bounded_loops, &foreign)
             });
         let rooted = |i: usize, r: &Repr| requires_roots && matches!(r, Repr::Ref(_))
             && (!entry_roots_only || i < incoming)
@@ -1414,6 +1419,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             .iter()
             .enumerate()
             .filter(|_| requires_roots)
+            // As for references: only values live across a safepoint.
+            .filter(|(i, _)| *i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(*i as LocalId))))
             .filter_map(|(i, r)| match r {
                 Repr::Value(vid) if value_has_ref(&self.prog.values, *vid) => {
                     let mut offs = Vec::new();
@@ -2520,6 +2527,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 phi.add_incoming(&[(&some, some_bb), (&none, none_bb)]);
                 Ok(Some(phi.as_basic_value()))
             }
+            CoreExprKind::RuntimeCall { func: "ai_str_from_utf8_prefix", args, .. } => self.gen_str_from_utf8_prefix(fcx, args, e.span),
             CoreExprKind::RuntimeCall { func, args, ret } => {
                 let f = self.module.get_function(func)
                     .ok_or_else(|| CodegenError(format!("unknown runtime extern `{}`", func)))?;
@@ -2674,8 +2682,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         this.builder.build_store(this.obj_addr(target, off), v).unwrap();
                         let ptrty = this.ctx.ptr_type(AddressSpace::default());
                         for p in &interior {
-                            let refv = this.builder.build_load(ptrty, this.obj_addr(target, *p), "iref").unwrap();
-                            this.emit_write_barrier(fcx, target, refv);
+                            let slot = this.obj_addr(target, *p);
+                            let refv = this.builder.build_load(ptrty, slot, "iref").unwrap();
+                            this.emit_write_barrier(fcx, target, slot, refv);
                         }
                         Ok(())
                     };
@@ -3469,6 +3478,86 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
+    /// `str_from_utf8_prefix(array, len)` (see the runtime function). A short
+    /// all-ASCII prefix, read while no copy is in progress, becomes a String
+    /// in the thread-local buffer inline; anything else calls the runtime.
+    fn gen_str_from_utf8_prefix(&mut self, fcx: &mut FnCtx<'ctx>, args: &[CoreExpr], span: crate::core::SpanId) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        const MAX_INLINE: u64 = 64;
+        const DATA: u64 = 24;
+        let i64t = self.ctx.i64_type();
+        let i8t = self.ctx.i8_type();
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let CoreExprKind::ConstInt(layout, _) = args[0].kind.as_ref() else {
+            return Err(CodegenError("str_from_utf8_prefix needs the String layout".into()));
+        };
+        let layout = *layout as u64;
+        let tid = self.gen_expr(fcx, &args[0])?.unwrap();
+        let array = self.gen_expr(fcx, &args[1])?.unwrap().into_pointer_value();
+        let len = self.gen_expr(fcx, &args[2])?.unwrap().into_int_value();
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
+        // Only while no copy is in progress may the array be read directly.
+        let mode = self.access_mode(fcx);
+        let copying = self.builder.build_and(mode, i8t.const_int(1, false), "str.copying").unwrap();
+        let idle = self.builder.build_int_compare(IntPredicate::EQ, copying, i8t.const_zero(), "str.idle").unwrap();
+        let short = self.builder.build_int_compare(IntPredicate::ULE, len, i64t.const_int(MAX_INLINE, false), "str.short").unwrap();
+        let eligible = self.builder.build_and(idle, short, "str.inline").unwrap();
+        let unrounded = self.builder.build_int_add(len, i64t.const_int(DATA + 7, false), "str.size.raw").unwrap();
+        let size = self.builder.build_and(unrounded, i64t.const_int(!7u64, false), "str.size").unwrap();
+        let tlab = self.tlab_reserve(fcx, size, eligible, site);
+        // Header, count, a zeroed last word (so whole words can be read),
+        // then the bytes.
+        let header_type = self.ctx.struct_type(&[i64t.into(), i64t.into(), i64t.into()], false);
+        let header = header_type.get_undef();
+        let header = self.builder.build_insert_value(header, i64t.const_zero(), 0, "str.header").unwrap();
+        let header = self.builder.build_insert_value(header, i64t.const_int(layout, false), 1, "str.header").unwrap();
+        let header = self.builder.build_insert_value(header, len, 2, "str.header").unwrap();
+        self.builder.build_store(tlab.object, header).unwrap().set_alignment(8).unwrap();
+        let last_word = self.builder.build_int_sub(size, i64t.const_int(8, false), "str.last").unwrap();
+        let last = unsafe { self.builder.build_gep(i8t, tlab.object, &[last_word], "str.last.word").unwrap() };
+        self.builder.build_store(last, i64t.const_zero()).unwrap().set_alignment(8).unwrap();
+        let data = self.obj_addr(tlab.object, DATA);
+        let source = self.obj_addr(array, DATA);
+        self.builder.build_memcpy(data, 8, source, 8, len).unwrap();
+        // All ASCII? Or together the words.
+        let check = self.ctx.append_basic_block(fcx.func, "str.ascii");
+        let checked = self.ctx.append_basic_block(fcx.func, "str.checked");
+        let entry = self.builder.get_insert_block().unwrap();
+        let any = self.builder.build_int_compare(IntPredicate::NE, len, i64t.const_zero(), "str.nonempty").unwrap();
+        self.builder.build_conditional_branch(any, check, checked).unwrap();
+        self.builder.position_at_end(check);
+        let offset = self.builder.build_phi(i64t, "str.offset").unwrap();
+        let acc = self.builder.build_phi(i64t, "str.bits").unwrap();
+        let word = self.builder.build_load(i64t, unsafe { self.builder.build_gep(i8t, data, &[offset.as_basic_value().into_int_value()], "str.word.at").unwrap() }, "str.word").unwrap();
+        word.as_instruction_value().unwrap().set_alignment(8).unwrap();
+        let bits = self.builder.build_or(acc.as_basic_value().into_int_value(), word.into_int_value(), "str.bits.next").unwrap();
+        let next = self.builder.build_int_add(offset.as_basic_value().into_int_value(), i64t.const_int(8, false), "str.offset.next").unwrap();
+        let more = self.builder.build_int_compare(IntPredicate::ULT, next, len, "str.more").unwrap();
+        offset.add_incoming(&[(&i64t.const_zero(), entry), (&next, check)]);
+        acc.add_incoming(&[(&i64t.const_zero(), entry), (&bits, check)]);
+        self.builder.build_conditional_branch(more, check, checked).unwrap();
+        self.builder.position_at_end(checked);
+        let all_bits = self.builder.build_phi(i64t, "str.bits.all").unwrap();
+        all_bits.add_incoming(&[(&i64t.const_zero(), entry), (&bits, check)]);
+        let high = self.builder.build_and(all_bits.as_basic_value().into_int_value(), i64t.const_int(0x8080_8080_8080_8080, false), "str.high").unwrap();
+        let ascii = self.builder.build_int_compare(IntPredicate::EQ, high, i64t.const_zero(), "str.ascii.all").unwrap();
+        let publish = self.ctx.append_basic_block(fcx.func, "str.publish");
+        // Not ASCII: leave the space unreserved and ask the runtime.
+        self.builder.build_conditional_branch(ascii, publish, tlab.slow).unwrap();
+        self.builder.position_at_end(publish);
+        self.tlab_publish(&tlab, site);
+        let fast_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(tlab.merge).unwrap();
+        self.builder.position_at_end(tlab.slow);
+        let f = self.module.get_function("ai_str_from_utf8_prefix").unwrap();
+        let slow = call_result(self.build_managed_call(fcx, f, &[fcx.thread.into(), tid.into(), array.into(), len.into()], "str.slow").unwrap()).into_pointer_value();
+        let slow_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(tlab.merge).unwrap();
+        self.builder.position_at_end(tlab.merge);
+        let result = self.builder.build_phi(ptr, "str.prefix").unwrap();
+        result.add_incoming(&[(&tlab.object, fast_end), (&slow, slow_end)]);
+        Ok(Some(result.as_basic_value()))
+    }
+
     fn enum_tag_offset(&self, layout: LayoutId) -> u64 {
         match &self.prog.layouts[layout as usize].meta.kind {
             crate::gc::TypeKind::Enum { tag_offset, .. } => *tag_offset as u64,
@@ -3830,7 +3919,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Called unconditionally on every pointer store; the runtime fast-paths the
     /// non-generational / non-old→young cases. Keeps the minor GC's old→young
     /// root set correct — a missed barrier would be a use-after-free.
-    fn emit_write_barrier(&self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, new_val: BasicValueEnum<'ctx>) {
+    fn emit_write_barrier(&self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, slot: PointerValue<'ctx>, new_val: BasicValueEnum<'ctx>) {
         if !new_val.is_pointer_value() {
             return; // only pointer stores can create an old→young edge
         }
@@ -3856,9 +3945,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let done = self.ctx.append_basic_block(fcx.func, "barrier.done");
         self.build_unlikely_branch(needed, slow, done);
         self.builder.position_at_end(slow);
+        // The runtime marks the card holding the slot.
         let f = self.module.get_function("ai_gc_write_barrier").unwrap();
         self.builder
-            .build_call(f, &[fcx.thread.into(), obj.into(), new_val.into()], "")
+            .build_call(f, &[fcx.thread.into(), slot.into(), new_val.into()], "")
             .unwrap();
         self.builder.build_unconditional_branch(done).unwrap();
         self.builder.position_at_end(done);
@@ -4317,7 +4407,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             for p in &refs {
                 let slot = unsafe { this.builder.build_gep(this.ctx.i8_type(), at, &[this.ctx.i64_type().const_int(*p as u64, false)], "record.ref").unwrap() };
                 let refv = this.builder.build_load(ptrty, slot, "record.iref").unwrap();
-                this.emit_write_barrier(fcx, target, refv);
+                this.emit_write_barrier(fcx, target, slot, refv);
             }
             Ok(())
         };

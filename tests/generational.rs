@@ -125,3 +125,26 @@ fn correct_under_generational_collection() {
         assert_eq!(result, want, "{} gave wrong result", ex);
     }
 }
+
+#[test]
+fn large_tenured_arrays_scan_only_dirty_cards_yet_keep_young_referents() {
+    // A large array is scanned at minor collections only in its dirty cards
+    // (unless its header's card is dirty). Young Strings stored into the
+    // middle of tenured reference and record arrays must survive repeated
+    // minor collections, with heap verification on.
+    for fixture in ["tests/fixtures/card_precise_refs.gcr", "tests/fixtures/card_precise_records.gcr"] {
+        for nursery in ["1", "2"] {
+            let out = Command::new(gcr_bin())
+                .args(["run", fixture])
+                .env("GCR_NURSERY_MB", nursery)
+                .env("GCR_GC_VERIFY", "1")
+                .env("GCR_GC_STATS", "1")
+                .output()
+                .expect("run gcr");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stdout.contains("bad=0 churn=true"), "{fixture} nursery {nursery}: {stdout}\n{stderr}");
+            assert!(stderr.contains("minor"), "{fixture}: expected collections: {stderr}");
+        }
+    }
+}

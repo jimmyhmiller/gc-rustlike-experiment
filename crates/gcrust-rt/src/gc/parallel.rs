@@ -85,6 +85,33 @@ fn worker_policy() -> WorkerPolicy {
     }
 }
 
+/// Visit the reference slots of varlen array `obj` (no fixed reference
+/// fields) whose addresses lie in `[lo, hi)`.
+///
+/// # Safety
+/// `obj` is a live object described by `info`, quiescent for the call.
+unsafe fn reference_slots_in(obj: *mut u8, info: &TypeInfo, lo: usize, hi: usize, visit: &mut impl FnMut(*mut u64)) {
+    let raw = unsafe { core::ptr::read(obj.add(info.varlen_count_offset()) as *const u64) } as usize;
+    let base = obj as usize + info.varlen_count_offset() + 8;
+    if info.varlen == VarLenKind::Values {
+        let first = lo.saturating_sub(base).div_ceil(8);
+        let last = (hi.saturating_sub(base).div_ceil(8)).min(raw);
+        for i in first..last { visit((base + i * 8) as *mut u64); }
+        return;
+    }
+    let stride = info.record_stride as usize;
+    if stride == 0 { return; }
+    let records = raw / stride;
+    let first = lo.saturating_sub(base) / stride;
+    let last = (hi.saturating_sub(base).div_ceil(stride)).min(records);
+    for i in first..last {
+        for &off in info.record_ptrs.iter() {
+            let slot = base + i * stride + off as usize;
+            if slot >= lo && slot < hi { visit(slot as *mut u64); }
+        }
+    }
+}
+
 fn traced_bytes(info: &TypeInfo, varlen_len: usize) -> usize {
     (info.value_field_count as usize)
         .saturating_add(info.interior_ptrs.len())
@@ -513,10 +540,15 @@ impl Heap {
     pub(super) unsafe fn scan_minor_remembered_roots(&self, visit: &mut dyn FnMut(*mut u64)) {
         let (objects, _) = unsafe { self.minor_remembered_work::<false>() };
         for task in objects {
-            let Work::Object(address) = task else { unreachable!() };
-            let object = address as *mut u8;
-            let info = self.type_info_by_id(unsafe { read_type_id(object, self.type_id_offset) });
-            unsafe { scan_object(object, info, &mut *visit); }
+            match task {
+                Work::Object(address) => {
+                    let object = address as *mut u8;
+                    let info = self.type_info_by_id(unsafe { read_type_id(object, self.type_id_offset) });
+                    unsafe { scan_object(object, info, &mut *visit); }
+                }
+                Work::Slot(slot) => visit(slot as *mut u64),
+                Work::Channel(_) => unreachable!(),
+            }
         }
     }
 
@@ -543,6 +575,10 @@ impl Heap {
             starts.update(space, &ranges, &self.type_table, table.card_size());
         }
         let mut objects = hashbrown::HashSet::with_hasher_in(std::hash::RandomState::new(), self.native_memory.registry_allocator());
+        // A large reference array is scanned only where its cards are dirty,
+        // unless the card holding its header is (whole-object markers dirty
+        // that card): (object, dirty card start) pairs, decided below.
+        let mut large: allocator_api2::vec::Vec<(usize, usize), _> = allocator_api2::vec::Vec::new_in(self.native_memory.registry_allocator());
         let mut scan_bytes = 0usize;
         for (card, addr) in dirty {
             let Some(start) = starts.get(card) else {
@@ -567,8 +603,12 @@ impl Heap {
                     _ => unsafe { read_varlen_count(obj, info) },
                 };
                 let size = info.allocation_size(len);
-                if obj as usize + size > addr as usize && objects.insert(obj as usize) {
-                    if COUNT_SCAN {
+                let precise = size > 4 * table.card_size() && info.value_field_count == 0 && info.interior_ptrs.is_empty()
+                    && (info.varlen == VarLenKind::Values || !info.record_ptrs.is_empty());
+                if obj as usize + size > addr as usize {
+                    if precise && (obj as usize) < addr as usize {
+                        large.push((obj as usize, addr as usize));
+                    } else if objects.insert(obj as usize) && COUNT_SCAN {
                         scan_bytes = scan_bytes.saturating_add(traced_bytes(info, len));
                     }
                 }
@@ -577,7 +617,15 @@ impl Heap {
             }
         }
         drop(starts);
-        (RememberedWork::from_objects(objects), scan_bytes)
+        let mut slots = allocator_api2::vec::Vec::new_in(self.native_memory.registry_allocator());
+        for (obj, card) in large {
+            if objects.contains(&obj) { continue; }
+            let object = obj as *mut u8;
+            let info = self.type_info_by_id(unsafe { read_type_id(object, self.type_id_offset) });
+            unsafe { reference_slots_in(object, info, card, card + table.card_size(), &mut |slot| slots.push(slot as usize)); }
+        }
+        if COUNT_SCAN { scan_bytes = scan_bytes.saturating_add(slots.len() * std::mem::size_of::<u64>()); }
+        (RememberedWork::from_objects(objects).with_slots(slots), scan_bytes)
     }
     unsafe fn parallel_evacuate<P: PtrPolicy>(
         &self,

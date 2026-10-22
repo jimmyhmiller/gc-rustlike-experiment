@@ -1,0 +1,16 @@
+fn main() -> i64 {
+    let n = 20000;
+    let mut v: Vec<String> = Vec::new();
+    for i in 0..n { v.push(i.to_string()); }
+    let mut churn = 0;
+    for round in 0..40 {
+        // Young strings into the middle of an old array.
+        for j in 0..2000 { let k = (j * 7919 + round * 13) % n; v[k] = k.to_string(); }
+        // Garbage to force minor collections.
+        for g in 0..20000 { let s = (g + round).to_string(); churn += s.len(); }
+    }
+    let mut bad = 0;
+    for k in 0..n { if v[k] != k.to_string() { bad += 1; } }
+    println!("bad={} churn={}", bad, churn > 0);
+    bad
+}

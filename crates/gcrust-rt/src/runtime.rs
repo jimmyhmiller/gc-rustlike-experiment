@@ -2511,18 +2511,21 @@ pub unsafe extern "C" fn ai_atom_ref_cas(
 }
 
 /// Generational write barrier. Compiled code calls this AFTER storing the
-/// pointer `new_val` into a field of object `obj`. If `obj` lives in tenured
-/// space and `new_val` points into the nursery, the card covering `obj` is
-/// marked dirty so the next minor GC treats `obj` as a root (finding the
-/// old→young pointer without scanning all of tenured space).
+/// pointer `new_val` into `slot`, a field or element of a tenured object
+/// (compiled code filters out young objects). If `new_val` points into the
+/// nursery, the card covering `slot` is marked dirty so the next minor GC
+/// visits the old→young pointer without scanning all of tenured space. A
+/// large array is scanned only in its dirty cards, so the card is the slot's,
+/// not the object's.
 ///
 /// Fast path: for a non-generational heap (no nursery) this is a single load +
 /// branch and returns immediately. Null/non-nursery writes also return cheaply.
 ///
 /// # Safety
-/// `thread` valid; `obj` a valid heap object; `new_val` a heap pointer or null.
+/// `thread` valid; `slot` inside a valid heap object; `new_val` a heap pointer
+/// or null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ai_gc_write_barrier(thread: *mut Thread, obj: *mut u8, new_val: *mut u8) {
+pub unsafe extern "C" fn ai_gc_write_barrier(thread: *mut Thread, slot: *mut u8, new_val: *mut u8) {
     unsafe {
         let heap = &*(*thread).heap;
         // Cheapest possible bail-out for the common (non-generational) case.
@@ -2530,7 +2533,7 @@ pub unsafe extern "C" fn ai_gc_write_barrier(thread: *mut Thread, obj: *mut u8, 
             return;
         }
         if !new_val.is_null() && heap.is_nursery(new_val) {
-            heap.mark_card_dirty(obj);
+            heap.mark_card_dirty(slot);
         }
     }
 }

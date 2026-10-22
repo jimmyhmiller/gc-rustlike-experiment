@@ -2356,6 +2356,12 @@ impl Heap {
         &self.multi_mutator
     }
 
+    /// Has only one mutator ever registered? Then no other thread can race
+    /// on an object (the collector only runs while it is stopped).
+    pub(crate) fn single_mutator(&self) -> bool {
+        self.multi_mutator.load(Ordering::Acquire) == 0
+    }
+
     /// The nursery's (base address, size); (0, 0) without a nursery. Fixed
     /// for the heap's lifetime.
     pub(crate) fn nursery_range(&self) -> (usize, usize) {

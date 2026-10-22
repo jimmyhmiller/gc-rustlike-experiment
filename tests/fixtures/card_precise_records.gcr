@@ -1,0 +1,15 @@
+struct Pair { s: String, n: i64 }
+fn main() -> i64 {
+    let n = 20000;
+    let mut v: Vec<Pair> = Vec::new();
+    for i in 0..n { v.push(Pair { s: i.to_string(), n: i }); }
+    let mut churn = 0;
+    for round in 0..40 {
+        for j in 0..2000 { let k = (j * 7919 + round * 13) % n; v[k] = Pair { s: k.to_string(), n: k }; }
+        for g in 0..20000 { let s = (g + round).to_string(); churn += s.len(); }
+    }
+    let mut bad = 0;
+    for k in 0..n { let p = v[k]; if p.s != k.to_string() || p.n != k { bad += 1; } }
+    println!("bad={} churn={}", bad, churn > 0);
+    bad
+}

@@ -49,10 +49,12 @@ pub unsafe extern "C" fn ai_array_copy(
         let backwards = src == dst && dst_pos > src_pos;
         let has_refs = info.varlen == VarLenKind::Values || !info.record_ptrs.is_empty();
         if !heap.barriers_active() {
-            if has_refs {
+            if has_refs && !heap.single_mutator() {
+                // Another mutator may be storing references: whole words.
                 copy_units(src.add(src_off), dst.add(dst_off), count * stride, stride, backwards);
             } else {
-                // Aligned scalar elements; memmove does not split them.
+                // No racing thread, or aligned scalar elements memmove does
+                // not split.
                 core::ptr::copy(src.add(src_off), dst.add(dst_off), count * stride);
             }
             mark_cards(heap, info, dst, dst_off, count, stride);

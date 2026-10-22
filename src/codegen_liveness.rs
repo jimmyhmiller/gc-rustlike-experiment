@@ -43,17 +43,18 @@ pub(crate) fn dead_after(function: &CoreFn, tracked: &Live) -> HashMap<usize, Li
     dead
 }
 
-/// The reference locals of `function` live across a safepoint: only these
-/// need traced root slots. Elsewhere no collection can run while the local
+/// The reference locals of `function` (`traced`: references, and values
+/// holding references) live across a safepoint: only these need traced root
+/// slots. Elsewhere no collection can run while the local
 /// holds a value, so it is never moved or reclaimed under it. Operands of a
 /// safepointing operation other than a direct call count as live across it
 /// (an allocation stores them after collecting); a callee roots its own
 /// arguments.
-pub(crate) fn safepoint_crossing(function: &CoreFn, nonrelocating: &[bool], loops: &crate::codegen_loops::BoundedLoops, foreign: &[bool]) -> Live {
+pub(crate) fn safepoint_crossing(function: &CoreFn, traced: impl Fn(&Repr) -> bool, nonrelocating: &[bool], loops: &crate::codegen_loops::BoundedLoops, foreign: &[bool]) -> Live {
     let mut dead = HashMap::new();
     let mut analysis = Analysis {
         dead: &mut dead, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, definitions: Live::new(),
-        all: function.locals.iter().enumerate().filter_map(|(id, repr)| matches!(repr, Repr::Ref(_)).then_some(id as LocalId)).collect(),
+        all: function.locals.iter().enumerate().filter_map(|(id, repr)| traced(repr).then_some(id as LocalId)).collect(),
         crossing: Some(Crossing { nonrelocating, loops, foreign, in_foreign: 0, set: Live::new() }),
     };
     analysis.block(&function.body, Live::new());

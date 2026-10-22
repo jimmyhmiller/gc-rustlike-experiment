@@ -3,9 +3,12 @@ use super::Work;
 use crate::runtime::metadata_allocator::MetadataAllocator;
 use std::{hash::RandomState, iter::FusedIterator};
 
+/// Remembered work: whole objects to scan, then single slots (the slots of
+/// a large array that lie in its dirty cards).
 #[derive(Default)]
 pub(super) struct RememberedWork<'a> {
     objects: Option<hashbrown::hash_set::IntoIter<usize, &'a MetadataAllocator>>,
+    slots: Option<allocator_api2::vec::IntoIter<usize, &'a MetadataAllocator>>,
 }
 impl<'a> RememberedWork<'a> {
     pub(super) fn from_objects(
@@ -13,16 +16,26 @@ impl<'a> RememberedWork<'a> {
     ) -> Self {
         Self {
             objects: Some(objects.into_iter()),
+            slots: None,
         }
+    }
+
+    pub(super) fn with_slots(mut self, slots: allocator_api2::vec::Vec<usize, &'a MetadataAllocator>) -> Self {
+        if !slots.is_empty() { self.slots = Some(slots.into_iter()); }
+        self
     }
 }
 impl Iterator for RememberedWork<'_> {
     type Item = Work;
     fn next(&mut self) -> Option<Work> {
-        self.objects.as_mut()?.next().map(Work::Object)
+        if let Some(object) = self.objects.as_mut().and_then(Iterator::next) {
+            return Some(Work::Object(object));
+        }
+        self.slots.as_mut()?.next().map(Work::Slot)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.objects.as_ref().map_or(0, ExactSizeIterator::len);
+        let len = self.objects.as_ref().map_or(0, ExactSizeIterator::len)
+            + self.slots.as_ref().map_or(0, ExactSizeIterator::len);
         (len, Some(len))
     }
 }
