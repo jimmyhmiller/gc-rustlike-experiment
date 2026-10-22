@@ -853,7 +853,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
-    /// Load one mutable managed slot in the language's SC order. Bool has
+    /// Load one mutable managed slot. Shared slots use LLVM `unordered`
+    /// atomics: Java plain-field semantics (no tearing, no ordering; DRF-SC
+    /// through the synchronizing operations). Bool has
     /// byte storage even though its SSA representation is i1.
     fn managed_load_idle(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let storage = if *repr == Repr::Scalar(ScalarRepr::Bool) {
@@ -869,7 +871,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
         let private = self.private_heap.contains(owner);
         self.set_heap_alias_metadata(instruction, owner)?;
-        if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
+        if !private { instruction.set_atomic_ordering(AtomicOrdering::Unordered).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.builder.build_int_truncate(value.into_int_value(), self.ctx.bool_type(), "managed.bool").unwrap().into()
         } else { value })
@@ -888,7 +890,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
         let private = self.private_heap.contains(owner);
         self.set_heap_alias_metadata(instruction, owner)?;
-        if !private { instruction.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent).map_err(|e| CodegenError(e.to_string()))?; }
+        if !private { instruction.set_atomic_ordering(AtomicOrdering::Unordered).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(())
     }
 
@@ -896,12 +898,42 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Read the heap's copying phase. A plain load: copying can only start
     /// in a pause, so an idle phase stays idle until the next safepoint. A
     /// stale "active" only takes the slow path, correct in either phase.
+    ///
+    /// The result packs two bits: 1 while copying, 2 once more than one
+    /// mutator exists. Inline aggregates are accessed directly only when
+    /// both are clear (no collector copy and no thread to race with).
     fn load_copy_phase(&self, fcx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
+        let i8t = self.ctx.i8_type();
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
         let address = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::COPYING_PHASE as u64);
-        let flag = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), address, "copy.phase.ptr").unwrap().into_pointer_value();
-        let phase = self.builder.build_load(self.ctx.i8_type(), flag, "copy.phase").unwrap();
+        let flag = self.builder.build_load(ptr, address, "copy.phase.ptr").unwrap().into_pointer_value();
+        let phase = self.builder.build_load(i8t, flag, "copy.phase").unwrap();
         phase.as_instruction_value().unwrap().set_alignment(1).unwrap();
-        phase
+        let address = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::MULTI_MUTATOR as u64);
+        let flag = self.builder.build_load(ptr, address, "multi.mutator.ptr").unwrap().into_pointer_value();
+        let multi = self.builder.build_load(i8t, flag, "multi.mutator").unwrap();
+        multi.as_instruction_value().unwrap().set_alignment(1).unwrap();
+        let copying = self.builder.build_int_compare(IntPredicate::NE, phase.into_int_value(), i8t.const_zero(), "copying").unwrap();
+        let shared = self.builder.build_int_compare(IntPredicate::NE, multi.into_int_value(), i8t.const_zero(), "shared").unwrap();
+        let copying = self.builder.build_int_z_extend(copying, i8t, "copying.bit").unwrap();
+        let shared = self.builder.build_int_z_extend(shared, i8t, "shared.bit").unwrap();
+        let shared = self.builder.build_left_shift(shared, i8t.const_int(1, false), "shared.bit2").unwrap();
+        self.builder.build_or(copying, shared, "access.mode").unwrap().into()
+    }
+
+    /// The cached access mode (see `load_copy_phase`).
+    fn access_mode(&self, fcx: &FnCtx<'ctx>) -> IntValue<'ctx> {
+        match fcx.phase {
+            Some(slot) => self.builder.build_load(self.ctx.i8_type(), slot, "access.mode.cached").unwrap().into_int_value(),
+            None => self.load_copy_phase(fcx).into_int_value(),
+        }
+    }
+
+    /// May inline aggregates be read and written directly (no copy in
+    /// progress and no other mutator)?
+    fn aggregate_direct(&self, fcx: &FnCtx<'ctx>) -> IntValue<'ctx> {
+        let mode = self.access_mode(fcx);
+        self.builder.build_int_compare(IntPredicate::EQ, mode, self.ctx.i8_type().const_zero(), "aggregate.direct").unwrap()
     }
 
     /// After a call that may safepoint, the copying phase may have changed.
@@ -915,11 +947,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     fn managed_access_blocks(&self, fcx: &FnCtx<'ctx>) -> (inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>) {
-        let phase = match fcx.phase {
-            Some(slot) => self.builder.build_load(self.ctx.i8_type(), slot, "copy.phase.cached").unwrap(),
-            None => self.load_copy_phase(fcx),
-        };
-        let active = self.builder.build_int_compare(IntPredicate::NE, phase.into_int_value(), self.ctx.i8_type().const_zero(), "copy.active").unwrap();
+        let mode = self.access_mode(fcx);
+        let phase = self.builder.build_and(mode, self.ctx.i8_type().const_int(1, false), "copy.phase.bit").unwrap();
+        let active = self.builder.build_int_compare(IntPredicate::NE, phase, self.ctx.i8_type().const_zero(), "copy.active").unwrap();
         let idle = self.ctx.append_basic_block(fcx.func, "access.idle");
         let copying = self.ctx.append_basic_block(fcx.func, "access.copying");
         let merge = self.ctx.append_basic_block(fcx.func, "access.merge");
@@ -1384,10 +1414,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // null. Register the frame for the first reference assignment, before
         // any subsequent safepoint. Leaf-return paths can then optimize away
         // frame traffic. Other functions retain entry registration.
-        let defer_frame = num_roots > 0 && num_indirect == 0
+        //
+        // Otherwise (incoming references, value locals holding references),
+        // the frame is still deferred: until it is linked the references live
+        // only in their working slots, and linking copies them into the traced
+        // mirrors. It is linked before every call that may safepoint, so a
+        // path that makes no such call never touches it.
+        let defer_frame = (num_roots > 0 && num_indirect == 0
             && (entry_roots_only || (f.closure_captures.is_empty()
             && f.params.iter().all(|repr| !self.repr_relocates(repr))))
+            || (!entry_roots_only && (num_roots > 0 || num_indirect > 0)))
             && !self.debug.as_ref().is_some_and(|debug| debug.full);
+        let late_roots = defer_frame && !entry_roots_only;
         let frame_active = if defer_frame {
             let active = self.builder.build_alloca(self.ctx.bool_type(), "roots.active").unwrap();
             self.builder.build_store(active, self.ctx.bool_type().const_zero()).unwrap();
@@ -1435,7 +1473,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             // Zero all indirect slots (filled with alloca-interior addresses below).
             let ind_field = self.builder.build_struct_gep(frame_ty, frame, 3, "ind.f").unwrap();
-            for k in 0..num_indirect {
+            for k in 0..if late_roots { 0 } else { num_indirect } {
                 let slot = unsafe {
                     self.builder.build_in_bounds_gep(
                         ind_arr, ind_field,
@@ -1486,6 +1524,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // address of each interior ref into an indirect slot. The alloca is stable
         // on the stack, so these addresses are set once and the GC updates the
         // refs they point at in place.
+        let mut late_indirect: Vec<(PointerValue<'ctx>, PointerValue<'ctx>)> = Vec::new();
         if let Some((_, _, _, _, ind_arr, ind_field, _)) = frame {
             let mut j = 0u32;
             for (local_idx, offs) in &value_indirect {
@@ -1502,7 +1541,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                             "islot",
                         ).unwrap()
                     };
-                    self.builder.build_store(slot, addr).unwrap();
+                    // A late frame records these addresses when it is linked.
+                    if late_roots { late_indirect.push((slot, addr)); }
+                    else { self.builder.build_store(slot, addr).unwrap(); }
                     j += 1;
                 }
             }
@@ -1525,7 +1566,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     let addr = self.obj_addr(env, cap.offset);
                     let v = self.builder.build_load(lty, addr, "cap").unwrap();
                     self.builder.build_store(slot, v).unwrap();
-                    if !entry_roots_only { if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); } }
+                    if !entry_roots_only && !late_roots { if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); } }
                 }
             }
         }
@@ -1536,7 +1577,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if let Some(slot) = slots[local] {
                     let arg = func.get_nth_param(llvm_idx).unwrap();
                     self.builder.build_store(slot, arg).unwrap();
-                    if !entry_roots_only { if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); } }
+                    if !entry_roots_only && !late_roots { if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); } }
                 }
                 llvm_idx += 1;
             }
@@ -1658,6 +1699,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             pending_copy_outs: Vec::new(),
             pending_ffi_buffers: Vec::new(),
             phase: None,
+            late_roots,
+            late_indirect,
             subprogram,
         };
         let phase = self.entry_alloca(self.ctx.i8_type().as_basic_type_enum(), "copy.phase.local");
@@ -1824,6 +1867,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             "ai_bounds_fail" | "ai_uninitialized_array_fail" | "ai_arithmetic_fail" | "ai_panic"
         ) };
         let has_roots = fcx.root_slots.iter().any(Option::is_some);
+        if fcx.late_roots && !no_relocation { self.ensure_root_frame_linked(fcx); }
         // ffi_leave begins BLOCKED, after native callbacks may already have
         // moved roots. Reload unconditionally after it returns RUNNING.
         let before = if has_roots && !no_relocation && symbol != "ai_ffi_leave" {
@@ -1847,9 +1891,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.build_store(origin_field, fcx.deferred_frame_origin.unwrap()).unwrap();
             let roots = frame_ty.get_field_type_at_index(2).unwrap().into_array_type();
             let roots_field = self.builder.build_struct_gep(frame_ty, frame, 2, "roots.f").unwrap();
-            for index in 0..roots.len() {
-                let slot = unsafe { self.builder.build_in_bounds_gep(roots, roots_field, &[self.ctx.i32_type().const_zero(), self.ctx.i32_type().const_int(index as u64, false)], "root.init").unwrap() };
-                self.builder.build_store(slot, self.ctx.ptr_type(AddressSpace::default()).const_null()).unwrap();
+            if fcx.late_roots {
+                // No safepoint has run yet: the working slots are current.
+                let ptr = self.ctx.ptr_type(AddressSpace::default());
+                for (working, mirror) in fcx.slots.iter().zip(&fcx.root_slots) {
+                    if let (Some(working), Some(mirror)) = (working, mirror) {
+                        let value = self.builder.build_load(ptr, *working, "root.current").unwrap();
+                        self.builder.build_store(*mirror, value).unwrap();
+                    }
+                }
+                for (slot, addr) in &fcx.late_indirect {
+                    self.builder.build_store(*slot, *addr).unwrap();
+                }
+            } else {
+                for index in 0..roots.len() {
+                    let slot = unsafe { self.builder.build_in_bounds_gep(roots, roots_field, &[self.ctx.i32_type().const_zero(), self.ctx.i32_type().const_int(index as u64, false)], "root.init").unwrap() };
+                    self.builder.build_store(slot, self.ctx.ptr_type(AddressSpace::default()).const_null()).unwrap();
+                }
             }
             let parent_field = self.builder.build_struct_gep(frame_ty, frame, 0, "parent.f").unwrap();
             let parent = self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), tf_ptr, "prevtop").unwrap();
@@ -1909,6 +1967,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         for local in dead {
             if let Some(root) = fcx.root_slots[*local as usize] {
                 self.builder.build_store(root, ptr.const_null()).unwrap();
+                // A late frame copies working slots when it is linked.
+                if fcx.late_roots {
+                    if let Some(working) = fcx.slots[*local as usize] { self.builder.build_store(working, ptr.const_null()).unwrap(); }
+                }
             }
         }
         // Indirect value roots retain their original lifetime for now. Clearing
@@ -2537,7 +2599,34 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         return Err(CodegenError("value-struct field is immutable".into()));
                     }
                 };
-                let completed = if let FieldLoc::ValueAt { value: vid, .. } = loc {
+                if let FieldLoc::ValueAt { value: vid, .. } = loc {
+                    // The references a stored aggregate embeds: each may be an
+                    // old→young edge, so each is barriered after the store.
+                    let lid = match &base.repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("setfield on non-ref".into())) };
+                    let vsize = self.prog.values[*vid as usize].size as u64;
+                    let interior: Vec<u64> = self.prog.layouts[lid as usize].interior_ptrs.iter()
+                        .map(|&p| p as u64).filter(|&p| p >= off && p < off + vsize).collect();
+                    let store_and_barrier = |this: &mut Self, fcx: &mut FnCtx<'ctx>, target: PointerValue<'ctx>| -> Result<(), CodegenError> {
+                        let v = this.gen_expr(fcx, value)?.unwrap();
+                        this.builder.build_store(this.obj_addr(target, off), v).unwrap();
+                        let ptrty = this.ctx.ptr_type(AddressSpace::default());
+                        for p in &interior {
+                            let refv = this.builder.build_load(ptrty, this.obj_addr(target, *p), "iref").unwrap();
+                            this.emit_write_barrier(fcx, target, refv);
+                        }
+                        Ok(())
+                    };
+                    // Direct when nothing can race the store; otherwise the
+                    // runtime's tear-free write, or a locked store if contended.
+                    let direct = self.aggregate_direct(fcx);
+                    let fast = self.ctx.append_basic_block(fcx.func, "aggregate.write.direct");
+                    let slow = self.ctx.append_basic_block(fcx.func, "aggregate.write.runtime");
+                    let done = self.ctx.append_basic_block(fcx.func, "aggregate.done");
+                    self.builder.build_conditional_branch(direct, fast, slow).unwrap();
+                    self.builder.position_at_end(fast);
+                    store_and_barrier(self, fcx, obj)?;
+                    self.builder.build_unconditional_branch(done).unwrap();
+                    self.builder.position_at_end(slow);
                     // ANF value locals already have stable native storage, with
                     // reference interiors rooted in the caller's frame. The
                     // nonparking attempt only reads it and cannot relocate it.
@@ -2568,67 +2657,24 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     let write = self.module.get_function("ai_managed_try_write").unwrap();
                     let result = call_result(self.build_managed_call(fcx, write, &[
                         fcx.thread.into(), obj.into(), self.ctx.i64_type().const_int(off, false).into(), input.into(),
-                        self.ctx.i64_type().const_int(self.prog.values[*vid as usize].size as u64, false).into(),
+                        self.ctx.i64_type().const_int(vsize, false).into(),
                         offsets.as_pointer_value().into(), self.ctx.i64_type().const_int(reference_count as u64, false).into(),
                     ], "aggregate.stored").unwrap()).into_int_value();
-                    let done = self.ctx.append_basic_block(fcx.func, "aggregate.done");
                     let fallback = self.ctx.append_basic_block(fcx.func, "aggregate.contended");
                     let success = self.builder.build_int_compare(IntPredicate::NE, result, self.ctx.i8_type().const_zero(), "aggregate.success").unwrap();
                     self.builder.build_conditional_branch(success, done, fallback).unwrap();
                     self.builder.position_at_end(fallback);
+                    // A contended acquisition can relocate both base and RHS.
                     obj = self.managed_lock(fcx, obj);
-                    Some(done)
-                } else { None };
-                // A contended acquisition can relocate both base and RHS.
-                let v = self.gen_expr(fcx, value)?.unwrap();
-                let addr = self.obj_addr(obj, off);
-                if aggregate { self.builder.build_store(addr, v).unwrap(); }
-                else { self.managed_store(fcx, obj, self.ctx.i64_type().const_int(off, false), v, &value.repr, matches!(loc, FieldLoc::Ptr { .. }), base)?; }
-                // Generational write barrier. A direct pointer store (FieldLoc::Ptr)
-                // may create an old→young edge. So may a flattened value-with-
-                // references store (FieldLoc::ValueAt): each reference embedded in
-                // the value is its own potential old→young edge. The old code
-                // barriered only Ptr stores, so mutating a value-with-ref field in a
-                // TENURED object left the card unmarked — a minor GC would not
-                // rescan it and could reclaim a still-referenced young object. Mark
-                // for each interior reference of the stored value.
-                match loc {
-                    FieldLoc::Ptr { .. } => {}, // Complete scalar/reference path owns its barriers.
-                    FieldLoc::ValueAt { value, .. } => {
-                        // `lay.interior_ptrs` are absolute object offsets of refs
-                        // embedded in flattened value fields; those within this
-                        // field's byte range [off, off+size) are exactly the refs
-                        // of the value we just stored. Re-load each and barrier it
-                        // (the barrier no-ops unless obj is tenured and the ref is
-                        // young), so the card is marked iff a real old→young edge
-                        // was created.
-                        let lid = match &base.repr {
-                            Repr::Ref(l) => *l,
-                            _ => return Err(CodegenError("setfield on non-ref".into())),
-                        };
-                        let lay = &self.prog.layouts[lid as usize];
-                        let vsize = self.prog.values[*value as usize].size as u64;
-                        let (lo, hi) = (off, off + vsize);
-                        let interior: Vec<u64> = lay
-                            .interior_ptrs
-                            .iter()
-                            .map(|&p| p as u64)
-                            .filter(|&p| p >= lo && p < hi)
-                            .collect();
-                        let ptrty = self.ctx.ptr_type(AddressSpace::default());
-                        for p in interior {
-                            let pa = self.obj_addr(obj, p);
-                            let refv = self.builder.build_load(ptrty, pa, "iref").unwrap();
-                            self.emit_write_barrier(fcx, obj, refv);
-                        }
-                    }
-                    _ => {}
-                }
-                if aggregate { self.managed_unlock(fcx); }
-                if let Some(done) = completed {
+                    store_and_barrier(self, fcx, obj)?;
+                    self.managed_unlock(fcx);
                     self.builder.build_unconditional_branch(done).unwrap();
                     self.builder.position_at_end(done);
+                    return Ok(None);
                 }
+                let _ = aggregate;
+                let v = self.gen_expr(fcx, value)?.unwrap();
+                self.managed_store(fcx, obj, self.ctx.i64_type().const_int(off, false), v, &value.repr, matches!(loc, FieldLoc::Ptr { .. }), base)?;
                 Ok(None)
             }
             CoreExprKind::Match { scrutinee, arms } => {
@@ -3698,6 +3744,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
     /// The byte stride of an array element repr, and whether it's a traced
     /// (pointer/Values) array.
+    fn elem_stride_of(&self, elem: &Repr) -> (u64, bool) {
+        match elem {
+            Repr::Value(vid) => (crate::core::record_shape(&self.prog.values, *vid).0 as u64, false),
+            _ => Self::elem_stride(elem),
+        }
+    }
+
+    /// The LLVM type of one array record of value `vid`: the value, after an
+    /// initialized word when it holds references.
+    fn record_ty(&self, vid: crate::core::ValueId) -> (inkwell::types::BasicTypeEnum<'ctx>, bool) {
+        let value = self.value_struct_ty(vid).as_basic_type_enum();
+        let (_, flagged) = crate::core::record_shape(&self.prog.values, vid);
+        if flagged { (self.ctx.struct_type(&[self.ctx.i64_type().into(), value], false).as_basic_type_enum(), true) }
+        else { (value, false) }
+    }
+
     fn elem_stride(elem: &Repr) -> (u64, bool) {
         match elem {
             Repr::Ref(_) | Repr::Value(_) => (8, true),
@@ -3817,7 +3879,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let i32t = self.ctx.i32_type();
         let i64t = self.ctx.i64_type();
-        let (stride, traced) = Self::elem_stride(elem);
+        let (stride, traced) = self.elem_stride_of(elem);
         let n = self.gen_expr(fcx, len)?.unwrap().into_int_value();
         let n64 = if n.get_type().get_bit_width() < 64 {
             self.builder.build_int_s_extend(n, i64t, "n64").unwrap()
@@ -3872,10 +3934,53 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     fn load_array_element(&mut self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, idx: IntValue<'ctx>, elem: &Repr, array: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        let (stride, _) = Self::elem_stride(elem);
+        let (stride, _) = self.elem_stride_of(elem);
         let offset = self.array_elem_offset(idx, stride);
         let ty = self.llvm_ty(elem).ok_or_else(|| CodegenError("array of unit".into()))?;
-        if matches!(elem, Repr::Value(_) | Repr::Ref(_)) {
+        if let Repr::Value(vid) = elem {
+            // An inline record: read directly when nothing can race it,
+            // otherwise as a tear-free snapshot.
+            let (rty, flagged) = self.record_ty(*vid);
+            let direct = self.aggregate_direct(fcx);
+            let fast = self.ctx.append_basic_block(fcx.func, "record.read.direct");
+            let slow = self.ctx.append_basic_block(fcx.func, "record.read.snapshot");
+            let merge = self.ctx.append_basic_block(fcx.func, "record.read.merge");
+            self.builder.build_conditional_branch(direct, fast, slow).unwrap();
+            self.builder.position_at_end(fast);
+            let at = unsafe { self.builder.build_gep(self.ctx.i8_type(), obj, &[offset], "record.at").unwrap() };
+            let quick = self.builder.build_load(rty, at, "record.direct").unwrap();
+            quick.as_instruction_value().unwrap().set_alignment(8).unwrap();
+            let fast_end = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(merge).unwrap();
+            self.builder.position_at_end(slow);
+            let snapshot = self.entry_alloca(rty, "record.snapshot.storage");
+            let read = self.module.get_function("ai_managed_read").unwrap();
+            self.build_managed_call(fcx, read, &[
+                fcx.thread.into(), obj.into(), offset.into(), snapshot.into(),
+                self.ctx.i64_type().const_int(stride, false).into(),
+            ], "").unwrap();
+            let snap = self.builder.build_load(rty, snapshot, "record.snapshot").unwrap();
+            let slow_end = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(merge).unwrap();
+            self.builder.position_at_end(merge);
+            let phi = self.builder.build_phi(rty, "record").unwrap();
+            phi.add_incoming(&[(&quick, fast_end), (&snap, slow_end)]);
+            let record = phi.as_basic_value();
+            if !flagged { return Ok(record); }
+            let flag = self.builder.build_extract_value(record.into_struct_value(), 0, "record.initialized").unwrap().into_int_value();
+            let empty = self.ctx.append_basic_block(fcx.func, "element.uninitialized");
+            let present = self.ctx.append_basic_block(fcx.func, "element.present");
+            let unset = self.builder.build_int_compare(IntPredicate::EQ, flag, self.ctx.i64_type().const_zero(), "element.unset").unwrap();
+            self.builder.build_conditional_branch(unset, empty, present).unwrap();
+            self.builder.position_at_end(empty);
+            let fail = self.module.get_function("ai_uninitialized_array_fail").unwrap();
+            self.build_managed_call(fcx, fail, &[fcx.thread.into(), idx.into()], "").unwrap();
+            self.builder.build_unreachable().unwrap();
+            self.builder.position_at_end(present);
+            let _ = ty;
+            return Ok(self.builder.build_extract_value(record.into_struct_value(), 1, "element.value").unwrap());
+        }
+        if matches!(elem, Repr::Ref(_)) {
             let pointer = self.managed_load(fcx, obj, offset, &Repr::Scalar(ScalarRepr::Ptr), "element.pointer", array)?.into_pointer_value();
             let empty = self.ctx.append_basic_block(fcx.func, "element.uninitialized");
             let present = self.ctx.append_basic_block(fcx.func, "element.present");
@@ -3997,13 +4102,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         elem: &Repr,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
-        // ANF has evaluated operands in source order. Boxing can collect, so
-        // allocate before reloading the destination from its relocated root.
-        let val = if matches!(elem, Repr::Value(_)) {
-            let lid = match array.repr { Repr::Ref(lid) => lid, _ => return Err(CodegenError("array destination is not a reference".into())) };
-            let boxed = self.prog.layouts[lid as usize].element_box.ok_or_else(|| CodegenError("value array has no element box layout".into()))?;
-            self.gen_alloc(fcx, boxed, None, std::slice::from_ref(value), crate::core::SpanId::default())?.unwrap()
-        } else if matches!(elem, Repr::Unit) {
+        if let Repr::Value(vid) = elem {
+            return self.gen_record_set(fcx, array, idx, value, *vid);
+        }
+        // ANF has evaluated operands in source order.
+        let val = if matches!(elem, Repr::Unit) {
             self.gen_expr(fcx, value)?;
             let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
             let idx64 = self.idx_to_i64(idx);
@@ -4017,10 +4120,91 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.emit_bounds_check(fcx, idx64, len);
         let (stride, _) = Self::elem_stride(elem);
         let offset = self.array_elem_offset(idx64, stride);
-        let stored_repr = if matches!(elem, Repr::Value(_)) {
-            Repr::Scalar(ScalarRepr::Ptr)
-        } else { elem.clone() };
-        self.managed_store(fcx, obj, offset, val, &stored_repr, matches!(elem, Repr::Ref(_) | Repr::Value(_)), array)?;
+        self.managed_store(fcx, obj, offset, val, elem, matches!(elem, Repr::Ref(_)), array)?;
+        Ok(None)
+    }
+
+    /// Store an inline record: directly when nothing can race it, otherwise
+    /// with the runtime's tear-free write (or a locked store if contended).
+    /// Each embedded reference is barriered.
+    fn gen_record_set(
+        &mut self,
+        fcx: &mut FnCtx<'ctx>,
+        array: &CoreExpr,
+        idx: IntValue<'ctx>,
+        value: &CoreExpr,
+        vid: crate::core::ValueId,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        let (stride, _) = self.elem_stride_of(&Repr::Value(vid));
+        let (rty, flagged) = self.record_ty(vid);
+        let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
+        let idx64 = self.idx_to_i64(idx);
+        let len = self.known_array_len(obj, array)?;
+        self.emit_bounds_check(fcx, idx64, len);
+        let offset = self.array_elem_offset(idx64, stride);
+        let mut refs = Vec::new();
+        value_interior_offsets(&self.prog.values, vid, if flagged { 8 } else { 0 }, &mut refs);
+        // The record for the (current) value.
+        let record = |this: &mut Self, fcx: &mut FnCtx<'ctx>| -> Result<BasicValueEnum<'ctx>, CodegenError> {
+            let v = this.gen_expr(fcx, value)?.unwrap();
+            if !flagged { return Ok(v); }
+            let st = rty.into_struct_type();
+            let r = this.builder.build_insert_value(st.get_undef(), this.ctx.i64_type().const_int(1, false), 0, "record.flag").unwrap();
+            Ok(this.builder.build_insert_value(r, v, 1, "record.value").unwrap().into_struct_value().into())
+        };
+        let store_and_barrier = |this: &mut Self, fcx: &mut FnCtx<'ctx>, target: PointerValue<'ctx>| -> Result<(), CodegenError> {
+            let r = record(this, fcx)?;
+            let at = unsafe { this.builder.build_gep(this.ctx.i8_type(), target, &[offset], "record.at").unwrap() };
+            this.builder.build_store(at, r).unwrap().set_alignment(8).unwrap();
+            let ptrty = this.ctx.ptr_type(AddressSpace::default());
+            for p in &refs {
+                let slot = unsafe { this.builder.build_gep(this.ctx.i8_type(), at, &[this.ctx.i64_type().const_int(*p as u64, false)], "record.ref").unwrap() };
+                let refv = this.builder.build_load(ptrty, slot, "record.iref").unwrap();
+                this.emit_write_barrier(fcx, target, refv);
+            }
+            Ok(())
+        };
+        let direct = self.aggregate_direct(fcx);
+        let fast = self.ctx.append_basic_block(fcx.func, "record.write.direct");
+        let slow = self.ctx.append_basic_block(fcx.func, "record.write.runtime");
+        let done = self.ctx.append_basic_block(fcx.func, "record.done");
+        self.builder.build_conditional_branch(direct, fast, slow).unwrap();
+        self.builder.position_at_end(fast);
+        store_and_barrier(self, fcx, obj)?;
+        self.builder.build_unconditional_branch(done).unwrap();
+        self.builder.position_at_end(slow);
+        // The nonparking attempt reads the record from native storage built
+        // just before it; nothing between can relocate its references.
+        let input = self.entry_alloca(rty, "record.input");
+        let r = record(self, fcx)?;
+        self.builder.build_store(input, r).unwrap();
+        let name = format!("__record_refs_{vid}");
+        let offsets = if let Some(global) = self.module.get_global(&name) { global } else {
+            let ty = self.ctx.i16_type();
+            let values: Vec<_> = refs.iter().map(|&at| ty.const_int(at as u64, false)).collect();
+            let initializer = ty.const_array(&values);
+            let global = self.module.add_global(initializer.get_type(), None, &name);
+            global.set_initializer(&initializer);
+            global.set_constant(true);
+            global.set_linkage(inkwell::module::Linkage::Private);
+            global
+        };
+        let write = self.module.get_function("ai_managed_try_write").unwrap();
+        let result = call_result(self.build_managed_call(fcx, write, &[
+            fcx.thread.into(), obj.into(), offset.into(), input.into(),
+            self.ctx.i64_type().const_int(stride, false).into(),
+            offsets.as_pointer_value().into(), self.ctx.i64_type().const_int(refs.len() as u64, false).into(),
+        ], "record.stored").unwrap()).into_int_value();
+        let fallback = self.ctx.append_basic_block(fcx.func, "record.contended");
+        let success = self.builder.build_int_compare(IntPredicate::NE, result, self.ctx.i8_type().const_zero(), "record.success").unwrap();
+        self.builder.build_conditional_branch(success, done, fallback).unwrap();
+        self.builder.position_at_end(fallback);
+        // A contended acquisition can relocate both the array and the value.
+        let locked = self.managed_lock(fcx, obj);
+        store_and_barrier(self, fcx, locked)?;
+        self.managed_unlock(fcx);
+        self.builder.build_unconditional_branch(done).unwrap();
+        self.builder.position_at_end(done);
         Ok(None)
     }
 
@@ -4081,6 +4265,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Some(rt) => rt.fn_type(&arg_tys, false),
             None => self.ctx.void_type().fn_type(&arg_tys, false),
         };
+        if fcx.late_roots { self.ensure_root_frame_linked(fcx); }
         let before = self.prepare_root_reload(fcx);
         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
         self.refresh_copy_phase(fcx);
@@ -4137,6 +4322,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             FieldLoc::Unit | FieldLoc::ValueField { .. } => unreachable!(),
         };
         let v = if aggregate {
+            // Direct when nothing can race the read; otherwise a tear-free
+            // snapshot through the runtime.
+            let direct = self.aggregate_direct(fcx);
+            let fast = self.ctx.append_basic_block(fcx.func, "aggregate.read.direct");
+            let slow = self.ctx.append_basic_block(fcx.func, "aggregate.read.snapshot");
+            let merge = self.ctx.append_basic_block(fcx.func, "aggregate.read.merge");
+            self.builder.build_conditional_branch(direct, fast, slow).unwrap();
+            self.builder.position_at_end(fast);
+            let quick = self.builder.build_load(lty, self.obj_addr(obj, off), "fld.direct").unwrap();
+            let fast_end = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(merge).unwrap();
+            self.builder.position_at_end(slow);
             let snapshot = self.entry_alloca(lty, "fld.snapshot.storage");
             let FieldLoc::ValueAt { value, .. } = loc else { unreachable!() };
             let bytes = self.prog.values[*value as usize].size as u64;
@@ -4145,7 +4342,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 fcx.thread.into(), obj.into(), self.ctx.i64_type().const_int(off, false).into(),
                 snapshot.into(), self.ctx.i64_type().const_int(bytes, false).into(),
             ], "").unwrap();
-            self.builder.build_load(lty, snapshot, "fld.snapshot").unwrap()
+            let snap = self.builder.build_load(lty, snapshot, "fld.snapshot").unwrap();
+            let slow_end = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(merge).unwrap();
+            self.builder.position_at_end(merge);
+            let phi = self.builder.build_phi(lty, "fld.aggregate").unwrap();
+            phi.add_incoming(&[(&quick, fast_end), (&snap, slow_end)]);
+            phi.as_basic_value()
         } else {
             let repr = match loc {
                 FieldLoc::Raw { repr, .. } => Repr::Scalar(*repr),
@@ -5223,6 +5426,12 @@ struct FnCtx<'ctx> {
     /// only start in a pause, so it is refreshed after each call that may
     /// safepoint; between them, one test settles every managed access.
     phase: Option<PointerValue<'ctx>>,
+    /// A deferred frame whose references may already be live in working
+    /// slots: linking it copies them into the traced mirrors.
+    late_roots: bool,
+    /// (indirect frame slot, value-local interior address) pairs a late frame
+    /// records when it is linked.
+    late_indirect: Vec<(PointerValue<'ctx>, PointerValue<'ctx>)>,
     /// This function's DWARF `DISubprogram` scope (debugger P2) — `Some` only when
     /// emitting debug info. Debug locations for the function's nodes use it as
     /// their scope (one function = one source, so scope/file stay consistent).
@@ -5355,6 +5564,7 @@ pub fn layouts_to_type_infos(prog: &CoreProgram) -> Vec<crate::gc::TypeInfo> {
                 crate::core::VarLen::None => ti,
                 crate::core::VarLen::Values => ti.with_varlen_values(l.ptr_fields),
                 crate::core::VarLen::Bytes => ti.with_varlen_bytes(l.ptr_fields),
+                crate::core::VarLen::Records => return ti.with_varlen_records(l.ptr_fields, l.elem_stride, l.interior_ptrs.clone()),
             };
             if !l.interior_ptrs.is_empty() {
                 ti = ti.with_owned_interior_ptrs(l.interior_ptrs.clone());
@@ -5790,7 +6000,7 @@ pub unsafe fn jit_run_i64(prog: &CoreProgram) -> Result<i64, CodegenError> {
 /// Encode the program's layouts as `AotLayout` source records (the same data
 /// the JIT path derives `TypeInfo`s from). `varlen`: 0=None, 1=Values, 2=Bytes.
 /// The runtime's `gcr_runtime_main` rebuilds the `TypeInfo` table from these.
-fn layouts_to_aot_records(prog: &CoreProgram) -> Vec<(u16, u16, u8)> {
+fn layouts_to_aot_records(prog: &CoreProgram) -> Vec<(u16, u16, u8, u16)> {
     physical_layouts(prog).layouts
         .iter()
         .map(|l| {
@@ -5798,8 +6008,10 @@ fn layouts_to_aot_records(prog: &CoreProgram) -> Vec<(u16, u16, u8)> {
                 crate::core::VarLen::None => 0u8,
                 crate::core::VarLen::Values => 1u8,
                 crate::core::VarLen::Bytes => 2u8,
+                crate::core::VarLen::Records => 3u8,
             };
-            (l.ptr_fields, l.raw_bytes, varlen)
+            let stride = if matches!(l.varlen, crate::core::VarLen::Records) { l.elem_stride } else { 0 };
+            (l.ptr_fields, l.raw_bytes, varlen, stride)
         })
         .collect()
 }
@@ -5901,15 +6113,17 @@ pub fn codegen_aot_object_level(
         false,
     );
     let records = layouts_to_aot_records(prog);
-    let pad0 = i8t.const_array(&[i8t.const_zero(), i8t.const_zero(), i8t.const_zero()]);
     let elems: Vec<_> = records
         .iter()
-        .map(|(pf, rb, vl)| {
+        .map(|(pf, rb, vl, stride)| {
+            // A record array's stride rides in the first two pad bytes.
+            let [lo, hi] = stride.to_le_bytes();
+            let pad = i8t.const_array(&[i8t.const_int(lo as u64, false), i8t.const_int(hi as u64, false), i8t.const_zero()]);
             aot_ty.const_named_struct(&[
                 i16t.const_int(*pf as u64, false).into(),
                 i16t.const_int(*rb as u64, false).into(),
                 i8t.const_int(*vl as u64, false).into(),
-                pad0.into(),
+                pad.into(),
             ])
         })
         .collect();
@@ -6649,10 +6863,10 @@ mod tests {
         // Keep a substantial reference graph alive while fresh aggregates and
         // scalar slots change. The collector runs independently of allocations.
         let source = r#"
-            struct Leaf { n: i64 }
+            #[heap] struct Leaf { n: i64 }
             #[value] struct Pair { left: Leaf, right: Leaf, total: i64 }
             struct Holder { pair: Pair, scalar: i64 }
-            struct Container { holder: Holder }
+            #[heap] struct Container { holder: Holder }
             fn main() -> i64 {
                 let mut live: Array<Leaf> = Array::new(120000);
                 for i in 0..120000 { live[i] = Leaf { n: i }; }
@@ -6758,8 +6972,11 @@ mod tests {
                 let collector = std::thread::spawn(move || {
                     // Avoid counting cycles over an empty heap before generated code
                     // has started publishing the live graph.
+                    // A lone mutator writes aggregates directly while no copy
+                    // runs, so its first runtime write only comes once copying
+                    // starts; shared mutators always write through the runtime.
                     while collector_heap.from_used() < 128 * 1024
-                        || FIRST_WRITER.load(Ordering::Acquire) == 0
+                        || (shared && FIRST_WRITER.load(Ordering::Acquire) == 0)
                         || (shared
                             && (!SECOND_WRITER_SEEN.load(Ordering::Acquire)
                                 || !READER_SEEN.load(Ordering::Acquire)))
@@ -6813,9 +7030,14 @@ mod tests {
                         }
                         // Give resumed mutators a real opportunity to execute
                         // between cycles instead of monopolizing their wakeups.
+                        // A lone mutator writes aggregates directly while no
+                        // copy runs, so it is not always observed: wait for an
+                        // observed operation or a short while.
                         let completed = OPERATIONS.load(Ordering::Acquire);
+                        let waited = std::time::Instant::now();
                         while OPERATIONS.load(Ordering::Acquire) == completed
                             && !collector_stop.load(Ordering::Acquire)
+                            && (shared || waited.elapsed() < std::time::Duration::from_millis(2))
                         {
                             std::thread::yield_now();
                         }
@@ -6882,7 +7104,7 @@ mod tests {
     fn generated_allocation_counters_saturate_at_unsigned_limits() {
         use crate::runtime::{self, RuntimeContext};
         use crate::gc::SiteCounter;
-        let src = "struct Point { x: i64, y: i64 } \
+        let src = "#[heap] struct Point { x: i64, y: i64 } \
                    fn mk() -> Point { Point { x: 3, y: 4 } } \
                    fn main() -> i64 { let p = mk(); p.x + p.y }";
         let module = parse_module(&lex(src).unwrap()).unwrap();

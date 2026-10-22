@@ -304,6 +304,8 @@ fn main() -> ExitCode {
             }
         }
         "build" => {
+            // Full debug info describes heap objects, so keep declared layouts.
+            if driver_args.iter().any(|a| a == "--debug") { gcrust::layout::set_inline_by_default(false); }
             // Linker args: the project manifest's `[link]` section (libs / paths
             // / frameworks), plus any `--link-arg <arg>` (repeatable) from the CLI.
             // A project build needs no CLI link flags at all.

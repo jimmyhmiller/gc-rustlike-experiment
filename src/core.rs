@@ -100,7 +100,25 @@ pub struct Layout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum VarLen { None, Values, Bytes }
+pub enum VarLen {
+    None,
+    Values,
+    Bytes,
+    /// Inline value aggregates in a byte tail: `elem_stride` bytes each, the
+    /// GC references of each at `interior_ptrs` (record-relative). A record of
+    /// a value holding references starts with an initialized word.
+    Records,
+}
+
+/// The size of one array record of value `vid` and whether it starts with an
+/// initialized word (values holding references do: zeroed storage is not a
+/// valid such value).
+pub fn record_shape(values: &[ValueLayout], vid: ValueId) -> (u32, bool) {
+    let size = (values[vid as usize].size + 7) & !7;
+    let mut refs = false;
+    let _ = crate::layout::visit_value_ref_offsets(values, vid, 0, &mut |_| refs = true);
+    if refs { (size + 8, true) } else { (size.max(8), false) }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
 pub enum FieldLoc {

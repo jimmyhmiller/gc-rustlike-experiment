@@ -212,6 +212,8 @@ pub struct Thread {
     pub relocation_epoch: *const std::sync::atomic::AtomicUsize,
     /// Heap-owned flag; generated access paths read it atomically while RUNNING.
     pub copying_phase: *const std::sync::atomic::AtomicU8,
+    /// Heap-owned flag: nonzero once a second mutator registered.
+    pub multi_mutator: *const std::sync::atomic::AtomicU8,
     // Owner-local ABI scope stack. Some = native/parked, None = callback is
     // managed. Never retain a mutable borrow across group restoration.
     foreign_scopes: std::cell::UnsafeCell<allocator_api2::vec::Vec<
@@ -229,6 +231,7 @@ pub mod thread_offsets {
     pub const TLAB_WINDOW: usize = 64;
     pub const RELOCATION_EPOCH: usize = 72;
     pub const COPYING_PHASE: usize = 80;
+    pub const MULTI_MUTATOR: usize = 88;
 }
 
 const _: () = {
@@ -240,6 +243,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Thread, tlab_window) == thread_offsets::TLAB_WINDOW);
     assert!(core::mem::offset_of!(Thread, relocation_epoch) == thread_offsets::RELOCATION_EPOCH);
     assert!(core::mem::offset_of!(Thread, copying_phase) == thread_offsets::COPYING_PHASE);
+    assert!(core::mem::offset_of!(Thread, multi_mutator) == thread_offsets::MULTI_MUTATOR);
 };
 
 // =============================================================================
@@ -464,6 +468,7 @@ impl RuntimeThread {
             tlab_window: unsafe { heap.configure_inline_tlab(dyna) },
             relocation_epoch: dyna.relocation_epoch_ptr(),
             copying_phase: heap.copying_phase_ptr(),
+            multi_mutator: heap.multi_mutator_ptr(),
             foreign_scopes: std::cell::UnsafeCell::new(allocator_api2::vec::Vec::new_in(
                 metadata_allocator::MetadataAllocator::new(&heap.native_memory.registry))),
         }, heap.native_memory.registry_allocator());
@@ -1832,7 +1837,9 @@ pub extern "C" fn ai_thread_current_id(_thread: *mut Thread) -> i64 {
 /// here with the exact same logic the JIT path uses, guaranteeing the GC
 /// scanner sees identical shapes regardless of compilation mode.
 ///
-/// `varlen`: 0 = None, 1 = Values, 2 = Bytes.
+/// `varlen`: 0 = None, 1 = Values, 2 = Bytes, 3 = Bytes of inline records
+/// whose stride is `_pad[0..2]` (little-endian); their reference offsets
+/// arrive as the layout's interior offsets in the metadata blob.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AotLayout {
@@ -1962,6 +1969,10 @@ pub unsafe extern "C" fn gcr_runtime_main_v4(
                 0 => ti,
                 1 => ti.with_varlen_values(l.ptr_fields),
                 2 => ti.with_varlen_bytes(l.ptr_fields),
+                3 => {
+                    let stride = u16::from_le_bytes([l._pad[0], l._pad[1]]);
+                    return ti.with_varlen_records(l.ptr_fields, stride, offsets);
+                }
                 other => panic!("gcr_runtime_main: invalid varlen kind {}", other),
             };
             if !offsets.is_empty() {
@@ -2847,7 +2858,7 @@ unsafe fn alloc_with_published_frame(
         // fresh owner before publication so those nursery edges are scanned.
         if heap.has_nursery() && heap.is_tenured(p)
             && (info.value_field_count != 0 || !info.interior_ptrs.is_empty()
-                || info.varlen == crate::gc::VarLenKind::Values)
+                || info.varlen == crate::gc::VarLenKind::Values || !info.record_ptrs.is_empty())
         {
             heap.mark_card_dirty(p);
         }

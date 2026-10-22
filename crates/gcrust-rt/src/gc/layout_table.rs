@@ -58,14 +58,17 @@ fn owned_offsets(info: &TypeInfo) -> usize {
         varlen: _,
         align_log2: _,
         interior_ptrs,
+        record_stride: _,
+        record_ptrs,
     } = info;
-    match interior_ptrs {
+    let owned = |offsets: &Cow<'static, [u16]>| match offsets {
         Cow::Borrowed(_) => 0,
         Cow::Owned(values) => values
             .capacity()
             .checked_mul(std::mem::size_of::<u16>())
             .expect("layout offset capacity overflow"),
-    }
+    };
+    owned(interior_ptrs).checked_add(owned(record_ptrs)).expect("layout offset capacity overflow")
 }
 /// Own the input while validating and inventorying it in one pass, before any
 /// Heap backing is created. Private fields prevent callers from altering the

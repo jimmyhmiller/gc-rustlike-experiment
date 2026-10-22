@@ -70,6 +70,8 @@ pub struct Param {
 pub struct StructDef {
     pub vis: bool,
     pub is_value: bool,
+    /// `#[heap]`: always a reference, never laid out inline.
+    pub is_heap: bool,
     pub name: String,
     pub generics: Generics,
     pub body: StructBody,
@@ -95,6 +97,8 @@ pub struct FieldDef {
 pub struct EnumDef {
     pub vis: bool,
     pub is_value: bool,
+    /// `#[heap]`: always a reference, never laid out inline.
+    pub is_heap: bool,
     pub name: String,
     pub generics: Generics,
     pub variants: Vec<VariantDef>,
@@ -477,4 +481,53 @@ pub fn expand_rest(ps: &[Pattern], arity: usize) -> Option<Vec<Pattern>> {
     out.extend((0..fill).map(|_| Pattern { kind: PatternKind::Wildcard, span }));
     out.extend_from_slice(&ps[pos + 1..]);
     Some(out)
+}
+
+/// Visit `e` and every expression inside it, outermost first (nested item
+/// bodies excluded).
+pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    match &*e.kind {
+        ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Str(_) | ExprKind::Char(_) | ExprKind::Bool(_)
+        | ExprKind::Unit | ExprKind::Path(_) | ExprKind::Continue => {}
+        ExprKind::Call(c, args) => { walk_expr(c, f); for a in args { walk_expr(a, f); } }
+        ExprKind::MethodCall { recv, args, .. } => { walk_expr(recv, f); for a in args { walk_expr(a, f); } }
+        ExprKind::Field { base, .. } => walk_expr(base, f),
+        ExprKind::Index { base, index } => { walk_expr(base, f); walk_expr(index, f); }
+        ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Try(x) => walk_expr(x, f),
+        ExprKind::Binary(_, a, b) => { walk_expr(a, f); walk_expr(b, f); }
+        ExprKind::Assign { target, value, .. } => { walk_expr(target, f); walk_expr(value, f); }
+        ExprKind::StructLit { fields, .. } => for fi in fields { if let Some(v) = &fi.value { walk_expr(v, f); } },
+        ExprKind::Tuple(xs) => for x in xs { walk_expr(x, f); },
+        ExprKind::Array(ArrayLit::Elems(xs)) => for x in xs { walk_expr(x, f); },
+        ExprKind::Array(ArrayLit::Repeat(v, n)) => { walk_expr(v, f); walk_expr(n, f); }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop { body: b } => walk_block(b, f),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            walk_expr(cond, f);
+            walk_block(then_branch, f);
+            if let Some(e) = else_branch { walk_expr(e, f); }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            walk_expr(scrutinee, f);
+            for a in arms { if let Some(g) = &a.guard { walk_expr(g, f); } walk_expr(&a.body, f); }
+        }
+        ExprKind::While { cond, body } => { walk_expr(cond, f); walk_block(body, f); }
+        ExprKind::For { iter, body, .. } => { walk_expr(iter, f); walk_block(body, f); }
+        ExprKind::Closure { body, .. } => walk_expr(body, f),
+        ExprKind::Return(x) | ExprKind::Break(x) => if let Some(x) = x { walk_expr(x, f); },
+        ExprKind::Range { lo, hi, .. } => {
+            if let Some(x) = lo { walk_expr(x, f); }
+            if let Some(x) = hi { walk_expr(x, f); }
+        }
+    }
+}
+
+pub fn walk_block(b: &Block, f: &mut dyn FnMut(&Expr)) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { init: Some(e), .. } | Stmt::Expr(e) => walk_expr(e, f),
+            _ => {}
+        }
+    }
+    if let Some(t) = &b.tail { walk_expr(t, f); }
 }

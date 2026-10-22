@@ -55,6 +55,33 @@ enum PendingRef {
     Vec(LayoutId, Ty),
 }
 
+thread_local! {
+    /// Structs lowering found must be references after all (see
+    /// `force_reference_struct`).
+    static FORCED_REFERENCES: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
+}
+
+/// Lay out struct `name` as a reference from now on (a later lowering of the
+/// program, after one found it must be one). Returns false if it already was.
+pub fn force_reference_struct(name: &str) -> bool {
+    FORCED_REFERENCES.with(|f| f.borrow_mut().insert(name.to_string()))
+}
+
+/// Forget forced references (a new program).
+pub fn reset_forced_references() {
+    FORCED_REFERENCES.with(|f| f.borrow_mut().clear());
+}
+
+thread_local! {
+    static INLINE_BY_DEFAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether undeclared structs and enums may be laid out inline. Full-debug
+/// builds turn it off: their debug info describes heap objects.
+pub fn set_inline_by_default(on: bool) {
+    INLINE_BY_DEFAULT.with(|i| i.set(on));
+}
+
 pub struct LayoutRegistry<'a> {
     ctx: &'a TyCtx,
     /// Interning: a canonical key for a `Ty` → its assigned id.
@@ -64,6 +91,8 @@ pub struct LayoutRegistry<'a> {
     nominal_value_ids: HashMap<Ty, ValueId>,
     pending_refs: Vec<PendingRef>,
     building_values: Vec<Ty>,
+    /// Enums being tried as inline values (see `named_repr`).
+    auto_values: Vec<Ty>,
     repr_depth: usize,
     flushing_refs: bool,
     pub layouts: Vec<Layout>,
@@ -99,7 +128,7 @@ pub(crate) struct LayoutProbeState {
 
 impl<'a> LayoutRegistry<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        LayoutRegistry { ctx, ref_ids: HashMap::new(), nominal_ref_ids: HashMap::new(), value_ids: HashMap::new(), nominal_value_ids: HashMap::new(), pending_refs: vec![], building_values: vec![], repr_depth: 0, flushing_refs: false, layouts: vec![], values: vec![] }
+        LayoutRegistry { ctx, ref_ids: HashMap::new(), nominal_ref_ids: HashMap::new(), value_ids: HashMap::new(), nominal_value_ids: HashMap::new(), pending_refs: vec![], building_values: vec![], auto_values: vec![], repr_depth: 0, flushing_refs: false, layouts: vec![], values: vec![] }
     }
 
     /// Record the registry so a discarded lowering attempt can be undone.
@@ -239,17 +268,80 @@ impl<'a> LayoutRegistry<'a> {
             let is_value = s.is_value;
             if is_value {
                 Ok(Repr::Value(self.value_struct(name, &s, args)?))
+            } else if let Some(vid) = self.auto_value_struct(name, &s, args)? {
+                Ok(Repr::Value(vid))
             } else {
                 Ok(Repr::Ref(self.ref_struct(name, &s, args)?))
             }
         } else if let Some(e) = self.ctx.enums.get(name).cloned() {
             if e.is_value {
                 Ok(Repr::Value(self.value_enum(name, &e, args)?))
+            } else if let Some(vid) = self.auto_value_enum(name, &e, args)? {
+                Ok(Repr::Value(vid))
             } else {
                 Ok(Repr::Ref(self.ref_enum(name, &e, args)?))
             }
         } else {
             Err(LayoutError(format!("unknown named type `{}`", name)))
+        }
+    }
+
+    /// A struct whose fields nothing assigns is laid out inline, as in Rust
+    /// (sharing is unobservable without assignment), unless that is infinite
+    /// or larger than `AUTO_VALUE_ENUM_BYTES`. Standard-library structs keep
+    /// their declared form (some are built by the runtime or by identity),
+    /// and lowering can still require a reference (`force_reference_struct`).
+    fn auto_value_struct(&mut self, name: &str, s: &crate::ast::StructDef, args: &[Ty]) -> R<Option<ValueId>> {
+        const AUTO_VALUE_STRUCT_BYTES: u32 = 64;
+        if s.is_heap || !INLINE_BY_DEFAULT.with(|i| i.get()) { return Ok(None); }
+        if crate::compile::prelude_source() == Some(s.span.source) { return Ok(None); }
+        if FORCED_REFERENCES.with(|f| f.borrow().contains(name)) { return Ok(None); }
+        let short = name.rsplit("::").next().unwrap_or(name);
+        let (by_type, any) = &self.ctx.assigned_fields;
+        let fields: Vec<String> = match &s.body {
+            crate::ast::StructBody::Named(fs) => fs.iter().map(|f| f.name.clone()).collect(),
+            crate::ast::StructBody::Tuple(ts) => (0..ts.len()).map(|i| i.to_string()).collect(),
+            crate::ast::StructBody::Unit => vec![],
+        };
+        if fields.iter().any(|f| any.contains(f) || by_type.contains(&(short.to_string(), f.clone()))) { return Ok(None); }
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_value_ids.get(&nominal) { return Ok(Some(*id)); }
+        if self.nominal_ref_ids.contains_key(&nominal) { return Ok(None); }
+        if self.auto_values.contains(&nominal) {
+            return Err(LayoutError(format!("recursive inline value type `{name}` has no finite representation")));
+        }
+        let snap = self.snapshot();
+        self.auto_values.push(nominal.clone());
+        let attempt = self.value_struct(name, s, args);
+        self.auto_values.pop();
+        match attempt {
+            Ok(vid) if self.values[vid as usize].size <= AUTO_VALUE_STRUCT_BYTES => Ok(Some(vid)),
+            _ => { self.restore(snap); Ok(None) }
+        }
+    }
+
+    /// Enums are values, as in Rust: an enum (payloads are immutable, so the
+    /// choice is not observable) is laid out inline unless that is infinite
+    /// (it contains itself, `Box` included) or larger than
+    /// `AUTO_VALUE_ENUM_BYTES`. Each enum type is decided once.
+    fn auto_value_enum(&mut self, name: &str, e: &crate::ast::EnumDef, args: &[Ty]) -> R<Option<ValueId>> {
+        const AUTO_VALUE_ENUM_BYTES: u32 = 64;
+        if e.is_heap || !INLINE_BY_DEFAULT.with(|i| i.get()) { return Ok(None); }
+        if FORCED_REFERENCES.with(|f| f.borrow().contains(name)) { return Ok(None); }
+        let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
+        if let Some(id) = self.nominal_value_ids.get(&nominal) { return Ok(Some(*id)); }
+        if self.nominal_ref_ids.contains_key(&nominal) { return Ok(None); }
+        // Reached again while being tried: the attempt that owns it fails.
+        if self.auto_values.contains(&nominal) {
+            return Err(LayoutError(format!("recursive inline value type `{name}` has no finite representation")));
+        }
+        let snap = self.snapshot();
+        self.auto_values.push(nominal.clone());
+        let attempt = self.value_enum(name, e, args);
+        self.auto_values.pop();
+        match attempt {
+            Ok(vid) if self.values[vid as usize].size <= AUTO_VALUE_ENUM_BYTES => Ok(Some(vid)),
+            _ => { self.restore(snap); Ok(None) }
         }
     }
 
@@ -606,20 +698,21 @@ impl<'a> LayoutRegistry<'a> {
     }
 
     fn fill_array(&mut self, id: LayoutId, elem: &Repr, key: String) -> R<()> {
-        let element_box = if let Repr::Value(vid) = elem {
-            let name = format!("<array-element:{}>", self.values[*vid as usize].name);
-            let size = self.values[*vid as usize].size;
-            if size > u16::MAX as u32 - HEADER as u32 { return Err(LayoutError("array value element exceeds pointer-offset limit".into())); }
-            let raw_bytes = u16::try_from(size).map_err(|_| LayoutError("array value element exceeds layout size limit".into()))?;
-            let mut interior_ptrs = Vec::new();
-            self.value_ref_offsets(*vid, HEADER, &mut interior_ptrs)?;
-            Some(self.intern_ref(&format!("<array-element-id:{vid}>"), Layout {
-                ptr_fields: 0, raw_bytes, varlen: VarLen::None,
-                field_map: vec![FieldLoc::ValueAt { offset: 0, value: *vid }],
-                name: name.clone(), elem_stride: 0, element_box: None,
-                interior_ptrs, meta: opaque_meta(&name),
-            }))
-        } else { None };
+        // Value elements are stored inline, as records.
+        if let Repr::Value(vid) = elem {
+            let (stride, flagged) = crate::core::record_shape(&self.values, *vid);
+            let stride = u16::try_from(stride).map_err(|_| LayoutError("array value element exceeds layout size limit".into()))?;
+            let mut record_ptrs = Vec::new();
+            self.value_ref_offsets(*vid, if flagged { 8 } else { 0 }, &mut record_ptrs)?;
+            self.layouts[id as usize] = Layout {
+                ptr_fields: 0, raw_bytes: 0, varlen: VarLen::Records,
+                field_map: vec![], name: key.clone(), elem_stride: stride,
+                element_box: None, interior_ptrs: record_ptrs, meta: opaque_meta(&key),
+            };
+            self.ref_ids.insert(key, id);
+            return Ok(());
+        }
+        let element_box = None;
         let traced = matches!(elem, Repr::Ref(_) | Repr::Value(_));
         let stride = match elem { Repr::Unit => 1, Repr::Scalar(s) => (s.bits().max(8) / 8) as u16, _ => 8 };
         self.layouts[id as usize] = Layout {
@@ -1130,7 +1223,7 @@ mod tests {
 
     #[test]
     fn generic_struct_monomorphizes_layout() {
-        let c = ctx("struct Pair<A, B> { a: A, b: B }");
+        let c = ctx("#[heap] struct Pair<A, B> { a: A, b: B }");
         let mut reg = LayoutRegistry::new(&c);
         let r = reg.repr(&Ty::Named {
             name: "Pair".into(),

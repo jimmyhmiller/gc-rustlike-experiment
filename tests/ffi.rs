@@ -92,7 +92,7 @@ fn extern_rejects_heap_struct_param() {
     // A non-value (heap `Ref`) struct must NOT cross — its address would move
     // under GC. Only stack-resident value structs are allowed.
     let src = r#"
-        struct Heapy { a: i64 }
+        #[heap] struct Heapy { a: i64 }
         extern "C" fn bad(h: Heapy) -> i64;
         fn main() -> i64 { let h = Heapy { a: 1 }; (unsafe { bad(h) }) }
     "#;

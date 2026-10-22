@@ -12,6 +12,15 @@ use crate::lexer::{lex, lex_with_source, SourceId};
 use crate::parser::{ParseError, parse_module};
 use std::path::{Path, PathBuf};
 
+thread_local! {
+    static PRELUDE_SOURCE: std::cell::Cell<Option<SourceId>> = const { std::cell::Cell::new(None) };
+}
+
+/// The source id the standard library was lexed with, once injected.
+pub fn prelude_source() -> Option<SourceId> {
+    PRELUDE_SOURCE.with(|p| p.get())
+}
+
 const PRELUDE_SRC: &str = concat!(
     include_str!("prelude.gcr"),
     "\n",
@@ -124,6 +133,7 @@ fn inject_prelude(user: Module, sources: &mut SourceMap) -> Module {
     // The prelude is its own source ("<std>"): register it + lex with its id so
     // prelude spans resolve against PRELUDE_SRC, never a fabricated user line.
     let sid = add_source(sources, "<std>".to_string(), PRELUDE_SRC.to_string());
+    PRELUDE_SOURCE.with(|p| p.set(Some(sid)));
     let prelude_tokens = lex_with_source(PRELUDE_SRC, sid).expect("prelude must lex");
     let prelude = parse_module(&prelude_tokens).expect("prelude must parse");
 

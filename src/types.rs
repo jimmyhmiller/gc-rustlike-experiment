@@ -75,6 +75,11 @@ pub struct TyCtx {
     /// The `static` items' full names; a static's index here is its slot in
     /// the program's static table.
     pub statics: Vec<String>,
+    /// Struct fields some code assigns: `(type, field)` for `self.f = ..` in
+    /// an impl of the type, and bare field names assigned through anything
+    /// else. A struct none of whose fields are assigned can be laid out
+    /// inline (see `layout::auto_value_struct`).
+    pub assigned_fields: (std::collections::HashSet<(String, String)>, std::collections::HashSet<String>),
     /// Associated constants by (receiver base, name): an inherent impl's,
     /// then a trait impl's, then the trait's default.
     pub assoc_consts: HashMap<(String, String), Rc<ConstDef>>,
@@ -333,6 +338,7 @@ impl TyCtx {
             enums: g.enums.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             fns: g.fns.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             consts: g.consts.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
+            assigned_fields: assigned_fields(g),
             statics: {
                 let mut names: Vec<String> = g.consts.iter().filter(|(_, c)| c.is_static.is_some()).map(|(k, _)| k.clone()).collect();
                 names.sort();
@@ -409,6 +415,37 @@ impl TyCtx {
 
         None
     }
+}
+
+/// Which struct fields are assigned anywhere (see `TyCtx::assigned_fields`).
+fn assigned_fields(g: &crate::resolve::GlobalTable) -> (std::collections::HashSet<(String, String)>, std::collections::HashSet<String>) {
+    let mut by_type = std::collections::HashSet::new();
+    let mut any = std::collections::HashSet::new();
+    let mut scan = |body: &Block, owner: Option<&str>| {
+        crate::ast::walk_block(body, &mut |e| {
+            let ExprKind::Assign { target, .. } = &*e.kind else { return };
+            let ExprKind::Field { base, field } = &*target.kind else { return };
+            let name = match field { FieldAccess::Named(n) => n.clone(), FieldAccess::Tuple(i) => i.to_string() };
+            match (&*base.kind, owner) {
+                (ExprKind::Path(p), Some(t)) if p.is_single() && p.last() == "self" => { by_type.insert((t.to_string(), name)); }
+                _ => { any.insert(name); }
+            }
+        });
+    };
+    for f in g.fns.values() { scan(&f.body, None); }
+    for imp in &g.impls {
+        let owner = match &imp.self_ty.kind {
+            TypeKind::Path(p, _) => Some(p.last().to_string()),
+            _ => None,
+        };
+        for m in &imp.items { scan(&m.body, owner.as_deref()); }
+    }
+    for t in g.traits.values() {
+        for item in &t.items {
+            if let TraitItem::Provided(m) = item { scan(&m.body, None); }
+        }
+    }
+    (by_type, any)
 }
 
 /// The canonical source name of a primitive type (`i64`, `f64`, …).

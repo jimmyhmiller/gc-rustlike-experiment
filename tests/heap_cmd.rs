@@ -36,7 +36,7 @@ fn heap_cmd_prefers_midexec_snapshot_with_live_roots() {
     // A `heap_snapshot()` call mid-execution → the chosen snapshot has live roots
     // (x and y are still on the stack), unlike a program-end dump.
     let src = "\
-struct P { x: i64, y: i64 }
+#[heap] struct P { x: i64, y: i64 }
 fn main() -> i64 {
     let a = P { x: 1, y: 2 };
     let b = P { x: 3, y: 4 };
@@ -59,8 +59,8 @@ fn heap_cmd_reports_shared_object_incoming_refs() {
     // A single heap object referenced by two cells → two incoming edges. The
     // explorer's "retained by" view reads exactly these `refs` arrays.
     let src = "\
-struct P { x: i64 }
-enum L { Nil, Cons(P, L) }
+#[heap] struct P { x: i64 }
+#[heap] enum L { Nil, Cons(P, L) }
 fn main() -> i64 {
     let shared = P { x: 99 };
     let pair = L::Cons(shared, L::Cons(shared, L::Nil));
@@ -88,7 +88,7 @@ fn heap_cmd_falls_back_to_program_end_dump() {
     // No `heap_snapshot()` call → the program-end dump is used. The objects are
     // unreachable at end (main returned), but the snapshot is still well-formed.
     let src = "\
-struct Box { v: i64 }
+#[heap] struct Box { v: i64 }
 fn main() -> i64 {
     let a = Box { v: 1 };
     let b = Box { v: 2 };
@@ -106,8 +106,8 @@ fn heap_cmd_series_bundles_snapshots_in_order() {
     // Several `heap_snapshot()` calls over a growing list → `--series` bundles
     // them in call order; the explorer's growth tab reads this monotonic climb.
     let src = "\
-struct N { v: i64 }
-enum L { Nil, Cons(N, L) }
+#[heap] struct N { v: i64 }
+#[heap] enum L { Nil, Cons(N, L) }
 fn main() -> i64 {
     let mut acc = L::Nil;
     let mut i = 0;
@@ -145,7 +145,7 @@ fn main() -> i64 {
 
 #[test]
 fn heap_cmd_without_out_prints_json_to_stdout() {
-    let src = "struct Q { n: i64 } fn main() -> i64 { let q = Q { n: 7 }; heap_snapshot(); q.n }";
+    let src = "#[heap] struct Q { n: i64 } fn main() -> i64 { let q = Q { n: 7 }; heap_snapshot(); q.n }";
     let (ok, _, stdout) = run_heap_tagged("stdout", src, false);
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout is valid JSON");

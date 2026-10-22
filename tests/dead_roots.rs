@@ -8,7 +8,7 @@ fn snapshots_exclude_dead_roots_and_keep_later_reads_live() {
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("main.gcr");
     std::fs::write(&source, r#"
-        struct Item { n: i64 }
+        #[heap] struct Item { n: i64 }
         fn main() -> i64 {
             let dead = Item { n: 0 };
             let live = Item { n: 42 };

@@ -9,7 +9,7 @@ use std::process::Command;
 fn heap_snapshot_intrinsic_captures_live_roots_midexec() {
     // x and y are live (rooted on the stack) when heap_snapshot() runs.
     let src = "\
-struct Box3 { a: i64, b: i64, c: i64 }
+#[heap] struct Box3 { a: i64, b: i64, c: i64 }
 fn main() -> i64 {
     let x = Box3 { a: 1, b: 2, c: 3 };
     let y = Box3 { a: 4, b: 5, c: 6 };
@@ -62,12 +62,12 @@ fn heap_snapshot_renders_compiled_inline_enum_variants_and_payloads() {
     std::fs::create_dir_all(&root).unwrap();
     let source = root.join("main.gcr");
     std::fs::write(&source, r#"
-        struct Node { n: i64 }
+        #[heap] struct Node { n: i64 }
         #[value] struct Pair { left: Node, right: Node, n: i64 }
         #[value] enum Nested { Empty, Full(Node), Pair(Pair) }
         #[value] enum Cell { Empty, Full(Node), Pair(Pair), Nested(Nested), Named { node: Node, n: i64 } }
-        struct Board { c: Cell }
-        enum BoxChoice { Empty, Full(Pair) }
+        #[heap] struct Board { c: Cell }
+        #[heap] enum BoxChoice { Empty, Full(Pair) }
         fn main() -> i64 {
             let empty = Board { c: Cell::Empty };
             let full = Board { c: Cell::Full(Node { n: 42 }) };

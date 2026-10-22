@@ -10,7 +10,7 @@ impl Project {
         std::fs::write(
             dir.join("src/main.gcr"),
             r#"
-            struct Cell { n: i64 }
+            #[heap] struct Cell { n: i64 }
             fn main() -> i64 {
                 let mut i = 0;
                 let mut total = 0;

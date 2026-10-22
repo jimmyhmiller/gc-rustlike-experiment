@@ -271,6 +271,10 @@ pub struct Heap {
     /// Current GC phase. Mutators check this to know if write barriers
     /// should be active.
     gc_phase: AtomicU8,
+    /// Set (and never cleared) once a second mutator registers: until then
+    /// no other thread can race on an object, so generated code may access
+    /// inline aggregates without a tear-free snapshot.
+    multi_mutator: AtomicU8,
 
     /// Global SATB queue. Mutator threads flush their local SATB buffers
     /// here, and the GC drains it during collection.
@@ -383,6 +387,7 @@ impl Heap {
             sampled_heap_peak: AtomicUsize::new(0),
             gc_events: Mutex::new(GcTelemetry::new()),
             gc_phase: AtomicU8::new(GcPhase::Idle as u8),
+            multi_mutator: AtomicU8::new(0),
             satb_queue: SATBQueue::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
             tracer: None,
             gc_every_alloc: AtomicBool::new(false),
@@ -452,6 +457,7 @@ impl Heap {
             sampled_heap_peak: AtomicUsize::new(0),
             gc_events: Mutex::new(GcTelemetry::new()),
             gc_phase: AtomicU8::new(GcPhase::Idle as u8),
+            multi_mutator: AtomicU8::new(0),
             satb_queue: SATBQueue::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
             tracer: None,
             gc_every_alloc: AtomicBool::new(false),
@@ -1115,7 +1121,11 @@ impl Heap {
         let allocator = crate::runtime::metadata_allocator::MetadataAllocator::new(&self.native_memory.registry);
         let ts = ThreadStateHandle::new_in(ThreadState::with_allocator(allocator.clone()), &allocator);
         let id = ts.trace_id();
-        self.threads.lock().unwrap().push(ts.clone());
+        {
+            let mut threads = self.threads.lock().unwrap();
+            threads.push(ts.clone());
+            if threads.len() > 1 { self.multi_mutator.store(1, Ordering::SeqCst); }
+        }
         // Keep gc_lock until every current registration is RUNNING again:
         // a collector must not start between restoring the old and new states.
         callers.restore();
@@ -2333,6 +2343,12 @@ impl Heap {
     /// this heap stays at its registered address and the mutator owns it.
     pub(crate) fn copying_phase_ptr(&self) -> *const AtomicU8 {
         &self.gc_phase
+    }
+
+    /// Stable flag for generated aggregate fast paths: nonzero once more
+    /// than one mutator has registered.
+    pub(crate) fn multi_mutator_ptr(&self) -> *const AtomicU8 {
+        &self.multi_mutator
     }
 
     /// Current GC phase.

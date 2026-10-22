@@ -1,6 +1,6 @@
 // A collecting C callback relocates the caller's roots while it is BLOCKED.
 // Both retained objects and mutable FFI copy-out must use refreshed pointers.
-struct Sentinel { sequence: i64, text: String }
+#[heap] struct Sentinel { sequence: i64, text: String }
 extern "C" fn qsort(mut base: RawPtr, n: i64, size: i64, compar: extern fn(RawPtr, RawPtr) -> i32);
 
 fn compare(a: RawPtr, b: RawPtr) -> i32 {

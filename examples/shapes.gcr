@@ -1,6 +1,6 @@
-// Heap types: a struct, an enum with payloads, pattern matching, and a small
-// object graph — all GC-managed. `gcr run` JITs this against the real copying
-// collector.
+// A struct, an enum with payloads, and pattern matching. As in Rust, both
+// are plain values here (stored inline, nothing allocated); `#[heap]` would
+// make either a GC-managed heap object.
 
 struct Point { x: i64, y: i64 }
 

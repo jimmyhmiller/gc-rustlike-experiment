@@ -7,6 +7,7 @@
 //! language, frontend, type system, monomorphization, codegen) is new.
 
 pub mod anf;
+pub mod copyprop;
 pub mod ast;
 pub mod codegen;
 mod codegen_effects;

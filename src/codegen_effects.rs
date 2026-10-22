@@ -192,7 +192,7 @@ mod tests {
     fn inline_memory_reads_are_safe_but_boxing_and_snapshot_locks_are_not() {
         let source = r#"
             #[value] struct Pair { x: i64 }
-            struct Holder { x: i64, pair: Pair }
+            #[heap] struct Holder { x: i64, pair: Pair }
             fn inspect(values: Array<Pair>, refs: Array<Holder>, h: Holder) -> i64 {
                 values[0].x + refs[0].x + h.x
             }
@@ -313,7 +313,9 @@ mod tests {
                 (source == "make").then(|| outlined.program.funcs[*id as usize].name.as_str())
             })
             .unwrap();
-        for (name, deferred) in [(helper, true), ("with_param", false)] {
+        // A function with incoming references defers too: its frame is linked
+        // (copying the working slots in) before the first safepoint.
+        for (name, deferred) in [(helper, true), ("with_param", true)] {
             let ir = compiled
                 .module
                 .get_function(name)

@@ -355,6 +355,7 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
         structs.push((struct_path, module, StructDef {
             vis: def.vis,
             is_value: false,
+            is_heap: false,
             name,
             generics: Generics { params, where_clauses: vec![] },
             body: StructBody::Named(fields),

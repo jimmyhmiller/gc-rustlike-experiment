@@ -343,7 +343,7 @@ fn failed_layout_registration_rolls_back_placeholders_and_worklists() {
         layout::LayoutRegistry,
         types::{Ty, TyCtx},
     };
-    let source = "#[value] struct Bad { next: Bad } struct Holder { bad: Bad } struct Good { n: i64 } fn main() -> i64 { 0 }";
+    let source = "#[value] struct Bad { next: Bad } struct Holder { bad: Bad } #[heap] struct Good { n: i64 } fn main() -> i64 { 0 }";
     let resolved = resolve_module(parse_with_prelude(source).unwrap().0).unwrap();
     let ctx = TyCtx::from_globals(&resolved.globals);
     let mut layouts = LayoutRegistry::new(&ctx);

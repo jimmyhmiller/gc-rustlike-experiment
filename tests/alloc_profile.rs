@@ -79,7 +79,11 @@ fn tmp(name: &str) -> PathBuf {
 fn aot_alloc_profile_reports_sites() {
     let lib = ensure_runtime_lib();
     let out = tmp("shapes");
-    build(include_str!("../examples/shapes.gcr"), &out, &lib);
+    // examples/shapes.gcr with its types kept on the heap, so it allocates.
+    let source = include_str!("../examples/shapes.gcr")
+        .replace("struct Point", "#[heap] struct Point")
+        .replace("enum Shape", "#[heap] enum Shape");
+    build(&source, &out, &lib);
 
     let output = Command::new(&out)
         .env("GCR_ALLOC_PROFILE", "1")
@@ -92,7 +96,7 @@ fn aot_alloc_profile_reports_sites() {
         stderr.contains("allocation-site profile"),
         "profile header missing; stderr:\n{stderr}"
     );
-    // shapes.gcr allocates a Point struct and Shape enum values in compiled code.
+    // The program allocates a Point struct and Shape enum values.
     assert!(
         stderr.contains("Point"),
         "profile should name the Point type; stderr:\n{stderr}"
@@ -125,7 +129,7 @@ fn alloc_profile_line_col_distinguishes_same_type_same_function() {
     let srcp = dir.join("loc.gcr");
     std::fs::write(
         &srcp,
-        "struct P { a: i64, b: i64 }\nfn main() -> i64 {\n  let x = P { a: 1, b: 2 };\n  let y = P { a: 3, b: 4 };\n  x.a + y.b\n}\n",
+        "#[heap] struct P { a: i64, b: i64 }\nfn main() -> i64 {\n  let x = P { a: 1, b: 2 };\n  let y = P { a: 3, b: 4 };\n  x.a + y.b\n}\n",
     )
     .unwrap();
 
@@ -214,7 +218,7 @@ fn alloc_profile_module_alloc_resolves_to_module_file() {
     std::fs::write(dir.join("main.gcr"), "mod thing;\nfn main() -> i64 { thing::make() }\n").unwrap();
     std::fs::write(
         dir.join("thing.gcr"),
-        "pub struct T { a: i64 }\npub fn make() -> i64 {\n  let t = T { a: 42 };\n  t.a\n}\n",
+        "#[heap] pub struct T { a: i64 }\npub fn make() -> i64 {\n  let t = T { a: 42 };\n  t.a\n}\n",
     )
     .unwrap();
 

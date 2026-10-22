@@ -74,7 +74,7 @@ fn dynamic_layout_offsets_are_freed_after_repeated_executions() {
 
     let source = r#"
         #[value] struct Inline { text: String, number: i64 }
-        struct Holder { value: Inline }
+        #[heap] struct Holder { value: Inline }
         fn main() -> i64 {
             let holder = Holder { value: Inline { text: "owned", number: 42 } };
             holder.value.number

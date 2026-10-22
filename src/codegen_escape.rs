@@ -681,8 +681,8 @@ mod tests {
     #[test]
     fn private_reference_arrays_and_fields_keep_mutation_and_aliasing_correct() {
         let source = "
-            struct Item { x: i64 }
-            struct Holder { items: Array<Item> }
+            #[heap] struct Item { x: i64 }
+            #[heap] struct Holder { items: Array<Item> }
             fn update(h: Holder) -> i64 {
                 let mut items = h.items;
                 let mut first = items[0];

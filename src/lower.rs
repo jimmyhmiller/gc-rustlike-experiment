@@ -261,7 +261,37 @@ fn wrap_statics(ctx: &mut TyCtx) {
     ctx.fns.insert("main".into(), Rc::new(wrapper));
 }
 
+thread_local! {
+    /// The inline struct or enum a failed lowering needed as a reference.
+    static NEEDS_REFERENCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Lowering needs `ty` (an inline struct or enum) to be a heap reference:
+/// identity, reflection, or field assignment the layout pre-pass missed.
+fn needs_reference(ty: &Ty) {
+    if let Ty::Named { name, .. } = ty {
+        NEEDS_REFERENCE.with(|n| *n.borrow_mut() = Some(name.clone()));
+    }
+}
+
+/// Lower the program. A struct or enum laid out inline by default that turns
+/// out to need a reference is made one, and the program is lowered again.
 pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
+    crate::layout::reset_forced_references();
+    loop {
+        NEEDS_REFERENCE.with(|n| n.borrow_mut().take());
+        match lower_program_once(globals) {
+            Err(error) => {
+                let retry = NEEDS_REFERENCE.with(|n| n.borrow_mut().take())
+                    .is_some_and(|name| crate::layout::force_reference_struct(&name));
+                if !retry { return Err(error); }
+            }
+            done => return done,
+        }
+    }
+}
+
+fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
     let mut ctx = TyCtx::from_globals(globals);
     wrap_entry(&mut ctx)?;
     wrap_statics(&mut ctx);
@@ -313,6 +343,7 @@ pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgr
     // GC-safety normalization: let-bind every GC temporary so the collector can
     // find it (no live pointer is ever stranded in a register across a safepoint).
     crate::anf::anf_program(&mut prog);
+    crate::copyprop::copy_propagate(&mut prog);
     Ok(prog)
 }
 
@@ -328,6 +359,21 @@ pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgr
 /// `lower_program` still reports any error reachable only through a generic
 /// instantiation.
 pub fn check_program(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<LowerError>> {
+    crate::layout::reset_forced_references();
+    loop {
+        NEEDS_REFERENCE.with(|n| n.borrow_mut().take());
+        match check_program_once(globals) {
+            Err(errors) => {
+                let retry = NEEDS_REFERENCE.with(|n| n.borrow_mut().take())
+                    .is_some_and(|name| crate::layout::force_reference_struct(&name));
+                if !retry { return Err(errors); }
+            }
+            done => return done,
+        }
+    }
+}
+
+fn check_program_once(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<LowerError>> {
     let ctx = TyCtx::from_globals(globals);
     let _normalizer = crate::types::enter_normalizer(&ctx);
     let mut errors = Vec::new();
@@ -3265,7 +3311,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         let loc = match &cbase.repr {
             Repr::Ref(lid) => self.reg.layouts[*lid as usize].field_map[idx],
-            _ => return err("field assignment on non-reference", span),
+            _ => { needs_reference(&bty); return err("field assignment on non-reference", span) }
         };
         // A place's base is evaluated once, before reading the old field and
         // evaluating the RHS. Its typed local remains rooted across calls.
@@ -4400,6 +4446,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         }
         let (obj, oty) = self.expr(&args[0], None)?;
         if !matches!(obj.repr, Repr::Ref(_)) {
+            needs_reference(&oty);
             return err(
                 format!("`{}` requires a heap (reference) value, got `{:?}`", name, oty),
                 span,
@@ -6253,6 +6300,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             };
             let elem = self.repr_of(&elem_ty, args[0].span)?;
             if !matches!(elem, Repr::Scalar(_) | Repr::Ref(_)) {
+                needs_reference(&elem_ty);
                 return err("Atom operations require a scalar or managed reference; inline aggregates have no CAS equality contract", span);
             }
             if matches!(elem, Repr::Scalar(s) if s.bits() == 128) {
@@ -6289,7 +6337,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let (buffer, buffer_ty) = self.expr(&args[1], None)?;
             let message_ty = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
             let message_repr = self.repr_of(&message_ty, span)?;
-            let Repr::Ref(layout) = message_repr else { return err("channel intrinsic requires a reference message box", span); };
+            let Repr::Ref(layout) = message_repr else { needs_reference(&message_ty); return err("channel intrinsic requires a reference message box", span); };
             let layout_expr = CoreExpr::new(CoreExprKind::ConstInt(layout as u128, ScalarRepr::I32), Repr::Scalar(ScalarRepr::I32));
             return Ok((
                 CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_chan_new", args: vec![ccap, buffer, layout_expr], ret: Repr::Scalar(ScalarRepr::Ptr) }, Repr::Scalar(ScalarRepr::Ptr)),
@@ -6302,7 +6350,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             if args.len() != 3 { return err("`chan_send` takes 3 arguments (buf, ctrl, value)", span); }
             let (cbuf, buffer_ty) = self.expr(&args[0], None)?;
             let expected = array_elem_ty(&buffer_ty).ok_or_else(|| LowerError { msg: "channel witness must be an Array".into(), span })?;
-            if !matches!(self.repr_of(&expected, span)?, Repr::Ref(_)) { return err("channel intrinsic requires a reference message box", span); }
+            if !matches!(self.repr_of(&expected, span)?, Repr::Ref(_)) { needs_reference(&expected); return err("channel intrinsic requires a reference message box", span); }
             let (cctrl, ctrl_ty) = self.expr(&args[1], Some(&Ty::Prim(Prim::RawPtr)))?;
             self.check_assignable(&ctrl_ty, &Ty::Prim(Prim::RawPtr), span)?;
             let (cval, actual) = self.expr(&args[2], Some(&expected))?;
@@ -6322,7 +6370,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let elem_ty = array_elem_ty(&bty)
                 .ok_or_else(|| LowerError { msg: format!("`chan_recv` buffer must be an Array, found `{}`", ty_display(&bty)), span: args[0].span })?;
             let elem = self.repr_of(&elem_ty, span)?;
-            if !matches!(elem, Repr::Ref(_)) { return err("channel intrinsic requires a reference message box", span); }
+            if !matches!(elem, Repr::Ref(_)) { needs_reference(&elem_ty); return err("channel intrinsic requires a reference message box", span); }
             let option_ty = Ty::Named { name: "Option".into(), args: vec![elem_ty] };
             let option_repr = self.repr_of(&option_ty, span)?;
             return Ok((

@@ -30,6 +30,20 @@ pub unsafe fn scan_object(obj: *mut u8, info: &TypeInfo, mut visitor: impl FnMut
         visitor(slot);
     }
 
+    // Visit references inside inline records (a byte tail of value aggregates).
+    if info.record_stride != 0 && !info.record_ptrs.is_empty() {
+        let bytes =
+            unsafe { core::ptr::read(obj.add(info.varlen_count_offset()) as *const u64) as usize };
+        let element_base = info.varlen_count_offset() + 8;
+        let stride = info.record_stride as usize;
+        for i in 0..bytes / stride {
+            for &off in info.record_ptrs.iter() {
+                let slot = unsafe { obj.add(element_base + i * stride + off as usize) as *mut u64 };
+                visitor(slot);
+            }
+        }
+    }
+
     // Visit varlen value elements
     if info.varlen == VarLenKind::Values {
         let count =

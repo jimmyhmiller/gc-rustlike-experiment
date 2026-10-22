@@ -153,7 +153,7 @@ fn emitted_inline_headers_keep_numeric_words_on_both_byte_orders() {
         targets::TargetData,
         values::{InstructionOpcode, StructValue},
     };
-    let source = "struct First { n: i64 } struct Second { first: First, n: i64 } fn make() -> Second { Second { first: First { n: 17 }, n: 25 } } fn main() -> i64 { let b = make(); b.first.n + b.n }";
+    let source = "#[heap] struct First { n: i64 } #[heap] struct Second { first: First, n: i64 } fn make() -> Second { Second { first: First { n: 17 }, n: 25 } } fn main() -> i64 { let b = make(); b.first.n + b.n }";
     let (module, _) = parse_with_prelude(source).unwrap();
     let resolved = resolve_module(module).unwrap();
     let program = lower_program(&resolved.globals).unwrap();

@@ -73,7 +73,9 @@ fn generated_accesses_are_atomic_or_proven_private_and_snapshots_cannot_collect(
         assert!(ir.lines().any(|line| line.contains("call i8 @ai_managed_try_write(")), "missing nonparking aggregate attempt: {ir}");
         assert!(ir.contains("aggregate.contended"), "missing rooted contention fallback: {ir}");
         for line in ir.lines() {
-            if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot")
+            // `%fld.direct` reads an aggregate only while no copy is running
+            // and no other mutator exists, so nothing can race or tear it.
+            if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot") && !line.contains("%fld.direct")
             {
                 assert!(
                     line.contains("load atomic") || line.contains("!alias.scope"),
@@ -90,7 +92,7 @@ fn generated_accesses_are_atomic_or_proven_private_and_snapshots_cannot_collect(
     ).unwrap();
     let ir = compiled.module.print_to_string().to_string();
     for line in ir.lines() {
-        if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot") {
+        if line.contains(" = load ") && line.contains("%fld") && !line.contains("%fld.snapshot") && !line.contains("%fld.direct") {
             assert!(line.contains("load atomic"), "non-atomic full-debug field: {line}");
         }
     }
@@ -236,9 +238,9 @@ fn scalar_and_reference_slots_keep_phase_checked_scoped_fallbacks() {
 fn native_aggregate_snapshot_uses_target_layout_before_optimization() {
     use gcrust::{compile::parse_with_prelude, lower::lower_program, resolve::resolve_module};
     let (module, _) = parse_with_prelude(r#"
-        struct Leaf { n: i64 }
+        #[heap] struct Leaf { n: i64 }
         #[value] struct Mixed { tag: i32, wide: i64, leaf: Leaf }
-        struct Holder { mixed: Mixed }
+        #[heap] struct Holder { mixed: Mixed }
         fn main() -> i64 {
             let holder = Holder { mixed: Mixed { tag: 7 as i32, wide: 123456789, leaf: Leaf { n: 42 } } };
             let observed = holder.mixed;

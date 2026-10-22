@@ -53,6 +53,14 @@ pub struct TypeInfo {
     /// own them, so repeated compilation/execution releases metadata with the
     /// type table rather than leaking one allocation per shape.
     pub interior_ptrs: Cow<'static, [u16]>,
+
+    /// For a `Bytes` tail holding inline records (an array of value
+    /// aggregates): each record's size in bytes, or 0 for plain bytes. The
+    /// tail's count is in bytes, a multiple of the stride.
+    pub record_stride: u16,
+
+    /// Offsets, within each record, of its GC references.
+    pub record_ptrs: Cow<'static, [u16]>,
 }
 
 /// Whether a heap object has a variable-length tail section.
@@ -104,6 +112,8 @@ impl TypeInfo {
             varlen: VarLenKind::None,
             align_log2: 3, // 8-byte alignment minimum
             interior_ptrs: Cow::Borrowed(offsets),
+            record_stride: 0,
+            record_ptrs: Cow::Borrowed(&[]),
         }
     }
 
@@ -138,6 +148,17 @@ impl TypeInfo {
     pub const fn with_varlen_bytes(mut self, fixed_fields: u16) -> Self {
         self.value_field_count = fixed_fields;
         self.varlen = VarLenKind::Bytes;
+        self
+    }
+
+    /// Add a variable-length tail of inline records, `stride` bytes each, with
+    /// GC references at `ptrs` within each record. The tail's count is in
+    /// bytes.
+    pub fn with_varlen_records(mut self, fixed_fields: u16, stride: u16, ptrs: Vec<u16>) -> Self {
+        self.value_field_count = fixed_fields;
+        self.varlen = VarLenKind::Bytes;
+        self.record_stride = stride;
+        self.record_ptrs = Cow::Owned(ptrs);
         self
     }
 
@@ -203,6 +224,14 @@ impl TypeInfo {
             let off = off as usize;
             off % 8 != 0 || off < raw_start || off.checked_add(8).is_none_or(|end| end > raw_end)
         }) {
+            return None;
+        }
+        // Records live in a byte tail; each reference is an aligned word
+        // inside its record.
+        if (self.record_stride != 0 || !self.record_ptrs.is_empty())
+            && (self.varlen != VarLenKind::Bytes || self.record_stride % 8 != 0 || self.record_stride == 0
+                || self.record_ptrs.iter().any(|&off| off % 8 != 0 || off as usize + 8 > self.record_stride as usize))
+        {
             return None;
         }
         self.checked_size_for_valid_layout(varlen_len)

@@ -23,7 +23,7 @@ fn wide_scalar_records_compile_without_tracking_scalar_root_lifetimes() {
         } else {
             "wide.f0"
         };
-        std::fs::write(&source, format!("struct Node {{n:i64}} #[value] struct Wide {{{prefix}{fields}}} fn main()->i64 {{let wide=Wide {{{initializer}{arguments}}}; {tail}}}")).unwrap();
+        std::fs::write(&source, format!("#[heap] struct Node {{n:i64}} #[value] struct Wide {{{prefix}{fields}}} fn main()->i64 {{let wide=Wide {{{initializer}{arguments}}}; {tail}}}")).unwrap();
         let output = support::run_with_timeout(
             Command::new(env!("CARGO_BIN_EXE_gcr"))
                 .arg("emit")

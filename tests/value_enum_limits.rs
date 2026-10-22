@@ -10,7 +10,7 @@ fn large_value_enum_reference_counts_report_layout_errors_without_panicking_or_w
         let source = root.join(format!("{count}.gcr"));
         let types = vec!["Node"; count].join(",");
         let arguments = vec!["node"; count].join(",");
-        std::fs::write(&source, format!("struct Node {{ n:i64 }} #[value] enum Huge {{ All({types}) }} fn main()->i64 {{ let node=Node {{n:1}}; let value=Huge::All({arguments}); 0 }}")).unwrap();
+        std::fs::write(&source, format!("#[heap] struct Node {{ n:i64 }} #[value] enum Huge {{ All({types}) }} fn main()->i64 {{ let node=Node {{n:1}}; let value=Huge::All({arguments}); 0 }}")).unwrap();
         let output = support::run_with_timeout(
             Command::new(env!("CARGO_BIN_EXE_gcr"))
                 .arg("emit")
@@ -58,7 +58,7 @@ fn nested_value_reference_offsets_are_checked_before_codegen() {
         ("recursive", "#[value] struct Inner { first:i64, huge:Huge } #[value] struct Outer { first:i64, inner:Inner }", "Outer {first:1,inner:Inner {first:2,huge:huge}}", false),
     ] {
         let source = root.join(format!("{name}.gcr"));
-        std::fs::write(&source, format!("struct Node {{ n:i64 }} #[value] enum Huge {{ All({types}) }} {definitions} fn main()->i64 {{ let node=Node {{n:1}}; let huge=Huge::All({arguments}); let outer={expression}; 0 }}")).unwrap();
+        std::fs::write(&source, format!("#[heap] struct Node {{ n:i64 }} #[value] enum Huge {{ All({types}) }} {definitions} fn main()->i64 {{ let node=Node {{n:1}}; let huge=Huge::All({arguments}); let outer={expression}; 0 }}")).unwrap();
         for stage in if accepted { vec!["layout"] } else { vec!["layout", "llvm"] } {
             let output = support::run_with_timeout(Command::new(env!("CARGO_BIN_EXE_gcr")).arg("emit").arg(stage).arg(&source), 30);
             let error = String::from_utf8_lossy(&output.stderr);
@@ -105,7 +105,7 @@ fn scalar_only_nested_offsets_do_not_overflow_reference_traversal() {
         .map(|i| format!("f{i}:s{i}"))
         .collect::<Vec<_>>()
         .join(",");
-    std::fs::write(&source, format!("struct Node {{ n:i64 }} {} #[value] struct Big {{ {fields} }} #[value] struct Leaf {{ n:i64 }} #[value] struct Inner {{ big:Big, leaf:Leaf }} #[value] struct Outer {{ node:Node, inner:Inner }} fn main()->i64 {{ {} let outer=Outer {{node:Node {{n:1}},inner:Inner {{big:Big {{{arguments}}},leaf:Leaf {{n:42}}}}}}; outer.inner.leaf.n }}", definitions.join(" "), initializers.join(" "))).unwrap();
+    std::fs::write(&source, format!("#[heap] struct Node {{ n:i64 }} {} #[value] struct Big {{ {fields} }} #[value] struct Leaf {{ n:i64 }} #[value] struct Inner {{ big:Big, leaf:Leaf }} #[value] struct Outer {{ node:Node, inner:Inner }} fn main()->i64 {{ {} let outer=Outer {{node:Node {{n:1}},inner:Inner {{big:Big {{{arguments}}},leaf:Leaf {{n:42}}}}}}; outer.inner.leaf.n }}", definitions.join(" "), initializers.join(" "))).unwrap();
     for stage in ["layout", "llvm"] {
         let output = support::run_with_timeout(
             Command::new(env!("CARGO_BIN_EXE_gcr"))

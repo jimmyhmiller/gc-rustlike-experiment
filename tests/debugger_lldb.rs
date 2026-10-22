@@ -35,6 +35,8 @@ fn build_debug(src: &str, out: &Path, runtime_lib: &Path) {
     unsafe {
         std::env::set_var("GCRUST_RUNTIME_LIB", runtime_lib);
     }
+    // As `gcr build --debug`: full debug info describes heap layouts.
+    gcrust::layout::set_inline_by_default(false);
     let (module, sources) = parse_with_prelude(src).expect("parse");
     let resolved = resolve_module(module).expect("resolve");
     let mut prog = lower_program(&resolved.globals).expect("lower");

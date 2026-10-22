@@ -90,6 +90,8 @@ fn traced_bytes(info: &TypeInfo, varlen_len: usize) -> usize {
         .saturating_add(info.interior_ptrs.len())
         .saturating_add(if info.varlen == VarLenKind::Values {
             varlen_len
+        } else if info.record_stride != 0 {
+            (varlen_len / info.record_stride as usize).saturating_mul(info.record_ptrs.len())
         } else {
             0
         })
@@ -669,6 +671,7 @@ impl Heap {
                                     // local buffers without per-field flush checks.
                                     // Stream larger scans between clean boundaries.
                                     let stream = info.varlen == VarLenKind::Values
+                                        || !info.record_ptrs.is_empty()
                                         || info.value_field_count as usize + info.interior_ptrs.len()
                                             > MAX_SMALL_OBJECT_SLOTS;
                                     let nursery_edge = if stream {
@@ -818,7 +821,8 @@ impl Heap {
                 align_log2: info.align_log2,
                 needs_scan: info.value_field_count != 0
                     || !info.interior_ptrs.is_empty()
-                    || (info.varlen == VarLenKind::Values && len != 0),
+                    || (info.varlen == VarLenKind::Values && len != 0)
+                    || (info.record_stride != 0 && !info.record_ptrs.is_empty() && len != 0),
                 claim,
             });
             if let Some(group) = channels.and_then(|channels| channels.source_group(old, type_id)) {
