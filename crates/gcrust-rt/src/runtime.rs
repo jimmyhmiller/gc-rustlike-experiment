@@ -3145,7 +3145,12 @@ unsafe fn alloc_string_from_utf8_bytes(thread: *mut Thread, type_id: u32, bytes:
         let t = &*thread;
         let heap = &*t.heap;
         let info: &TypeInfo = heap.type_info_by_id(type_id as u16);
-        let obj = alloc_with_published_frame(t, heap, info, bytes.len());
+        // The thread-local buffer first, as `ai_gc_alloc_varlen` does.
+        let fast = match heap.object_request::<Full>(info, bytes.len()) {
+            Some(request) => request.try_allocate_local(&*t.dyna_thread),
+            None => core::ptr::null_mut(),
+        };
+        let obj = if fast.is_null() { alloc_with_published_frame(t, heap, info, bytes.len()) } else { fast };
         // Count/header and zero-filled storage are complete before a poll.
         // A partially copied String remains private; GC treats bytes as opaque.
         if bytes.len() <= string_copy::COPY_BYTES {
@@ -3281,10 +3286,21 @@ pub unsafe extern "C" fn ai_str_from_bytes(thread: *mut Thread, type_id: i64, ar
 pub unsafe extern "C" fn ai_str_from_utf8_prefix(thread: *mut Thread, type_id: i64, array: *const u8, len: i64) -> *mut u8 {
     unsafe {
         with_array_bytes(thread, array, len, |bytes| {
-            let valid = match std::str::from_utf8(bytes) { Ok(_) => bytes.len(), Err(e) => e.valid_up_to() };
+            let valid = if is_ascii(bytes) { bytes.len() } else {
+                match std::str::from_utf8(bytes) { Ok(_) => bytes.len(), Err(e) => e.valid_up_to() }
+            };
             alloc_string_from_utf8_bytes(thread, type_id as u32, &bytes[..valid])
         })
     }
+}
+
+/// Are all of `bytes` ASCII? Eight at a time; short identifiers are common.
+fn is_ascii(bytes: &[u8]) -> bool {
+    let mut words = bytes.chunks_exact(8);
+    let mut high = 0u64;
+    for word in &mut words { high |= u64::from_ne_bytes(word.try_into().unwrap()); }
+    for byte in words.remainder() { high |= *byte as u64; }
+    high & 0x8080_8080_8080_8080 == 0
 }
 
 /// Run `body` on a native copy of the first `len` bytes of a `u8` array,
@@ -3293,9 +3309,11 @@ unsafe fn with_array_bytes<R>(thread: *mut Thread, array: *const u8, len: i64, b
     const STACK: usize = 256;
     let len = len.max(0) as usize;
     if len <= STACK {
-        let mut buffer = [0u8; STACK];
-        if len > 0 { unsafe { ffi_copy::scalar(thread, array, buffer.as_mut_ptr(), len as i64, 8, false); } }
-        return body(&buffer[..len]);
+        // A short copy needs no polls: one access, then the bytes.
+        let mut buffer = core::mem::MaybeUninit::<[u8; STACK]>::uninit();
+        let start = buffer.as_mut_ptr().cast::<u8>();
+        if len > 0 { unsafe { ai_buf_copy_in(thread, array, start, len as i64, 8); } }
+        return body(unsafe { core::slice::from_raw_parts(start, len) });
     }
     let mut bytes = vec![0u8; len];
     unsafe { ffi_copy::scalar(thread, array, bytes.as_mut_ptr(), len as i64, 8, false); }

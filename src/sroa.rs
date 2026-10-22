@@ -53,7 +53,7 @@ fn replace_fn(f: &mut CoreFn, layouts: &[Layout]) -> bool {
     if !escaping.is_empty() {
         let dead = crate::codegen_liveness::dead_after(f, &escaping);
         let mut ok: HashMap<LocalId, bool> = escaping.iter().map(|l| (*l, true)).collect();
-        check_block(&f.body, &dead, &escaping, &mut ok);
+        check_block(&f.body, &dead, &escaping, &mut ok, false);
         for (l, good) in ok { if good { candidates.push(l); materialized.insert(l); } }
     }
     if candidates.is_empty() { return false; }
@@ -86,24 +86,26 @@ fn replace_fn(f: &mut CoreFn, layouts: &[Layout]) -> bool {
 }
 
 /// Clear `ok` for each escaping object one of whose escapes is not the only
-/// use of it in its statement, after which it is dead (or is in a tail).
-fn check_block(b: &CoreBlock, dead: &HashMap<usize, BTreeSet<LocalId>>, escaping: &BTreeSet<LocalId>, ok: &mut HashMap<LocalId, bool>) {
+/// use of it in its statement, after which it is dead. An escape in a nested
+/// block's tail belongs to the enclosing statement (`covered` for the tails
+/// of blocks inside one); one in no statement fails.
+fn check_block(b: &CoreBlock, dead: &HashMap<usize, BTreeSet<LocalId>>, escaping: &BTreeSet<LocalId>, ok: &mut HashMap<LocalId, bool>, covered: bool) {
     for s in &b.stmts {
         let (CoreStmt::Let(_, e) | CoreStmt::Expr(e)) = s;
         for x in own_escapes(e, escaping) {
             let last = dead.get(&(s as *const CoreStmt as usize)).is_some_and(|d| d.contains(&x));
             if !last || occurrences(e, x) != 1 { ok.insert(x, false); }
         }
-        for nested in nested_blocks(e) { check_block(nested, dead, escaping, ok); }
+        for nested in nested_blocks(e) { check_block(nested, dead, escaping, ok, true); }
     }
     if let Some(t) = &b.tail {
-        for x in own_escapes(t, escaping) { ok.insert(x, false); }
-        for nested in nested_blocks(t) { check_block(nested, dead, escaping, ok); }
+        if !covered { for x in own_escapes(t, escaping) { ok.insert(x, false); } }
+        for nested in nested_blocks(t) { check_block(nested, dead, escaping, ok, covered); }
     }
 }
 
-/// The objects read in `e` itself (outside its nested blocks) other than as
-/// the object of a field access.
+/// The objects read in `e` itself, or in the tails of blocks within it (not
+/// in their statements), other than as the object of a field access.
 fn own_escapes(e: &CoreExpr, objects: &BTreeSet<LocalId>) -> Vec<LocalId> {
     let mut out = Vec::new();
     fn walk(e: &CoreExpr, objects: &BTreeSet<LocalId>, out: &mut Vec<LocalId>) {
@@ -111,8 +113,13 @@ fn own_escapes(e: &CoreExpr, objects: &BTreeSet<LocalId>) -> Vec<LocalId> {
             CoreExprKind::Local(l) if objects.contains(l) => out.push(*l),
             CoreExprKind::Field { base, .. } if matches!(base.kind.as_ref(), CoreExprKind::Local(_)) => {}
             CoreExprKind::SetField { base, value, .. } if matches!(base.kind.as_ref(), CoreExprKind::Local(_)) => walk(value, objects, out),
-            CoreExprKind::If(c, ..) => walk(c, objects, out),
-            CoreExprKind::Block(_) | CoreExprKind::Loop(_) | CoreExprKind::Once { .. } => {}
+            CoreExprKind::If(c, y, n) => {
+                walk(c, objects, out);
+                for t in [&y.tail, &n.tail].into_iter().flatten() { walk(t, objects, out); }
+            }
+            CoreExprKind::Block(b) | CoreExprKind::Loop(b) | CoreExprKind::Once { body: b, .. } => {
+                if let Some(t) = &b.tail { walk(t, objects, out); }
+            }
             CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
                 walk(scrutinee, objects, out);
                 for a in arms { walk(&a.body, objects, out); }

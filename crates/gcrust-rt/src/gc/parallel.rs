@@ -612,8 +612,13 @@ impl Heap {
             }
         }
         let workers = policy.workers(|| {
+            // A minor collection's work is its survivors, not the nursery's
+            // allocation volume: estimate them by the last one's.
             let source_bytes = if minor {
-                self.nursery_state.as_ref().unwrap().nursery.used()
+                match self.last_minor_promoted.load(Ordering::Relaxed) {
+                    usize::MAX => self.nursery_state.as_ref().unwrap().nursery.used(),
+                    promoted => promoted,
+                }
             } else {
                 self.from_used()
             };

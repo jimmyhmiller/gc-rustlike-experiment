@@ -275,6 +275,9 @@ pub struct Heap {
     /// no other thread can race on an object, so generated code may access
     /// inline aggregates without a tear-free snapshot.
     multi_mutator: AtomicU8,
+    /// Bytes the last minor collection promoted (`usize::MAX` before the
+    /// first): the next one's expected evacuation work.
+    pub(crate) last_minor_promoted: AtomicUsize,
 
     /// Global SATB queue. Mutator threads flush their local SATB buffers
     /// here, and the GC drains it during collection.
@@ -388,6 +391,7 @@ impl Heap {
             gc_events: Mutex::new(GcTelemetry::new()),
             gc_phase: AtomicU8::new(GcPhase::Idle as u8),
             multi_mutator: AtomicU8::new(0),
+            last_minor_promoted: AtomicUsize::new(usize::MAX),
             satb_queue: SATBQueue::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
             tracer: None,
             gc_every_alloc: AtomicBool::new(false),
@@ -458,6 +462,7 @@ impl Heap {
             gc_events: Mutex::new(GcTelemetry::new()),
             gc_phase: AtomicU8::new(GcPhase::Idle as u8),
             multi_mutator: AtomicU8::new(0),
+            last_minor_promoted: AtomicUsize::new(usize::MAX),
             satb_queue: SATBQueue::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
             tracer: None,
             gc_every_alloc: AtomicBool::new(false),
@@ -3121,6 +3126,7 @@ impl Heap {
         ns.minor_collections.fetch_add(1, Ordering::Relaxed);
         // GC-log: nursery is reset (after ≈ 0); tenured growth = promoted volume.
         let promoted = (self.from_used() as u64).saturating_sub(gc_before_tenured);
+        self.last_minor_promoted.store(promoted as usize, Ordering::Relaxed);
         self.record_gc_duration(
             GcKind::Minor,
             gc_t0.elapsed().saturating_sub(major_elapsed),

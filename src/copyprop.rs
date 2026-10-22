@@ -10,6 +10,11 @@
 //! `o`'s single definition is a parameter or capture, a match-arm binding,
 //! or a `let` outside every loop. Then every use of `n` (all after its
 //! `let`) sees the value `o` had at the copy, so `o` can stand in for it.
+//!
+//! It is also removed when every use of `n` follows its `let` within its
+//! block, and `o`'s `let` precedes `n`'s in that block or an enclosing one:
+//! `o` is then not redefined while `n` is in use, even inside a loop, since
+//! running `o`'s `let` again also runs `n`'s before any use of `n`.
 
 use crate::core::{CoreBlock, CoreExpr, CoreExprKind, CoreFn, CoreProgram, CoreStmt, LocalId, Repr};
 use std::collections::HashMap;
@@ -33,8 +38,10 @@ fn propagate_fn(f: &mut CoreFn) {
     let incoming = f.closure_captures.len() + f.params.len();
     for d in defs.iter_mut().take(incoming) { *d = Defs { count: 1, stable: true }; }
     count_block(&f.body, 0, &mut defs);
+    let mut order = Order { next: 0, lets: HashMap::new(), uses: vec![(u32::MAX, 0); f.locals.len()] };
+    order.block(&f.body);
     let mut copies: HashMap<LocalId, LocalId> = HashMap::new();
-    find_copies_block(&f.body, &defs, &f.locals, &mut copies);
+    find_copies_block(&f.body, &defs, &f.locals, &order, &mut copies);
     if copies.is_empty() { return; }
     // Resolve chains (`a = b; c = a`).
     let resolve = |mut l: LocalId| { let mut n = 0; while let Some(&o) = copies.get(&l) { l = o; n += 1; if n > copies.len() { break; } } l };
@@ -77,33 +84,87 @@ fn count_expr(e: &CoreExpr, loops: u32, defs: &mut [Defs]) {
     }
 }
 
-fn find_copies_block(b: &CoreBlock, defs: &[Defs], locals: &[Repr], out: &mut HashMap<LocalId, LocalId>) {
+/// Statements numbered in pre-order. A `let` is at number `at`, its value's
+/// statements end at `end`, and the rest of its block ends at `block_end`.
+struct Order {
+    next: u32,
+    lets: HashMap<LocalId, Let>,
+    /// Each local's first and last use, by statement number.
+    uses: Vec<(u32, u32)>,
+}
+
+#[derive(Clone, Copy)]
+struct Let { at: u32, end: u32, block_end: u32 }
+
+impl Order {
+    fn block(&mut self, b: &CoreBlock) {
+        let mut in_block = Vec::new();
+        for s in &b.stmts {
+            let at = self.next;
+            self.next += 1;
+            let (CoreStmt::Let(_, e) | CoreStmt::Expr(e)) = s;
+            self.expr(e, at);
+            if let CoreStmt::Let(l, _) = s { in_block.push((*l, at, self.next - 1)); }
+        }
+        if let Some(t) = &b.tail { let at = self.next; self.next += 1; self.expr(t, at); }
+        let block_end = self.next - 1;
+        for (l, at, end) in in_block { self.lets.insert(l, Let { at, end, block_end }); }
+    }
+
+    fn expr(&mut self, e: &CoreExpr, at: u32) {
+        match e.kind.as_ref() {
+            CoreExprKind::Local(l) => {
+                let u = &mut self.uses[*l as usize];
+                *u = (u.0.min(at), u.1.max(at));
+            }
+            CoreExprKind::Loop(b) | CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => self.block(b),
+            CoreExprKind::If(c, y, n) => { self.expr(c, at); self.block(y); self.block(n); }
+            CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
+                self.expr(scrutinee, at);
+                for a in arms { self.expr(&a.body, at); }
+            }
+            _ => for c in children(e) { self.expr(c, at) },
+        }
+    }
+
+    /// Is every use of `n` after its `let` in its block, and `o`'s `let`
+    /// before `n`'s in that block or an enclosing one?
+    fn scoped_copy(&self, n: LocalId, o: LocalId) -> bool {
+        let (Some(ln), Some(lo)) = (self.lets.get(&n), self.lets.get(&o)) else { return false };
+        let (first, last) = self.uses[n as usize];
+        let uses_scoped = first == u32::MAX || (first > ln.end && last <= ln.block_end);
+        uses_scoped && lo.end < ln.at && ln.at <= lo.block_end
+    }
+}
+
+fn find_copies_block(b: &CoreBlock, defs: &[Defs], locals: &[Repr], order: &Order, out: &mut HashMap<LocalId, LocalId>) {
     for s in &b.stmts {
         match s {
             CoreStmt::Let(n, e) => {
                 if let CoreExprKind::Local(o) = e.kind.as_ref() {
                     let (dn, d_o) = (defs[*n as usize], defs[*o as usize]);
-                    if dn.count == 1 && d_o.count == 1 && d_o.stable && n != o && locals[*n as usize] == locals[*o as usize] {
+                    if dn.count == 1 && d_o.count == 1 && n != o && locals[*n as usize] == locals[*o as usize]
+                        && (d_o.stable || order.scoped_copy(*n, *o)) {
                         out.insert(*n, *o);
                     }
                 }
-                find_copies_expr(e, defs, locals, out);
+                find_copies_expr(e, defs, locals, order, out);
             }
-            CoreStmt::Expr(e) => find_copies_expr(e, defs, locals, out),
+            CoreStmt::Expr(e) => find_copies_expr(e, defs, locals, order, out),
         }
     }
-    if let Some(t) = &b.tail { find_copies_expr(t, defs, locals, out); }
+    if let Some(t) = &b.tail { find_copies_expr(t, defs, locals, order, out); }
 }
 
-fn find_copies_expr(e: &CoreExpr, defs: &[Defs], locals: &[Repr], out: &mut HashMap<LocalId, LocalId>) {
+fn find_copies_expr(e: &CoreExpr, defs: &[Defs], locals: &[Repr], order: &Order, out: &mut HashMap<LocalId, LocalId>) {
     match e.kind.as_ref() {
-        CoreExprKind::Loop(b) | CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => find_copies_block(b, defs, locals, out),
-        CoreExprKind::If(c, y, n) => { find_copies_expr(c, defs, locals, out); find_copies_block(y, defs, locals, out); find_copies_block(n, defs, locals, out); }
+        CoreExprKind::Loop(b) | CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => find_copies_block(b, defs, locals, order, out),
+        CoreExprKind::If(c, y, n) => { find_copies_expr(c, defs, locals, order, out); find_copies_block(y, defs, locals, order, out); find_copies_block(n, defs, locals, order, out); }
         CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
-            find_copies_expr(scrutinee, defs, locals, out);
-            for a in arms { find_copies_expr(&a.body, defs, locals, out); }
+            find_copies_expr(scrutinee, defs, locals, order, out);
+            for a in arms { find_copies_expr(&a.body, defs, locals, order, out); }
         }
-        _ => for c in children(e) { find_copies_expr(c, defs, locals, out) },
+        _ => for c in children(e) { find_copies_expr(c, defs, locals, order, out) },
     }
 }
 

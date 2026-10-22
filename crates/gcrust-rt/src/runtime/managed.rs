@@ -244,15 +244,17 @@ pub unsafe extern "C" fn ai_managed_unlock(thread: *mut Thread) {
     }
 }
 
-/// Copy the FFI buffer one indivisible SC array element at a time. The native
-/// side is private/unshared and may be unaligned. The managed side has natural
-/// element alignment. Whole arrays are not an indivisible snapshot.
+/// Copy an FFI buffer to or from managed array elements. Each element is
+/// copied whole (no tearing) with plain-field semantics: no ordering beyond
+/// that, as for any managed slot. Elements are at most eight bytes and
+/// naturally aligned, so the aligned middle moves eight bytes at a time
+/// without splitting one. The native side is private/unshared and may be
+/// unaligned. Whole arrays are not an indivisible snapshot.
 ///
 /// # Safety
 /// Both buffers span byte_len initialized bytes; managed has natural alignment
 /// for bits (1/8/16/32/64). Caller retains canonical object access for the whole
-/// copy and remains RUNNING without safepoints or managed blocking. Normal
-/// per-element atomic synchronization is required among mutators.
+/// copy and remains RUNNING without safepoints or managed blocking.
 pub(super) unsafe fn copy_scalar_buffer(
     managed: *mut u8,
     native: *mut u8,
@@ -271,9 +273,10 @@ pub(super) unsafe fn copy_scalar_buffer(
         byte_len >= 0 && byte_len % stride == 0,
         "invalid scalar buffer size"
     );
+    let byte_len = byte_len as usize;
     macro_rules! copy {
-        ($integer:ty, $atomic:ty) => {{
-            for offset in (0..byte_len as usize).step_by(stride as usize) {
+        ($integer:ty, $atomic:ty, $range:expr) => {{
+            for offset in ($range).step_by(std::mem::size_of::<$integer>()) {
                 unsafe {
                     let cell = &*managed.add(offset).cast::<$atomic>();
                     let raw = native.add(offset).cast::<$integer>();
@@ -282,9 +285,9 @@ pub(super) unsafe fn copy_scalar_buffer(
                         if bits == 1 {
                             value &= 1;
                         }
-                        cell.store(value, Ordering::SeqCst);
+                        cell.store(value, Ordering::Relaxed);
                     } else {
-                        let mut value = cell.load(Ordering::SeqCst);
+                        let mut value = cell.load(Ordering::Relaxed);
                         if bits == 1 {
                             value &= 1;
                         }
@@ -294,11 +297,27 @@ pub(super) unsafe fn copy_scalar_buffer(
             }
         }};
     }
+    // Booleans are normalized one at a time.
+    if bits == 1 {
+        copy!(u8, std::sync::atomic::AtomicU8, 0..byte_len);
+        return;
+    }
+    // Elements up to the first eight-byte boundary, then whole words, then
+    // the rest.
+    let head = (managed.align_offset(8)).min(byte_len) / stride as usize * stride as usize;
+    let words_end = head + (byte_len - head) / 8 * 8;
     match bits {
-        1 | 8 => copy!(u8, std::sync::atomic::AtomicU8),
-        16 => copy!(u16, std::sync::atomic::AtomicU16),
-        32 => copy!(u32, std::sync::atomic::AtomicU32),
-        64 => copy!(u64, AtomicU64),
+        8 => copy!(u8, std::sync::atomic::AtomicU8, 0..head),
+        16 => copy!(u16, std::sync::atomic::AtomicU16, 0..head),
+        32 => copy!(u32, std::sync::atomic::AtomicU32, 0..head),
+        _ => {}
+    }
+    copy!(u64, AtomicU64, head..words_end);
+    match bits {
+        8 => copy!(u8, std::sync::atomic::AtomicU8, words_end..byte_len),
+        16 => copy!(u16, std::sync::atomic::AtomicU16, words_end..byte_len),
+        32 => copy!(u32, std::sync::atomic::AtomicU32, words_end..byte_len),
+        64 => copy!(u64, AtomicU64, words_end..byte_len),
         _ => unreachable!(),
     }
 }
