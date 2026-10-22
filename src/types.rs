@@ -71,6 +71,9 @@ pub struct TyCtx {
     /// `const` and `static` items, plus associated constants keyed
     /// `Type::NAME` (impls) and `Trait::NAME` (trait defaults).
     pub consts: HashMap<String, Rc<ConstDef>>,
+    /// The `static` items' full names; a static's index here is its slot in
+    /// the program's static table.
+    pub statics: Vec<String>,
     /// Associated constants by (receiver base, name): an inherent impl's,
     /// then a trait impl's, then the trait's default.
     pub assoc_consts: HashMap<(String, String), Rc<ConstDef>>,
@@ -329,6 +332,11 @@ impl TyCtx {
             enums: g.enums.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             fns: g.fns.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             consts: g.consts.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
+            statics: {
+                let mut names: Vec<String> = g.consts.iter().filter(|(_, c)| c.is_static.is_some()).map(|(k, _)| k.clone()).collect();
+                names.sort();
+                names
+            },
             traits: g.traits.iter().map(|(k, v)| (k.clone(), Rc::new(v.clone()))).collect(),
             impls: g.impls.iter().map(|i| Rc::new(i.clone())).collect(),
             variants,

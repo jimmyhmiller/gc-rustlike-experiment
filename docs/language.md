@@ -182,7 +182,7 @@ These follow Rust; differences come from having no references.
   assigned later (its type comes from the first assignment, and the binding
   may be reassigned); `for c in 'a'..='z'`; let chains
   (`if let Some(x) = a && x > 0 && let Some(y) = b { .. }`, also in `while`).
-- **Items and paths.** `const` and `static` items (a `static` is a constant);
+- **Items and paths.** `const` items (inlined where used) and `static` / `static mut` items (one shared location for the whole program and all its threads; reading or writing a `static mut` needs `unsafe`, and initializers run before `main`, each after the statics it names);
   nested `fn`s and other items inside functions (hoisted beside the enclosing
   item; like Rust's, they capture nothing); `pub(crate)`/`pub(super)` (all
   `pub`); `crate::`, `super::`, and `self::` paths; lifetime parameters,
@@ -300,6 +300,11 @@ range patterns over integers and chars (`1..=9`, `'a'..='z'`, `10..100`,
 `if let` and `while let`, not in `let`. An or-pattern repeats its arm for each
 alternative, and a range is a guard, so a range does not count toward
 exhaustiveness.
+
+A path naming a `const` (`MAX`, `Limits::TOP`) is a constant pattern: it
+matches values equal to the constant (`==`). Any other upper-case name that is
+not a variant, constant, or type is a binding (`let N = 5;`); a binding may not
+shadow a `static`.
 
 Slice patterns match a `Vec` or array: `[]`, `[x]`, `[first, .., last]`,
 `[x, rest @ ..]` (`rest` is a copy of the remaining elements), with names,

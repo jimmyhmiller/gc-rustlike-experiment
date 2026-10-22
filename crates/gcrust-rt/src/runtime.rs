@@ -1768,6 +1768,44 @@ pub unsafe extern "C" fn ai_atomic_i64_compare_and_set(
     }
 }
 
+/// Install the program's table of `static` cells (an array of references) as
+/// a heap-wide root. Generated `main` calls this before running initializers.
+/// A second install (re-entering `main`) replaces the table.
+///
+/// # Safety
+/// `thread` is this OS thread's live RUNNING mutator; `table` is a live object
+/// in its heap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_statics_install(thread: *mut Thread, table: *mut u8) {
+    unsafe {
+        let heap = &*(*thread).heap;
+        let slot = heap.statics_slot.load(Ordering::Acquire);
+        if slot != usize::MAX {
+            heap.globals.set(slot, table as u64);
+            return;
+        }
+        let slot = handoff_storage::admit(thread, heap, table);
+        heap.statics_slot.store(slot, Ordering::Release);
+    }
+}
+
+/// The table installed by [`ai_statics_install`]. Every thread of the program
+/// shares it.
+///
+/// # Safety
+/// `thread` is this OS thread's live RUNNING mutator.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_statics_table(thread: *mut Thread) -> *mut u8 {
+    unsafe {
+        let heap = &*(*thread).heap;
+        let slot = heap.statics_slot.load(Ordering::Acquire);
+        if slot == usize::MAX {
+            abort_with_diagnostic(thread, b"gc-rust: a static was used before main initialized it")
+        }
+        heap.globals.get(slot) as *mut u8
+    }
+}
+
 /// A stable per-thread id (`Thread.current_id()`), derived from the OS thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn ai_thread_current_id(_thread: *mut Thread) -> i64 {

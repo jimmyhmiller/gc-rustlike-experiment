@@ -288,6 +288,24 @@ impl Qualifier<'_> {
             }
         }
         if let PatternKind::Struct { path, .. } = &mut pattern.kind { self.expand_self(path); }
+        // An upper-case name the parser took for a unit variant is a binding
+        // (`let N = 5;`) unless a variant, constant, or type has that name.
+        if let PatternKind::Variant { path, payload } = &pattern.kind {
+            if path.is_single() && payload.is_empty() {
+                let name = path.last();
+                let statics = self.g.by_last.get(name).into_iter().flatten()
+                    .any(|full| self.g.consts.get(full).is_some_and(|c| c.is_static.is_some()));
+                if statics {
+                    return Err(ResolveError { msg: format!("bindings cannot shadow statics (`{name}` is a static)"), span: pattern.span });
+                }
+                let known = self.g.by_last.contains_key(name) || self.g.use_aliases.contains_key(name)
+                    || self.g.enums.values().any(|e| e.variants.iter().any(|v| v.name == name));
+                if !known {
+                    pattern.kind = PatternKind::Binding { is_mut: false, name: name.to_string() };
+                    return Ok(());
+                }
+            }
+        }
         match &mut pattern.kind {
             PatternKind::Variant { path, payload } => {
                 self.prefix(path)?;

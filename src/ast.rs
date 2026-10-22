@@ -179,6 +179,8 @@ pub struct TypeAlias {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ConstDef {
     pub vis: bool,
+    /// `None` for a `const`; `Some(is_mut)` for a `static` / `static mut`.
+    pub is_static: Option<bool>,
     pub name: String,
     pub ty: Type,
     pub value: Expr,

@@ -237,9 +237,34 @@ fn wrap_entry(ctx: &mut TyCtx) -> LResult<()> {
     Ok(())
 }
 
+/// `NAME.v` through static `full`'s cell: the place a static names.
+fn static_place(full: &str, span: Span) -> Expr {
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+    ex(ExprKind::Field {
+        base: ex(ExprKind::Path(Path::single(format!("static#{full}"), span))),
+        field: FieldAccess::Named("v".into()),
+    })
+}
+
+/// With `static` items, `main` first builds the static table, then runs.
+fn wrap_statics(ctx: &mut TyCtx) {
+    if ctx.statics.is_empty() { return; }
+    let Some(main_f) = ctx.fns.get("main").cloned() else { return };
+    let span = main_f.body.span;
+    let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+    let call = |name: &str| ex(ExprKind::Call(ex(ExprKind::Path(Path::single(name.into(), span))), vec![]));
+    let mut wrapper = (*main_f).clone();
+    wrapper.body = Block { stmts: vec![Stmt::Expr(call("static#init"))], tail: Some(call("__gcr_static_main")), span };
+    let mut user = (*main_f).clone();
+    user.name = "__gcr_static_main".into();
+    ctx.fns.insert("__gcr_static_main".into(), Rc::new(user));
+    ctx.fns.insert("main".into(), Rc::new(wrapper));
+}
+
 pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
     let mut ctx = TyCtx::from_globals(globals);
     wrap_entry(&mut ctx)?;
+    wrap_statics(&mut ctx);
     let ctx = ctx;
     let _normalizer = crate::types::enter_normalizer(&ctx);
     let mut reg = LayoutRegistry::new(&ctx);
@@ -1347,6 +1372,12 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     /// describes the place for the error message ("variable", "field of",
     /// "element of").
     fn check_mutable_root(&self, target: &Expr, what: &str, span: Span) -> LResult<()> {
+        if let Some(root) = Self::path_root_name(target).filter(|r| self.lookup_mut(r).is_none()) {
+            if root.starts_with("static#") { return Ok(()); }
+            if let Some((full, def)) = self.const_def(&Path::single(root, span)).filter(|(_, d)| d.is_static.is_some()) {
+                return self.check_static_assign(&full, &def, what, span);
+            }
+        }
         match Self::path_root_name(target) {
             Some(root) => match self.lookup_mut(&root) {
                 Some(true) => Ok(()),
@@ -1824,12 +1855,105 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         None
     }
 
+    /// Assigning to a static (or into one) needs a `static mut` and `unsafe`.
+    fn check_static_assign(&self, full: &str, def: &ConstDef, what: &str, span: Span) -> LResult<()> {
+        if def.is_static != Some(true) {
+            let what = if what.is_empty() { String::new() } else { format!("{what} ") };
+            return err(format!("cannot assign to {what}immutable static item `{}` (declare it `static mut`)", full.rsplit("::").next().unwrap_or(full)), span);
+        }
+        self.require_unsafe("use of a `static mut`", span)
+    }
+
+    /// The array of static cells: references, traced by each cell's header.
+    fn statics_table(&mut self, span: Span) -> LResult<(Ty, LayoutId, Repr)> {
+        let ty = Ty::Array(Box::new(Ty::Prim(Prim::Str)), self.ctx.statics.len() as u64);
+        let Repr::Ref(layout) = self.repr_of(&ty, span)? else { return err("static table without an array representation", span) };
+        let elem = self.repr_of(&Ty::Prim(Prim::Str), span)?;
+        Ok((ty, layout, elem))
+    }
+
+    /// Static `full`'s cell, a `MutCell<T>` in the program's static table.
+    fn static_cell(&mut self, full: &str, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let def = self.ctx.consts[full].clone();
+        let index = self.ctx.statics.iter().position(|s| s == full).expect("static is indexed");
+        let ty = ground_type(&def.ty, &HashMap::new(), self.ctx)?;
+        let cell_ty = Ty::Named { name: "MutCell".into(), args: vec![ty] };
+        let cell = self.repr_of(&cell_ty, span)?;
+        let (_, layout, _) = self.statics_table(span)?;
+        let table = CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_statics_table", args: vec![], ret: Repr::Ref(layout) }, Repr::Ref(layout));
+        let index = CoreExpr::new(CoreExprKind::ConstInt(index as u64, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+        let get = CoreExprKind::ArrayGetChecked { array: Box::new(table), index: Box::new(index), elem: cell.clone() };
+        Ok((CoreExpr::new(get, cell), cell_ty))
+    }
+
+    /// Build the static table and run every initializer, each after the
+    /// statics it names. The entry wrapper calls this before the user's `main`.
+    fn init_statics(&mut self, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let (table_ty, layout, elem) = self.statics_table(span)?;
+        let table = self.fresh_local(Repr::Ref(layout), table_ty);
+        let local = || CoreExpr::new(CoreExprKind::Local(table), Repr::Ref(layout));
+        let int = |n: usize| CoreExpr::new(CoreExprKind::ConstInt(n as u64, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
+        let len = Box::new(int(self.ctx.statics.len()));
+        let mut stmts = vec![
+            CoreStmt::Let(table, CoreExpr::new(CoreExprKind::ArrayNew { layout, len, elem: elem.clone() }, Repr::Ref(layout))),
+            CoreStmt::Expr(CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_statics_install", args: vec![local()], ret: Repr::Unit }, Repr::Unit)),
+        ];
+        let mut state = vec![0u8; self.ctx.statics.len()];
+        let mut order = Vec::new();
+        for i in 0..state.len() { self.static_order(i, &mut state, &mut order)?; }
+        for i in order {
+            let full = self.ctx.statics[i].clone();
+            let def = self.ctx.consts[&full].clone();
+            let ty = ground_type(&def.ty, &HashMap::new(), self.ctx)?;
+            let cell_ty = Ty::Named { name: "MutCell".into(), args: vec![ty] };
+            let at = def.value.span;
+            let lit = Expr { kind: std::sync::Arc::new(ExprKind::StructLit {
+                path: Path::single("MutCell".into(), at),
+                fields: vec![FieldInit { name: "v".into(), value: Some(def.value.clone()), span: at }],
+                span: at,
+            }), span: at };
+            // An initializer sees no local bindings.
+            let saved = std::mem::replace(&mut self.scope, vec![HashMap::new()]);
+            let result = self.expr(&lit, Some(&cell_ty));
+            self.scope = saved;
+            let (cell, _) = result?;
+            stmts.push(CoreStmt::Expr(CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(local()), index: Box::new(int(i)), value: Box::new(cell), elem: elem.clone() }, Repr::Unit)));
+        }
+        Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts, tail: None })), Repr::Unit), Ty::unit()))
+    }
+
+    /// Depth-first: the statics static `i`'s initializer names come first.
+    fn static_order(&self, i: usize, state: &mut [u8], order: &mut Vec<usize>) -> LResult<()> {
+        let full = &self.ctx.statics[i];
+        let def = &self.ctx.consts[full];
+        match state[i] {
+            2 => return Ok(()),
+            1 => return err(format!("static `{}` is initialized in terms of itself", def.name), def.span),
+            _ => {}
+        }
+        state[i] = 1;
+        let mut names = Vec::new();
+        collect_free_vars(&def.value, &[], &mut Vec::new(), &mut names);
+        for n in names {
+            let dep = self.const_def(&Path::single(n, def.value.span))
+                .and_then(|(f, d)| d.is_static.and_then(|_| self.ctx.statics.iter().position(|s| *s == f)));
+            if let Some(j) = dep { self.static_order(j, state, order)?; }
+        }
+        state[i] = 2;
+        order.push(i);
+        Ok(())
+    }
+
     /// A constant's value, inlined where it is used (as Rust does), checked
     /// against its declared type. Its expression sees no local bindings.
     fn const_value(&mut self, name: &str, def: &ConstDef, expected: Option<&Ty>, span: Span) -> LResult<(CoreExpr, Ty)> {
         thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
         if DEPTH.with(|d| d.get()) > 64 {
             return err(format!("constant `{}` is defined in terms of itself", name), span);
+        }
+        if let Some(is_mut) = def.is_static {
+            if is_mut { self.require_unsafe("use of a `static mut`", span)?; }
+            return self.expr(&static_place(name, span), expected);
         }
         let ty = ground_type(&def.ty, &HashMap::new(), self.ctx)?;
         let _ = expected;
@@ -1984,6 +2108,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             ExprKind::Unit => Ok((CoreExpr::new(CoreExprKind::Unit, Repr::Unit), Ty::unit())),
 
+            ExprKind::Path(path) if path.is_single() && path.last().starts_with("static#") => {
+                self.static_cell(&path.last()["static#".len()..], e.span)
+            }
             ExprKind::Path(path) if path.is_single() => {
                 let name = path.last();
                 if let Some((id, ty)) = self.lookup(name) {
@@ -2074,6 +2201,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             // A path with type arguments not being called (`f::<T>` as a value).
             ExprKind::Cast(inner, _) if turbofish_of(e).is_some() => self.expr(inner, expected),
+            ExprKind::Call(callee, args) if matches!(&*callee.kind, ExprKind::Path(p) if p.is_single() && p.last() == "static#init") => {
+                self.init_statics(e.span)
+            }
             ExprKind::Call(callee, args) => {
                 // A variant constructor call (`Result::Err(x)`) needs `expected`
                 // to infer type params the payload doesn't pin; intercept it
@@ -2322,6 +2452,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 // `s.field = v` → store into the heap object's field slot.
                 if let ExprKind::Field { base, field } = &*target.kind {
                     return self.assign_field(base, field, op, value, e.span);
+                }
+                // `NAME = v` on a `static mut` stores into its cell.
+                if let ExprKind::Path(p) = &*target.kind {
+                    if !(p.is_single() && self.lookup(p.last()).is_some()) {
+                        if let Some((full, def)) = self.const_def(p).filter(|(_, d)| d.is_static.is_some()) {
+                            self.check_static_assign(&full, &def, "", e.span)?;
+                            let ExprKind::Field { base, field } = &*static_place(&full, e.span).kind else { unreachable!() };
+                            return self.assign_field(base, field, op, value, e.span);
+                        }
+                    }
                 }
                 // Otherwise: assignment to a simple local.
                 let ExprKind::Path(p) = &*target.kind else {
@@ -3137,6 +3277,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // catch-all), literal, tuple, or struct pattern routes to the chain.
         let switchable = arms.iter().all(|a| match &a.pattern.kind {
             PatternKind::Wildcard => true,
+            PatternKind::Variant { .. } if self.const_pattern(&a.pattern, &sty) => false,
             PatternKind::Variant { payload, .. } => payload.iter().all(|p| matches!(
                 &p.kind, PatternKind::Binding { .. } | PatternKind::Wildcard
             )),
@@ -3445,6 +3586,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let cond = self.literal_eq(scrut, lit, sty, span)?;
                 Ok((Some(cond), vec![], false))
             }
+            PatternKind::Variant { path, .. } if self.const_pattern(pat, sty) => {
+                Ok((Some(self.const_eq(scrut, sty, path, span)?), vec![], false))
+            }
             PatternKind::Variant { path, payload } => {
                 let (tag, fields) = self.variant_fields(sty, path, span)?;
                 let expanded = expand_rest(payload, fields.len());
@@ -3584,6 +3728,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             PatternKind::At { pat, .. } => self.space_pat(pat, ty, span)?,
             PatternKind::Literal(LitPattern::Bool(b)) => SpacePat::Ctor(*b as u32, vec![]),
             PatternKind::Literal(lit) => SpacePat::Lit(format!("{:?}", lit)),
+            PatternKind::Variant { path, .. } if self.const_pattern(p, ty) => SpacePat::Lit(format!("const {}", path.segments.join("::"))),
             PatternKind::Variant { path, payload } => {
                 let (tag, fields) = self.variant_fields(ty, path, span)?;
                 let expanded = expand_rest(payload, fields.len());
@@ -3759,6 +3904,38 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     /// Build a boolean equality test `scrut == <literal>` for a literal pattern.
+    /// Is `p` a constant pattern: a bare path naming a `const` rather than a
+    /// variant of the scrutinee's enum?
+    fn const_pattern(&self, p: &Pattern, ty: &Ty) -> bool {
+        let PatternKind::Variant { path, payload } = &p.kind else { return false };
+        if !payload.is_empty() { return false; }
+        if !self.const_def(path).is_some_and(|(_, d)| d.is_static.is_none()) { return false; }
+        let is_variant = match ty {
+            Ty::Named { name, .. } => self.ctx.enums.get(name).is_some_and(|e| e.variants.iter().any(|v| v.name == path.last()))
+                && (path.is_single() || self.ctx.variants.contains_key(&path.segments.join("::"))),
+            _ => false,
+        };
+        !is_variant
+    }
+
+    /// `scrut == CONST` for a constant pattern.
+    fn const_eq(&mut self, scrut: &CoreExpr, sty: &Ty, path: &Path, span: Span) -> LResult<CoreExpr> {
+        let bool_repr = Repr::Scalar(ScalarRepr::Bool);
+        let konst = Expr { kind: std::sync::Arc::new(ExprKind::Path(path.clone())), span };
+        if matches!(scrut.repr, Repr::Scalar(_)) || matches!(sty, Ty::Prim(Prim::Str)) {
+            let (k, kty) = self.expr(&konst, Some(sty))?;
+            self.check_assignable(&kty, sty, span)?;
+            let kind = if matches!(sty, Ty::Prim(Prim::Str)) {
+                CoreExprKind::StrEq(Box::new(scrut.clone()), Box::new(k))
+            } else {
+                CoreExprKind::Bin(BinOp::Eq, Box::new(scrut.clone()), Box::new(k))
+            };
+            return Ok(CoreExpr::new(kind, bool_repr));
+        }
+        let (eq, _) = self.overloaded_binary(BinOp::Eq, scrut.clone(), sty.clone(), &konst, &konst, span)?;
+        Ok(eq)
+    }
+
     fn literal_eq(&mut self, scrut: &CoreExpr, lit: &LitPattern, sty: &Ty, span: Span) -> LResult<CoreExpr> {
         let bool_repr = Repr::Scalar(ScalarRepr::Bool);
         match lit {

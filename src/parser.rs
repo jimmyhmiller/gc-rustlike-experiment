@@ -1003,7 +1003,7 @@ impl Parser {
                 Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single("const#required".into(), start))), span: start }
             };
             self.expect(&TokKind::Semi)?;
-            return Ok(TraitItem::Const(ConstDef { vis: true, name, ty, value, span: start.to(self.prev_span()) }));
+            return Ok(TraitItem::Const(ConstDef { vis: true, is_static: None, name, ty, value, span: start.to(self.prev_span()) }));
         }
         if self.eat_kw(Kw::Type) {
             let n = self.ident()?;
@@ -1097,15 +1097,17 @@ impl Parser {
 
     fn const_def(&mut self, vis: bool) -> PResult<ConstDef> {
         let start = self.span();
-        // `const` or `static`.
+        // `const`, `static`, or `static mut`.
+        let is_static = self.at_kw(Kw::Static).then_some(());
         self.bump();
+        let is_static = is_static.map(|()| self.eat_kw(Kw::Mut));
         let name = self.ident()?;
         self.expect(&TokKind::Colon)?;
         let ty = self.ty()?;
         self.expect(&TokKind::Eq)?;
         let value = self.expr()?;
         self.expect(&TokKind::Semi)?;
-        Ok(ConstDef { vis, name, ty, value, span: start.to(self.prev_span()) })
+        Ok(ConstDef { vis, is_static, name, ty, value, span: start.to(self.prev_span()) })
     }
 
     fn mod_def(&mut self, vis: bool) -> PResult<ModDef> {

@@ -3020,6 +3020,17 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.ctx.void_type().fn_type(&[ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        // void ai_statics_install(ptr thread, ptr table); ptr ai_statics_table(ptr thread)
+        self.module.add_function(
+            "ai_statics_install",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        self.module.add_function(
+            "ai_statics_table",
+            ptr.fn_type(&[ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // i64 ai_thread_current_id(ptr thread)
         self.module.add_function(
             "ai_thread_current_id",
@@ -5457,6 +5468,8 @@ fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::
         ("ai_thread_sleep", runtime::ai_thread_sleep as *const () as usize),
         ("ai_thread_yield", runtime::ai_thread_yield as *const () as usize),
         ("ai_thread_current_id", runtime::ai_thread_current_id as *const () as usize),
+        ("ai_statics_install", runtime::ai_statics_install as *const () as usize),
+        ("ai_statics_table", runtime::ai_statics_table as *const () as usize),
         ("ai_closure_code_ptr", runtime::ai_closure_code_ptr as *const () as usize),
         ("ai_object_type_id", runtime::ai_object_type_id as *const () as usize),
         ("ai_chan_new", runtime::ai_chan_new as *const () as usize),

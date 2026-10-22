@@ -181,6 +181,9 @@ pub struct Heap {
     /// Vacant global slots reserved solely for thread environment handoffs.
     /// Cleared before reuse; active handoffs remain ordinary scanned globals.
     pub(crate) thread_handoff_slots: Mutex<crate::runtime::handoff_storage::Slots>,
+    /// The `globals` slot holding the program's table of `static` cells, or
+    /// `usize::MAX` before the program installs one.
+    pub(crate) statics_slot: AtomicUsize,
     /// Native channels, retained until root children have drained.
     pub(crate) channels: Mutex<crate::runtime::ChannelRegistry>,
     /// Shared queue/FFI backing ledger; queries do not lock the channel registry.
@@ -354,6 +357,7 @@ impl Heap {
             state_slots: Mutex::new(std::collections::HashMap::new()),
             thread_completions: crate::runtime::CompletionRegistry::native_mutex_in(crate::runtime::native_metadata::MetadataAllocator::new(&native_memory.registry)),
             thread_handoff_slots: crate::runtime::handoff_storage::Slots::native_mutex_in(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
+            statics_slot: AtomicUsize::new(usize::MAX),
             channels: crate::runtime::ChannelRegistry::native_mutex_in(crate::runtime::native_metadata::MetadataAllocator::new(&native_memory.registry)),
             native_memory: native_memory.clone(),
             native_retirement: Default::default(),
@@ -422,6 +426,7 @@ impl Heap {
             state_slots: Mutex::new(std::collections::HashMap::new()),
             thread_completions: crate::runtime::CompletionRegistry::native_mutex_in(crate::runtime::native_metadata::MetadataAllocator::new(&native_memory.registry)),
             thread_handoff_slots: crate::runtime::handoff_storage::Slots::native_mutex_in(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
+            statics_slot: AtomicUsize::new(usize::MAX),
             channels: crate::runtime::ChannelRegistry::native_mutex_in(crate::runtime::native_metadata::MetadataAllocator::new(&native_memory.registry)),
             native_memory: native_memory.clone(),
             native_retirement: Default::default(),

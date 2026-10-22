@@ -838,3 +838,41 @@ fn standard_macros_are_macro_rules() {
     let msg = compile_error("fn main() -> i64 { compile_error!(\"stop here\"); 0 }");
     assert!(msg.contains("stop here"), "{msg}");
 }
+
+#[test]
+fn statics_and_constant_patterns() {
+    assert_eq!(run(r#"
+        static BASE: i64 = OFFSET * 2;
+        static OFFSET: i64 = 5;
+        static mut COUNTER: i64 = 0;
+        static mut LOG: Vec<String> = Vec::new();
+        static HITS: AtomicI64 = AtomicI64::new(0);
+        struct Config { level: i64 }
+        static mut CONFIG: Config = Config { level: 1 };
+        const M: i64 = 3;
+        const NAME: String = "bob";
+        struct Limits;
+        impl Limits { const TOP: i64 = 9; }
+        fn bump() -> i64 { unsafe { COUNTER += 1; LOG.push(format!("bump {}", COUNTER)); COUNTER } }
+        fn main() -> i64 {
+            bump();
+            bump();
+            HITS.fetch_add(1);
+            unsafe { CONFIG.level = 7; }
+            let t = Thread::spawn(|| { HITS.fetch_add(10); unsafe { COUNTER += 100; } 0 });
+            t.join();
+            let picked: Vec<i64> = vec![1, 3, 9].iter().map(|n| match n { M => 30, Limits::TOP => 90, 0 | 1 => 10, _ => 0 }).collect();
+            let named = match "bob".to_string() { NAME => 1, _ => 0 };
+            let N = 2;
+            unsafe {
+                assert_eq!(LOG, vec!["bump 1".to_string(), "bump 2".to_string()]);
+                assert_eq!(picked, vec![10, 30, 90]);
+                BASE + COUNTER + CONFIG.level + HITS.load() + named + N
+            }
+        }
+    "#), 10 + 102 + 7 + 11 + 1 + 2);
+    assert!(compile_error("static X: i64 = 1; fn main() -> i64 { X = 2; 0 }").contains("immutable static"));
+    assert!(compile_error("static mut X: i64 = 1; fn main() -> i64 { X }").contains("unsafe"));
+    assert!(compile_error("static A: i64 = B; static B: i64 = A; fn main() -> i64 { 0 }").contains("in terms of itself"));
+    assert!(compile_error("static mut X: i64 = 1; fn main() -> i64 { let X = 5; X }").contains("cannot shadow statics"));
+}
