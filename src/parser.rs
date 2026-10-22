@@ -14,7 +14,9 @@ pub struct ParseError {
 }
 
 pub fn parse_module(tokens: &[Token]) -> Result<Module, ParseError> {
-    let mut p = Parser { toks: tokens.to_vec(), pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: Default::default(), macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() };
+    // Every module sees the standard macros (`println!`, `vec!`, ...).
+    let macros = std::rc::Rc::new(std::cell::RefCell::new(prelude_macros()));
+    let mut p = Parser::new(tokens.to_vec(), macros);
     let mut items = Vec::new();
     while !p.at(&TokKind::Eof) {
         items.extend(p.items()?);
@@ -67,6 +69,9 @@ struct Parser {
     /// (`struct Cache<F: Fn(i64) -> i64>`): those parameters are replaced by
     /// the closure type, and their positions dropped from later `Cache<..>`.
     closure_struct_params: std::collections::HashMap<String, Vec<usize>>,
+    /// Destructuring parameters of the function being parsed
+    /// (`fn f((a, b): (i64, i64))`): `let (a, b) = param#N;` opens its body.
+    param_lets: Vec<Stmt>,
 }
 
 /// A loop being parsed. `break value` assigns `loop#N`; a `break 'label` or
@@ -75,6 +80,8 @@ struct Parser {
 struct LoopCtx {
     id: u32,
     label: Option<String>,
+    /// A labeled block (`'a: { .. }`): only `break 'a` targets it.
+    is_block: bool,
     value: bool,
     brk: bool,
     cnt: bool,
@@ -93,6 +100,7 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(String, bool)>) {
         PatternKind::Variant { payload, .. } => for q in payload { pattern_names(q, out) },
         PatternKind::Struct { fields, .. } => for (_, q) in fields { pattern_names(q, out) },
         PatternKind::Tuple(ps) => for q in ps { pattern_names(q, out) },
+        PatternKind::At { is_mut, name, pat } => { out.push((name.clone(), *is_mut)); pattern_names(pat, out) }
         PatternKind::Wildcard | PatternKind::Literal(_) => {}
     }
 }
@@ -241,6 +249,23 @@ fn closure_params(g: &mut Generics) -> Vec<(String, Type)> {
     out
 }
 
+/// Replace `Self` in `t` by `me`.
+fn replace_self(t: &mut Type, me: &Type) {
+    match &mut t.kind {
+        TypeKind::SelfType => *t = me.clone(),
+        TypeKind::Path(p, args) => {
+            if p.is_single() && p.last() == "Self" && args.is_empty() { *t = me.clone(); return; }
+            for a in args { replace_self(a, me); }
+        }
+        TypeKind::Tuple(ts) => for a in ts { replace_self(a, me); },
+        TypeKind::Array(e, _) => replace_self(e, me),
+        TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => {
+            for a in ps { replace_self(a, me); }
+            if let Some(r) = r { replace_self(r, me); }
+        }
+    }
+}
+
 /// Replace each named type parameter in `t` by its type.
 fn subst_type(t: &mut Type, map: &[(String, Type)]) {
     match &mut t.kind {
@@ -269,6 +294,78 @@ enum ChainPart {
     Cond(Expr),
 }
 
+/// Tokens rendered as source text, spaced the way `stringify!` does.
+fn tokens_text(toks: &[Token]) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&TokKind> = None;
+    for t in toks {
+        let text = match &t.kind {
+            TokKind::Int(n, s) => format!("{}{}", n, suffix_text(*s)),
+            TokKind::Float(f, s) => format!("{:?}{}", f, suffix_text(*s)),
+            TokKind::Str(x) => format!("{:?}", x),
+            TokKind::Char(c) => format!("{:?}", c),
+            TokKind::ByteStr(b) => format!("b{:?}", String::from_utf8_lossy(b)),
+            TokKind::Ident(x) => x.clone(),
+            TokKind::Lifetime(l) => format!("'{}", l),
+            TokKind::Keyword(k) => format!("{:?}", k).to_lowercase().replace("selfvalue", "self").replace("selftype", "Self"),
+            TokKind::GroupOpen | TokKind::GroupClose => continue,
+            other => punct_text(other).to_string(),
+        };
+        let tight_before = matches!(t.kind, TokKind::Comma | TokKind::Semi | TokKind::Dot | TokKind::RParen | TokKind::RBracket | TokKind::Question | TokKind::ColonColon)
+            || (matches!(t.kind, TokKind::LParen | TokKind::LBracket) && matches!(prev, Some(TokKind::Ident(_)) | Some(TokKind::Not)));
+        let tight_after = matches!(prev, Some(TokKind::LParen | TokKind::LBracket | TokKind::Dot | TokKind::ColonColon | TokKind::Not | TokKind::Hash));
+        if !out.is_empty() && !tight_before && !tight_after { out.push(' '); }
+        out.push_str(&text);
+        prev = Some(&t.kind);
+    }
+    out
+}
+
+fn suffix_text(s: crate::lexer::NumSuffix) -> &'static str {
+    use crate::lexer::NumSuffix as S;
+    match s {
+        S::None => "", S::I8 => "i8", S::I16 => "i16", S::I32 => "i32", S::I64 => "i64",
+        S::U8 => "u8", S::U16 => "u16", S::U32 => "u32", S::U64 => "u64", S::F32 => "f32", S::F64 => "f64",
+    }
+}
+
+fn punct_text(k: &TokKind) -> &'static str {
+    match k {
+        TokKind::LParen => "(", TokKind::RParen => ")", TokKind::LBrace => "{", TokKind::RBrace => "}",
+        TokKind::LBracket => "[", TokKind::RBracket => "]", TokKind::Comma => ",", TokKind::Semi => ";",
+        TokKind::Colon => ":", TokKind::ColonColon => "::", TokKind::Arrow => "->", TokKind::FatArrow => "=>",
+        TokKind::Dot => ".", TokKind::DotDot => "..", TokKind::DotDotEq => "..=", TokKind::Question => "?",
+        TokKind::At => "@", TokKind::Hash => "#", TokKind::Dollar => "$", TokKind::Plus => "+", TokKind::Minus => "-",
+        TokKind::Star => "*", TokKind::Slash => "/", TokKind::Percent => "%", TokKind::Eq => "=", TokKind::EqEq => "==",
+        TokKind::Ne => "!=", TokKind::Lt => "<", TokKind::Le => "<=", TokKind::Gt => ">", TokKind::Ge => ">=",
+        TokKind::AndAnd => "&&", TokKind::OrOr => "||", TokKind::Not => "!", TokKind::Amp => "&", TokKind::Pipe => "|",
+        TokKind::Caret => "^", TokKind::Shl => "<<", TokKind::Shr => ">>", TokKind::PlusEq => "+=", TokKind::MinusEq => "-=",
+        TokKind::StarEq => "*=", TokKind::SlashEq => "/=", TokKind::PercentEq => "%=",
+        _ => "",
+    }
+}
+
+/// The source id the prelude macros are lexed with; tokens from their
+/// bodies take the invocation's span.
+pub(crate) const PRELUDE_MACRO_SOURCE: crate::lexer::SourceId = 0xFFF0;
+
+thread_local! {
+    static PRELUDE_MACRO_TABLE: std::cell::RefCell<Option<std::collections::HashMap<String, std::rc::Rc<crate::macros::MacroRules>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The standard `macro_rules!` macros (`prelude_macros.gcr`), parsed once.
+fn prelude_macros() -> std::collections::HashMap<String, std::rc::Rc<crate::macros::MacroRules>> {
+    if let Some(t) = PRELUDE_MACRO_TABLE.with(|t| t.borrow().clone()) { return t; }
+    let toks = crate::lexer::lex_with_source(include_str!("prelude_macros.gcr"), PRELUDE_MACRO_SOURCE).expect("prelude macros lex");
+    let mut p = Parser::new(toks, Default::default());
+    while !p.at(&TokKind::Eof) {
+        p.items().expect("prelude macros parse");
+    }
+    let table = p.macros.borrow().clone();
+    PRELUDE_MACRO_TABLE.with(|t| *t.borrow_mut() = Some(table.clone()));
+    table
+}
+
 /// A parsed `#[name]` or `#[name(arg, ...)]` attribute.
 struct Attr {
     name: String,
@@ -285,6 +382,10 @@ const MAX_EXPR_DEPTH: u32 = 128;
 type PResult<T> = Result<T, ParseError>;
 
 impl Parser {
+    fn new(toks: Vec<Token>, macros: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<crate::macros::MacroRules>>>>) -> Parser {
+        Parser { toks, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros, macro_depth: 0, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default(), param_lets: Vec::new() }
+    }
+
     // ---- token cursor ------------------------------------------------------
     fn peek(&self) -> &TokKind {
         &self.toks[self.pos].kind
@@ -374,7 +475,7 @@ impl Parser {
         }
         // `#[value]` selects the inline value-type representation on a struct/enum.
         let is_value = attrs.iter().any(|a| a.name == "value");
-        let skip = attrs.iter().any(|a| a.name == "test" || (a.name == "cfg" && a.args.iter().any(|(n, _)| n == "test")));
+        let skip = attrs.iter().any(|a| a.name == "test" || (a.name == "cfg" && a.args.iter().any(|(n, _)| n == "off")));
         let derives: Vec<(String, Span)> = attrs.iter().filter(|a| a.name == "derive").flat_map(|a| a.args.clone()).collect();
         let vis = self.visibility()?;
         if is_value && !matches!(self.peek(), TokKind::Keyword(Kw::Struct) | TokKind::Keyword(Kw::Enum)) {
@@ -384,6 +485,12 @@ impl Parser {
         let kind = match self.peek() {
             TokKind::Keyword(Kw::Extern) => ItemKind::Fn(self.extern_fn(vis)?),
             TokKind::Keyword(Kw::Fn) => ItemKind::Fn(self.fn_def(vis)?),
+            // `const fn` and `unsafe fn` (and `unsafe impl` / `unsafe trait`,
+            // whose `unsafe` only asserts what the programmer checked).
+            TokKind::Keyword(Kw::Const) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Unsafe)) => ItemKind::Fn(self.qualified_fn(vis)?),
+            TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Const)) => ItemKind::Fn(self.qualified_fn(vis)?),
+            TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Impl)) => { self.bump(); ItemKind::Impl(self.impl_block()?) }
+            TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Trait)) => { self.bump(); ItemKind::Trait(self.trait_def(vis)?) }
             TokKind::Keyword(Kw::Struct) => ItemKind::Struct(self.struct_def(vis, is_value)?),
             TokKind::Keyword(Kw::Enum) => ItemKind::Enum(self.enum_def(vis, is_value)?),
             TokKind::Keyword(Kw::Trait) => ItemKind::Trait(self.trait_def(vis)?),
@@ -429,7 +536,7 @@ impl Parser {
                 let mut tokens = crate::lexer::lex_with_source(&source, at.source)
                     .map_err(|e| ParseError { msg: format!("derive: {}", e.msg), span: at })?;
                 for t in &mut tokens { t.span = at; }
-                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() };
+                let mut p = Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default(), param_lets: Vec::new() };
                 while !p.at(&TokKind::Eof) {
                     let items = p.items().map_err(|e| ParseError { msg: format!("in derived `{}`: {}", trait_name, e.msg), span: at })?;
                     self.pending.extend(items);
@@ -460,23 +567,13 @@ impl Parser {
                         return Err(self.error(format!("`#[{}]` takes no arguments", name)));
                     }
                 }
+                // `#[cfg(pred)]`: the item is kept only when `pred` holds.
                 "cfg" => {
-                    // Only `#[cfg(test)]` is meaningful: the item is skipped.
                     let s = self.span();
-                    let mut words = Vec::new();
-                    let mut depth = 0i32;
-                    loop {
-                        match self.peek().clone() {
-                            TokKind::Eof => return Err(self.error("unterminated attribute")),
-                            TokKind::RBracket if depth == 0 => break,
-                            TokKind::LParen => depth += 1,
-                            TokKind::RParen => depth -= 1,
-                            TokKind::Ident(w) => words.push(w),
-                            _ => words.push(String::new()),
-                        }
-                        self.bump();
-                    }
-                    if words == ["test"] { args.push(("test".to_string(), s)); }
+                    self.expect(&TokKind::LParen)?;
+                    let keep = self.cfg_predicate()?;
+                    self.expect(&TokKind::RParen)?;
+                    if !keep { args.push(("off".to_string(), s)); }
                 }
                 "derive" => {
                     self.expect(&TokKind::LParen)?;
@@ -491,7 +588,11 @@ impl Parser {
                     self.expect(&TokKind::RParen)?;
                 }
                 "allow" | "warn" | "deny" | "forbid" | "expect" | "inline" | "cold" | "must_use" | "doc"
-                | "track_caller" | "non_exhaustive" | "rustfmt" | "clippy" | "deprecated" => {
+                | "track_caller" | "non_exhaustive" | "rustfmt" | "clippy" | "deprecated"
+                // Layout and linking hints with no meaning here, and test
+                // harness markers (the items they mark are tests, skipped).
+                | "repr" | "macro_export" | "macro_use" | "automatically_derived" | "no_mangle"
+                | "should_panic" | "ignore" | "cfg_attr" | "allow_internal_unstable" | "export_name" | "link" => {
                     self.skip_attr_args()?;
                 }
                 _ => {
@@ -505,6 +606,65 @@ impl Parser {
             attrs.push(Attr { name, args, span: start.to(self.prev_span()) });
         }
         Ok(attrs)
+    }
+
+    /// A `cfg` predicate: `test` and `feature = ".."` are off; `unix`,
+    /// `target_os = ".."`, `target_pointer_width`, and `debug_assertions`
+    /// follow the compiling host; `not`, `all`, and `any` combine.
+    fn cfg_predicate(&mut self) -> PResult<bool> {
+        let name = self.ident()?;
+        if self.eat(&TokKind::LParen) {
+            let mut values = Vec::new();
+            while !self.at(&TokKind::RParen) {
+                values.push(self.cfg_predicate()?);
+                if !self.eat(&TokKind::Comma) { break; }
+            }
+            self.expect(&TokKind::RParen)?;
+            return match name.as_str() {
+                "not" if values.len() == 1 => Ok(!values[0]),
+                "all" => Ok(values.iter().all(|v| *v)),
+                "any" => Ok(values.iter().any(|v| *v)),
+                _ => Err(self.error(format!("unknown `cfg` operator `{name}`"))),
+            };
+        }
+        if self.eat(&TokKind::Eq) {
+            let TokKind::Str(value) = self.peek().clone() else { return Err(self.error("expected a string in `cfg`")) };
+            self.bump();
+            return Ok(match name.as_str() {
+                "target_os" => value == std::env::consts::OS,
+                "target_family" => value == std::env::consts::FAMILY,
+                "target_arch" => value == std::env::consts::ARCH,
+                "target_pointer_width" => value == "64",
+                "target_endian" => value == if cfg!(target_endian = "little") { "little" } else { "big" },
+                _ => false, // features and anything else are not enabled
+            });
+        }
+        Ok(match name.as_str() {
+            "unix" => cfg!(unix),
+            "windows" => cfg!(windows),
+            "debug_assertions" => true,
+            _ => false, // `test`, `doc`, `miri`, ...
+        })
+    }
+
+    /// At `#`: do these attributes mark an item (`#[derive] struct ..`)?
+    fn is_item_attr_ahead(&self) -> bool {
+        let mut i = 0;
+        while matches!(self.peek_at(i), TokKind::Hash) {
+            // Skip `#[ .. ]`.
+            let Some(end) = crate::macros::tree_end(&self.toks, self.pos + i + 1) else { return false };
+            i = end - self.pos;
+        }
+        matches!(self.peek_at(i), TokKind::Keyword(Kw::Fn | Kw::Struct | Kw::Enum | Kw::Trait | Kw::Impl | Kw::Type | Kw::Const | Kw::Static | Kw::Mod | Kw::Use | Kw::Pub | Kw::Unsafe))
+            || matches!(self.peek_at(i), TokKind::Ident(n) if n == "macro_rules")
+    }
+
+    /// Outer attributes on a statement, field, variant, parameter, or arm:
+    /// returns whether the thing they mark is kept (`#[cfg(..)]`).
+    fn inner_attributes(&mut self) -> PResult<bool> {
+        if !self.at(&TokKind::Hash) { return Ok(true); }
+        let attrs = self.attributes()?;
+        Ok(!attrs.iter().any(|a| a.name == "cfg" && a.args.iter().any(|(n, _)| n == "off")))
     }
 
     /// Skip an ignored attribute's arguments up to (not including) its `]`.
@@ -522,13 +682,35 @@ impl Parser {
         }
     }
 
+    /// `const`, `unsafe`, and `async` before `fn`; returns whether `unsafe`.
+    /// A `const fn` is an ordinary function here.
+    fn fn_qualifiers(&mut self) -> bool {
+        let mut is_unsafe = false;
+        loop {
+            match self.peek() {
+                TokKind::Keyword(Kw::Const) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Unsafe)) => { self.bump(); }
+                TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Fn | Kw::Const)) => { self.bump(); is_unsafe = true; }
+                _ => return is_unsafe,
+            }
+        }
+    }
+
+    fn qualified_fn(&mut self, vis: bool) -> PResult<FnDef> {
+        let is_unsafe = self.fn_qualifiers();
+        let mut f = self.fn_def(vis)?;
+        f.is_unsafe = is_unsafe;
+        Ok(f)
+    }
+
     fn fn_def(&mut self, vis: bool) -> PResult<FnDef> {
         let start = self.expect_kw(Kw::Fn)?;
         let name = self.ident()?;
         let (generics, params, has_self, self_is_mut, ret) = self.fn_signature()?;
+        let lets = std::mem::take(&mut self.param_lets);
         let mut body = self.block()?;
+        if !lets.is_empty() { body.stmts.splice(0..0, lets); }
         crate::capture::share_mutated_captures(&mut body);
-        Ok(FnDef { vis, name, generics, params, has_self, self_is_mut, ret, body, is_extern: false, span: start.to(self.prev_span()) })
+        Ok(FnDef { vis, name, generics, params, has_self, self_is_mut, ret, body, is_extern: false, is_unsafe: false, span: start.to(self.prev_span()) })
     }
 
     /// `<generics>(params) -> ret where ...`. An argument's `impl Trait`
@@ -582,7 +764,7 @@ impl Parser {
         let body = Block { stmts: Vec::new(), tail: None, span: start.to(self.prev_span()) };
         Ok(FnDef {
             vis, name, generics, params, has_self, self_is_mut, ret, body,
-            is_extern: true, span: start.to(self.prev_span()),
+            is_extern: true, is_unsafe: false, span: start.to(self.prev_span()),
         })
     }
 
@@ -607,12 +789,33 @@ impl Parser {
             }
         }
         while !self.at(&TokKind::RParen) {
+            if !self.inner_attributes()? {
+                // A `#[cfg]`-disabled parameter.
+                while !self.at(&TokKind::Comma) && !self.at(&TokKind::RParen) { self.bump(); }
+                if !self.eat(&TokKind::Comma) { break; }
+                continue;
+            }
             let pstart = self.span();
-            let is_mut = self.eat_kw(Kw::Mut);
-            let name = self.ident()?;
-            self.expect(&TokKind::Colon)?;
-            let ty = self.ty()?;
-            params.push(Param { is_mut, name, ty, span: pstart.to(self.prev_span()) });
+            let simple = matches!(self.peek(), TokKind::Ident(_)) && matches!(self.peek_at(1), TokKind::Colon)
+                || matches!(self.peek(), TokKind::Keyword(Kw::Mut)) && matches!(self.peek_at(2), TokKind::Colon);
+            if simple {
+                let is_mut = self.eat_kw(Kw::Mut);
+                let name = self.ident()?;
+                self.expect(&TokKind::Colon)?;
+                let ty = self.ty()?;
+                params.push(Param { is_mut, name, ty, span: pstart.to(self.prev_span()) });
+            } else {
+                // A pattern parameter: a fresh name, destructured in the body.
+                let pattern = self.pattern()?;
+                self.expect(&TokKind::Colon)?;
+                let ty = self.ty()?;
+                let span = pstart.to(self.prev_span());
+                self.pattern_counter += 1;
+                let name = format!("param#{}", self.pattern_counter);
+                let init = Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(name.clone(), span))), span };
+                self.param_lets.push(Stmt::Let { pattern, ty: None, init: Some(init), span });
+                params.push(Param { is_mut: false, name, ty, span });
+            }
             if !self.eat(&TokKind::Comma) {
                 break;
             }
@@ -636,7 +839,9 @@ impl Parser {
             self.bump();
             let mut fields = Vec::new();
             while !self.at(&TokKind::RBrace) {
-                fields.push(self.field_def()?);
+                let keep = self.inner_attributes()?;
+                let f = self.field_def()?;
+                if keep { fields.push(f); }
                 if !self.eat(&TokKind::Comma) {
                     break;
                 }
@@ -647,6 +852,7 @@ impl Parser {
             self.bump();
             let mut tys = Vec::new();
             while !self.at(&TokKind::RParen) {
+                self.inner_attributes()?;
                 self.visibility()?;
                 tys.push(self.ty()?);
                 if !self.eat(&TokKind::Comma) {
@@ -661,6 +867,17 @@ impl Parser {
             StructBody::Unit
         };
         let mut body = body;
+        // `Self` in a field type is the struct itself (`Option<Box<Self>>`).
+        let me = Type {
+            kind: TypeKind::Path(Path::single(name.clone(), start), generics.params.iter()
+                .map(|p| Type { kind: TypeKind::Path(Path::single(p.name.clone(), start), vec![]), span: start }).collect()),
+            span: start,
+        };
+        match &mut body {
+            StructBody::Named(fields) => for f in fields { replace_self(&mut f.ty, &me); },
+            StructBody::Tuple(tys) => for t in tys { replace_self(t, &me); },
+            StructBody::Unit => {}
+        }
         if !closures.is_empty() {
             match &mut body {
                 StructBody::Named(fields) => for f in fields { subst_type(&mut f.ty, &closures); },
@@ -689,6 +906,7 @@ impl Parser {
         self.expect(&TokKind::LBrace)?;
         let mut variants = Vec::new();
         while !self.at(&TokKind::RBrace) {
+            self.inner_attributes()?;
             let vstart = self.span();
             let vname = self.ident()?;
             let payload = if self.at(&TokKind::LParen) {
@@ -724,6 +942,19 @@ impl Parser {
             if !self.eat(&TokKind::Comma) { break; }
         }
         self.expect(&TokKind::RBrace)?;
+        // `Self` in a payload is the enum itself (`Cons(i64, Box<Self>)`).
+        let me = Type {
+            kind: TypeKind::Path(Path::single(name.clone(), start), generics.params.iter()
+                .map(|p| Type { kind: TypeKind::Path(Path::single(p.name.clone(), start), vec![]), span: start }).collect()),
+            span: start,
+        };
+        for v in &mut variants {
+            match &mut v.payload {
+                VariantPayload::Tuple(tys) => for t in tys { replace_self(t, &me); },
+                VariantPayload::Named(fields) => for f in fields { replace_self(&mut f.ty, &me); },
+                VariantPayload::None => {}
+            }
+        }
         Ok(EnumDef { vis, is_value, name, generics, variants, span: start.to(self.prev_span()) })
     }
 
@@ -782,19 +1013,22 @@ impl Parser {
             return Ok(TraitItem::AssocType(n));
         }
         // A method: parse the signature, then either `;` (required) or a body.
+        let is_unsafe = self.fn_qualifiers();
         let start = self.expect_kw(Kw::Fn)?;
         let name = self.ident()?;
         let (generics, params, has_self, self_is_mut, ret) = self.fn_signature()?;
+        let lets = std::mem::take(&mut self.param_lets);
         if self.eat(&TokKind::Semi) {
             Ok(TraitItem::Required(FnSig {
                 name, generics, params, has_self, self_is_mut, ret, span: start.to(self.prev_span()),
             }))
         } else {
             let mut body = self.block()?;
+            if !lets.is_empty() { body.stmts.splice(0..0, lets); }
             crate::capture::share_mutated_captures(&mut body);
             Ok(TraitItem::Provided(FnDef {
                 vis: false, name, generics, params, has_self, self_is_mut, ret, body,
-                is_extern: false,
+                is_extern: false, is_unsafe,
                 span: start.to(self.prev_span()),
             }))
         }
@@ -834,7 +1068,7 @@ impl Parser {
                 assoc_types.push((name, ty));
                 continue;
             }
-            items.push(self.fn_def(vis)?);
+            items.push(self.qualified_fn(vis)?);
         }
         self.expect(&TokKind::RBrace)?;
         let mut self_ty = self_ty;
@@ -1144,6 +1378,11 @@ impl Parser {
                 let ret = if self.eat(&TokKind::Arrow) { Some(Box::new(self.ty()?)) } else { None };
                 TypeKind::ExternFn(params, ret)
             }
+            // The never type: `fn fail() -> !`.
+            TokKind::Not => {
+                self.bump();
+                TypeKind::Path(Path::single("!".into(), start), vec![])
+            }
             // A const generic argument: `Matrix<2, 3>`.
             TokKind::Int(n, _) => {
                 let n = *n;
@@ -1358,6 +1597,15 @@ impl Parser {
         while !self.at(&TokKind::RBrace) {
             // Flag checks for labeled jumps out of a loop in the last statement.
             stmts.append(&mut self.pending_checks);
+            // `#[allow(..)] let x = ..;` (a `#[cfg]`-disabled statement is
+            // parsed and dropped).
+            if self.at(&TokKind::Hash) && !self.is_item_attr_ahead() {
+                let keep = self.inner_attributes()?;
+                if !keep {
+                    if self.at_kw(Kw::Let) { self.let_stmt()?; } else { self.expr()?; self.eat(&TokKind::Semi); }
+                    continue;
+                }
+            }
             if self.at_kw(Kw::Let) {
                 stmts.push(self.let_stmt()?);
                 continue;
@@ -1437,13 +1685,14 @@ impl Parser {
     }
 
     fn is_item_start(&self) -> bool {
-        matches!(
+        (self.at(&TokKind::Hash) && self.is_item_attr_ahead()) || matches!(
             self.peek(),
             TokKind::Keyword(
                 Kw::Fn | Kw::Struct | Kw::Enum | Kw::Trait | Kw::Impl
                     | Kw::Type | Kw::Const | Kw::Static | Kw::Mod | Kw::Use
             )
         ) || matches!((self.peek(), self.peek_at(1)), (TokKind::Ident(n), TokKind::Not) if n == "macro_rules")
+          || matches!((self.peek(), self.peek_at(1)), (TokKind::Keyword(Kw::Unsafe), TokKind::Keyword(Kw::Fn | Kw::Impl | Kw::Trait | Kw::Const)))
     }
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
@@ -1507,7 +1756,7 @@ impl Parser {
         if matches!(self.peek(), TokKind::DotDot | TokKind::DotDotEq) && min_bp <= 2 {
             let inclusive = matches!(self.peek(), TokKind::DotDotEq);
             self.bump();
-            let hi = if self.starts_expr() { Some(self.expr_bp(3)?) } else { None };
+            let hi = if self.starts_range_end() { Some(self.expr_bp(3)?) } else { None };
             let span = start.to(self.prev_span());
             return Ok(Expr { kind: std::sync::Arc::new(ExprKind::Range { lo: None, hi, inclusive }), span });
         }
@@ -1527,7 +1776,7 @@ impl Parser {
             if matches!(self.peek(), TokKind::DotDot | TokKind::DotDotEq) && min_bp <= 2 {
                 let inclusive = matches!(self.peek(), TokKind::DotDotEq);
                 self.bump();
-                let hi = if self.starts_expr() { Some(self.expr_bp(3)?) } else { None };
+                let hi = if self.starts_range_end() { Some(self.expr_bp(3)?) } else { None };
                 let span = start.to(self.prev_span());
                 lhs = Expr {
                     kind: std::sync::Arc::new(ExprKind::Range { lo: Some(lhs), hi, inclusive }),
@@ -1777,6 +2026,13 @@ impl Parser {
             TokKind::Int(n, sfx) => { self.bump(); ExprKind::Int(n, sfx) }
             TokKind::Float(f, sfx) => { self.bump(); ExprKind::Float(f, sfx) }
             TokKind::Str(s) => { self.bump(); ExprKind::Str(s) }
+            // `b"ab"` is an array of its bytes.
+            TokKind::ByteStr(bytes) => {
+                self.bump();
+                ExprKind::Array(ArrayLit::Elems(bytes.into_iter().map(|b| Expr {
+                    kind: std::sync::Arc::new(ExprKind::Int(b as u64, crate::lexer::NumSuffix::U8)), span: start,
+                }).collect()))
+            }
             TokKind::Char(c) => { self.bump(); ExprKind::Char(c) }
             TokKind::Keyword(Kw::True) => { self.bump(); ExprKind::Bool(true) }
             TokKind::Keyword(Kw::False) => { self.bump(); ExprKind::Bool(false) }
@@ -1808,8 +2064,8 @@ impl Parser {
                 self.bump();
                 self.bump();
                 return match self.peek() {
-                    TokKind::Keyword(Kw::Loop | Kw::While | Kw::For) => self.labeled_loop(Some(label)),
-                    _ => Err(self.error("a label must be followed by `loop`, `while`, or `for`")),
+                    TokKind::Keyword(Kw::Loop | Kw::While | Kw::For) | TokKind::LBrace => self.labeled_loop(Some(label)),
+                    _ => Err(self.error("a label must be followed by `loop`, `while`, `for`, or a block")),
                 };
             }
             TokKind::Pipe | TokKind::OrOr => return self.closure(),
@@ -1817,6 +2073,16 @@ impl Parser {
             TokKind::Ident(w) if w == "move" && matches!(self.peek_at(1), TokKind::Pipe | TokKind::OrOr) => {
                 self.bump();
                 return self.closure();
+            }
+            // An expression a macro substituted, in invisible delimiters.
+            TokKind::GroupOpen => {
+                self.bump();
+                let saved = std::mem::take(&mut self.no_struct);
+                let inner = self.expr();
+                self.no_struct = saved;
+                let inner = inner?;
+                self.expect(&TokKind::GroupClose)?;
+                return Ok(inner);
             }
             TokKind::LParen => {
                 self.bump();
@@ -1892,84 +2158,93 @@ impl Parser {
             self.expect(&TokKind::LBracket)?;
             TokKind::RBracket
         };
-        match name.as_str() {
-            "vec" => self.vec_macro(start, &close),
-            "format" | "println" | "print" | "eprintln" | "panic" => {
-                let message = if self.at(&close) && name != "format" {
-                    None
-                } else {
-                    Some(self.format_args(&close, &name)?)
-                };
-                self.expect(&close)?;
-                let span = start.to(self.prev_span());
-                let call = |f: &str, arg: Expr| Expr {
-                    kind: std::sync::Arc::new(ExprKind::Call(Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(f.to_string(), span))), span }, vec![arg])),
-                    span,
-                };
-                let text = |t: &str| Expr { kind: std::sync::Arc::new(ExprKind::Str(t.to_string())), span };
-                // Like Rust's, the printing macros evaluate to `()`.
-                let unit = |e: Expr| Expr { kind: std::sync::Arc::new(ExprKind::Block(Block { stmts: vec![Stmt::Expr(e)], tail: None, span })), span };
-                Ok(match (name.as_str(), message) {
-                    ("format", Some(m)) => m,
-                    ("println", m) => unit(call("println", m.unwrap_or_else(|| text("")))),
-                    ("print", m) => unit(call("print", m.unwrap_or_else(|| text("")))),
-                    ("eprintln", m) => unit(call("stderr_line", m.unwrap_or_else(|| text("")))),
-                    (_, m) => call("panic", m.unwrap_or_else(|| text("explicit panic"))),
-                })
-            }
-            // `write!(f, "...", args)` appends to anything with `write_str`.
-            "write" | "writeln" => {
-                let target = self.delimited_expr()?;
-                let message = if self.eat(&TokKind::Comma) && !self.at(&close) {
-                    Some(self.format_args(&close, &name)?)
-                } else {
-                    None
-                };
-                self.expect(&close)?;
-                let span = start.to(self.prev_span());
-                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
-                let text = |t: &str| ex(ExprKind::Str(t.to_string()));
-                let message = match (name.as_str(), message) {
-                    ("writeln", Some(m)) => ex(ExprKind::Binary(BinOp::Add, m, text("\n"))),
-                    ("writeln", None) => text("\n"),
-                    (_, Some(m)) => m,
-                    (_, None) => return Err(ParseError { msg: "`write!` needs a format string".into(), span }),
-                };
-                Ok(ex(ExprKind::MethodCall { recv: target, method: "write_str".into(), args: vec![message], span }))
-            }
-            "unreachable" | "todo" | "unimplemented" => {
-                let message = if self.at(&close) { None } else { Some(self.format_args(&close, &name)?) };
-                self.expect(&close)?;
-                let span = start.to(self.prev_span());
-                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
-                let prefix = match name.as_str() {
-                    "unreachable" => "internal error: entered unreachable code",
-                    "todo" => "not yet implemented",
-                    _ => "not implemented",
-                };
-                let text = ex(ExprKind::Str(prefix.to_string()));
-                let message = match message {
-                    Some(m) => ex(ExprKind::Binary(BinOp::Add, ex(ExprKind::Binary(BinOp::Add, text, ex(ExprKind::Str(": ".into())))), m)),
-                    None => text,
-                };
-                Ok(ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".to_string(), span))), vec![message])))
-            }
-            // `matches!(e, PAT [if guard])`
-            "matches" => {
-                let scrutinee = self.delimited_expr()?;
-                self.expect(&TokKind::Comma)?;
-                let alts = self.pattern_alts()?;
-                let guard = if self.eat_kw(Kw::If) { Some(self.delimited_expr()?) } else { None };
+        self.builtin_macro(&name, start, &close)
+    }
+
+    /// The compiler's built-in macros: the ones Rust itself cannot express
+    /// with `macro_rules!`. The standard macros (`println!`, `vec!`, ...)
+    /// are `macro_rules!` in `prelude_macros.gcr`, built on these.
+    fn builtin_macro(&mut self, name: &str, start: Span, close: &TokKind) -> PResult<Expr> {
+        let lit = |kind: ExprKind, span: Span| Expr { kind: std::sync::Arc::new(kind), span };
+        match name {
+            // `format_args!("{} {x:>4}", a)`: the formatted `String`.
+            "format_args" => {
+                let e = self.format_args(close, name)?;
                 self.eat(&TokKind::Comma);
-                self.expect(&close)?;
-                let span = start.to(self.prev_span());
-                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
-                let mut arms: Vec<MatchArm> = alts.into_iter()
-                    .map(|(pattern, guards)| self.arm(pattern, guards, guard.clone(), ex(ExprKind::Bool(true)), span)).collect();
-                arms.push(MatchArm { pattern: Pattern { kind: PatternKind::Wildcard, span }, guard: None, body: ex(ExprKind::Bool(false)), span });
-                Ok(ex(ExprKind::Match { scrutinee, arms }))
+                self.expect(close)?;
+                Ok(e)
             }
-            "assert" | "assert_eq" | "assert_ne" => self.assert_macro(start, &name, &close),
+            // `stringify!(a + b)`: the tokens as written ("a + b").
+            "stringify" => {
+                let begin = self.pos;
+                let mut depth = 0i32;
+                while !(depth == 0 && self.at(close)) {
+                    match self.peek() {
+                        TokKind::Eof => return Err(self.error("unclosed `stringify!`")),
+                        TokKind::LParen | TokKind::LBracket | TokKind::LBrace | TokKind::GroupOpen => depth += 1,
+                        TokKind::RParen | TokKind::RBracket | TokKind::RBrace | TokKind::GroupClose => depth -= 1,
+                        _ => {}
+                    }
+                    self.bump();
+                }
+                let text = tokens_text(&self.toks[begin..self.pos]);
+                self.expect(close)?;
+                Ok(lit(ExprKind::Str(text), start.to(self.prev_span())))
+            }
+            // `concat!("a", 1, true)`: literals joined into one string.
+            "concat" => {
+                let mut out = String::new();
+                while !self.at(close) {
+                    let negative = self.eat(&TokKind::Minus);
+                    if negative { out.push('-'); }
+                    match self.peek().clone() {
+                        TokKind::Str(t) => out.push_str(&t),
+                        TokKind::Char(c) => out.push(c),
+                        TokKind::Int(n, _) => out.push_str(&n.to_string()),
+                        TokKind::Float(f, _) => out.push_str(&f.to_string()),
+                        TokKind::Keyword(Kw::True) => out.push_str("true"),
+                        TokKind::Keyword(Kw::False) => out.push_str("false"),
+                        _ => return Err(self.error("`concat!` takes literals")),
+                    }
+                    self.bump();
+                    if !self.eat(&TokKind::Comma) { break; }
+                }
+                self.expect(close)?;
+                Ok(lit(ExprKind::Str(out), start.to(self.prev_span())))
+            }
+            "line" | "column" => {
+                self.expect(close)?;
+                let (line, column) = crate::lexer::source_position(start);
+                let n = if name == "line" { line } else { column };
+                Ok(lit(ExprKind::Int(n as u64, crate::lexer::NumSuffix::U32), start.to(self.prev_span())))
+            }
+            "file" => {
+                self.expect(close)?;
+                let path = crate::lexer::source_path(start.source).map(|p| p.display().to_string()).unwrap_or_else(|| "<input>".into());
+                Ok(lit(ExprKind::Str(path), start.to(self.prev_span())))
+            }
+            "module_path" => {
+                self.expect(close)?;
+                let mut path = vec!["crate".to_string()];
+                path.extend(self.module_path.iter().cloned());
+                Ok(lit(ExprKind::Str(path.join("::")), start.to(self.prev_span())))
+            }
+            // `include_str!("file")`: the file's text, relative to this source.
+            "include_str" => {
+                let TokKind::Str(rel) = self.peek().clone() else { return Err(self.error("`include_str!` takes a string literal path")) };
+                self.bump();
+                self.expect(close)?;
+                let span = start.to(self.prev_span());
+                let base = crate::lexer::source_path(start.source).and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| ".".into());
+                let path = base.join(&rel);
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| ParseError { msg: format!("`include_str!` cannot read `{}`: {}", path.display(), e), span })?;
+                Ok(lit(ExprKind::Str(text), span))
+            }
+            "compile_error" => {
+                let TokKind::Str(msg) = self.peek().clone() else { return Err(self.error("`compile_error!` takes a string literal")) };
+                Err(ParseError { msg, span: start })
+            }
             _ => Err(ParseError { msg: format!("unknown macro `{}!`", name), span: start }),
         }
     }
@@ -2025,11 +2300,13 @@ impl Parser {
             let mut all = toks.to_vec();
             let eof_span = toks.last().map(|t| t.span).unwrap_or(at);
             all.push(Token { kind: TokKind::Eof, span: eof_span });
-            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() };
+            let mut p = Parser { toks: all, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: macros.clone(), macro_depth: depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default(), param_lets: Vec::new() };
             let ok = match kind {
                 "expr" => p.delimited_expr().is_ok(),
                 "ty" => p.ty().is_ok(),
-                "pat" | "pat_param" => p.pattern().is_ok(),
+                // A `pat` fragment may have `|` alternatives (Rust 2021).
+                "pat" => p.pattern_alts().is_ok(),
+                "pat_param" => p.pattern_one().is_ok(),
                 "path" => p.path().is_ok(),
                 "block" => matches!(p.peek(), TokKind::LBrace) && p.block().is_ok(),
                 "stmt" => p.let_stmt().is_ok() || { p.pos = 0; p.delimited_expr().is_ok() },
@@ -2038,13 +2315,23 @@ impl Parser {
             };
             (ok && p.pos > 0).then_some(p.pos.min(toks.len()))
         };
-        crate::macros::expand(name, &rules, &input, &measure, at).map_err(|(msg, span)| ParseError { msg, span })
+        let mut out = crate::macros::expand(name, &rules, &input, &measure, at).map_err(|(msg, span)| ParseError { msg, span })?;
+        // A standard macro's own tokens report at its use, as rustc does.
+        for t in &mut out { if t.span.source == PRELUDE_MACRO_SOURCE { t.span = at; } }
+        Ok(out)
     }
 
     fn sub_parser(&self, mut tokens: Vec<Token>, at: Span) -> Parser {
         let eof_span = tokens.last().map(|t| t.span).unwrap_or(at);
         tokens.push(Token { kind: TokKind::Eof, span: eof_span });
-        Parser { toks: tokens, pos: 0, no_struct: 0, depth: 0, pending: Vec::new(), impl_params: None, macros: self.macros.clone(), macro_depth: self.macro_depth + 1, pattern_counter: 0, loops: Vec::new(), pending_checks: Vec::new(), loop_counter_next: 0, module_path: Vec::new(), last_turbofish: None, slice_lets: Default::default(), closure_struct_params: Default::default() }
+        // Fresh names from an expansion must not meet the enclosing code's.
+        let mut p = Parser::new(tokens, self.macros.clone());
+        p.macro_depth = self.macro_depth + 1;
+        p.pattern_counter = self.pattern_counter + 1_000_000 * p.macro_depth;
+        p.loop_counter_next = self.loop_counter_next + 1_000_000 * p.macro_depth;
+        p.module_path = self.module_path.clone();
+        p.closure_struct_params = self.closure_struct_params.clone();
+        p
     }
 
     /// An expansion in expression position: its tokens as the body of a block,
@@ -2090,7 +2377,7 @@ impl Parser {
         Ok(args)
     }
 
-    /// `"format string", args...` (the part inside `format!(...)`).
+    /// `"format string", args...` (the part inside `format_args!(...)`).
     fn format_args(&mut self, close: &TokKind, macro_name: &str) -> PResult<Expr> {
         let fmt_span = self.span();
         let TokKind::Str(fmt) = self.peek().clone() else {
@@ -2101,100 +2388,7 @@ impl Parser {
         expand_format(&fmt, args, fmt_span)
     }
 
-    /// `vec![]`, `vec![a, b, c]`, and `vec![x; n]`.
-    fn vec_macro(&mut self, start: Span, close: &TokKind) -> PResult<Expr> {
-        let mut items = Vec::new();
-        let mut repeat = None;
-        if !self.at(close) {
-            let first = self.delimited_expr()?;
-            if self.eat(&TokKind::Semi) {
-                repeat = Some((first, self.delimited_expr()?));
-            } else {
-                items.push(first);
-                if self.eat(&TokKind::Comma) { items.extend(self.macro_args(close)?); }
-            }
-        }
-        self.expect(close)?;
-        let span = start.to(self.prev_span());
-        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
-        let var = |n: &str| ex(ExprKind::Path(Path::single(n.to_string(), span)));
-        let let_ = |n: &str, is_mut: bool, init: Expr| Stmt::Let {
-            pattern: Pattern { kind: PatternKind::Binding { is_mut, name: n.to_string() }, span },
-            ty: None,
-            init: Some(init),
-            span,
-        };
-        let assoc = |f: &str, args: Vec<Expr>| ex(ExprKind::Call(
-            ex(ExprKind::Path(Path { segments: vec!["Vec".to_string(), f.to_string()], span })),
-            args,
-        ));
-        let push = |value: Expr| Stmt::Expr(ex(ExprKind::MethodCall { recv: var("vec#items"), method: "push".into(), args: vec![value], span }));
-        if items.is_empty() && repeat.is_none() {
-            return Ok(assoc("new", vec![]));
-        }
-        let stmts = match repeat {
-            // The element is evaluated once; every slot holds that same value.
-            Some((value, count)) => vec![
-                let_("vec#value", false, value),
-                let_("vec#count", false, count),
-                let_("vec#items", true, assoc("with_capacity", vec![var("vec#count")])),
-                Stmt::Expr(ex(ExprKind::For {
-                    pat: Pattern { kind: PatternKind::Wildcard, span },
-                    iter: ex(ExprKind::Range { lo: Some(ex(ExprKind::Int(0, crate::lexer::NumSuffix::None))), hi: Some(var("vec#count")), inclusive: false }),
-                    body: Block { stmts: vec![push(var("vec#value"))], tail: None, span },
-                })),
-            ],
-            // `vec![a, b]` is built from an array literal, so an expected
-            // element type (such as a trait object) reaches every element.
-            None => return Ok(assoc("from_array", vec![ex(ExprKind::Array(ArrayLit::Elems(items)))])),
-        };
-        Ok(ex(ExprKind::Block(Block { stmts, tail: Some(var("vec#items")), span })))
-    }
 
-    /// `assert!(cond[, fmt, args...])`, `assert_eq!(a, b[, ...])`, `assert_ne!`.
-    fn assert_macro(&mut self, start: Span, name: &str, close: &TokKind) -> PResult<Expr> {
-        let operands = if name == "assert" { 1 } else { 2 };
-        let mut exprs = Vec::new();
-        for i in 0..operands {
-            if i > 0 { self.expect(&TokKind::Comma)?; }
-            exprs.push(self.delimited_expr()?);
-        }
-        let message = if self.eat(&TokKind::Comma) && !self.at(close) { Some(self.format_args(close, name)?) } else { None };
-        self.expect(close)?;
-        let span = start.to(self.prev_span());
-        let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
-        let default = match name {
-            "assert" => "assertion failed",
-            "assert_eq" => "assertion `left == right` failed",
-            _ => "assertion `left != right` failed",
-        };
-        let message = message.unwrap_or_else(|| ex(ExprKind::Str(default.to_string())));
-        let fail = Block {
-            stmts: vec![Stmt::Expr(ex(ExprKind::Call(ex(ExprKind::Path(Path::single("panic".to_string(), span))), vec![message])))],
-            tail: None,
-            span,
-        };
-        if name == "assert" {
-            let cond = exprs.pop().unwrap();
-            return Ok(ex(ExprKind::If { cond: ex(ExprKind::Unary(UnOp::Not, cond)), then_branch: fail, else_branch: None }));
-        }
-        let right = exprs.pop().unwrap();
-        let left = exprs.pop().unwrap();
-        let var = |n: &str| ex(ExprKind::Path(Path::single(n.to_string(), span)));
-        let let_ = |n: &str, init: Expr| Stmt::Let {
-            pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: n.to_string() }, span },
-            ty: None,
-            init: Some(init),
-            span,
-        };
-        let op = if name == "assert_eq" { BinOp::Ne } else { BinOp::Eq };
-        let check = ex(ExprKind::If { cond: ex(ExprKind::Binary(op, var("assert#left"), var("assert#right"))), then_branch: fail, else_branch: None });
-        Ok(ex(ExprKind::Block(Block {
-            stmts: vec![let_("assert#left", left), let_("assert#right", right), Stmt::Expr(check)],
-            tail: None,
-            span,
-        })))
-    }
 
     fn path_or_self(&mut self) -> PResult<Path> {
         // `self::x`: the current inline module's `x`.
@@ -2236,15 +2430,36 @@ impl Parser {
     fn closure(&mut self) -> PResult<Expr> {
         let start = self.span();
         let mut params = Vec::new();
+        let mut closure_lets = Vec::new();
         if self.eat(&TokKind::OrOr) {
             // empty params `||`
         } else {
             self.expect(&TokKind::Pipe)?;
             while !self.at(&TokKind::Pipe) {
                 let pstart = self.span();
-                let name = self.ident()?;
-                let ty = if self.eat(&TokKind::Colon) { Some(self.ty()?) } else { None };
-                params.push(ClosureParam { name, ty, span: pstart.to(self.prev_span()) });
+                // `|x|`, or a pattern (`|(a, b)|`, `|mut acc|`, `|P { x, .. }|`)
+                // bound from a fresh name at the start of the body.
+                let simple = matches!(self.peek(), TokKind::Ident(n) if n != "_")
+                    && matches!(self.peek_at(1), TokKind::Colon | TokKind::Comma | TokKind::Pipe);
+                if simple {
+                    let name = self.ident()?;
+                    let ty = if self.eat(&TokKind::Colon) { Some(self.ty()?) } else { None };
+                    params.push(ClosureParam { name, ty, span: pstart.to(self.prev_span()) });
+                } else {
+                    // No `|` alternatives here: `|` closes the parameters.
+                    let alts = self.pattern_one()?;
+                    let pattern = match <[_; 1]>::try_from(alts) {
+                        Ok([(p, g)]) if g.is_empty() => p,
+                        _ => return Err(ParseError { msg: "a closure parameter cannot use a range pattern".into(), span: pstart.to(self.prev_span()) }),
+                    };
+                    let ty = if self.eat(&TokKind::Colon) { Some(self.ty()?) } else { None };
+                    let span = pstart.to(self.prev_span());
+                    self.pattern_counter += 1;
+                    let name = format!("param#{}", self.pattern_counter);
+                    let init = Expr { kind: std::sync::Arc::new(ExprKind::Path(Path::single(name.clone(), span))), span };
+                    closure_lets.push(Stmt::Let { pattern, ty: None, init: Some(init), span });
+                    params.push(ClosureParam { name, ty, span });
+                }
                 if !self.eat(&TokKind::Comma) { break; }
             }
             self.expect(&TokKind::Pipe)?;
@@ -2252,6 +2467,10 @@ impl Parser {
         let ret = if self.eat(&TokKind::Arrow) { Some(self.ty()?) } else { None };
         let body = self.expr()?;
         let span = start.to(self.prev_span());
+        let body = if closure_lets.is_empty() { body } else {
+            let bspan = body.span;
+            Expr { kind: std::sync::Arc::new(ExprKind::Block(Block { stmts: closure_lets, tail: Some(body), span: bspan })), span: bspan }
+        };
         Ok(Expr { kind: std::sync::Arc::new(ExprKind::Closure { params, ret, body }), span })
     }
 
@@ -2274,6 +2493,27 @@ impl Parser {
     /// parts. `None` (with the cursor restored) for a condition without a
     /// `let`, or a single `let` (handled as `if let`).
     fn let_chain(&mut self) -> PResult<Option<Vec<ChainPart>>> {
+        // Look ahead (without parsing: parsing may split `>>` in place) for
+        // `&& let` before the condition's block.
+        let mut depth = 0i32;
+        let mut i = 0;
+        let mut chained_let = false;
+        loop {
+            match self.peek_at(i) {
+                TokKind::Eof => break,
+                TokKind::LBrace if depth == 0 => break,
+                TokKind::LParen | TokKind::LBracket | TokKind::LBrace | TokKind::GroupOpen => depth += 1,
+                TokKind::RParen | TokKind::RBracket | TokKind::RBrace | TokKind::GroupClose => depth -= 1,
+                TokKind::AndAnd if depth == 0 => {
+                    if matches!(self.peek_at(i + 1), TokKind::Keyword(Kw::Let)) { chained_let = true; }
+                }
+                _ => {}
+            }
+            if self.pos + i >= self.toks.len() { break; }
+            i += 1;
+        }
+        let starts_let = self.at_kw(Kw::Let);
+        if !chained_let && !(starts_let && self.chain_has_and()) { return Ok(None); }
         let save = self.pos;
         let mut parts = Vec::new();
         let mut lets = 0;
@@ -2301,6 +2541,25 @@ impl Parser {
             return Ok(None);
         }
         Ok(Some(parts))
+    }
+
+    /// After `if let`: does an `&&` follow at the top level before the block
+    /// (`if let Some(x) = o && x > 0`)?
+    fn chain_has_and(&self) -> bool {
+        let mut depth = 0i32;
+        let mut i = 0;
+        loop {
+            match self.peek_at(i) {
+                TokKind::Eof => return false,
+                TokKind::LBrace if depth == 0 => return false,
+                TokKind::LParen | TokKind::LBracket | TokKind::LBrace | TokKind::GroupOpen => depth += 1,
+                TokKind::RParen | TokKind::RBracket | TokKind::RBrace | TokKind::GroupClose => depth -= 1,
+                TokKind::AndAnd if depth == 0 => return true,
+                _ => {}
+            }
+            if self.pos + i >= self.toks.len() { return false; }
+            i += 1;
+        }
     }
 
     /// `if`/`while` over a let chain: nested matches and ifs that fall to
@@ -2376,6 +2635,7 @@ impl Parser {
         self.expect(&TokKind::LBrace)?;
         let mut arms = Vec::new();
         while !self.at(&TokKind::RBrace) {
+            self.inner_attributes()?;
             let astart = self.span();
             let alts = self.pattern_alts()?;
             let guard = if self.eat_kw(Kw::If) { Some(self.expr()?) } else { None };
@@ -2438,10 +2698,17 @@ impl Parser {
         let start = self.span();
         self.loop_counter_next += 1;
         let id = self.loop_counter_next;
-        self.loops.push(LoopCtx { id, label, value: false, brk: false, cnt: false, propagate: Vec::new() });
+        let is_block = matches!(self.peek(), TokKind::LBrace);
+        self.loops.push(LoopCtx { id, label, is_block, value: false, brk: false, cnt: false, propagate: Vec::new() });
         let parsed = match self.peek() {
             TokKind::Keyword(Kw::Loop) => self.loop_expr(),
             TokKind::Keyword(Kw::While) => self.while_expr(),
+            // `'a: { body }` is `'a: loop { break 'a { body } }`.
+            TokKind::LBrace => self.block_expr().map(|b| {
+                let span = b.span;
+                let brk = Expr { kind: std::sync::Arc::new(ExprKind::Break(Some(b))), span };
+                Expr { kind: std::sync::Arc::new(ExprKind::Loop { body: Block { stmts: vec![], tail: Some(brk), span } }), span }
+            }),
             _ => self.for_expr(),
         };
         let ctx = self.loops.pop().unwrap();
@@ -2494,11 +2761,12 @@ impl Parser {
                 Some(i) => i,
                 None => return Err(ParseError { msg: format!("no enclosing loop is labeled `'{l}`"), span }),
             },
-            None if self.loops.is_empty() => {
+            // An unlabeled jump targets the innermost loop, not a labeled block.
+            None => match self.loops.iter().rposition(|c| !c.is_block) {
+                Some(i) => i,
                 // Reported by lowering ("break outside loop").
-                return Ok(ex(if is_continue { ExprKind::Continue } else { ExprKind::Break(value) }));
-            }
-            None => self.loops.len() - 1,
+                None => return Ok(ex(if is_continue { ExprKind::Continue } else { ExprKind::Break(value) })),
+            },
         };
         let innermost = target == self.loops.len() - 1;
         let tid = self.loops[target].id;
@@ -2551,10 +2819,16 @@ impl Parser {
         r
     }
 
+    /// After `..`: does an upper bound follow? Not a `{` where a struct
+    /// literal is not allowed (`for i in 5.. { body }`).
+    fn starts_range_end(&self) -> bool {
+        self.starts_expr() && !(self.no_struct > 0 && self.at(&TokKind::LBrace))
+    }
+
     fn starts_expr(&self) -> bool {
         matches!(
             self.peek(),
-            TokKind::Int(..) | TokKind::Float(..) | TokKind::Str(_) | TokKind::Char(_)
+            TokKind::Int(..) | TokKind::Float(..) | TokKind::Str(_) | TokKind::Char(_) | TokKind::ByteStr(_) | TokKind::GroupOpen
                 | TokKind::Ident(_) | TokKind::LParen | TokKind::LBracket | TokKind::LBrace
                 | TokKind::Minus | TokKind::Not | TokKind::Pipe | TokKind::OrOr
                 | TokKind::Keyword(
@@ -2640,6 +2914,13 @@ impl Parser {
         };
         let inclusive = self.at(&TokKind::DotDotEq);
         let is_range = inclusive || self.at(&TokKind::DotDot);
+        // A path that does not start a range is an ordinary pattern
+        // (`Msg::Move(..)`, a unit variant), even after `name @`.
+        let from_path = matches!(&*lo.kind, ExprKind::Path(_));
+        if !is_range && from_path {
+            self.pos = save;
+            return Ok(None);
+        }
         if !is_range && !negative && name.is_none() {
             // An ordinary literal pattern.
             self.pos = save;
@@ -2685,6 +2966,14 @@ impl Parser {
     fn pattern_list(&mut self, close: &TokKind) -> PResult<Vec<Vec<(Pattern, Vec<Expr>)>>> {
         let mut parts = Vec::new();
         while !self.at(close) {
+            // `..`: the remaining elements (see `ast::expand_rest`).
+            if self.at(&TokKind::DotDot) {
+                let span = self.span();
+                self.bump();
+                parts.push(vec![(Pattern { kind: PatternKind::Binding { is_mut: false, name: REST_PATTERN.into() }, span }, Vec::new())]);
+                if !self.eat(&TokKind::Comma) { break; }
+                continue;
+            }
             parts.push(self.pattern_alts()?);
             if !self.eat(&TokKind::Comma) { break; }
         }
@@ -2803,14 +3092,22 @@ impl Parser {
         if let Some(alt) = self.guarded_literal_pattern(None)? {
             return Ok(vec![alt]);
         }
-        // `name @ 1..=9`
+        // `ref x` / `ref mut x`: every binding already shares the value.
+        if matches!(self.peek(), TokKind::Ident(r) if r == "ref") && matches!(self.peek_at(1), TokKind::Ident(_) | TokKind::Keyword(Kw::Mut)) {
+            self.bump();
+        }
+        // `name @ 1..=9` (a guard), or `name @ PATTERN`.
+        let at_mut = matches!(self.peek(), TokKind::Keyword(Kw::Mut)) && matches!(self.peek_at(2), TokKind::At);
+        if at_mut { self.bump(); }
         if let (TokKind::Ident(name), TokKind::At) = (self.peek().clone(), self.peek_at(1).clone()) {
             self.bump();
             self.bump();
-            return match self.guarded_literal_pattern(Some(name))? {
-                Some(alt) => Ok(vec![alt]),
-                None => Err(self.error("`name @` is supported before a literal or range pattern")),
-            };
+            if let Some(alt) = self.guarded_literal_pattern(Some(name.clone()))? {
+                return Ok(vec![alt]);
+            }
+            let inner = self.pattern_one()?;
+            let span = start.to(self.prev_span());
+            return Ok(inner.into_iter().map(|(p, g)| (Pattern { kind: PatternKind::At { is_mut: at_mut, name: name.clone(), pat: Box::new(p) }, span }, g)).collect());
         }
         let single = |kind: PatternKind, this: &Self| vec![(Pattern { kind, span: start.to(this.prev_span()) }, Vec::new())];
         let kind = match self.peek().clone() {

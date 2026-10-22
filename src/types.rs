@@ -507,6 +507,10 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
                 let targs = args.iter().map(|a| lower_type_with(a, generics, ctx)).collect::<Result<_, _>>()?;
                 return Ok(Ty::Named { name: path.segments.join("::"), args: targs });
             }
+            // `!`: the never type (an expression that does not return).
+            if path.is_single() && name == "!" && args.is_empty() {
+                return Ok(Ty::Infer(u32::MAX));
+            }
             if path.is_single() && name == "_" && args.is_empty() {
                 return Ok(Ty::Var("_".into()));
             }

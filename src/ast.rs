@@ -53,6 +53,8 @@ pub struct FnDef {
     /// function with no body. Its `body` is empty and must not be lowered; the
     /// `name` is the unmangled C symbol. See `docs/ffi.md`.
     pub is_extern: bool,
+    /// `unsafe fn`: calls need an `unsafe` block; the body is unsafe context.
+    pub is_unsafe: bool,
     pub span: Span,
 }
 
@@ -447,6 +449,8 @@ pub enum PatternKind {
     /// `Struct { field: pat, ... }`.
     Struct { path: Path, fields: Vec<(String, Pattern)>, rest: bool },
     Tuple(Vec<Pattern>),
+    /// `name @ pattern`: binds the whole value and matches `pattern`.
+    At { is_mut: bool, name: String, pat: Box<Pattern> },
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -455,4 +459,20 @@ pub enum LitPattern {
     Bool(bool),
     Char(char),
     Str(String),
+}
+
+/// The name a `..` element of a tuple or tuple-variant pattern parses to
+/// (`(a, ..)`, `P(a, .., z)`); `expand_rest` fills it with wildcards.
+pub const REST_PATTERN: &str = "..";
+
+/// `ps` with its `..` element replaced by enough wildcards to make `arity`
+/// elements, or `None` when there is no `..`.
+pub fn expand_rest(ps: &[Pattern], arity: usize) -> Option<Vec<Pattern>> {
+    let pos = ps.iter().position(|p| matches!(&p.kind, PatternKind::Binding { name, .. } if name == REST_PATTERN))?;
+    let fill = arity.saturating_sub(ps.len() - 1);
+    let span = ps[pos].span;
+    let mut out: Vec<Pattern> = ps[..pos].to_vec();
+    out.extend((0..fill).map(|_| Pattern { kind: PatternKind::Wildcard, span }));
+    out.extend_from_slice(&ps[pos + 1..]);
+    Some(out)
 }

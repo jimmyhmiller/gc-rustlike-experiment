@@ -45,6 +45,7 @@ fn stdout_line(text: String) -> Result<i64, IoError> {
     if r.code == 0 { Ok(0) } else { Err(IoError::from_response(r, "stdout", "")) }
 }
 fn stderr_line(text: String) -> i64 { let r = host_io(6, "", text, 0); r.code }
+fn stderr_write(text: String) -> i64 { let r = host_io(8, "", text, 0); r.code }
 
 // JSON string encoding preserves UTF-8 and escapes every ASCII control byte.
 fn json_quote(text: String) -> String {

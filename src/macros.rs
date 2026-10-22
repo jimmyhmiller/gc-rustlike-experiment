@@ -45,6 +45,7 @@ pub fn close_of(open: &TokKind) -> Option<TokKind> {
         TokKind::LParen => Some(TokKind::RParen),
         TokKind::LBracket => Some(TokKind::RBracket),
         TokKind::LBrace => Some(TokKind::RBrace),
+        TokKind::GroupOpen => Some(TokKind::GroupClose),
         _ => None,
     }
 }
@@ -277,23 +278,48 @@ fn trans_vars(ts: &[Trans], out: &mut Vec<String>) {
     }
 }
 
-fn transcribe(ts: &[Trans], env: &Env, out: &mut Vec<Token>) -> Result<(), (String, Span)> {
+/// The names a macro body binds with `let` (`let tmp = ..`, `let mut n`).
+/// They are renamed per expansion, so they cannot capture or shadow names in
+/// the code the macro is used in (partial hygiene).
+fn let_names(ts: &[Trans], out: &mut Vec<String>) {
+    let mut i = 0;
+    while i < ts.len() {
+        match &ts[i] {
+            Trans::Tok(Token { kind: TokKind::Keyword(crate::lexer::Kw::Let), .. }) => {
+                let mut j = i + 1;
+                if matches!(ts.get(j), Some(Trans::Tok(Token { kind: TokKind::Keyword(crate::lexer::Kw::Mut), .. }))) { j += 1; }
+                if let Some(Trans::Tok(Token { kind: TokKind::Ident(n), .. })) = ts.get(j) { out.push(n.clone()); }
+            }
+            Trans::Group(_, inner, _) | Trans::Rep(inner, _, _) => let_names(inner, out),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+thread_local! { static EXPANSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+fn transcribe(ts: &[Trans], env: &Env, out: &mut Vec<Token>, hygiene: &(Vec<String>, u32)) -> Result<(), (String, Span)> {
     for t in ts {
         match t {
+            Trans::Tok(Token { kind: TokKind::Ident(n), span }) if hygiene.0.contains(n) => {
+                out.push(Token { kind: TokKind::Ident(format!("{n}#m{}", hygiene.1)), span: *span });
+            }
             Trans::Tok(tok) => out.push(tok.clone()),
             Trans::Group(open, inner, close) => {
                 out.push(open.clone());
-                transcribe(inner, env, out)?;
+                transcribe(inner, env, out, hygiene)?;
                 out.push(close.clone());
             }
             Trans::Var(name, span) => match env.get(name) {
                 Some(Binding::Leaf(toks, kind)) => {
-                    // An expression keeps its grouping where it is used.
+                    // An expression keeps its grouping where it is used,
+                    // through invisible delimiters.
                     let wrap = kind == "expr" && toks.len() > 1;
                     let at = toks.first().map(|t| t.span).unwrap_or(*span);
-                    if wrap { out.push(Token { kind: TokKind::LParen, span: at }); }
+                    if wrap { out.push(Token { kind: TokKind::GroupOpen, span: at }); }
                     out.extend(toks.iter().cloned());
-                    if wrap { out.push(Token { kind: TokKind::RParen, span: at }); }
+                    if wrap { out.push(Token { kind: TokKind::GroupClose, span: at }); }
                 }
                 Some(Binding::Seq(_)) => return Err((format!("`${name}` is repeated; use it inside `$( ... )*`"), *span)),
                 // Not a macro variable: `$` was literal text (rare).
@@ -325,7 +351,7 @@ fn transcribe(ts: &[Trans], env: &Env, out: &mut Vec<Token>) -> Result<(), (Stri
                             inner_env.insert(n.clone(), items[i].clone());
                         }
                     }
-                    transcribe(inner, &inner_env, out)?;
+                    transcribe(inner, &inner_env, out, hygiene)?;
                 }
             }
         }
@@ -339,8 +365,11 @@ pub fn expand(name: &str, rules: &MacroRules, input: &[Token], measure: &Measure
     for (matcher, body) in &rules.rules {
         let mut env = Env::new();
         if match_seq(matcher, input, measure, &mut env) == Some(input.len()) {
+            let mut names = Vec::new();
+            let_names(body, &mut names);
+            let id = EXPANSION.with(|e| { e.set(e.get() + 1); e.get() });
             let mut out = Vec::new();
-            transcribe(body, &env, &mut out)?;
+            transcribe(body, &env, &mut out, &(names, id))?;
             return Ok(out);
         }
     }

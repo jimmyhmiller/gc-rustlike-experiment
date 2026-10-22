@@ -1636,8 +1636,8 @@ trait Iterator {
         if step <= 0 { panic("Iterator::step_by: step must be positive"); }
         StepBy { iter: self, step: step, first: true }
     }
-    fn zip<J: Iterator>(self, other: J) -> Zip<Self, J> { Zip { a: self, b: other } }
-    fn chain<J: Iterator<Item = Self::Item>>(self, other: J) -> Chain<Self, J> { Chain { a: self, b: other, first: true } }
+    fn zip<J: IntoIterator>(self, other: J) -> Zip<Self, J::IntoIter> { Zip { a: self, b: other.into_iter() } }
+    fn chain<J: IntoIterator<Item = Self::Item>>(self, other: J) -> Chain<Self, J::IntoIter> { Chain { a: self, b: other.into_iter(), first: true } }
     fn take_while(self, p: fn(Self::Item) -> bool) -> TakeWhile<Self, Self::Item> { TakeWhile { iter: self, p: p, done: false } }
     fn skip_while(self, p: fn(Self::Item) -> bool) -> SkipWhile<Self, Self::Item> { SkipWhile { iter: self, p: p, started: false } }
     fn flat_map<J: Iterator>(self, f: fn(Self::Item) -> J) -> FlatMap<Self, Self::Item, J> {
@@ -1855,6 +1855,16 @@ impl Range {
     fn contains(self, x: i64) -> bool { x >= self.start && x < self.end }
     fn is_empty(self) -> bool { self.start >= self.end }
 }
+// `lo..` used as a value: counts up without end.
+struct RangeFrom { start: i64 }
+impl Iterator for RangeFrom {
+    type Item = i64;
+    fn next(mut self) -> Option<i64> {
+        let x = self.start;
+        self.start = x + 1;
+        Option::Some(x)
+    }
+}
 struct RangeRev { start: i64, end: i64 }
 impl Iterator for RangeRev {
     type Item = i64;
@@ -1905,7 +1915,7 @@ impl<T> Vec<T> {
     fn skip(self, n: i64) -> Skip<VecIter<T>> { self.iter().skip(n) }
     fn take(self, n: i64) -> Take<VecIter<T>> { self.iter().take(n) }
     fn step_by(self, n: i64) -> StepBy<VecIter<T>> { self.iter().step_by(n) }
-    fn zip<J: Iterator>(self, other: J) -> Zip<VecIter<T>, J> { self.iter().zip(other) }
+    fn zip<J: IntoIterator>(self, other: J) -> Zip<VecIter<T>, J::IntoIter> { self.iter().zip(other) }
     fn peekable(self) -> Peekable<VecIter<T>, T> { self.iter().peekable() }
     fn filter_map<B>(self, f: fn(T) -> Option<B>) -> FilterMap<VecIter<T>, T, B> { self.iter().filter_map(f) }
     fn flat_map<J: Iterator>(self, f: fn(T) -> J) -> FlatMap<VecIter<T>, T, J> { self.iter().flat_map(f) }

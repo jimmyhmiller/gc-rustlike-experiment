@@ -18,6 +18,8 @@ pub const ABSOLUTE: u32 = 4;
 pub const WRITE_ATOMIC: u32 = 5;
 pub const STDERR: u32 = 6;
 pub const STDOUT: u32 = 7;
+/// Write to stderr without a trailing newline (`eprint!`).
+pub const STDERR_RAW: u32 = 8;
 
 #[derive(Debug, Default)]
 struct Outcome {
@@ -172,6 +174,11 @@ fn perform(op: u32, path: &str, text: &str, limit: i64) -> io::Result<Outcome> {
             let mut stderr = io::stderr().lock();
             stderr.write_all(text.as_bytes())?;
             stderr.write_all(b"\n")?;
+        }
+        STDERR_RAW => {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(text.as_bytes())?;
+            stderr.flush()?;
         }
         STDOUT => {
             let mut stdout = io::stdout().lock();

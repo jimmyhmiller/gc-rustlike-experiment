@@ -175,6 +175,7 @@ pub(crate) fn pattern_binds(p: &Pattern, name: &str) -> bool {
         PatternKind::Variant { payload, .. } => payload.iter().any(|q| pattern_binds(q, name)),
         PatternKind::Struct { fields, .. } => fields.iter().any(|(_, q)| pattern_binds(q, name)),
         PatternKind::Tuple(ps) => ps.iter().any(|q| pattern_binds(q, name)),
+        PatternKind::At { name: n, pat, .. } => n == name || pattern_binds(pat, name),
         PatternKind::Wildcard | PatternKind::Literal(_) => false,
     }
 }

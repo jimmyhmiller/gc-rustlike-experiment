@@ -334,7 +334,7 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
                         vis: false, name: m.name, generics: Generics::default(), params: m.params,
                         has_self: true, self_is_mut: m.self_is_mut, ret: m.ret,
                         body: Block { stmts: vec![], tail: Some(ex(ExprKind::Call(callee, args))), span },
-                        is_extern: false, span: m.span,
+                        is_extern: false, is_unsafe: false, span: m.span,
                     }
                 }).collect();
                 let assoc_types = t.items.iter().filter_map(|i| match i {
@@ -1038,7 +1038,7 @@ fn check_type(
 
 pub fn is_builtin_type(name: &str) -> bool {
     // A const generic argument (`Matrix<2, 3>`).
-    if name.starts_with("const#") { return true; }
+    if name.starts_with("const#") || name == "!" { return true; }
     // The trait of a qualified projection (`<T as Mul<f64>>::Output`).
     if name.starts_with("trait#") { return true; }
     matches!(

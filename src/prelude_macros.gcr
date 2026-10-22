@@ -1,0 +1,117 @@
+// The standard macros, written with `macro_rules!` as Rust's standard library
+// writes them. They build on the compiler's built-in macros, which (as in
+// Rust) cannot be written with `macro_rules!`: `format_args!` (here it builds
+// the formatted `String`), `stringify!`, `concat!`, `line!`, `column!`,
+// `file!`, `include_str!`, `module_path!`, and `compile_error!`.
+//
+// These are visible in every program and module. A program's own
+// `macro_rules!` of the same name replaces one. Errors inside an expansion
+// point at the macro's use.
+
+macro_rules! format {
+    ($($arg:tt)*) => { format_args!($($arg)*) };
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => { { print(format_args!($($arg)*)); } };
+}
+
+macro_rules! println {
+    () => { { println(""); } };
+    ($($arg:tt)*) => { { println(format_args!($($arg)*)); } };
+}
+
+macro_rules! eprint {
+    ($($arg:tt)*) => { { stderr_write(format_args!($($arg)*)); } };
+}
+
+macro_rules! eprintln {
+    () => { { stderr_line(""); } };
+    ($($arg:tt)*) => { { stderr_line(format_args!($($arg)*)); } };
+}
+
+macro_rules! panic {
+    () => { panic("explicit panic") };
+    ($($arg:tt)+) => { panic(format_args!($($arg)+)) };
+}
+
+// `write!(f, ...)` appends to anything with `write_str` (a `Formatter`).
+macro_rules! write {
+    ($dst:expr, $($arg:tt)+) => { $dst.write_str(format_args!($($arg)+)) };
+}
+
+macro_rules! writeln {
+    ($dst:expr $(,)?) => { $dst.write_str("\n") };
+    ($dst:expr, $($arg:tt)+) => { $dst.write_str(format_args!($($arg)+) + "\n") };
+}
+
+macro_rules! assert {
+    ($cond:expr $(,)?) => { if !$cond { panic("assertion failed"); } };
+    ($cond:expr, $($arg:tt)+) => { if !$cond { panic(format_args!($($arg)+)); } };
+}
+
+macro_rules! assert_eq {
+    ($left:expr, $right:expr $(,)?) => { if $left != $right { panic("assertion `left == right` failed"); } };
+    ($left:expr, $right:expr, $($arg:tt)+) => { if $left != $right { panic(format_args!($($arg)+)); } };
+}
+
+macro_rules! assert_ne {
+    ($left:expr, $right:expr $(,)?) => { if $left == $right { panic("assertion `left != right` failed"); } };
+    ($left:expr, $right:expr, $($arg:tt)+) => { if $left == $right { panic(format_args!($($arg)+)); } };
+}
+
+// Debug assertions are always on (there is no release-only mode).
+macro_rules! debug_assert {
+    ($($arg:tt)*) => { assert!($($arg)*) };
+}
+
+macro_rules! debug_assert_eq {
+    ($($arg:tt)*) => { assert_eq!($($arg)*) };
+}
+
+macro_rules! debug_assert_ne {
+    ($($arg:tt)*) => { assert_ne!($($arg)*) };
+}
+
+macro_rules! todo {
+    () => { panic("not yet implemented") };
+    ($($arg:tt)+) => { panic("not yet implemented: " + format_args!($($arg)+)) };
+}
+
+macro_rules! unimplemented {
+    () => { panic("not implemented") };
+    ($($arg:tt)+) => { panic("not implemented: " + format_args!($($arg)+)) };
+}
+
+macro_rules! unreachable {
+    () => { panic("internal error: entered unreachable code") };
+    ($($arg:tt)+) => { panic("internal error: entered unreachable code: " + format_args!($($arg)+)) };
+}
+
+// `vec![x; n]` holds the same value in every slot (for a struct, the same
+// reference).
+macro_rules! vec {
+    () => { Vec::new() };
+    ($elem:expr; $n:expr) => { Vec::from_array([$elem; $n]) };
+    ($($x:expr),+ $(,)?) => { Vec::from_array([$($x),+]) };
+}
+
+macro_rules! matches {
+    ($expression:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {
+        match $expression { $pattern $(if $guard)? => true, _ => false }
+    };
+}
+
+// Print a value with its source location and expression, and return it.
+macro_rules! dbg {
+    () => { stderr_line(format_args!("[{}:{}:{}]", file!(), line!(), column!())) };
+    ($val:expr $(,)?) => {
+        match $val {
+            tmp => {
+                stderr_line(format_args!("[{}:{}:{}] {} = {:#?}", file!(), line!(), column!(), stringify!($val), tmp));
+                tmp
+            }
+        }
+    };
+    ($($val:expr),+ $(,)?) => { ($(dbg!($val)),+,) };
+}

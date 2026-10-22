@@ -66,6 +66,11 @@ pub enum TokKind {
     Question, At, Hash, Dollar,
     /// `'name`: a loop label (or a lifetime, which is skipped).
     Lifetime(String),
+    /// `b"ab"`: the bytes of a byte string.
+    ByteStr(Vec<u8>),
+    /// Invisible delimiters around an `expr` a macro substituted: they group
+    /// like parentheses but are not written (`stringify!`).
+    GroupOpen, GroupClose,
     Plus, Minus, Star, Slash, Percent,
     Eq, EqEq, Ne, Lt, Le, Gt, Ge,
     AndAnd, OrOr, Not,
@@ -115,13 +120,44 @@ pub struct LexError {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(src).run()
+    lex_with_source(src, 0)
+}
+
+thread_local! {
+    /// Each lexed source's text and (when it is a file) path, for the
+    /// compiler's built-in macros: `line!`, `column!`, `file!`, `include_str!`.
+    static SOURCES: std::cell::RefCell<std::collections::HashMap<SourceId, (std::rc::Rc<str>, Option<std::path::PathBuf>)>> = Default::default();
+}
+
+/// Record the file a source was read from (`file!`, `include_str!`).
+pub fn register_source_path(source: SourceId, path: &std::path::Path) {
+    SOURCES.with(|s| {
+        if let Some(entry) = s.borrow_mut().get_mut(&source) { entry.1 = Some(path.to_path_buf()); }
+    });
+}
+
+/// The 1-based line and column of a byte offset in a lexed source.
+pub fn source_position(span: Span) -> (u32, u32) {
+    SOURCES.with(|s| {
+        let s = s.borrow();
+        let Some((text, _)) = s.get(&span.source) else { return (1, 1) };
+        let before = &text[..(span.start as usize).min(text.len())];
+        let line = before.matches('\n').count() as u32 + 1;
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) as u32 + 1;
+        (line, column)
+    })
+}
+
+/// The path of the file a source came from, if any.
+pub fn source_path(source: SourceId) -> Option<std::path::PathBuf> {
+    SOURCES.with(|s| s.borrow().get(&source).and_then(|e| e.1.clone()))
 }
 
 /// Lex `src` tagging every token span with `source` (the source's [`SourceId`]).
 /// Used by `compile.rs` for the prelude / `mod` files (lexed in their own offset
 /// spaces) so their spans resolve against the right text. `lex` is `source = 0`.
 pub fn lex_with_source(src: &str, source: SourceId) -> Result<Vec<Token>, LexError> {
+    SOURCES.with(|s| { s.borrow_mut().insert(source, (std::rc::Rc::from(src), None)); });
     let mut toks = Lexer::new(src).run().map_err(|mut error| {
         error.span.source = source;
         error
@@ -180,6 +216,23 @@ impl<'a> Lexer<'a> {
             match c {
                 b'0'..=b'9' => self.lex_number(start)?,
                 b'"' => self.lex_string(start)?,
+                // Raw strings `r"..."`, `r#"..."#`; byte strings `b"..."`,
+                // `br"..."`; bytes `b'a'`.
+                b'r' if self.raw_string_ahead(1) => self.lex_raw_string(start, 1, false)?,
+                b'b' if self.peek_at(1) == b'r' && self.raw_string_ahead(2) => self.lex_raw_string(start, 2, true)?,
+                b'b' if self.peek_at(1) == b'"' => {
+                    self.pos += 1;
+                    self.lex_string(start)?;
+                    let Some(Token { kind: TokKind::Str(text), .. }) = self.toks.pop() else { unreachable!() };
+                    self.push(TokKind::ByteStr(text.into_bytes()), start);
+                }
+                b'b' if self.peek_at(1) == b'\'' => {
+                    self.pos += 1;
+                    self.lex_char(start)?;
+                    let Some(Token { kind: TokKind::Char(c), .. }) = self.toks.pop() else { unreachable!() };
+                    if (c as u32) > 255 { return Err(self.err("a byte literal must be ASCII or `\\xNN`", start)); }
+                    self.push(TokKind::Int(c as u64, NumSuffix::U8), start);
+                }
                 // `'name` (no closing quote after one char) is a label.
                 b'\'' if self.is_label_start() => {
                     self.pos += 1;
@@ -192,6 +245,38 @@ impl<'a> Lexer<'a> {
                 c if is_ident_start(c) => self.lex_ident(start),
                 _ => self.lex_punct(start)?,
             }
+        }
+    }
+
+    fn peek_at(&self, n: usize) -> u8 {
+        self.src.get(self.pos + n).copied().unwrap_or(0)
+    }
+
+    /// Does a raw string (`"` after zero or more `#`) start `skip` bytes on?
+    fn raw_string_ahead(&self, skip: usize) -> bool {
+        let mut i = skip;
+        while self.peek_at(i) == b'#' { i += 1; }
+        self.peek_at(i) == b'"'
+    }
+
+    /// `r#"..."#`: no escapes; ends at `"` followed by as many `#`.
+    fn lex_raw_string(&mut self, start: usize, skip: usize, bytes: bool) -> Result<(), LexError> {
+        self.pos += skip;
+        let mut hashes = 0;
+        while self.peek() == b'#' { hashes += 1; self.pos += 1; }
+        self.pos += 1; // opening quote
+        let body_start = self.pos;
+        loop {
+            if self.pos >= self.src.len() {
+                return Err(self.err("unterminated raw string literal", start));
+            }
+            if self.src[self.pos] == b'"' && (1..=hashes).all(|k| self.peek_at(k) == b'#') {
+                let text = self.text[body_start..self.pos].to_string();
+                self.pos += 1 + hashes;
+                self.push(if bytes { TokKind::ByteStr(text.into_bytes()) } else { TokKind::Str(text) }, start);
+                return Ok(());
+            }
+            self.pos += 1;
         }
     }
 
@@ -403,6 +488,13 @@ impl<'a> Lexer<'a> {
         let e = self.bump_char().ok_or_else(|| self.err("unterminated escape", start))?;
         Ok(match e {
             'n' => '\n', 't' => '\t', 'r' => '\r', '0' => '\0',
+            // `\x41`: a byte in hex (ASCII in strings and chars).
+            'x' => {
+                let hex = self.text.get(self.pos..self.pos + 2).ok_or_else(|| self.err("expected two hex digits after `\\x`", start))?;
+                let code = u8::from_str_radix(hex, 16).map_err(|_| self.err("invalid `\\x` escape", start))?;
+                self.pos += 2;
+                code as char
+            }
             '\\' => '\\', '\'' => '\'', '"' => '"',
             'u' => {
                 if self.bump_char() != Some('{') {

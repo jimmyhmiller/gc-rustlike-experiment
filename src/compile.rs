@@ -85,6 +85,7 @@ fn load_file_modules(items: &mut Vec<Item>, dir: &Path, sources: &mut SourceMap)
                 // its spans resolve against its own text, not the user file.
                 let sid = add_source(sources, file.display().to_string(), src.clone());
                 let toks = lex_with_source(&src, sid).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
+                crate::lexer::register_source_path(sid, &file);
                 let mut parsed = parse_module(&toks)?;
                 // Recurse into this file's own `mod foo;` declarations.
                 load_file_modules(&mut parsed.items, &subdir, sources)?;
@@ -168,6 +169,7 @@ pub fn parse_file_with_prelude(path: &Path) -> Result<(Module, SourceMap), Parse
     let mut sources: SourceMap = Vec::new();
     add_source(&mut sources, path.display().to_string(), src.clone()); // user = id 0
     let tokens = lex(&src).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
+    crate::lexer::register_source_path(0, path);
     let mut user = parse_module(&tokens)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     load_file_modules(&mut user.items, dir, &mut sources)?; // mods get ids 1..

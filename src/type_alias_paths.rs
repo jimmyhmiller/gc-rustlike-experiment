@@ -93,6 +93,21 @@ impl Qualifier<'_> {
                         .or_else(|| self.g.structs.get(&canon).map(|s| s.generics.params.len()))
                         .or_else(|| self.g.enums.get(&canon).map(|e| e.generics.params.len()))
                         .unwrap();
+                    // Omitted trailing arguments take the type's defaults
+                    // (`struct W<T = i64>` written as `W`).
+                    let params = self.g.structs.get(&canon).map(|s| &s.generics.params)
+                        .or_else(|| self.g.enums.get(&canon).map(|e| &e.generics.params));
+                    if let Some(params) = params {
+                        if !namespace && args.len() < params.len() && params[args.len()..].iter().all(|p| p.default.is_some()) {
+                            for i in args.len()..params.len() {
+                                let map: Vec<(String, Type)> = params.iter().zip(args.iter()).map(|(p, a)| (p.name.clone(), a.clone())).collect();
+                                let mut t = params[i].default.clone().unwrap();
+                                subst_written(&mut t, &map);
+                                self.ty(&mut t, generics, false)?;
+                                args.push(t);
+                            }
+                        }
+                    }
                     let bare_namespace =
                         namespace && args.is_empty() && !self.g.aliases.contains_key(&canon);
                     if !bare_namespace && args.len() != arity {
@@ -263,7 +278,10 @@ impl Qualifier<'_> {
             self.expand_self(path);
             if let Some((canon, body)) = self.struct_named(path) {
                 if matches!(body, StructBody::Tuple(_) | StructBody::Unit) {
-                    let fields = std::mem::take(payload).into_iter().enumerate().map(|(i, p)| (i.to_string(), p)).collect();
+                    let arity = if let StructBody::Tuple(t) = body { t.len() } else { 0 };
+                    let parts = std::mem::take(payload);
+                    let parts = expand_rest(&parts, arity).unwrap_or(parts);
+                    let fields = parts.into_iter().enumerate().map(|(i, p)| (i.to_string(), p)).collect();
                     let path = Path { segments: canon.split("::").map(str::to_string).collect(), span: path.span };
                     pattern.kind = PatternKind::Struct { path, fields, rest: false };
                 }
@@ -288,6 +306,7 @@ impl Qualifier<'_> {
                     self.pattern(p)?;
                 }
             }
+            PatternKind::At { pat, .. } => self.pattern(pat)?,
             PatternKind::Wildcard | PatternKind::Binding { .. } | PatternKind::Literal(_) => {}
         }
         Ok(())

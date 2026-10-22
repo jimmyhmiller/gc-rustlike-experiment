@@ -754,3 +754,87 @@ fn complete_trait_support() {
         }
     "#), 3);
 }
+
+#[test]
+fn literals_items_patterns_blocks_attributes_and_inference() {
+    assert_eq!(run(r###"
+        #[repr(u8)]
+        #[derive(Debug, Clone, Copy)]
+        enum E { A = 1, B = 2 }
+        const fn sq(x: i64) -> i64 { x * x }
+        const N: i64 = sq(4);
+        unsafe fn danger() -> i64 { 3 }
+        unsafe trait Zeroable {}
+        unsafe impl Zeroable for i64 {}
+        fn fail() -> ! { panic!("never") }
+        struct W<T = i64> { v: T }
+        #[derive(Debug)]
+        struct Node { v: i64, next: Option<Box<Self>> }
+        #[derive(Debug, Clone, Default)]
+        struct C { a: i64, b: bool, #[allow(dead_code)] c: String }
+        enum Msg { Move(i64, i64, i64), Quit }
+        struct P { x: i64, y: i64 }
+        fn add((a, b): (i64, i64)) -> i64 { a + b }
+        fn px(P { x, .. }: P) -> i64 { x }
+        #[cfg(feature = "nope")]
+        fn picked() -> i64 { 1 }
+        #[cfg(not(feature = "nope"))]
+        fn picked() -> i64 { 2 }
+        fn main() -> i64 {
+            assert_eq!(r"a\nb".len(), 4);
+            assert_eq!(r#"say "hi""#, "say \"hi\"");
+            assert_eq!(b"ab", [97u8, 98u8]);
+            assert_eq!(b'a' + 1, 98u8);
+            assert_eq!("\x41", "A");
+            assert_eq!(E::B as u8 + N as u8 + unsafe { danger() } as u8, 21u8);
+            let x: i64 = if true { 3 } else { fail() };
+            let w: W = W { v: x };
+            let n = Node { v: 1, next: Some(Box::new(Node { v: 2, next: None })) };
+            let c = C { a: 3, ..Default::default() };
+            let t = (1, 2, 3, 4);
+            let (first, .., last) = t;
+            let m = match Msg::Move(5, 6, 7) { m @ Msg::Move(x, ..) => { let _ = m; x } Msg::Quit => 0 };
+            let o = match Some(5) { v @ Some(1..=9) => v, _ => None };
+            let ref mut z = 4;
+            let v = 'blk: { if w.v > 2 { break 'blk 10; } 6 };
+            let mut a = 1; let mut b = 2;
+            (a, b) = (b, a);
+            let from: Vec<i64> = (5..).take(2).collect();
+            let pairs = vec![(1, 2), (3, 4)];
+            let prods: Vec<i64> = pairs.iter().map(|(p, q)| p * q).collect();
+            #[allow(unused_variables)]
+            let unused = 0;
+            assert_eq!(n.next.map(|x| x.v), Some(2));
+            assert_eq!(o, Some(5));
+            assert_eq!((c.a, c.b), (3, false));
+            assert_eq!(from, vec![5, 6]);
+            assert_eq!(prods, vec![2, 12]);
+            first + last + m + z + v + a * 10 + b + add((1, 2)) + px(P { x: 9, y: 0 }) + picked()
+        }
+    "###), 1 + 4 + 5 + 4 + 10 + 20 + 1 + 3 + 9 + 2);
+}
+
+#[test]
+fn standard_macros_are_macro_rules() {
+    assert_eq!(run(r#"
+        macro_rules! swap_lets { ($a:ident, $b:ident) => { let tmp = $a; $a = $b; $b = tmp; }; }
+        macro_rules! square_all { ($($x:expr),*) => { vec![$($x * $x),*] }; }
+        macro_rules! println { ($($t:tt)*) => { 7 }; }
+        fn main() -> i64 {
+            let mut a = 1; let mut b = 2; let tmp = 99;
+            swap_lets!(a, b);
+            assert_eq!((a, b, tmp), (2, 1, 99));
+            assert_eq!(square_all!(1, 2, 3), vec![1, 4, 9]);
+            assert!(matches!(Some(4), Some(1 | 4) if true));
+            let v = dbg!(a + 1);
+            assert_eq!(stringify!(foo(a, b) + 1), "foo(a, b) + 1");
+            assert_eq!(concat!("x", 1, 2.5, true, 'c'), "x12.5truec");
+            assert_eq!(format!("{}-{}", v, line!()), "3-14");
+            debug_assert_eq!(v, 3, "custom {}", v);
+            assert_ne!(v, 4);
+            println!("shadowed by the program's own macro")
+        }
+    "#), 7);
+    let msg = compile_error("fn main() -> i64 { compile_error!(\"stop here\"); 0 }");
+    assert!(msg.contains("stop here"), "{msg}");
+}

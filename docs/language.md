@@ -76,7 +76,15 @@ iteration a fresh `x`; `continue` is safe. `for x in items` visits a `Vec` or
 `Array` (any type with `len()` and indexing) in index order. `if let PAT = e`
 and `while let PAT = e` are `match` with a wildcard arm.
 
-Built-in macros expand in the parser:
+The standard macros are written with `macro_rules!` in `src/prelude_macros.gcr`
+and visible everywhere (a program's own macro of the same name replaces one):
+`format!`, `print!`, `println!`, `eprint!`, `eprintln!`, `panic!`, `write!`,
+`writeln!`, `assert!`, `assert_eq!`, `assert_ne!`, `debug_assert*!`, `todo!`,
+`unimplemented!`, `unreachable!`, `vec!`, `matches!`, and `dbg!`. They build on
+the compiler's built-in macros, which, as in Rust, cannot be written with
+`macro_rules!`: `format_args!` (here it produces the formatted `String`),
+`stringify!`, `concat!`, `line!`, `column!`, `file!`, `include_str!`,
+`module_path!`, and `compile_error!`. What the standard macros do:
 
 - `format!("...", args)` builds a `String`. `{}` takes the next argument, `{N}`
   argument N, and `{name}` a variable in scope; `{{` and `}}` are literal
@@ -230,9 +238,25 @@ These follow Rust; differences come from having no references.
   `is_whitespace`, `to_digit`, `to_ascii_uppercase`, and the other ASCII
   classifiers (non-ASCII classification is approximate).
 - **Macros.** `macro_rules!` with `expr`, `ident`, `ty`, `tt`, `literal`,
-  `pat`, `path`, `block`, `stmt`, and `item` fragments and `$(..),*`, `+`, `?`
-  repetitions, used as expressions, statements, or items. A macro must be
-  defined before its use. Expansion is not hygienic.
+  `pat` (with `|` alternatives), `pat_param`, `path`, `block`, `stmt`, and
+  `item` fragments and `$(..),*`, `+`, `?` repetitions, used as expressions,
+  statements, or items. A macro must be defined before its use. Names a macro
+  body binds with `let` are renamed per expansion, so they neither capture nor
+  shadow the caller's names; other names are not hygienic.
+- **Literals.** Raw strings (`r"..."`, `r#"..."#`), byte strings (`b"ab"` is a
+  `[u8; 2]`), byte literals (`b'a'` is a `u8`), and `\x41` escapes.
+- **Items.** `const fn` (an ordinary function), `unsafe fn` (callable only in
+  `unsafe`; its body is unsafe context), `unsafe trait`/`unsafe impl`, the never
+  type (`fn fail() -> !`), default type parameters on structs and enums
+  (`struct W<T = i64>`), `Self` in field types. `#[cfg(..)]` is evaluated
+  (`feature = ".."` and `test` are off; `unix`, `target_os`, `debug_assertions`
+  follow the host); `#[repr]` and lint attributes are accepted on items,
+  fields, variants, parameters, arms, and statements.
+- **More patterns and expressions.** `name @ PATTERN`, `..` in tuple and
+  tuple-struct patterns, `ref`/`ref mut` (no effect), patterns as function and
+  closure parameters (`|(a, b)| ..`, `fn f((x, y): (i64, i64))`), labeled
+  blocks (`'a: { .. break 'a v; .. }`), destructuring assignment
+  (`(a, b) = (b, a)`), and `lo..` as an endless iterator.
 
 ## Callable expressions and argument inference
 

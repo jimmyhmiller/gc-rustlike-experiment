@@ -436,6 +436,7 @@ fn bind_pattern_names(p: &Pattern, bound: &mut Vec<String>) {
         PatternKind::Variant { payload, .. } => for sp in payload { bind_pattern_names(sp, bound); },
         PatternKind::Struct { fields, .. } => for (_, sp) in fields { bind_pattern_names(sp, bound); },
         PatternKind::Tuple(ps) => for sp in ps { bind_pattern_names(sp, bound); },
+        PatternKind::At { name, pat, .. } => { bound.push(name.clone()); bind_pattern_names(pat, bound); }
         PatternKind::Wildcard | PatternKind::Literal(_) => {}
     }
 }
@@ -455,6 +456,7 @@ fn first_assignment(e: &Expr, name: &str) -> Option<Expr> {
         ExprKind::For { iter, body, .. } => first_assignment(iter, name).or_else(|| first_assignment_block(body, name)),
         ExprKind::Match { scrutinee, arms } => first_assignment(scrutinee, name)
             .or_else(|| arms.iter().find_map(|a| first_assignment(&a.body, name))),
+        ExprKind::Break(Some(v)) | ExprKind::Return(Some(v)) => first_assignment(v, name),
         _ => None,
     }
 }
@@ -910,7 +912,8 @@ fn lower_fn_attempt<'a>(
         ret_ty: ret_ty.clone(),
         infer_ret: false,
         infer: std::mem::take(infer),
-        unsafe_depth: 0,
+        // An `unsafe fn`'s body is unsafe context.
+        unsafe_depth: job.f.is_unsafe as usize,
         deferred_locals: vec![],
         loop_exits: vec![],
         type_probe: false,
@@ -2219,8 +2222,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             ExprKind::For { pat, iter, body } => {
                 // Ranges, Vecs and arrays loop by index; anything else that
-                // implements `Iterator` is driven by `next`.
-                if !matches!(&*iter.kind, ExprKind::Range { .. }) {
+                // implements `Iterator` is driven by `next` (`lo..` too).
+                if !matches!(&*iter.kind, ExprKind::Range { hi: Some(_), .. }) {
                     let ty = self.probe_expr_type(iter, None)?;
                     let indexed = array_elem_ty(&ty).is_some() || matches!(&ty, Ty::Named { name, .. } if name == "Vec");
                     if !indexed && self.ctx.type_implements_trait(&ty, "Iterator") {
@@ -2238,6 +2241,16 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.expr(&desugared, None)
             }
 
+            // `lo..` as a value is an endless `RangeFrom` iterator.
+            ExprKind::Range { lo: Some(lo), hi: None, .. } if self.ctx.structs.contains_key("RangeFrom") => {
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: e.span };
+                let lit = ex(ExprKind::StructLit {
+                    path: Path::single("RangeFrom".into(), e.span),
+                    fields: vec![FieldInit { name: "start".into(), value: Some(lo.clone()), span: e.span }],
+                    span: e.span,
+                });
+                self.expr(&lit, None)
+            }
             // `lo..hi` / `lo..=hi` as a value is a `Range` iterator.
             ExprKind::Range { lo: Some(lo), hi: Some(hi), inclusive } if self.ctx.structs.contains_key("Range") => {
                 let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span: e.span };
@@ -2278,6 +2291,27 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 Ok((CoreExpr::new(CoreExprKind::Continue, Repr::Unit), never_ty()))
             }
 
+            // `(a, b) = (b, a)`, `[x, y] = arr`: assign each part from a
+            // temporary holding the value (evaluated once, first).
+            ExprKind::Assign { target, op: None, value } if matches!(&*target.kind, ExprKind::Tuple(_) | ExprKind::Array(ArrayLit::Elems(_))) => {
+                let span = e.span;
+                let ex = |kind: ExprKind| Expr { kind: std::sync::Arc::new(kind), span };
+                // A nested target reuses the name; its `let` reads the outer
+                // temporary before shadowing it.
+                let tmp = format!("assign#{}", span.start);
+                let var = || ex(ExprKind::Path(Path::single(tmp.clone(), span)));
+                let mut stmts = vec![Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: tmp.clone() }, span }, ty: None, init: Some(value.clone()), span }];
+                let parts: Vec<(Expr, Expr)> = match &*target.kind {
+                    ExprKind::Tuple(ts) => ts.iter().enumerate().map(|(i, t)| (t.clone(), ex(ExprKind::Field { base: var(), field: FieldAccess::Tuple(i as u32) }))).collect(),
+                    ExprKind::Array(ArrayLit::Elems(ts)) => ts.iter().enumerate().map(|(i, t)| (t.clone(), ex(ExprKind::Index { base: var(), index: ex(ExprKind::Int(i as u64, crate::lexer::NumSuffix::None)) }))).collect(),
+                    _ => unreachable!(),
+                };
+                for (t, v) in parts {
+                    if matches!(&*t.kind, ExprKind::Path(p) if p.is_single() && p.last() == "_") { continue; }
+                    stmts.push(Stmt::Expr(ex(ExprKind::Assign { target: t, op: None, value: v })));
+                }
+                self.expr(&ex(ExprKind::Block(Block { stmts, tail: None, span })), None)
+            }
             ExprKind::Assign { target, op, value } => {
                 if let ExprKind::Index { base, index } = &*target.kind {
                     return match op {
@@ -2709,12 +2743,17 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                     inits.push(FieldInit { name: df.name.clone(), value: Some(ex(ExprKind::Field { base: var(), field: FieldAccess::Named(df.name.clone()) })), span });
                 }
             }
-            let block = ex(ExprKind::Block(Block {
-                stmts: vec![Stmt::Let { pattern: Pattern { kind: PatternKind::Binding { is_mut: false, name: "update#base".into() }, span }, ty: None, init: Some(base), span }],
-                tail: Some(ex(ExprKind::StructLit { path: path.clone(), fields: inits, span })),
-                span,
-            }));
-            return self.expr(&block, expected);
+            // The base has the struct's type (`..Default::default()` needs it).
+            let base_expected = expected.cloned().or_else(|| s.generics.params.is_empty().then(|| Ty::Named { name: canon.clone(), args: vec![] }));
+            let (cbase, bty) = self.expr(&base, base_expected.as_ref())?;
+            let id = self.fresh_local(cbase.repr.clone(), bty.clone());
+            self.push_scope();
+            self.bind("update#base", id, bty.clone());
+            let result = self.expr(&ex(ExprKind::StructLit { path: path.clone(), fields: inits, span }), expected.or(Some(&bty)));
+            self.pop_scope();
+            let (value, ty) = result?;
+            let repr = value.repr.clone();
+            return Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts: vec![CoreStmt::Let(id, cbase)], tail: Some(value) })), repr), ty));
         }
         let gparams: Vec<String> = s.generics.params.iter().map(|p| p.name.clone()).collect();
         let template = alias_template.unwrap_or_else(|| Ty::Named {
@@ -3225,11 +3264,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             PatternKind::Variant { path, payload } => {
                 if let Ok((_, fields)) = self.variant_fields(ty, path, p.span) {
+                    let payload = expand_rest(payload, fields.len()).unwrap_or_else(|| payload.clone());
                     for (sp, fty) in payload.iter().zip(&fields) { self.bind_probe_pattern(sp, fty); }
                 }
             }
             PatternKind::Tuple(ps) => {
                 if let Ty::Tuple(elems) = ty {
+                    let ps = expand_rest(ps, elems.len()).unwrap_or_else(|| ps.clone());
                     for (sp, ety) in ps.iter().zip(elems) { self.bind_probe_pattern(sp, ety); }
                 }
             }
@@ -3239,6 +3280,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                         if let Some(i) = names.iter().position(|n| n == fname) { self.bind_probe_pattern(sp, &tys[i]); }
                     }
                 }
+            }
+            PatternKind::At { name, is_mut, pat } => {
+                let id = self.fresh_local(Repr::Unit, ty.clone());
+                self.bind_mut(name, id, ty.clone(), *is_mut);
+                self.bind_probe_pattern(pat, ty);
             }
             PatternKind::Wildcard | PatternKind::Literal(_) => {}
         }
@@ -3388,12 +3434,21 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.bind_mut(name, id, sty.clone(), *is_mut);
                 Ok((None, vec![(id, scrut.clone())], true))
             }
+            PatternKind::At { name, is_mut, pat } => {
+                let (cond, mut binds, irrefutable) = self.pattern_test(pat, scrut, sty, span)?;
+                let id = self.fresh_local(scrut.repr.clone(), sty.clone());
+                self.bind_mut(name, id, sty.clone(), *is_mut);
+                binds.insert(0, (id, scrut.clone()));
+                Ok((cond, binds, irrefutable))
+            }
             PatternKind::Literal(lit) => {
                 let cond = self.literal_eq(scrut, lit, sty, span)?;
                 Ok((Some(cond), vec![], false))
             }
             PatternKind::Variant { path, payload } => {
                 let (tag, fields) = self.variant_fields(sty, path, span)?;
+                let expanded = expand_rest(payload, fields.len());
+                let payload = expanded.as_ref().unwrap_or(payload);
                 if payload.len() != fields.len() {
                     return err(format!("variant `{}` has {} fields, pattern has {}", path.last(), fields.len(), payload.len()), span);
                 }
@@ -3451,6 +3506,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let Ty::Tuple(elems) = sty else {
                     return err(format!("tuple pattern against `{}`", ty_display(sty)), span);
                 };
+                let expanded = expand_rest(ps, elems.len());
+                let ps = expanded.as_ref().unwrap_or(ps);
                 if ps.len() != elems.len() {
                     return err(format!("tuple pattern has {} elements, the value has {}", ps.len(), elems.len()), span);
                 }
@@ -3524,10 +3581,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     fn space_pat(&mut self, p: &Pattern, ty: &Ty, span: Span) -> LResult<SpacePat> {
         Ok(match &p.kind {
             PatternKind::Wildcard | PatternKind::Binding { .. } => SpacePat::Wild,
+            PatternKind::At { pat, .. } => self.space_pat(pat, ty, span)?,
             PatternKind::Literal(LitPattern::Bool(b)) => SpacePat::Ctor(*b as u32, vec![]),
             PatternKind::Literal(lit) => SpacePat::Lit(format!("{:?}", lit)),
             PatternKind::Variant { path, payload } => {
                 let (tag, fields) = self.variant_fields(ty, path, span)?;
+                let expanded = expand_rest(payload, fields.len());
+                let payload = expanded.as_ref().unwrap_or(payload);
                 let mut subs = Vec::new();
                 for (sp, st) in payload.iter().zip(&fields) { subs.push(self.space_pat(sp, st, span)?); }
                 SpacePat::Ctor(tag, subs)
@@ -3554,6 +3614,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             PatternKind::Tuple(ps) => {
                 let Ty::Tuple(elems) = ty else { return err("tuple pattern against a non-tuple", span) };
+                let expanded = expand_rest(ps, elems.len());
+                let ps = expanded.as_ref().unwrap_or(ps);
                 let mut subs = Vec::new();
                 for (sp, st) in ps.iter().zip(elems) { subs.push(self.space_pat(sp, st, span)?); }
                 SpacePat::Ctor(0, subs)
@@ -4851,6 +4913,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
 
         let turbofish = OPERAND_TURBOFISH.with(|t| t.borrow_mut().take());
         let m = entry.method.clone();
+        if m.is_unsafe {
+            self.require_unsafe(&format!("calling `unsafe fn {}`", m.name), span)?;
+        }
         // Method-level generics inferred from args.
         let mgparams: Vec<String> = m.generics.params.iter().map(|p| p.name.clone()).collect();
         if args.len() != m.params.len() {
@@ -4943,6 +5008,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
         let m = entry.method.clone();
+        if m.is_unsafe {
+            self.require_unsafe(&format!("calling `unsafe fn {}`", m.name), span)?;
+        }
         if args.len() != m.params.len() {
             return err(
                 format!("`{}::{}` expects {} args, got {}", base, m.name, m.params.len(), args.len()),
@@ -5680,7 +5748,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 return err("host_io operation must be a literal integer", span);
             };
             let op = u32::try_from(*op).map_err(|_| LowerError { msg: "invalid host operation".into(), span })?;
-            if op > crate::runtime::io::STDOUT { return err("unknown host operation", span); }
+            if op > crate::runtime::io::STDERR_RAW { return err("unknown host operation", span); }
             let str_ty = Ty::Prim(Prim::Str);
             let array_ty = Ty::Named { name: "Array".into(), args: vec![str_ty.clone()] };
             let response_ty = Ty::Named { name: "IoResponse".into(), args: vec![] };
@@ -6068,6 +6136,9 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             return err(format!("unknown function `{}`{}", name, hint), span);
         };
         let f = self.ctx.fns[&fq].clone();
+        if f.is_unsafe {
+            self.require_unsafe(&format!("calling `unsafe fn {name}`"), span)?;
+        }
         if args.len() != f.params.len() {
             return err(format!("`{}` expects {} args, got {}", name, f.params.len(), args.len()), span);
         }
