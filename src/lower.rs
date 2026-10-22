@@ -344,6 +344,9 @@ fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProg
     // find it (no live pointer is ever stranded in a register across a safepoint).
     crate::anf::anf_program(&mut prog);
     crate::copyprop::copy_propagate(&mut prog);
+    crate::inline::inline_program(&mut prog);
+    crate::sroa::scalar_replace(&mut prog);
+    crate::copyprop::copy_propagate(&mut prog);
     Ok(prog)
 }
 
@@ -408,7 +411,7 @@ fn install_fn(prog: &mut CoreProgram, id: FuncId, f: CoreFn) {
 }
 
 fn placeholder_fn() -> CoreFn {
-    CoreFn { name: String::new(), params: vec![], extern_by_ref: vec![], ret: Repr::Unit, locals: vec![], local_names: vec![], body: CoreBlock { stmts: vec![], tail: None }, closure_captures: vec![], is_closure: false, is_extern: false, span: crate::core::NO_SPAN }
+    CoreFn { name: String::new(), params: vec![], extern_by_ref: vec![], ret: Repr::Unit, locals: vec![], local_names: vec![], body: CoreBlock { stmts: vec![], tail: None }, closure_captures: vec![], is_closure: false, is_extern: false, hints: Default::default(), span: crate::core::NO_SPAN }
 }
 
 /// Collect free variable names referenced in `e`: single-segment path uses that
@@ -934,7 +937,7 @@ fn lower_fn_body<'a>(
             local_names: vec![],
             body: CoreBlock { stmts: vec![], tail: None },
             closure_captures: vec![], is_closure: false,
-            is_extern: true,
+            is_extern: true, hints: Default::default(),
             span: fn_span,
         });
     }
@@ -1069,7 +1072,7 @@ fn lower_fn_with(lo: &mut FnLowerer<'_, '_, '_>, job: &Job, ret_ty: &Ty, fn_span
         local_names: std::mem::take(&mut lo.local_names),
         body,
         closure_captures: vec![], is_closure: false,
-        is_extern: false,
+        is_extern: false, hints: f.hints,
         span: fn_span,
     })
 }
@@ -4262,6 +4265,30 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.array_store(ca, aty, idx, val, span)
     }
 
+    /// `array_copy(src, src_pos, dst, dst_pos, n)`: copy `n` elements, as
+    /// `dst[dst_pos..dst_pos + n].copy_from_slice(&src[src_pos..src_pos + n])`
+    /// (overlap allowed). Aborts when either range is out of bounds.
+    fn array_copy_op(&mut self, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        self.check_mutable_root(&args[2], "element of", span)?;
+        let (src, src_ty) = self.expr(&args[0], None)?;
+        let elem_ty = array_elem_ty(&src_ty).ok_or_else(|| LowerError { msg: "array_copy on a non-array".into(), span })?;
+        let elem = self.repr_of(&elem_ty, span)?;
+        let mut lowered = vec![src];
+        for (arg, ty) in args[1..].iter().zip([Ty::i64(), src_ty.clone(), Ty::i64(), Ty::i64()]) {
+            let (e, actual) = self.expr(arg, Some(&ty))?;
+            self.check_assignable(&actual, &ty, arg.span)?;
+            lowered.push(e);
+        }
+        let stride = match &elem {
+            Repr::Value(vid) => crate::core::record_shape(&self.reg.values, *vid).0 as u128,
+            Repr::Scalar(s) => (s.bits().max(8) / 8) as u128,
+            Repr::Ref(_) => 8,
+            Repr::Unit => 1,
+        };
+        lowered.push(CoreExpr::new(CoreExprKind::ConstInt(stride, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64)));
+        Ok((CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_array_copy", args: lowered, ret: Repr::Unit }, Repr::Unit), Ty::unit()))
+    }
+
     fn array_store(&mut self, ca: CoreExpr, aty: Ty, idx: &Expr, val: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_set on a non-array".into(), span })?;
         let elem = self.repr_of(&elem_ty, span)?;
@@ -4349,8 +4376,8 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.check_assignable(&at, &bytes_ty, args[1].span)?;
                 Ok((CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_str_copy_bytes", args: vec![s, array], ret: Repr::Unit }, Repr::Unit), Ty::unit()))
             }
-            "str_from_bytes" => {
-                if args.len() != 2 { return err("`str_from_bytes` takes a `u8` array and a length", span); }
+            "str_from_bytes" | "str_from_utf8_prefix" => {
+                if args.len() != 2 { return err(&format!("`{name}` takes a `u8` array and a length"), span); }
                 let bytes_ty = Ty::Named { name: "Array".into(), args: vec![Ty::Prim(Prim::U8)] };
                 let (array, at) = self.expr(&args[0], Some(&bytes_ty))?;
                 self.check_assignable(&at, &bytes_ty, args[0].span)?;
@@ -4359,7 +4386,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 let layout = self.string_layout_id(span)?;
                 let tid = CoreExpr::new(CoreExprKind::ConstInt(layout as u128, ScalarRepr::I64), Repr::Scalar(ScalarRepr::I64));
                 Ok((
-                    CoreExpr::new(CoreExprKind::RuntimeCall { func: "ai_str_from_bytes", args: vec![tid, array, len], ret: Repr::Ref(layout) }, Repr::Ref(layout)),
+                    CoreExpr::new(CoreExprKind::RuntimeCall { func: if name == "str_from_bytes" { "ai_str_from_bytes" } else { "ai_str_from_utf8_prefix" }, args: vec![tid, array, len], ret: Repr::Ref(layout) }, Repr::Ref(layout)),
                     str_ty,
                 ))
             }
@@ -4834,7 +4861,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             local_names,
             body: CoreBlock { stmts: body_block.stmts, tail: body_block.tail },
             closure_captures, is_closure: true,
-            is_extern: false,
+            is_extern: false, hints: Default::default(),
             span: fn_span,
         }, ret_ty))
     }
@@ -6180,6 +6207,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 "array_get" if args.len() == 2 => return self.array_get_op(&args[0], &args[1], span),
                 "array_get_unchecked" if args.len() == 2 => return self.array_get_unchecked_op(&args[0], &args[1], span),
                 "array_set" if args.len() == 3 => return self.array_set_op(&args[0], &args[1], &args[2], span),
+                "array_copy" if args.len() == 5 => return self.array_copy_op(args, span),
                 _ => {}
             }
         }
@@ -6240,7 +6268,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             match name {
                 "print_str" | "print" | "str_len" | "str_eq" | "str_concat"
                 | "str_get" | "str_substring" | "to_string" | "str_to_float" | "str_hash"
-                | "read_file" | "float_bits" | "char_to_str" | "fmt_f64" | "str_from_bytes" | "str_copy_bytes" => {
+                | "read_file" | "float_bits" | "char_to_str" | "fmt_f64" | "str_from_bytes" | "str_from_utf8_prefix" | "str_copy_bytes" => {
                     return self.str_intrinsic(name, args, span);
                 }
                 "type_id_of" | "type_name_of" | "field_count" | "field_name" | "field_kind"

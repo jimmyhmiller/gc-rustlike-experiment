@@ -68,6 +68,9 @@ mod completion_registry_growth;
 mod channel_remembered_tests;
 #[path = "runtime/native_retirement.rs"]
 pub(crate) mod native_retirement;
+#[path = "runtime/array_copy.rs"]
+mod array_copy;
+pub use array_copy::ai_array_copy;
 mod slots;
 pub use slots::{ai_slot_bits8_load, ai_slot_bits8_store, ai_slot_bits16_load, ai_slot_bits16_store,
     ai_slot_bits32_load, ai_slot_bits32_store, ai_slot_bits64_load, ai_slot_bits64_store, ai_slot_ref_store};
@@ -214,6 +217,11 @@ pub struct Thread {
     pub copying_phase: *const std::sync::atomic::AtomicU8,
     /// Heap-owned flag: nonzero once a second mutator registered.
     pub multi_mutator: *const std::sync::atomic::AtomicU8,
+    /// The nursery's fixed address range (size 0 without generations):
+    /// generated write barriers call the runtime only for a young value
+    /// stored into an old object.
+    pub nursery_base: usize,
+    pub nursery_size: usize,
     // Owner-local ABI scope stack. Some = native/parked, None = callback is
     // managed. Never retain a mutable borrow across group restoration.
     foreign_scopes: std::cell::UnsafeCell<allocator_api2::vec::Vec<
@@ -232,6 +240,8 @@ pub mod thread_offsets {
     pub const RELOCATION_EPOCH: usize = 72;
     pub const COPYING_PHASE: usize = 80;
     pub const MULTI_MUTATOR: usize = 88;
+    pub const NURSERY_BASE: usize = 96;
+    pub const NURSERY_SIZE: usize = 104;
 }
 
 const _: () = {
@@ -244,6 +254,8 @@ const _: () = {
     assert!(core::mem::offset_of!(Thread, relocation_epoch) == thread_offsets::RELOCATION_EPOCH);
     assert!(core::mem::offset_of!(Thread, copying_phase) == thread_offsets::COPYING_PHASE);
     assert!(core::mem::offset_of!(Thread, multi_mutator) == thread_offsets::MULTI_MUTATOR);
+    assert!(core::mem::offset_of!(Thread, nursery_base) == thread_offsets::NURSERY_BASE);
+    assert!(core::mem::offset_of!(Thread, nursery_size) == thread_offsets::NURSERY_SIZE);
 };
 
 // =============================================================================
@@ -469,6 +481,8 @@ impl RuntimeThread {
             relocation_epoch: dyna.relocation_epoch_ptr(),
             copying_phase: heap.copying_phase_ptr(),
             multi_mutator: heap.multi_mutator_ptr(),
+            nursery_base: heap.nursery_range().0,
+            nursery_size: heap.nursery_range().1,
             foreign_scopes: std::cell::UnsafeCell::new(allocator_api2::vec::Vec::new_in(
                 metadata_allocator::MetadataAllocator::new(&heap.native_memory.registry))),
         }, heap.native_memory.registry_allocator());
@@ -3250,14 +3264,42 @@ pub unsafe extern "C" fn ai_str_substring(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ai_str_from_bytes(thread: *mut Thread, type_id: i64, array: *const u8, len: i64) -> *mut u8 {
     unsafe {
-        let len = len.max(0);
-        let mut bytes = vec![0u8; len as usize];
-        if len > 0 { ffi_copy::scalar(thread, array, bytes.as_mut_ptr(), len, 8, false); }
-        match std::str::from_utf8(&bytes) {
+        with_array_bytes(thread, array, len, |bytes| match std::str::from_utf8(bytes) {
             Ok(text) => alloc_string_from_text(thread, type_id as u32, text),
             Err(_) => abort_with_diagnostic(thread, b"gc-rust: invalid UTF-8 bytes for a String"),
-        }
+        })
     }
+}
+
+/// `str_from_utf8_prefix(array, len)`: a fresh `String` holding the longest
+/// valid UTF-8 prefix of the first `len` bytes of a `u8` array
+/// (`String::from_utf8` compares its length with `len`).
+///
+/// # Safety
+/// As `ai_str_from_bytes`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_str_from_utf8_prefix(thread: *mut Thread, type_id: i64, array: *const u8, len: i64) -> *mut u8 {
+    unsafe {
+        with_array_bytes(thread, array, len, |bytes| {
+            let valid = match std::str::from_utf8(bytes) { Ok(_) => bytes.len(), Err(e) => e.valid_up_to() };
+            alloc_string_from_utf8_bytes(thread, type_id as u32, &bytes[..valid])
+        })
+    }
+}
+
+/// Run `body` on a native copy of the first `len` bytes of a `u8` array,
+/// which stays valid while `body` allocates. Short arrays use the stack.
+unsafe fn with_array_bytes<R>(thread: *mut Thread, array: *const u8, len: i64, body: impl FnOnce(&[u8]) -> R) -> R {
+    const STACK: usize = 256;
+    let len = len.max(0) as usize;
+    if len <= STACK {
+        let mut buffer = [0u8; STACK];
+        if len > 0 { unsafe { ffi_copy::scalar(thread, array, buffer.as_mut_ptr(), len as i64, 8, false); } }
+        return body(&buffer[..len]);
+    }
+    let mut bytes = vec![0u8; len];
+    unsafe { ffi_copy::scalar(thread, array, bytes.as_mut_ptr(), len as i64, 8, false); }
+    body(&bytes)
 }
 
 /// `str_copy_bytes(s, array)`: copy the bytes of `s` into the first

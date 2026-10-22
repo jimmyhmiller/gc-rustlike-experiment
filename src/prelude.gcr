@@ -245,34 +245,6 @@ impl Display for FromUtf8Error {
     fn fmt(self, f: Formatter) -> FmtResult { f.write_str(format!("invalid utf-8 sequence at byte {}", self.valid_up_to)) }
 }
 
-// The length of the longest valid UTF-8 prefix of `bytes[..len]`.
-fn utf8_valid_up_to(bytes: Vec<u8>) -> i64 {
-    let n = bytes.len();
-    let mut i = 0;
-    while i < n {
-        let b = bytes[i] as i64;
-        let (width, low, high) = if b < 128 { (1, 128, 191) }
-            else if b >= 194 && b <= 223 { (2, 128, 191) }
-            else if b == 224 { (3, 160, 191) }
-            else if b >= 225 && b <= 239 && b != 237 { (3, 128, 191) }
-            else if b == 237 { (3, 128, 159) }
-            else if b == 240 { (4, 144, 191) }
-            else if b >= 241 && b <= 243 { (4, 128, 191) }
-            else if b == 244 { (4, 128, 143) }
-            else { return i };
-        if i + width > n { return i; }
-        let mut k = 1;
-        while k < width {
-            let c = bytes[i + k] as i64;
-            let (lo, hi) = if k == 1 { (low, high) } else { (128, 191) };
-            if c < lo || c > hi { return i; }
-            k += 1;
-        }
-        i += width;
-    }
-    n
-}
-
 impl String {
     // A copy of the string's bytes (strings are immutable, so a copy is the
     // only way to hand them out).
@@ -286,9 +258,9 @@ impl String {
     fn bytes(self) -> VecIter<u8> { self.as_bytes().into_iter() }
     fn as_str(self) -> String { self }
     fn from_utf8(bytes: Vec<u8>) -> Result<String, FromUtf8Error> {
-        let valid = utf8_valid_up_to(bytes);
-        if valid == bytes.len() { Ok(str_from_bytes(bytes.data, bytes.len())) }
-        else { Err(FromUtf8Error { bytes: bytes, valid_up_to: valid }) }
+        let valid = str_from_utf8_prefix(bytes.data, bytes.len());
+        if valid.len() == bytes.len() { Ok(valid) }
+        else { Err(FromUtf8Error { bytes: bytes, valid_up_to: valid.len() }) }
     }
 }
 
@@ -664,6 +636,17 @@ impl<T, E> Result<T, E> {
 // requires external synchronization. Concurrent collections use separate APIs.
 struct Vec<T> { data: Array<T>, len: i64, cap: i64 }
 
+// New storage of `cap` slots holding the first `len` elements of `data`.
+// Growth takes the storage, not the Vec, so a Vec used only in one function
+// can live in locals there.
+#[cold]
+#[inline(never)]
+fn vec_grow<T>(data: Array<T>, len: i64, cap: i64) -> Array<T> {
+    let mut grown: Array<T> = Array::new(cap);
+    array_copy(data, 0, grown, 0, len);
+    grown
+}
+
 impl<T> Vec<T> {
     fn new() -> Vec<T> { Vec { data: Array::new(4), len: 0, cap: 4 } }
 
@@ -680,31 +663,30 @@ impl<T> Vec<T> {
         Vec { data: Array::new(c), len: 0, cap: c }
     }
 
+    #[inline]
     fn len(self) -> i64 { self.len }
+    #[inline]
     fn is_empty(self) -> bool { self.len == 0 }
 
     // Bounds-checked access: Some(element) when 0 <= i < len, otherwise None.
+    #[inline]
     fn get(self, i: i64) -> Option<T> {
         if i < 0 || i >= self.len { Option::None } else { Option::Some(self.data[i]) }
     }
     fn first(self) -> Option<T> { self.get(0) }
     fn last(self) -> Option<T> { self.get(self.len - 1) }
 
+    #[inline]
     fn push(mut self, x: T) {
         if self.len == self.cap {
-            let new_cap = self.cap * 2;
-            let mut grown: Array<T> = Array::new(new_cap);
-            let mut i = 0;
-            while i < self.len {
-                grown[i] = self.data[i];
-                i += 1;
-            }
-            self.data = grown;
-            self.cap = new_cap;
+            self.cap = (self.cap * 2).max(4);
+            self.data = vec_grow(self.data, self.len, self.cap);
         }
         self.data[self.len] = x;
         self.len += 1;
     }
+
+
 
     // Remove and return the last element, or None if the Vec is empty.
     fn pop(mut self) -> Option<T> {
@@ -727,16 +709,14 @@ impl<T> Vec<T> {
     fn insert(mut self, i: i64, x: T) {
         if i < 0 || i > self.len { panic!("insertion index (is {}) should be <= len (is {})", i, self.len); }
         self.push(x);
-        let mut j = self.len - 1;
-        while j > i { self.data[j] = self.data[j - 1]; j -= 1; }
+        array_copy(self.data, i, self.data, i + 1, self.len - 1 - i);
         self.data[i] = x;
     }
     // Take out the element at `i`, shifting the rest down.
     fn remove(mut self, i: i64) -> T {
         if i < 0 || i >= self.len { panic!("removal index (is {}) should be < len (is {})", i, self.len); }
         let x = self.data[i];
-        let mut j = i;
-        while j + 1 < self.len { self.data[j] = self.data[j + 1]; j += 1; }
+        array_copy(self.data, i + 1, self.data, i, self.len - 1 - i);
         self.len = self.len - 1;
         x
     }
@@ -757,12 +737,13 @@ impl<T> Vec<T> {
 
     // Append every element of `other`.
     fn extend(mut self, other: Vec<T>) {
-        let mut i = 0;
         let n = other.len;
-        while i < n {
-            self.push(other.data[i]);
-            i += 1;
+        if self.len + n > self.cap {
+            self.cap = (self.cap * 2).max(self.len + n);
+            self.data = vec_grow(self.data, self.len, self.cap);
         }
+        array_copy(other.data, 0, self.data, self.len, n);
+        self.len += n;
     }
 
     // Reverse the elements in place.
@@ -896,12 +877,18 @@ impl<T> Vec<T> {
     }
 }
 
+// The failure of `v[i]`, kept out of line.
+#[cold]
+#[inline(never)]
+fn vec_index_fail(i: i64, len: i64) {
+    panic!("index out of bounds: the len is {} but the index is {}", len, i);
+}
+
 impl<T> Index<i64> for Vec<T> {
     type Output = T;
+    #[inline]
     fn index(self, i: i64) -> T {
-        if i < 0 || i >= self.len {
-            panic!("index out of bounds: the len is {} but the index is {}", self.len, i);
-        }
+        if i < 0 || i >= self.len { vec_index_fail(i, self.len); }
         self.data[i]
     }
 }
@@ -913,16 +900,16 @@ impl<T> IndexRange<Vec<T>> for Vec<T> {
             panic!("range {}..{} is out of bounds for a Vec of length {}", lo, hi, self.len);
         }
         let mut out: Vec<T> = Vec::with_capacity(hi - lo);
-        for i in lo..hi { out.push(self.data[i]); }
+        array_copy(self.data, lo, out.data, 0, hi - lo);
+        out.len = hi - lo;
         out
     }
 }
 
 impl<T> IndexSet<T> for Vec<T> {
+    #[inline]
     fn index_set(mut self, i: i64, value: T) {
-        if i < 0 || i >= self.len {
-            panic!("index out of bounds: the len is {} but the index is {}", self.len, i);
-        }
+        if i < 0 || i >= self.len { vec_index_fail(i, self.len); }
         self.data[i] = value;
     }
 }
@@ -931,11 +918,7 @@ impl<T> Clone for Vec<T> {
     fn clone(self) -> Vec<T> {
         let cap = self.cap.max(1);
         let mut data: Array<T> = Array::new(cap);
-        let mut i = 0;
-        while i < self.len {
-            data[i] = self.data[i];
-            i += 1;
-        }
+        array_copy(self.data, 0, data, 0, self.len);
         Vec { data: data, len: self.len, cap: cap }
     }
 }

@@ -15,12 +15,15 @@ pub(crate) fn check(body: &CoreBlock, deferred: &[LocalId]) -> Result {
     Checker {
         deferred: deferred.iter().copied().collect(),
         breaks: Vec::new(),
+        leaves: Vec::new(),
     }
     .block(body, &mut Some(State::new()))
 }
 struct Checker {
     deferred: State,
     breaks: Vec<Vec<State>>,
+    /// The states reaching each enclosing `Once` exit, by label.
+    leaves: Vec<(u32, Vec<State>)>,
 }
 fn merge(a: Flow, b: Flow) -> Flow {
     match (a, b) {
@@ -119,6 +122,22 @@ impl Checker {
                         .last_mut()
                         .expect("lowering validated break scope")
                         .push(state);
+                }
+            }
+            Once { label, body } => {
+                self.leaves.push((*label, Vec::new()));
+                self.block(body, flow)?;
+                let (_, exits) = self.leaves.pop().unwrap();
+                *flow = exits.into_iter().fold(flow.take(), |a, b| merge(a, Some(b)));
+            }
+            Leave { label, value } => {
+                if let Some(value) = value {
+                    self.expr(value, flow)?;
+                }
+                if let Some(state) = flow.take() {
+                    let exits = self.leaves.iter_mut().rev().find(|(l, _)| l == label)
+                        .expect("leave inside its once");
+                    exits.1.push(state);
                 }
             }
             Continue => *flow = None,

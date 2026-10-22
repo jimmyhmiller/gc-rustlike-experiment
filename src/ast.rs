@@ -55,7 +55,28 @@ pub struct FnDef {
     pub is_extern: bool,
     /// `unsafe fn`: calls need an `unsafe` block; the body is unsafe context.
     pub is_unsafe: bool,
+    /// `#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`.
+    pub hints: FnHints,
     pub span: Span,
+}
+
+/// Code generation hints from a function's attributes, as in Rust.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FnHints {
+    pub inline: InlineHint,
+    pub cold: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub enum InlineHint {
+    #[default]
+    None,
+    /// `#[inline]`
+    Hint,
+    /// `#[inline(always)]`
+    Always,
+    /// `#[inline(never)]`
+    Never,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]

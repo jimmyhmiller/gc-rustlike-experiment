@@ -81,6 +81,10 @@ fn private_and_shared_object_graphs_survive_moving_collections() {
         }
     }
     assert!(counts[0].0 >= 780);
-    assert!(counts.iter().all(|count| *count == counts[0]), "{counts:?}");
+    // JIT and native builds optimize alike; `--debug` keeps every object a
+    // local creates (no inlining or scalar replacement), so it may allocate more.
+    let (optimized, debug) = counts.split_at(8);
+    assert!(optimized.iter().all(|count| *count == optimized[0]), "{counts:?}");
+    assert!(debug.iter().all(|count| *count == debug[0] && count.0 >= optimized[0].0), "{counts:?}");
     std::fs::remove_dir_all(dir).unwrap();
 }

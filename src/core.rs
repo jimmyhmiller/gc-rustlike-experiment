@@ -90,6 +90,10 @@ pub struct Layout {
     /// `gc::TypeInfo::interior_ptrs` so the collector traces them. Empty for the
     /// common case (no value-with-ref fields).
     pub interior_ptrs: Vec<u16>,
+    /// Declared `#[heap]`: every value is a real heap object, never replaced
+    /// by locals (`crate::sroa`), so heap inspection sees each one.
+    #[serde(skip)]
+    pub pinned: bool,
     /// Runtime reflection metadata (nominal type/field names + field types) for
     /// this layout. Travels 1:1 with the layout so the JIT/AOT paths and the
     /// `emit reflect` view all read the same source of truth. Skipped in the
@@ -277,6 +281,8 @@ pub struct CoreFn {
     /// and `name` is the unmangled C symbol resolved at link/JIT time. Calls to
     /// it omit the `Thread*` argument. See `docs/ffi.md`.
     pub is_extern: bool,
+    /// `#[inline(..)]` / `#[cold]` from the source function.
+    pub hints: crate::ast::FnHints,
     /// The function's definition span (interned), for DWARF: it names the source
     /// + line the function is DEFINED in — used to place its `DISubprogram` in the
     /// right `DIFile` (a monomorphized prelude/`mod` function resolves to ITS
@@ -524,6 +530,13 @@ pub enum CoreExprKind {
     Block(Box<CoreBlock>),
 
     Loop(Box<CoreBlock>),
+    /// A block run once that `Leave` with its `label` exits early, from any
+    /// depth (through loops). Its value is the tail's, or the `Leave`'s.
+    /// Inlining uses it for the callee's body, `return` becoming `Leave`.
+    /// Labels are unique within a function.
+    Once { label: u32, body: Box<CoreBlock> },
+    /// Exit the enclosing `Once` labeled `label` with `value`.
+    Leave { label: u32, value: Option<Box<CoreExpr>> },
     Break(Option<Box<CoreExpr>>),
     Continue,
     Return(Option<Box<CoreExpr>>),

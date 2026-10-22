@@ -157,8 +157,8 @@ fn children(e: &CoreExpr) -> Vec<&CoreExpr> {
             .chain(block_children(yes))
             .chain(block_children(no))
             .collect(),
-        Block(block) | Loop(block) => block_children(block),
-        Break(value) | Return(value) => value.iter().map(|e| e.as_ref()).collect(),
+        Block(block) | Loop(block) | Once { body: block, .. } => block_children(block),
+        Break(value) | Return(value) | Leave { value, .. } => value.iter().map(|e| e.as_ref()).collect(),
         Assign { value, .. } => vec![value],
         ConstInt(..) | ConstFloat(..) | ConstBool(..) | ConstChar(..) | ConstZero(..)
         | ConstStr(..) | Unit | Local(..) | Continue | ThreadYield | ThreadCurrentId
@@ -300,9 +300,6 @@ impl Analysis<'_> {
             | FloatIntrinsic(..)
             | FloatBits(..)
             | Cast { .. }
-            | ArrayGet { .. }
-            | ArrayGetUnchecked { .. }
-            | ArrayGetChecked { .. }
             | Break(..)
             | Return(..) => {
                 let costs = children(e)
@@ -316,7 +313,8 @@ impl Analysis<'_> {
                 let costs = children(e).into_iter().map(|e| self.expression(e, env).1).collect::<Vec<_>>();
                 (None, total(costs))
             }
-            ArraySet { elem, .. } if !matches!(elem, Repr::Value(_)) => {
+            ArrayGet { elem, .. } | ArrayGetUnchecked { elem, .. } | ArrayGetChecked { elem, .. } | ArraySet { elem, .. }
+                if !matches!(elem, Repr::Value(_)) => {
                 let costs = children(e)
                     .into_iter()
                     .map(|e| self.expression(e, env).1)
@@ -449,7 +447,9 @@ mod tests {
     use super::*;
     use inkwell::values::AnyValue;
 
+    // Bounds come from each call's arguments, so callees stay calls.
     fn analyze(source: &str) -> (CoreProgram, BoundedLoops) {
+        crate::inline::set_enabled(false);
         let (module, _) = crate::compile::parse_with_prelude(source).unwrap();
         let program =
             crate::lower::lower_program(&crate::resolve::resolve_module(module).unwrap().globals)

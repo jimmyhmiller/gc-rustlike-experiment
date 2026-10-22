@@ -2351,6 +2351,15 @@ impl Heap {
         &self.multi_mutator
     }
 
+    /// The nursery's (base address, size); (0, 0) without a nursery. Fixed
+    /// for the heap's lifetime.
+    pub(crate) fn nursery_range(&self) -> (usize, usize) {
+        match &self.nursery_state {
+            Some(ns) => (ns.nursery.base() as usize, ns.nursery.size()),
+            None => (0, 0),
+        }
+    }
+
     /// Current GC phase.
     pub fn gc_phase(&self) -> GcPhase {
         match self.gc_phase.load(Ordering::Acquire) {

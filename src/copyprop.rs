@@ -71,7 +71,7 @@ fn count_expr(e: &CoreExpr, loops: u32, defs: &mut [Defs]) {
             }
         }
         CoreExprKind::Loop(b) => count_block(b, loops + 1, defs),
-        CoreExprKind::Block(b) => count_block(b, loops, defs),
+        CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => count_block(b, loops, defs),
         CoreExprKind::If(c, y, n) => { count_expr(c, loops, defs); count_block(y, loops, defs); count_block(n, loops, defs); }
         _ => for c in children(e) { count_expr(c, loops, defs) },
     }
@@ -97,7 +97,7 @@ fn find_copies_block(b: &CoreBlock, defs: &[Defs], locals: &[Repr], out: &mut Ha
 
 fn find_copies_expr(e: &CoreExpr, defs: &[Defs], locals: &[Repr], out: &mut HashMap<LocalId, LocalId>) {
     match e.kind.as_ref() {
-        CoreExprKind::Loop(b) | CoreExprKind::Block(b) => find_copies_block(b, defs, locals, out),
+        CoreExprKind::Loop(b) | CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => find_copies_block(b, defs, locals, out),
         CoreExprKind::If(c, y, n) => { find_copies_expr(c, defs, locals, out); find_copies_block(y, defs, locals, out); find_copies_block(n, defs, locals, out); }
         CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
             find_copies_expr(scrutinee, defs, locals, out);
@@ -120,7 +120,7 @@ fn rewrite_block(b: &mut CoreBlock, map: &HashMap<LocalId, LocalId>) {
 fn rewrite_expr(e: &mut CoreExpr, map: &HashMap<LocalId, LocalId>) {
     match e.kind.as_mut() {
         CoreExprKind::Local(l) => { if let Some(&o) = map.get(l) { *l = o; } }
-        CoreExprKind::Loop(b) | CoreExprKind::Block(b) => rewrite_block(b, map),
+        CoreExprKind::Loop(b) | CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => rewrite_block(b, map),
         CoreExprKind::If(c, y, n) => { rewrite_expr(c, map); rewrite_block(y, map); rewrite_block(n, map); }
         CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
             rewrite_expr(scrutinee, map);
@@ -132,7 +132,7 @@ fn rewrite_expr(e: &mut CoreExpr, map: &HashMap<LocalId, LocalId>) {
 
 /// Operand children of the kinds without blocks or arms (those are handled
 /// by the callers). Adding an IR operation must state its operands here.
-fn children(e: &CoreExpr) -> Vec<&CoreExpr> {
+pub(crate) fn children(e: &CoreExpr) -> Vec<&CoreExpr> {
     use CoreExprKind::*;
     match e.kind.as_ref() {
         Bin(_, a, b) | StrEq(a, b) | StrGet(a, b) => vec![a, b],
@@ -161,15 +161,15 @@ fn children(e: &CoreExpr) -> Vec<&CoreExpr> {
         Field { base, .. } => vec![base],
         SetField { base, value, .. } => vec![base, value],
         EnumPayload { scrutinee, .. } => vec![scrutinee],
-        Break(value) | Return(value) => value.iter().map(|e| e.as_ref()).collect(),
+        Break(value) | Return(value) | Leave { value, .. } => value.iter().map(|e| e.as_ref()).collect(),
         Assign { value, .. } => vec![value],
-        Match { .. } | ValueMatch { .. } | If(..) | Block(_) | Loop(_) => Vec::new(),
+        Match { .. } | ValueMatch { .. } | If(..) | Block(_) | Loop(_) | Once { .. } => Vec::new(),
         ConstInt(..) | ConstFloat(..) | ConstBool(..) | ConstChar(..) | ConstZero(..) | ConstStr(..)
         | Unit | Local(..) | Continue | ThreadYield | ThreadCurrentId | CallbackPtr(..) => Vec::new(),
     }
 }
 
-fn children_mut(e: &mut CoreExpr) -> Vec<&mut CoreExpr> {
+pub(crate) fn children_mut(e: &mut CoreExpr) -> Vec<&mut CoreExpr> {
     use CoreExprKind::*;
     match e.kind.as_mut() {
         Bin(_, a, b) | StrEq(a, b) | StrGet(a, b) => vec![a, b],
@@ -198,9 +198,9 @@ fn children_mut(e: &mut CoreExpr) -> Vec<&mut CoreExpr> {
         Field { base, .. } => vec![base],
         SetField { base, value, .. } => vec![base, value],
         EnumPayload { scrutinee, .. } => vec![scrutinee],
-        Break(value) | Return(value) => value.iter_mut().map(|e| e.as_mut()).collect(),
+        Break(value) | Return(value) | Leave { value, .. } => value.iter_mut().map(|e| e.as_mut()).collect(),
         Assign { value, .. } => vec![value],
-        Match { .. } | ValueMatch { .. } | If(..) | Block(_) | Loop(_) => Vec::new(),
+        Match { .. } | ValueMatch { .. } | If(..) | Block(_) | Loop(_) | Once { .. } => Vec::new(),
         ConstInt(..) | ConstFloat(..) | ConstBool(..) | ConstChar(..) | ConstZero(..) | ConstStr(..)
         | Unit | Local(..) | Continue | ThreadYield | ThreadCurrentId | CallbackPtr(..) => Vec::new(),
     }

@@ -8,6 +8,8 @@
 
 pub mod anf;
 pub mod copyprop;
+pub mod inline;
+pub mod sroa;
 pub mod ast;
 pub mod codegen;
 mod codegen_effects;

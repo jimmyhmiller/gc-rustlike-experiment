@@ -203,7 +203,7 @@ fn scalar_and_reference_slots_keep_phase_checked_scoped_fallbacks() {
     use gcrust::lower::lower_program;
     use gcrust::resolve::resolve_module;
     let (module, _) = parse_with_prelude(r#"
-        struct Item { byte: i8, word: i16, wide: i32, number: i64, text: String }
+        #[heap] struct Item { byte: i8, word: i16, wide: i32, number: i64, text: String }
         fn main() -> i64 {
             let mut item = Item { byte: 1 as i8, word: 2 as i16, wide: 3 as i32, number: 4, text: "a" };
             item.byte = item.byte + 1 as i8;

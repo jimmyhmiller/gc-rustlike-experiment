@@ -7,7 +7,31 @@ use crate::core::{CoreBlock, CoreExpr, CoreExprKind, CoreProgram, CoreStmt, Func
 
 pub(crate) fn native_atomic_is_nonrelocating(symbol: &str) -> bool {
     matches!(symbol, "ai_atomic_i64_load" | "ai_atomic_i64_store" |
-        "ai_atomic_i64_fetch_add" | "ai_atomic_i64_compare_and_set")
+        "ai_atomic_i64_fetch_add" | "ai_atomic_i64_compare_and_set" |
+        // Bulk array copy: barriered stores, no allocation or parking.
+        "ai_array_copy")
+}
+
+/// Can evaluating `e` itself, after its operands, reach a safepoint (so a
+/// collection may move the references held across it)? Loops are not
+/// covered: their header poll is per iteration.
+pub(crate) fn node_may_safepoint(e: &CoreExpr, nonrelocating: &[bool]) -> bool {
+    use CoreExprKind::*;
+    match e.kind.as_ref() {
+        Call(callee, _) => !nonrelocating[*callee as usize],
+        RuntimeCall { func, .. } => !native_atomic_is_nonrelocating(func),
+        ArraySet { elem, .. } | ArrayGet { elem, .. } | ArrayGetUnchecked { elem, .. } | ArrayGetChecked { elem, .. } =>
+            matches!(elem, crate::core::Repr::Value(_)),
+        Field { loc, .. } => matches!(loc, crate::core::FieldLoc::ValueAt { .. }),
+        SetField { loc, .. } => matches!(loc, crate::core::FieldLoc::ValueAt { .. }),
+        ConstInt(..) | ConstFloat(..) | ConstBool(..) | ConstChar(..) | ConstZero(..) | Unit
+        | Local(..) | Bin(..) | Un(..) | FloatIntrinsic(..) | FloatBits(..) | Cast { .. } | Assign { .. }
+        | Return(..) | Break(..) | Continue | Leave { .. } | Block(..) | Once { .. } | If(..) | Loop(..)
+        | ArrayLen(..) | TypeIdOf(..)
+        | MakeValue { .. } | MakeValueVariant { .. } | Match { .. } | ValueMatch { .. }
+        | EnumTag(..) | EnumPayload { .. } | StrLen(..) | StrEqLit(..) => false,
+        _ => true,
+    }
 }
 
 pub(crate) fn nonrelocating_functions(program: &CoreProgram) -> Vec<bool> {
@@ -63,10 +87,14 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
         | FloatBits(value)
         | Cast { value, .. }
         | Assign { value, .. } => expression_is_nonrelocating(value, calls),
-        Return(value) => value
+        Return(value) | Break(value) | Leave { value, .. } => value
             .as_ref()
             .is_none_or(|value| expression_is_nonrelocating(value, calls)),
-        Block(block) => block_is_nonrelocating(block, calls),
+        Continue => true,
+        Block(block) | Once { body: block, .. } => block_is_nonrelocating(block, calls),
+        // Strings are immutable; their length and literal comparisons are
+        // inline loads.
+        StrLen(s) | StrEqLit(s, _) => expression_is_nonrelocating(s, calls),
         If(condition, yes, no) => {
             expression_is_nonrelocating(condition, calls)
                 && block_is_nonrelocating(yes, calls)
@@ -83,10 +111,13 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
         // paths may park for diagnostics but never return. Inline aggregate
         // construction also cannot park or allocate on a returning path.
         ArrayLen(array) | TypeIdOf(array) => expression_is_nonrelocating(array, calls),
-        ArrayGet { array, index, .. }
-        | ArrayGetUnchecked { array, index, .. }
-        | ArrayGetChecked { array, index, .. } => {
-            expression_is_nonrelocating(array, calls) && expression_is_nonrelocating(index, calls)
+        // An inline record is read under the aggregate lock when contended,
+        // which may park.
+        ArrayGet { array, index, elem }
+        | ArrayGetUnchecked { array, index, elem }
+        | ArrayGetChecked { array, index, elem } => {
+            !matches!(elem, crate::core::Repr::Value(_))
+                && expression_is_nonrelocating(array, calls) && expression_is_nonrelocating(index, calls)
         }
         ArraySet {
             array,
@@ -211,10 +242,10 @@ mod tests {
             }
         "#;
         let (program, safe) = analyze(source);
-        for name in ["inspect", "copy"] {
-            assert!(effect(&program, &safe, name), "{name}");
-        }
-        for name in ["snapshot", "write_values", "main"] {
+        assert!(effect(&program, &safe, "copy"));
+        // An inline record is read under the aggregate lock when contended,
+        // which may park.
+        for name in ["inspect", "snapshot", "write_values", "main"] {
             assert!(!effect(&program, &safe, name), "{name}");
         }
         assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 20);
@@ -327,7 +358,9 @@ mod tests {
         assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 766);
     }
 
+    // Each function's own effects are under test, so callees stay calls.
     fn analyze(source: &str) -> (CoreProgram, Vec<bool>) {
+        crate::inline::set_enabled(false);
         let (module, _) = crate::compile::parse_with_prelude(source).unwrap();
         let resolved = crate::resolve::resolve_module(module).unwrap();
         let program = crate::lower::lower_program(&resolved.globals).unwrap();
@@ -380,10 +413,11 @@ pub(crate) fn body_nonrelocating(
         match e.kind.as_ref() {
             Loop(body) => loops.contains(body) && block_safe(body, callees, loops),
             ArrayLen(array) => expression_safe(array, callees, loops),
-            ArrayGet { array, index, .. }
-            | ArrayGetUnchecked { array, index, .. }
-            | ArrayGetChecked { array, index, .. } => {
-                expression_safe(array, callees, loops) && expression_safe(index, callees, loops)
+            ArrayGet { array, index, elem }
+            | ArrayGetUnchecked { array, index, elem }
+            | ArrayGetChecked { array, index, elem } => {
+                !matches!(elem, crate::core::Repr::Value(_))
+                    && expression_safe(array, callees, loops) && expression_safe(index, callees, loops)
             }
             Field { base, loc } => {
                 !matches!(loc, crate::core::FieldLoc::ValueAt { .. })
@@ -417,9 +451,10 @@ pub(crate) fn body_nonrelocating(
             | Assign { value: v, .. }
             | EnumTag(v)
             | EnumPayload { scrutinee: v, .. } => expression_safe(v, callees, loops),
-            Return(v) | Break(v) => v
+            Return(v) | Break(v) | Leave { value: v, .. } => v
                 .as_ref()
                 .is_none_or(|v| expression_safe(v, callees, loops)),
+            Once { body, .. } => block_safe(body, callees, loops),
             Block(block) => block_safe(block, callees, loops),
             If(c, a, b) => {
                 expression_safe(c, callees, loops)

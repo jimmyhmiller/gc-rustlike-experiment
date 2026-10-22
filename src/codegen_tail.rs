@@ -173,7 +173,8 @@ impl Tail<'_> {
                 }
             }
             Loop(block) => self.block(block, false, depth + 1),
-            Return(..) | Continue => {}
+            Once { body, .. } => self.block(body, false, depth),
+            Return(..) | Continue | Leave { .. } => {}
             _ if tail => {
                 // Divergent unit loops in a non-unit function cannot return.
                 if matches!(e.repr, Repr::Unit) && !matches!(self.ret, Repr::Unit) {

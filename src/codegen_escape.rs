@@ -71,6 +71,8 @@ struct Analysis<'p> {
     stores: Vec<(Node, Node)>,
     loads: Vec<(Node, Node)>,
     breaks: Vec<Option<Node>>,
+    /// Each enclosing `Once`'s label and result node.
+    onces: Vec<(u32, Option<Node>)>,
 }
 
 impl<'p> Analysis<'p> {
@@ -88,6 +90,7 @@ impl<'p> Analysis<'p> {
             stores: Vec::new(),
             loads: Vec::new(),
             breaks: Vec::new(),
+            onces: Vec::new(),
         };
         for function in &program.funcs {
             let locals = function.locals.iter().map(|_| a.node()).collect();
@@ -262,6 +265,17 @@ impl<'p> Analysis<'p> {
             Break(value) => {
                 let value = value.as_ref().and_then(|value| self.expression(id, value));
                 self.flow(value, self.breaks.last().copied().flatten());
+            }
+            Once { label, body } => {
+                self.onces.push((*label, result));
+                let value = self.block(id, body);
+                self.flow(value, result);
+                self.onces.pop();
+            }
+            Leave { label, value } => {
+                let value = value.as_ref().and_then(|value| self.expression(id, value));
+                let target = self.onces.iter().rev().find(|(l, _)| l == label).and_then(|o| o.1);
+                self.flow(value, target);
             }
             Return(value) => {
                 let value = value.as_ref().and_then(|value| self.expression(id, value));
@@ -631,7 +645,10 @@ mod tests {
     use crate::resolve::resolve_module;
     use inkwell::values::AnyValue;
 
+    // Each function is analyzed as written: inlining would fold the
+    // callees under test into `main`.
     fn program(source: &str) -> crate::core::CoreProgram {
+        crate::inline::set_enabled(false);
         let (module, _) = parse_with_prelude(source).unwrap();
         lower_program(&resolve_module(module).unwrap().globals).unwrap()
     }

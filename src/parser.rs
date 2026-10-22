@@ -417,6 +417,28 @@ struct Attr {
     span: Span,
 }
 
+/// The code generation hints `#[inline(..)]` and `#[cold]` give.
+fn fn_hints(attrs: &[Attr]) -> FnHints {
+    let mut hints = FnHints::default();
+    for a in attrs {
+        match a.name.as_str() {
+            "inline" => hints.inline = match a.args.first().map(|(n, _)| n.as_str()) {
+                Some("always") => InlineHint::Always,
+                Some("never") => InlineHint::Never,
+                _ => InlineHint::Hint,
+            },
+            "cold" => hints.cold = true,
+            _ => {}
+        }
+    }
+    hints
+}
+
+/// Is the item these attributes mark dropped (`#[test]`, `#[cfg(..)]` off)?
+fn attrs_skip(attrs: &[Attr]) -> bool {
+    attrs.iter().any(|a| a.name == "test" || (a.name == "cfg" && a.args.iter().any(|(n, _)| n == "off")))
+}
+
 /// Maximum expression/block nesting depth before the parser bails with an error.
 /// Real programs nest a few dozen deep at most; 128 is well above that yet low
 /// enough that the recursive-descent frames stay within a small (2 MB) thread
@@ -521,7 +543,8 @@ impl Parser {
         let is_value = attrs.iter().any(|a| a.name == "value");
         // `#[heap]` keeps a struct or enum a heap reference (never inline).
         let is_heap = attrs.iter().any(|a| a.name == "heap");
-        let skip = attrs.iter().any(|a| a.name == "test" || (a.name == "cfg" && a.args.iter().any(|(n, _)| n == "off")));
+        let skip = attrs_skip(&attrs);
+        let hints = fn_hints(&attrs);
         let derives: Vec<(String, Span)> = attrs.iter().filter(|a| a.name == "derive").flat_map(|a| a.args.clone()).collect();
         let vis = self.visibility()?;
         if is_value && !matches!(self.peek(), TokKind::Keyword(Kw::Struct) | TokKind::Keyword(Kw::Enum)) {
@@ -530,10 +553,10 @@ impl Parser {
         }
         let kind = match self.peek() {
             TokKind::Keyword(Kw::Extern) => ItemKind::Fn(self.extern_fn(vis)?),
-            TokKind::Keyword(Kw::Fn) => ItemKind::Fn(self.fn_def(vis)?),
+            TokKind::Keyword(Kw::Fn) => ItemKind::Fn(FnDef { hints, ..self.fn_def(vis)? }),
             // `const fn` and `unsafe fn` (and `unsafe impl` / `unsafe trait`,
             // whose `unsafe` only asserts what the programmer checked).
-            _ if self.fn_qualified_ahead(0) => ItemKind::Fn(self.qualified_fn(vis)?),
+            _ if self.fn_qualified_ahead(0) => ItemKind::Fn(FnDef { hints, ..self.qualified_fn(vis)? }),
             TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Impl)) => { self.bump(); ItemKind::Impl(self.impl_block()?) }
             TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Trait)) => { self.bump(); ItemKind::Trait(self.trait_def(vis)?) }
             TokKind::Keyword(Kw::Struct) => ItemKind::Struct(StructDef { is_heap, ..self.struct_def(vis, is_value)? }),
@@ -642,7 +665,20 @@ impl Parser {
                     }
                     self.expect(&TokKind::RParen)?;
                 }
-                "allow" | "warn" | "deny" | "forbid" | "expect" | "inline" | "cold" | "must_use" | "doc"
+                // `#[inline]`, `#[inline(always)]`, `#[inline(never)]`.
+                "inline" => {
+                    if self.eat(&TokKind::LParen) {
+                        let s = self.span();
+                        let mode = self.ident()?;
+                        if mode != "always" && mode != "never" {
+                            return Err(ParseError { msg: format!("unknown `#[inline({mode})]`; expected `always` or `never`"), span: s });
+                        }
+                        args.push((mode, s));
+                        self.expect(&TokKind::RParen)?;
+                    }
+                }
+                "cold" => {}
+                "allow" | "warn" | "deny" | "forbid" | "expect" | "must_use" | "doc"
                 | "track_caller" | "non_exhaustive" | "rustfmt" | "clippy" | "deprecated"
                 // Layout and linking hints with no meaning here, and test
                 // harness markers (the items they mark are tests, skipped).
@@ -790,7 +826,7 @@ impl Parser {
         let mut body = self.block()?;
         if !lets.is_empty() { body.stmts.splice(0..0, lets); }
         crate::capture::share_mutated_captures(&mut body);
-        Ok(FnDef { vis, name, generics, params, has_self, self_is_mut, ret, body, is_extern: false, is_unsafe: false, span: start.to(self.prev_span()) })
+        Ok(FnDef { vis, name, generics, params, has_self, self_is_mut, ret, body, is_extern: false, is_unsafe: false, hints: FnHints::default(), span: start.to(self.prev_span()) })
     }
 
     /// `<generics>(params) -> ret where ...`. An argument's `impl Trait`
@@ -844,7 +880,7 @@ impl Parser {
         let body = Block { stmts: Vec::new(), tail: None, span: start.to(self.prev_span()) };
         Ok(FnDef {
             vis, name, generics, params, has_self, self_is_mut, ret, body,
-            is_extern: true, is_unsafe: false, span: start.to(self.prev_span()),
+            is_extern: true, is_unsafe: false, hints: FnHints::default(), span: start.to(self.prev_span()),
         })
     }
 
@@ -1065,7 +1101,12 @@ impl Parser {
                 items.push(TraitItem::AssocType(n));
                 continue;
             }
-            items.push(self.trait_item()?);
+            let attrs = self.attributes()?;
+            let item = match self.trait_item()? {
+                TraitItem::Provided(f) => TraitItem::Provided(FnDef { hints: fn_hints(&attrs), ..f }),
+                other => other,
+            };
+            if !attrs_skip(&attrs) { items.push(item); }
         }
         self.expect(&TokKind::RBrace)?;
         Ok(TraitDef { vis, name, generics, supertraits, items, assoc_defaults, span: start.to(self.prev_span()) })
@@ -1114,7 +1155,7 @@ impl Parser {
             }
             Ok(TraitItem::Provided(FnDef {
                 vis: false, name, generics, params, has_self, self_is_mut, ret, body,
-                is_extern: false, is_unsafe,
+                is_extern: false, is_unsafe, hints: FnHints::default(),
                 span: start.to(self.prev_span()),
             }))
         }
@@ -1141,9 +1182,11 @@ impl Parser {
         let mut assoc_types = Vec::new();
         let mut consts = Vec::new();
         while !self.at(&TokKind::RBrace) {
+            let attrs = self.attributes()?;
             let vis = self.visibility()?;
             if self.at_kw(Kw::Const) {
-                consts.push(self.const_def(vis)?);
+                let c = self.const_def(vis)?;
+                if !attrs_skip(&attrs) { consts.push(c); }
                 continue;
             }
             if self.eat_kw(Kw::Type) {
@@ -1154,7 +1197,8 @@ impl Parser {
                 assoc_types.push((name, ty));
                 continue;
             }
-            items.push(self.qualified_fn(vis)?);
+            let f = FnDef { hints: fn_hints(&attrs), ..self.qualified_fn(vis)? };
+            if !attrs_skip(&attrs) { items.push(f); }
         }
         self.expect(&TokKind::RBrace)?;
         let mut self_ty = self_ty;

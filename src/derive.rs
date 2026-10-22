@@ -173,7 +173,7 @@ fn clone(item: &ItemKind) -> String {
         }),
         _ => unreachable!(),
     };
-    format!("fn clone(self) -> Self {{ {body} }}")
+    format!("#[inline] fn clone(self) -> Self {{ {body} }}")
 }
 
 fn eq(item: &ItemKind) -> String {
@@ -202,7 +202,7 @@ fn eq(item: &ItemKind) -> String {
         }
         _ => unreachable!(),
     };
-    format!("fn eq(self, other: Self) -> bool {{ {body} }}")
+    format!("#[inline] fn eq(self, other: Self) -> bool {{ {body} }}")
 }
 
 fn hash_fold(values: &[String], start: &str) -> String {
@@ -270,7 +270,7 @@ fn ord(item: &ItemKind) -> String {
         }
         _ => unreachable!(),
     };
-    format!("fn cmp(self, other: Self) -> Ordering {{ {body} }}")
+    format!("#[inline] fn cmp(self, other: Self) -> Ordering {{ {body} }}")
 }
 
 /// Lexicographic `partial_cmp` of paired values.
@@ -314,7 +314,7 @@ fn partial_ord(item: &ItemKind) -> String {
         }
         _ => unreachable!(),
     };
-    format!("fn partial_cmp(self, other: Self) -> Option<Ordering> {{ {body} }}")
+    format!("#[inline] fn partial_cmp(self, other: Self) -> Option<Ordering> {{ {body} }}")
 }
 
 /// `T::default()` for a written field type.

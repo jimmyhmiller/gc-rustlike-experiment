@@ -350,6 +350,9 @@ impl<'a> Anf<'a> {
             CoreExprKind::Break(v) => {
                 CoreExprKind::Break(v.map(|e| self.boxed(e, pending)))
             }
+            CoreExprKind::Leave { label, value } => {
+                CoreExprKind::Leave { label, value: value.map(|e| self.boxed(e, pending)) }
+            }
 
             // Control-flow contexts: the scrutinee/condition is eager (and may be
             // hoisted by the caller), but branch/arm bodies are their own
@@ -372,6 +375,7 @@ impl<'a> Anf<'a> {
             }
             CoreExprKind::Block(b) => CoreExprKind::Block(Box::new(self.block(*b))),
             CoreExprKind::Loop(b) => CoreExprKind::Loop(Box::new(self.block(*b))),
+            CoreExprKind::Once { label, body } => CoreExprKind::Once { label, body: Box::new(self.block(*body)) },
         };
         CoreExpr::new(k, repr).at(span)
     }
