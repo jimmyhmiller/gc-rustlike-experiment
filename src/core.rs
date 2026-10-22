@@ -22,7 +22,7 @@ pub enum Repr {
     Ref(LayoutId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum ScalarRepr {
     I8, I16, I32, I64,
     U8, U16, U32, U64,
@@ -124,7 +124,7 @@ pub fn record_shape(values: &[ValueLayout], vid: ValueId) -> (u32, bool) {
     if refs { (size + 8, true) } else { (size.max(8), false) }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]
 pub enum FieldLoc {
     /// A source field with zero-size unit representation. No address or storage.
     Unit,

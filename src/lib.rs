@@ -8,6 +8,7 @@
 
 pub mod anf;
 pub mod copyprop;
+pub mod fieldcse;
 pub mod inline;
 pub mod sroa;
 pub mod ast;
