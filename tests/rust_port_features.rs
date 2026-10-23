@@ -354,3 +354,49 @@ fn gcr_test_runs_unit_and_integration_tests() {
         assert!(text.contains(line), "missing `{line}` in:\n{text}");
     }
 }
+
+#[test]
+fn arc_and_rc_share_a_box_and_deref_to_it() {
+    assert_eq!(run(r#"
+        use std::sync::Arc;
+        use std::rc::Rc;
+        #[derive(Debug, Clone, PartialEq)]
+        struct Proto { name: String, code: Vec<i64> }
+        #[derive(Debug, Clone)]
+        enum Val { Unit, Int(i64), P(Arc<Proto>), F(Arc<dyn Fn(i64) -> i64>) }
+        fn total(p: Proto) -> i64 { p.code.iter().sum() }
+        fn main() -> i64 {
+            let p = Arc::new(Proto { name: "f".to_string(), code: vec![1, 2, 3] });
+            let q = p.clone();
+            assert!(Arc::ptr_eq(p, q));
+            assert!(!Arc::ptr_eq(p, Arc::new(Proto::clone(p))));
+            assert_eq!(p.name, "f");
+            assert_eq!(p.code.len(), 3);
+            assert_eq!(p.code[1], 2);
+            assert_eq!(total(q), 6);
+            let mut deep = Proto::clone(p);
+            deep.code.push(4);
+            assert_eq!(p.code.len(), 3);
+            let double: Arc<dyn Fn(i64) -> i64> = Arc::new(|x| x * 2);
+            let v = vec![Val::Unit, Val::Int(4), Val::P(q), Val::F(double)];
+            let mut n = 0;
+            for x in v.iter() {
+                match x {
+                    Val::P(pp) => n += pp.code.len() as i64,
+                    Val::Int(i) => n += i,
+                    Val::F(f) => n += f(10),
+                    Val::Unit => {}
+                }
+            }
+            assert_eq!(n, 27);
+            let r: Rc<Vec<i64>> = Rc::new(vec![5, 6]);
+            assert_eq!(r.len(), 2);
+            assert_eq!(format!("{:?} {}", r, Arc::new(3)), "[5, 6] 3");
+            assert!(Arc::new(1) == Arc::new(1));
+            let o: Arc<Option<i64>> = Arc::new(Some(2));
+            let got = match o { Some(x) => x, None => 0 };
+            assert_eq!(got, 2);
+            0
+        }
+    "#), 0);
+}

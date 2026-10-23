@@ -588,10 +588,10 @@ pub(crate) fn lower_type_with(t: &Type, generics: &[String], ctx: &impl TypeEnvi
                 return Ok(Ty::Named { name: "Array".into(), args: targs });
             }
             let qualified = path.segments.join("::");
-            // Every heap value is already a shared GC reference, so the owning
-            // pointers are the type they point to (unless the program declares
-            // its own type of that name).
-            if path.is_single() && matches!(name, "Box" | "Rc" | "Arc") && targs.len() == 1 && ctx.canonical(&qualified).is_none() {
+            // Every heap value is already a GC reference, so an owning `Box`
+            // is the type it points to (unless the program declares its own
+            // `Box`). `Rc` and `Arc` are shared boxes (the prelude's `Arc`).
+            if path.is_single() && name == "Box" && targs.len() == 1 && ctx.canonical(&qualified).is_none() {
                 return Ok(targs.into_iter().next().unwrap());
             }
             let canon = ctx.canonical(&qualified).unwrap_or(qualified);

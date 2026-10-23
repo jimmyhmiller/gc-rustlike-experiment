@@ -39,9 +39,10 @@ struct Clobbers {
 pub fn reuse_field_reads(prog: &mut CoreProgram) {
     if !crate::inline::enabled() { return; }
     let writers = field_writers(prog);
+    let diverging = crate::codegen_effects::diverging_functions(prog);
     for f in &mut prog.funcs {
         if f.is_extern { continue; }
-        let mut cx = Reuse { writers: &writers, avail: HashMap::new(), views: HashMap::new(), same: HashMap::new(), live: true, onces: Vec::new(), locals: &mut f.locals };
+        let mut cx = Reuse { writers: &writers, diverging: &diverging, avail: HashMap::new(), views: HashMap::new(), same: HashMap::new(), live: true, onces: Vec::new(), locals: &mut f.locals };
         let mut body = std::mem::replace(&mut f.body, CoreBlock { stmts: vec![], tail: None });
         cx.block(&mut body);
         f.body = body;
@@ -91,6 +92,7 @@ fn key(base: &CoreExpr, loc: &FieldLoc) -> Option<Key> {
 
 struct Reuse<'a> {
     writers: &'a [bool],
+    diverging: &'a [bool],
     /// (object local, field) → the local holding its last read.
     avail: HashMap<(LocalId, Key), LocalId>,
     /// Aggregate locals equal to a projection of an available read: the
@@ -280,6 +282,7 @@ impl Reuse<'_> {
                 self.live = false;
             }
             Return(_) | Break(_) | Continue | Panic(_) => self.live = false,
+            Call(g, _) if self.diverging[*g as usize] => self.live = false,
             _ => {}
         }
     }

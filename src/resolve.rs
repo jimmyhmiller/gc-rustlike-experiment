@@ -1104,8 +1104,8 @@ pub fn is_builtin_type(name: &str) -> bool {
             | "bool" | "char" | "String" | "Bytes" | "RawPtr"
             // generic builtins resolved structurally later
             | "Vec" | "Array" | "Option" | "Result"
-            // owning pointers: the type they point to (see `lower_type_with`)
-            | "Box" | "Rc" | "Arc"
+            // the owning pointer: the type it points to (see `lower_type_with`)
+            | "Box"
             // a hole in `collect::<Vec<_>>()`
             | "_"
             // explicit type arguments (parser::turbofish_marker)

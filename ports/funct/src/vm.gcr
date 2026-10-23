@@ -12,7 +12,7 @@ use crate::bytecode::{CaptureSrc, Const, FnProto, Instr, Pat};
 use crate::compiler::{compile_program, module_global_name, ProgramCtx};
 use crate::parser::parse;
 use crate::value::shared::{HostBound, Lock};
-use crate::value::{AtomCell, Closure, Value, Variant, VariantPayload};
+use crate::value::{AtomCell, Closure, FList, Value, Variant, VariantPayload};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
@@ -1590,7 +1590,7 @@ fn bin_op(mut stack: Vec<Value>, kind: BinKind) -> Result<(), Fault> {
         (BinKind::Add, Str(x), Str(y)) => Value::str(format!("{}{}", x, y)),
         // list concat
         (BinKind::Add, List(x), List(y)) => {
-            let mut items = x.clone();
+            let mut items = FList::clone(x); // PORT: `(**x).clone()`
             items.extend(y.iter().cloned());
             Value::list_v(items)
         }

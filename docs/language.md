@@ -142,12 +142,21 @@ These follow Rust; differences come from having no references.
   renames it: `std::sync::atomic::Ordering` is `AtomicOrdering`,
   `std::error::Error` is `StdError`, `std::io::{Error, Result}` are
   `IoError` and `IoResult`. An integration test (`tests/*.gcr`) names the
-  crate by its package name (`use funct::Funct;`). `Box<T>`, `Rc<T>`, and
-  `Arc<T>` are `T`, and `Box::new(x)` is `x`; `Rc::ptr_eq`/`std::ptr::eq`
-  compare identity.
+  crate by its package name (`use funct::Funct;`). `Box<T>` is `T`, and
+  `Box::new(x)` is `x`; `std::ptr::eq` compares identity.
+- **Shared pointers and `Deref`.** `Arc<T>` (and `Rc<T>`, the same type) is a
+  shared box holding an immutable `T`, as in Rust: `Arc::new(x)` boxes `x`,
+  `clone` shares the box, and `Arc::ptr_eq` compares boxes. What Rust writes
+  as `*arc` happens implicitly through the `Deref` trait: a method, field,
+  index, or call the pointer lacks is the target's (`arc.len()`,
+  `proto.code`, `f(args)` for `f: Arc<dyn Fn(..)>`); an `Arc<T>` passed
+  where a `T` is expected is the `T`; and a `match` with patterns matches
+  what it points to. `T::clone(arc)` (Rust's `(*arc).clone()`) clones the
+  target. Equality, ordering, hashing, `Display`, and `Debug` are the
+  target's.
 - **Clone.** Cloning a `Vec` clones its elements, as in Rust. A type with no
-  `Clone` impl (an atomic, a closure, a host handle) is cloned by sharing it:
-  in Rust such a clone can only be an `Rc`/`Arc` clone.
+  `Clone` impl (an atomic, a closure, a host handle) is cloned by sharing it,
+  like an `Arc` clone in Rust.
 - **Std library pieces.** `std::any` (`Any`, `TypeId`, `type_name`,
   `downcast_ref`/`downcast_mut` on `dyn Any`), `std::path::{Path, PathBuf}`
   (one type), `std::fs::{read_to_string, read_dir, write, create_dir_all,

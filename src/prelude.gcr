@@ -2621,6 +2621,36 @@ impl<T> Default for Vec<T> { fn default() -> Vec<T> { Vec::new() } }
 impl<T> Default for Option<T> { fn default() -> Option<T> { Option::None } }
 impl<K: Eq + Hash, V> Default for HashMap<K, V> { fn default() -> HashMap<K, V> { HashMap::new() } }
 
+// ---- Shared pointers -------------------------------------------------------------
+// Rust's implicit `*x` for a smart pointer: a method, field, index, or
+// argument that `x` lacks is the target's.
+trait Deref { type Target; fn deref(self) -> Self::Target; }
+
+// `Arc<T>` (and `Rc<T>`): a shared box holding an immutable `T`, as in Rust.
+// `clone` shares the box; `Arc::ptr_eq` compares boxes.
+struct Arc<T> { value: T }
+type Rc<T> = Arc<T>;
+impl<T> Arc<T> {
+    fn new(value: T) -> Arc<T> { Arc { value: value } }
+    fn ptr_eq(a: Arc<T>, b: Arc<T>) -> bool { std::ptr::eq(a, b) }
+    fn as_ref(self) -> T { self.value }
+}
+impl<T: Clone> Arc<T> {
+    fn unwrap_or_clone(this: Arc<T>) -> T { this.value.clone() }
+}
+impl<T> Deref for Arc<T> { type Target = T; fn deref(self) -> T { self.value } }
+impl<T> Clone for Arc<T> { fn clone(self) -> Arc<T> { self } }
+impl<T> From<T> for Arc<T> { fn from(value: T) -> Arc<T> { Arc::new(value) } }
+impl<T: Default> Default for Arc<T> { fn default() -> Arc<T> { Arc::new(T::default()) } }
+impl<T: Display> Display for Arc<T> { fn fmt(self, f: Formatter) -> FmtResult { Display::fmt(self.value, f) } }
+impl<T: Debug> Debug for Arc<T> { fn fmt(self, f: Formatter) -> FmtResult { Debug::fmt(self.value, f) } }
+impl<T: Eq> Eq for Arc<T> { fn eq(self, other: Arc<T>) -> bool { self.value == other.value } }
+impl<T: Ord> Ord for Arc<T> { fn cmp(self, other: Arc<T>) -> Ordering { self.value.cmp(other.value) } }
+impl<T: PartialOrd> PartialOrd for Arc<T> {
+    fn partial_cmp(self, other: Arc<T>) -> Option<Ordering> { self.value.partial_cmp(other.value) }
+}
+impl<T: Hash> Hash for Arc<T> { fn hash(self) -> i64 { self.value.hash() } }
+
 // ---- Clone for scalars and strings ----------------------------------------------
 // Copying a scalar or an immutable String is cloning it.
 

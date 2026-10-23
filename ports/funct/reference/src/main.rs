@@ -35,6 +35,13 @@ fn main() {
             let elapsed = start.elapsed().as_nanos() as u64;
             println!("items={} ns_per_pass={}", count as u64 / iters, elapsed / iters);
         }
+        "newbench" => {
+            let iters: u64 = args[3].parse().unwrap();
+            let start = Instant::now();
+            for _ in 0..iters { std::hint::black_box(funct::Funct::new()); }
+            let elapsed = start.elapsed().as_nanos() as u64;
+            println!("ns_per_pass={}", elapsed / iters);
+        }
         other => println!("unknown mode {}", other),
     }
 }

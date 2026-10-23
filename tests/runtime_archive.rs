@@ -118,7 +118,7 @@ fn older_custom_runtime_cannot_silently_link_projected_metadata_contract() {
         .arg("build").arg(&source).arg("-o").arg(fixture.0.join("app"))
         .env("GCRUST_RUNTIME_LIB", &archive), 60);
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("gcr_runtime_main_v4"),
+    assert!(String::from_utf8_lossy(&result.stderr).contains("gcr_runtime_process_main_v4"),
         "{}", String::from_utf8_lossy(&result.stderr));
 }
 
@@ -128,7 +128,7 @@ fn polling_scans_require_versioned_runtime_symbols() {
     let source = fixture.0.join("main.gcr");
     std::fs::write(&source, r#"fn main() -> i64 { let args = process_args().expect("args"); let s = args[0]; let value = str_to_float(s); if str_eq(s, "abc") { str_hash(s) + value as i64 } else { 0 } }"#).unwrap();
     let legacy = fixture.0.join("legacy.c");
-    std::fs::write(&legacy, "long gcr_runtime_main_v4(void*a,long b,void*c,long d,void*e){return 0;} long ai_str_hash(void*a,void*b){return 0;} long ai_str_eq(void*a,void*b,void*c){return 1;} double ai_str_to_float(void*a,void*b){return 0;}").unwrap();
+    std::fs::write(&legacy, "long gcr_runtime_process_main_v4(void*a,long b,void*c,long d,void*e){return 0;} long ai_str_hash(void*a,void*b){return 0;} long ai_str_eq(void*a,void*b,void*c){return 1;} double ai_str_to_float(void*a,void*b){return 0;}").unwrap();
     let object = fixture.0.join("legacy.o");
     let archive = fixture.0.join("legacy.a");
     assert!(Command::new("clang").arg("-c").arg(&legacy).arg("-o").arg(&object).status().unwrap().success());
@@ -154,7 +154,7 @@ fn polling_foreign_copies_require_versioned_runtime_symbols() {
         }
     "#).unwrap();
     let legacy = fixture.0.join("legacy.c");
-    std::fs::write(&legacy, "long gcr_runtime_main_v4(void*a,long b,void*c,long d,void*e){return 0;} long ai_str_copy_to_buf(void*a,void*b,void*c){return 0;} void ai_buf_copy_in(void*a,void*b,void*c,long d,long e){} void ai_buf_copy_out(void*a,void*b,void*c,long d,long e){}").unwrap();
+    std::fs::write(&legacy, "long gcr_runtime_process_main_v4(void*a,long b,void*c,long d,void*e){return 0;} long ai_str_copy_to_buf(void*a,void*b,void*c){return 0;} void ai_buf_copy_in(void*a,void*b,void*c,long d,long e){} void ai_buf_copy_out(void*a,void*b,void*c,long d,long e){}").unwrap();
     let object = fixture.0.join("legacy.o");
     let archive = fixture.0.join("legacy.a");
     assert!(Command::new("clang").arg("-c").arg(&legacy).arg("-o").arg(&object).status().unwrap().success());
@@ -178,7 +178,7 @@ fn accounted_foreign_buffers_require_versioned_runtime_symbols() {
         fn main() -> i64 { unsafe { strlen(as_c_bytes("text")) } }
     "#).unwrap();
     let legacy = fixture.0.join("legacy.c");
-    std::fs::write(&legacy, "long gcr_runtime_main_v4(void*a,long b,void*c,long d,void*e){return 0;} void *ai_ffi_buffer_alloc_v1(long n){return 0;} void ai_ffi_buffer_free_v1(void*p,long n){} long ai_str_copy_to_buf_v2(void*a,void*b,void*c){return 0;}").unwrap();
+    std::fs::write(&legacy, "long gcr_runtime_process_main_v4(void*a,long b,void*c,long d,void*e){return 0;} void *ai_ffi_buffer_alloc_v1(long n){return 0;} void ai_ffi_buffer_free_v1(void*p,long n){} long ai_str_copy_to_buf_v2(void*a,void*b,void*c){return 0;}").unwrap();
     let object = fixture.0.join("legacy.o");
     let archive = fixture.0.join("legacy.a");
     assert!(Command::new("clang").arg("-c").arg(&legacy).arg("-o").arg(&object).status().unwrap().success());

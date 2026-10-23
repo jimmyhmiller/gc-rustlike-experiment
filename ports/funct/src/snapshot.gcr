@@ -363,7 +363,7 @@ impl Funct {
         let (atom_table, cell_table) = enc.finish();
         let snap = StateSnapshot {
             version: SNAPSHOT_VERSION,
-            fns: self.fns.iter().map(|p| p.clone()).collect(),
+            fns: self.fns.iter().map(|p| FnProto::clone(p)).collect(), // PORT: `(**p).clone()`
             fn_ids: self
                 .ctx
                 .fn_ids

@@ -34,7 +34,7 @@ fn now_ns() -> u64 { unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) } }
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // PORT: the comparison modes are not part of funct.
-    if args.len() >= 3 && matches!(args[1].as_str(), "lex" | "lexbench" | "parse" | "parsebench") {
+    if args.len() >= 3 && matches!(args[1].as_str(), "lex" | "lexbench" | "parse" | "parsebench" | "newbench") {
         compare_driver(args);
         return;
     }
@@ -106,6 +106,14 @@ fn compare_driver(args: Vec<String>) {
             for _ in 0..iters { count += parse(src).unwrap().items.len(); }
             let elapsed = now_ns() - start;
             println!("items={} ns_per_pass={}", count / iters, elapsed / iters as u64);
+        }
+        "newbench" => {
+            let iters: i64 = args[3].parse().unwrap();
+            let mut count = 0;
+            let start = now_ns();
+            for _ in 0..iters { count += Funct::new().fns.len() as i64; }
+            let elapsed = now_ns() - start;
+            println!("fns={} ns_per_pass={}", count / iters, elapsed / iters as u64);
         }
         other => println!("unknown mode {}", other),
     }

@@ -2040,6 +2040,34 @@ pub unsafe extern "C" fn gcr_runtime_main_v4(
     meta_len: usize,
     entry: extern "C" fn(*mut Thread) -> i64,
 ) -> i64 {
+    unsafe { runtime_main(layouts, ti_count, meta, meta_len, entry, false) }
+}
+
+/// [`gcr_runtime_main_v4`] as an executable's `main`: when the program
+/// finishes, the process exits with its result. The operating system
+/// reclaims the heap and metadata, so the runtime is not torn down.
+///
+/// # Safety
+/// As [`gcr_runtime_main_v4`]; it does not return when the program finishes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gcr_runtime_process_main_v4(
+    layouts: *const AotLayout,
+    ti_count: usize,
+    meta: *const u8,
+    meta_len: usize,
+    entry: extern "C" fn(*mut Thread) -> i64,
+) -> i64 {
+    unsafe { runtime_main(layouts, ti_count, meta, meta_len, entry, true) }
+}
+
+unsafe fn runtime_main(
+    layouts: *const AotLayout,
+    ti_count: usize,
+    meta: *const u8,
+    meta_len: usize,
+    entry: extern "C" fn(*mut Thread) -> i64,
+    process_main: bool,
+) -> i64 {
     use crate::gc::{Full, ObjHeader, TypeInfo};
     let slice = if ti_count == 0 {
         &[][..]
@@ -2052,13 +2080,15 @@ pub unsafe extern "C" fn gcr_runtime_main_v4(
     // `TypeInfo`s as we build the table (so the GC traces refs embedded in
     // flattened value fields). Each descriptor owns its decoded offsets; they
     // are released with the execution, matching the JIT path.
-    let (meta_types, meta_values, interior, alloc_sites) = if meta_len > 0 {
+    // The rest of the blob (names, reflection and allocation-site tables) is
+    // decoded only if something reads it.
+    let meta_bytes: &'static [u8] = if meta_len > 0 {
         assert!(!meta.is_null(), "gcr_runtime_main: null metadata blob");
-        let bytes = unsafe { std::slice::from_raw_parts(meta, meta_len) };
-        crate::gc::reflect::decode(bytes)
+        unsafe { std::slice::from_raw_parts(meta, meta_len) }
     } else {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        &[]
     };
+    let interior = if meta_bytes.is_empty() { Vec::new() } else { crate::gc::reflect::decode_interior(meta_bytes) };
 
     // Rebuild the type table exactly as `codegen::layouts_to_type_infos` does:
     // pointer fields first (traced), then raw bytes, then any varlen tail, plus
@@ -2106,16 +2136,11 @@ pub unsafe extern "C" fn gcr_runtime_main_v4(
     } else {
         RuntimeContext::new_generational(nursery, tenured, type_table)
     };
-    // Install the reflection metadata decoded above (type/field names + types)
-    // so heap-exploration tooling and in-language reflection have nominal info.
-    if !meta_types.is_empty() || !meta_values.is_empty() {
-        rt.heap().set_type_meta(meta_types);
-        rt.heap().set_value_meta(meta_values);
-    }
-    // Install the allocation-site table (Target-1b) so a profile can name each
-    // site's (function, type). Installed even if empty is a no-op.
-    if !alloc_sites.is_empty() {
-        rt.heap().set_alloc_sites(alloc_sites);
+    // Reflection metadata (type/field names + types) for heap-exploration
+    // tooling and in-language reflection, and the allocation-site table
+    // (Target-1b) naming each site's (function, type) in a profile.
+    if !meta_bytes.is_empty() {
+        rt.heap().set_lazy_meta(meta_bytes);
     }
     let thread = rt.thread_ptr();
     // Configure streaming before user code can collect; no per-run event Vec.
@@ -2172,6 +2197,12 @@ pub unsafe extern "C" fn gcr_runtime_main_v4(
         let message = format!("gc-rust: {error}\n");
         unsafe { write_diagnostic(thread, message.as_bytes()); }
         return 1;
+    }
+    if process_main {
+        // The process ends here; `rt` is reclaimed with it, not torn down.
+        use std::io::Write;
+        let _ = std::io::stdout().lock().flush();
+        std::process::exit(result as i32);
     }
     result
 }

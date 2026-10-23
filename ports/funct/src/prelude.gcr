@@ -1,7 +1,7 @@
 //! Prelude: built-in natives (atoms, I/O, basics) plus a small stdlib
 //! written in funct itself (map/filter/fold/...), compiled at engine startup.
 
-use crate::value::{Value, VariantPayload};
+use crate::value::{FList, Value, VariantPayload};
 use crate::vm::{Fault, Funct};
 
 pub const PRELUDE_SRC: String = r#"
@@ -71,7 +71,7 @@ pub fn install(mut vm: Funct) {
         expect_arity("push", args, 2)?;
         match args[0] {
             Value::List(items) => {
-                let mut out = items.clone();
+                let mut out = FList::clone(items); // PORT: `(**items).clone()`
                 out.push_back(args[1].clone());
                 Ok(Value::list_v(out))
             }
@@ -595,7 +595,7 @@ fn install_collections(mut vm: Funct) {
                 if items.is_empty() {
                     return Err(Fault::new("pop: list is empty"));
                 }
-                let mut out = items.clone();
+                let mut out = FList::clone(items); // PORT: `(**items).clone()`
                 out.pop_back();
                 Ok(Value::list_v(out))
             }
@@ -609,7 +609,7 @@ fn install_collections(mut vm: Funct) {
         expect_arity("insert_at", args, 3)?;
         match (args[0], args[1]) {
             (Value::List(items), Value::Int(i)) if i >= 0 && (i as usize) <= items.len() => {
-                let mut out = items.clone();
+                let mut out = FList::clone(items); // PORT: `(**items).clone()`
                 out.insert(i as usize, args[2].clone());
                 Ok(Value::list_v(out))
             }
@@ -629,7 +629,7 @@ fn install_collections(mut vm: Funct) {
         expect_arity("remove_at", args, 2)?;
         match (args[0], args[1]) {
             (Value::List(items), Value::Int(i)) if i >= 0 && (i as usize) < items.len() => {
-                let mut out = items.clone();
+                let mut out = FList::clone(items); // PORT: `(**items).clone()`
                 out.remove(i as usize);
                 Ok(Value::list_v(out))
             }
@@ -814,7 +814,7 @@ fn assoc_key(container: Value, key: Value, v: Value) -> Result<Value, Fault> {
         }
         (Value::List(items), Value::Int(i)) => {
             if i >= 0 && (i as usize) < items.len() {
-                let mut out = items.clone();
+                let mut out = FList::clone(items); // PORT: `(**items).clone()`
                 out[i as usize] = v;
                 Ok(Value::list_v(out))
             } else {

@@ -478,3 +478,54 @@ pub(crate) fn body_nonrelocating(
     }
     block_safe(block, callees, loops)
 }
+
+/// The functions that never return: every path through the body panics or
+/// calls such a function (`vec_index_fail`). A call to one ends its path, so
+/// nothing is live across it.
+pub(crate) fn diverging_functions(program: &CoreProgram) -> Vec<bool> {
+    let mut diverging = vec![false; program.funcs.len()];
+    loop {
+        let mut changed = false;
+        for (id, function) in program.funcs.iter().enumerate() {
+            if diverging[id] || function.is_extern { continue; }
+            let mut exits = false;
+            crate::inline::visit_block(&function.body, &mut |e| if matches!(e.kind.as_ref(), CoreExprKind::Return(_)) { exits = true; });
+            if !exits && block_diverges(&function.body, &diverging) {
+                diverging[id] = true;
+                changed = true;
+            }
+        }
+        if !changed { return diverging; }
+    }
+}
+
+/// Whether running `block` never completes (or leaves it) normally.
+pub(crate) fn block_diverges(block: &CoreBlock, diverging: &[bool]) -> bool {
+    block.stmts.iter().any(|s| match s { CoreStmt::Let(_, e) | CoreStmt::Expr(e) => expr_diverges(e, diverging) })
+        || block.tail.as_ref().is_some_and(|t| expr_diverges(t, diverging))
+}
+
+/// Whether evaluating `e` never completes normally: it panics, calls a
+/// diverging function, or every way through it does.
+pub(crate) fn expr_diverges(e: &CoreExpr, diverging: &[bool]) -> bool {
+    use CoreExprKind::*;
+    let any_exit = |b: &CoreBlock, exit: fn(&CoreExprKind) -> bool| {
+        let mut found = false;
+        crate::inline::visit_block(b, &mut |e| if exit(e.kind.as_ref()) { found = true; });
+        found
+    };
+    match e.kind.as_ref() {
+        Panic(_) => true,
+        Call(g, args) => diverging.get(*g as usize).copied().unwrap_or(false) || args.iter().any(|a| expr_diverges(a, diverging)),
+        If(c, y, n) => expr_diverges(c, diverging) || (block_diverges(y, diverging) && block_diverges(n, diverging)),
+        Block(b) => block_diverges(b, diverging),
+        Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => expr_diverges(scrutinee, diverging)
+            || (!arms.is_empty() && arms.iter().all(|a| expr_diverges(&a.body, diverging))),
+        // A `leave` or `break` inside ends the construct normally.
+        Once { body, .. } => block_diverges(body, diverging) && !any_exit(body, |k| matches!(k, Leave { .. })),
+        Loop(body) => !any_exit(body, |k| matches!(k, Break(_))),
+        Bin(crate::ast::BinOp::And | crate::ast::BinOp::Or, a, _) => expr_diverges(a, diverging),
+        Return(_) | Break(_) | Continue | Leave { .. } => false,
+        _ => crate::copyprop::children(e).into_iter().any(|c| expr_diverges(c, diverging)),
+    }
+}

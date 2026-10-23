@@ -15,8 +15,9 @@ use std::fmt;
 /// crate uses these aliases — they are the single seam to change if a
 /// non-thread-safe (Rc/RefCell) build is ever needed again.
 pub mod shared {
-    // PORT: `Arc` is the value itself in gc-rust (objects are shared GC
-    // references), so `Sh<T>` disappears from the port's types.
+    // PORT: `pub use std::sync::{Arc as Sh, Weak as ShWeak};` gc-rust has no
+    // weak references (the atom registry holds atoms strongly).
+    pub type Sh<T> = Arc<T>;
 
     /// Interior-mutable slot.
     // PORT: Rust's is a Mutex whose guards deref to the value. Values here are
@@ -59,7 +60,7 @@ pub mod shared {
 }
 
 use crate::imbl;
-use shared::{AnyLock, Lock, NativeBound};
+use shared::{AnyLock, Lock, NativeBound, Sh};
 
 /// Persistent (structurally-shared) sequence: O(1) clone, ~O(log n) push/index,
 /// amortized O(1) push when uniquely owned. Backs both lists and tuples.
@@ -74,17 +75,21 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
+    // PORT: `Sh<str>`; a gc-rust `String` is already immutable and shared.
     Str(String),
-    List(FList),
-    Tuple(FList),
+    // List/Tuple hold the persistent vector behind an `Sh` (Arc) so the `Value`
+    // enum stays small (~32 B not ~72 B): a bare `imbl::Vector` is 64 bytes
+    // inline, and `Value` is moved/cloned/dropped on every stack operation.
+    List(Sh<FList>),
+    Tuple(Sh<FList>),
     Record(FMap),
-    Variant(Variant),
-    Closure(Closure),
+    Variant(Sh<Variant>),
+    Closure(Sh<Closure>),
     /// Index into the engine's native function table.
     NativeFn(u32),
-    Atom(AtomCell),
+    Atom(Sh<AtomCell>),
     /// Internal: shared slot for a captured `let mut` local. Never user-visible.
-    Cell(Lock<Value>),
+    Cell(Sh<Lock<Value>>),
     /// Opaque host value registered via interop.
     Native(NativeValue),
     /// start, end, inclusive
@@ -140,16 +145,16 @@ impl Value {
     }
 
     pub fn list(items: Vec<Value>) -> Value {
-        Value::List(items.into_iter().collect())
+        Value::List(Sh::new(items.into_iter().collect()))
     }
 
     pub fn tuple(items: Vec<Value>) -> Value {
-        Value::Tuple(items.into_iter().collect())
+        Value::Tuple(Sh::new(items.into_iter().collect()))
     }
 
     /// Build a list directly from an already-constructed persistent vector.
     pub fn list_v(items: FList) -> Value {
-        Value::List(items)
+        Value::List(Sh::new(items))
     }
 
     pub fn record(fields: BTreeMap<String, Value>) -> Value {
@@ -157,10 +162,10 @@ impl Value {
     }
 
     pub fn variant(tag: String, payload: VariantPayload) -> Value {
-        Value::Variant(Variant {
+        Value::Variant(Sh::new(Variant {
             tag: tag.to_string(),
             payload,
-        })
+        }))
     }
 
     pub fn ok(v: Value) -> Value {
@@ -235,10 +240,10 @@ impl PartialEq for Value {
                         _ => false,
                     }
             }
-            (Closure(a), Closure(b)) => std::ptr::eq(a, b),
+            (Closure(a), Closure(b)) => Sh::ptr_eq(a, b),
             (NativeFn(a), NativeFn(b)) => a == b,
-            (Atom(a), Atom(b)) => std::ptr::eq(a, b),
-            (Cell(a), Cell(b)) => std::ptr::eq(a, b),
+            (Atom(a), Atom(b)) => Sh::ptr_eq(a, b),
+            (Cell(a), Cell(b)) => Sh::ptr_eq(a, b),
             (Native(a), Native(b)) => std::ptr::eq(a.data, b.data),
             (Range(a, b, c), Range(d, e, f)) => a == d && b == e && c == f,
             _ => false,

@@ -415,6 +415,41 @@ impl<'a> Reader<'a> {
         self.pos += len;
         s
     }
+    fn skip_string(&mut self) {
+        let len = self.u16() as usize;
+        self.pos += len;
+    }
+    fn skip_field_list(&mut self) {
+        for _ in 0..self.u16() {
+            self.skip_string();
+            self.u16();
+            match self.u8() {
+                0 | 2 => { self.u16(); }
+                1 => { self.u8(); }
+                3 => {
+                    self.u16();
+                    let count = self.u16() as usize;
+                    self.pos += 4 * count;
+                }
+                other => panic!("reflect::decode: invalid FieldTy tag {other}"),
+            }
+        }
+    }
+    fn skip_kind(&mut self) {
+        match self.u8() {
+            0 => self.skip_field_list(),
+            1 => {
+                self.u16();
+                for _ in 0..self.u16() {
+                    self.skip_string();
+                    self.u32();
+                    self.skip_field_list();
+                }
+            }
+            2 => {}
+            other => panic!("reflect::decode: invalid TypeKind tag {other}"),
+        }
+    }
     fn field(&mut self) -> FieldMeta {
         let name = self.string();
         let offset = self.u16();
@@ -495,6 +530,25 @@ pub fn decode(bytes: &[u8]) -> (Vec<TypeMeta>, Vec<ValueMeta>, Vec<Vec<u16>>, Ve
         alloc_sites.push(AllocSite { function, type_id, location });
     }
     (types, values, interior, alloc_sites)
+}
+
+/// Only the per-type interior-pointer offsets of a blob from [`encode`]: what
+/// the collector needs to run. The names and tables only reflection reads are
+/// skipped, without allocating; [`decode`] reads them when they are wanted.
+pub fn decode_interior(bytes: &[u8]) -> Vec<Vec<u16>> {
+    let mut r = Reader { buf: bytes, pos: 0 };
+    for _ in 0..2 {
+        for _ in 0..r.u32() {
+            r.u16();
+            r.skip_string();
+            r.skip_kind();
+        }
+    }
+    let icount = r.u32() as usize;
+    (0..icount).map(|_| {
+        let n = r.u16() as usize;
+        (0..n).map(|_| r.u16()).collect()
+    }).collect()
 }
 
 #[cfg(test)]

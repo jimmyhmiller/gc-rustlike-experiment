@@ -528,6 +528,11 @@ struct BufferExtent {
     initialized: AtomicUsize,
 }
 
+/// The largest buffer a thread reserves at once. A thread's buffers double
+/// from 2 KiB with allocation demand up to this, so a busy thread rarely
+/// returns to the shared allocator.
+const MAX_BUFFER_BYTES: usize = 256 * 1024;
+
 /// Owning-mutator allocation window used by compiled code. All fields except
 /// the pointed-to epoch, stress flag, and initialized prefix are owner-only.
 /// The pause coordinator closes generated windows before resumption; native
@@ -661,7 +666,7 @@ impl Tlab {
                 }
             }
             if self.extent.is_some() {
-                self.target_bytes = (self.target_bytes * 2).min(32768);
+                self.target_bytes = (self.target_bytes * 2).min(MAX_BUFFER_BYTES);
             }
             self.window.limit = 0;
             self.extent = None;
@@ -1016,11 +1021,11 @@ mod tlab_tests {
         assert!(
             buffers
                 .iter()
-                .all(|buffer| buffer.end - buffer.start <= 32768)
+                .all(|buffer| buffer.end - buffer.start <= MAX_BUFFER_BYTES)
         );
         assert_eq!(
             buffers.last().unwrap().end - buffers.last().unwrap().start,
-            32768
+            MAX_BUFFER_BYTES
         );
     }
 }

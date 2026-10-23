@@ -140,6 +140,7 @@ pub fn codegen_with_debug<'ctx>(
         (origins, scope)
     }).collect();
     let nonrelocating = crate::codegen_effects::nonrelocating_functions(prog);
+    let diverging = crate::codegen_effects::diverging_functions(prog);
     let root_liveness= if level.is_full() { Default::default() } else { crate::codegen_liveness::RootLiveness::analyze(prog) };
     let mut cg = Codegen {
         ctx,
@@ -149,6 +150,7 @@ pub fn codegen_with_debug<'ctx>(
         funcs: HashMap::new(),
         outlined_helpers: outlined.helpers,
         nonrelocating,
+        diverging,
         private_heap,
         bounded_loops,
         heap_scopes,
@@ -586,6 +588,8 @@ struct Codegen<'ctx, 'p> {
     private_heap: crate::codegen_escape::PrivateHeap,
     bounded_loops: crate::codegen_loops::BoundedLoops,
     heap_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
+    /// Functions that never return (see `codegen_effects::diverging_functions`).
+    diverging: Vec<bool>,
     /// The module's data layout, for byte offsets within GC frames.
     target_data: inkwell::targets::TargetData,
     /// Cache of synthesized FFI callback trampolines, keyed by the gc-rust
@@ -1396,7 +1400,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     Repr::Value(v) => value_has_ref(&self.prog.values, *v),
                     _ => false,
                 };
-                crate::codegen_liveness::safepoint_crossing(f, traced, &self.nonrelocating, &self.bounded_loops, &foreign)
+                crate::codegen_liveness::safepoint_crossing(f, traced, &self.nonrelocating, &self.diverging, &self.bounded_loops, &foreign)
             });
         let rooted = |i: usize, r: &Repr| requires_roots && matches!(r, Repr::Ref(_))
             && (!entry_roots_only || i < incoming)
@@ -1419,6 +1423,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let mut sharers = vec![0u32; f.locals.len()];
         for i in 0..f.locals.len() { sharers[owner(i)] += 1; }
         let shared_slot: Vec<bool> = (0..f.locals.len()).map(|i| sharers[owner(i)] > 1).collect();
+        if std::env::var_os("GCR_CROSSING").is_some_and(|n| f.name.contains(n.to_str().unwrap_or_default())) {
+            let mut c: Vec<_> = crossing.iter().flatten().copied().collect();
+            c.sort();
+            eprintln!("crossing {}: {:?}", f.name, c);
+        }
         if std::env::var_os("GCR_SLOT_STATS").is_some() {
             let pairs: Vec<String> = (0..f.locals.len()).filter(|&i| owner(i) != i).map(|i| format!("l{i}->l{}", owner(i))).collect();
             eprintln!("slots {}: {}", f.name, pairs.join(" "));
@@ -2562,7 +2571,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 Ok(Some(r))
             }
             CoreExprKind::Cast { value, from, to } => self.gen_cast(fcx, value, from, to),
-            CoreExprKind::Call(fid, args) => self.gen_call(fcx, *fid, args),
+            CoreExprKind::Call(fid, args) => {
+                let result = self.gen_call(fcx, *fid, args)?;
+                // A call that never returns ends the path, like a panic.
+                if self.diverging[*fid as usize] && self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.builder.build_unreachable().unwrap();
+                    return Ok(None);
+                }
+                Ok(result)
+            }
             CoreExprKind::PtrReadI64(p) => {
                 let pv = self.gen_expr(fcx, p)?.unwrap().into_pointer_value();
                 let v = self.builder.build_load(self.ctx.i64_type(), pv, "ptrd").unwrap();
@@ -4289,7 +4306,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // inline: header, then its count word, then zeroed elements.
         let lay = &self.physical_layouts.layouts[layout as usize];
         let values = matches!(lay.varlen, crate::core::VarLen::Values);
-        let inline = lay.ptr_fields == 0 && lay.raw_bytes == 0 && lay.interior_ptrs.is_empty() && !matches!(lay.varlen, crate::core::VarLen::None);
+        // Records holding references start zeroed: null references, and an
+        // unset initialized word where a record has one.
+        let inline = lay.ptr_fields == 0 && lay.raw_bytes == 0 && !matches!(lay.varlen, crate::core::VarLen::None);
         let tlab = if inline {
             const DATA: u64 = 24;
             let max = (8192 - DATA) / stride.max(1);
@@ -6737,7 +6756,7 @@ pub fn codegen_aot_object_level(
         false,
     );
     let runtime_main = module.add_function(
-        "gcr_runtime_main_v4",
+        "gcr_runtime_process_main_v4",
         runtime_main_ty,
         Some(inkwell::module::Linkage::External),
     );
@@ -6844,6 +6863,11 @@ pub fn build_executable_level(
     if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {
         linker.arg("-fsanitize=thread");
     }
+    // An executable exports only `main` (gc-rust has no exported functions),
+    // and unreferenced runtime code is dropped: a small export trie and image
+    // keep `dyld`'s work at launch small.
+    #[cfg(target_os = "macos")]
+    linker.args(["-Wl,-dead_strip", "-Wl,-exported_symbol,_main"]);
     let status = linker
         .arg("-o")
         .arg(out_path)

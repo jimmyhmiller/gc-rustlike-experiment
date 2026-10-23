@@ -346,8 +346,8 @@ fn default(item: &ItemKind) -> Result<String, String> {
 /// A written type as source text.
 fn type_src(ty: &Type) -> String {
     match &ty.kind {
-        // `Box<T>`, `Rc<T>`, `Arc<T>` are `T`.
-        TypeKind::Path(p, args) if p.is_single() && matches!(p.last(), "Box" | "Rc" | "Arc") && args.len() == 1 => type_src(&args[0]),
+        // `Box<T>` is `T`.
+        TypeKind::Path(p, args) if p.is_single() && p.last() == "Box" && args.len() == 1 => type_src(&args[0]),
         TypeKind::Path(p, args) => {
             let mut segments = p.segments.clone();
             if let Some(last) = segments.last_mut() {

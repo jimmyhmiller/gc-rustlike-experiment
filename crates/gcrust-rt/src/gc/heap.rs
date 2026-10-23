@@ -244,6 +244,10 @@ pub struct Heap {
     /// when the embedder supplies none (the per-thread counters still
     /// accumulate, just unlabelled). Reads are lock-free after the one-time set.
     alloc_sites: OnceLock<super::installed_metadata::InstalledTable<AllocSite>>,
+    /// A compiled program's encoded metadata, decoded into the tables above
+    /// the first time one is read (see [`Heap::set_lazy_meta`]).
+    lazy_meta: OnceLock<&'static [u8]>,
+    lazy_meta_once: std::sync::Once,
     /// Allocation-site counters salvaged from threads that have deregistered
     /// (joined) before a profile is taken. Without this, a worker thread's
     /// allocations would silently vanish from the profile when it exits. Folded
@@ -384,6 +388,8 @@ impl Heap {
             type_meta: OnceLock::new(),
             value_meta: OnceLock::new(),
             alloc_sites: OnceLock::new(),
+            lazy_meta: OnceLock::new(),
+            lazy_meta_once: std::sync::Once::new(),
             retired_alloc_counters: Mutex::new(allocator_api2::vec::Vec::new_in(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry))),
             saw_extra_roots: AtomicBool::new(false),
             collections: AtomicUsize::new(0),
@@ -455,6 +461,8 @@ impl Heap {
             type_meta: OnceLock::new(),
             value_meta: OnceLock::new(),
             alloc_sites: OnceLock::new(),
+            lazy_meta: OnceLock::new(),
+            lazy_meta_once: std::sync::Once::new(),
             retired_alloc_counters: Mutex::new(allocator_api2::vec::Vec::new_in(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry))),
             saw_extra_roots: AtomicBool::new(false),
             collections: AtomicUsize::new(0),
@@ -703,12 +711,31 @@ impl Heap {
     /// installed or the id is out of range. Pairs with [`obj_type_id`] to render
     /// an object with its source names.
     pub fn type_meta_by_id(&self, type_id: u16) -> Option<&TypeMeta> {
+        self.decode_lazy_meta();
         self.type_meta.get()?.as_slice().get(type_id as usize)
     }
 
     /// The full reflection metadata table (empty slice if none installed).
     pub fn type_meta_all(&self) -> &[TypeMeta] {
+        self.decode_lazy_meta();
         self.type_meta.get().map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Install a compiled program's encoded metadata (`reflect::encode`): its
+    /// type, value, and allocation-site tables are decoded when first read.
+    /// Startup then pays only for the interior-pointer offsets it needs.
+    pub fn set_lazy_meta(&self, bytes: &'static [u8]) {
+        let _ = self.lazy_meta.set(bytes);
+    }
+
+    fn decode_lazy_meta(&self) {
+        let Some(bytes) = self.lazy_meta.get() else { return };
+        self.lazy_meta_once.call_once(|| {
+            let (types, values, _, sites) = super::reflect::decode(bytes);
+            if !types.is_empty() { self.set_type_meta(types); }
+            if !values.is_empty() { self.set_value_meta(values); }
+            if !sites.is_empty() { self.set_alloc_sites(sites); }
+        });
     }
 
     /// Install the value-aggregate reflection metadata (indexed by `value_id`).
@@ -720,6 +747,7 @@ impl Heap {
     /// Reflection metadata for an inline `#[value]` aggregate by `value_id`, or
     /// `None` if none was installed or the id is out of range.
     pub fn value_meta_by_id(&self, value_id: u16) -> Option<&ValueMeta> {
+        self.decode_lazy_meta();
         self.value_meta.get()?.as_slice().get(value_id as usize)
     }
 
@@ -732,6 +760,7 @@ impl Heap {
 
     /// The installed allocation-site table (empty slice if none installed).
     pub fn alloc_sites_all(&self) -> &[AllocSite] {
+        self.decode_lazy_meta();
         self.alloc_sites.get().map(|v| v.as_slice()).unwrap_or(&[])
     }
 

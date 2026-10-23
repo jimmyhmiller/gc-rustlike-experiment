@@ -16,10 +16,11 @@ pub(crate) struct RootLiveness { dead: HashMap<usize, Live> }
 impl RootLiveness {
     pub(crate) fn analyze(program: &CoreProgram) -> Self {
         let mut result = Self::default();
+        let diverging = crate::codegen_effects::diverging_functions(program);
         for function in &program.funcs {
             if function.is_extern { continue; }
             let mut analysis = Analysis {
-                dead: &mut result.dead, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(),
+                dead: &mut result.dead, diverging: &diverging, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(),
                 all: function.locals.iter().enumerate().filter_map(|(id, repr)| matches!(repr, Repr::Ref(_)).then_some(id as LocalId)).collect(),
             };
             analysis.block(&function.body, Live::new());
@@ -36,7 +37,7 @@ impl RootLiveness {
 pub(crate) fn dead_after(function: &CoreFn, tracked: &Live) -> HashMap<usize, Live> {
     let mut dead = HashMap::new();
     let mut analysis = Analysis {
-        dead: &mut dead, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: false,
+        dead: &mut dead, diverging: &[], loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: false,
         definitions: Live::new(), all: tracked.clone(), crossing: None,
     };
     analysis.block(&function.body, Live::new());
@@ -50,10 +51,10 @@ pub(crate) fn dead_after(function: &CoreFn, tracked: &Live) -> HashMap<usize, Li
 /// safepointing operation other than a direct call count as live across it
 /// (an allocation stores them after collecting); a callee roots its own
 /// arguments.
-pub(crate) fn safepoint_crossing(function: &CoreFn, traced: impl Fn(&Repr) -> bool, nonrelocating: &[bool], loops: &crate::codegen_loops::BoundedLoops, foreign: &[bool]) -> Live {
+pub(crate) fn safepoint_crossing(function: &CoreFn, traced: impl Fn(&Repr) -> bool, nonrelocating: &[bool], diverging: &[bool], loops: &crate::codegen_loops::BoundedLoops, foreign: &[bool]) -> Live {
     let mut dead = HashMap::new();
     let mut analysis = Analysis {
-        dead: &mut dead, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, definitions: Live::new(),
+        dead: &mut dead, diverging, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, definitions: Live::new(),
         all: function.locals.iter().enumerate().filter_map(|(id, repr)| traced(repr).then_some(id as LocalId)).collect(),
         crossing: Some(Crossing { nonrelocating, loops, foreign, in_foreign: 0, set: Live::new() }),
     };
@@ -73,6 +74,8 @@ struct Crossing<'a> {
 }
 struct Analysis<'a> {
     dead: &'a mut HashMap<usize, Live>,
+    /// Functions that never return: nothing is live after a call to one.
+    diverging: &'a [bool],
     definitions: Live,
     loops: Vec<(Live, Live)>, // break and continue successors
     onces: Vec<(u32, Live)>,  // each `Once` exit's successor, by label
@@ -111,6 +114,12 @@ impl Analysis<'_> {
     }
     fn expr(&mut self, expression: &CoreExpr, mut live: Live) -> Live {
         use CoreExprKind::*;
+        // A panic, or a call that never returns, has no successor.
+        match expression.kind.as_ref() {
+            Panic(_) => live = Live::new(),
+            Call(callee, _) if self.diverging.get(*callee as usize).copied().unwrap_or(false) => live = Live::new(),
+            _ => {}
+        }
         if let Some(crossing) = &mut self.crossing {
             if crossing.in_foreign > 0 {
                 // An exit from a foreign call's arguments releases buffers.
@@ -255,7 +264,7 @@ mod tests {
     fn statement(expression: CoreExpr) -> CoreStmt { CoreStmt::Expr(expression) }
     fn analyze(block: &CoreBlock, count: u32) -> HashMap<usize, Live> {
         let mut after = HashMap::new();
-        Analysis { dead: &mut after, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(), all: (0..count).collect() }.block(block, Live::new());
+        Analysis { dead: &mut after, diverging: &[], loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(), all: (0..count).collect() }.block(block, Live::new());
         after
     }
     #[test]
@@ -276,7 +285,7 @@ mod tests {
         let expected = analyze(&block, 4);
         let tracked: Live = [0, 2].into();
         let mut actual = HashMap::new();
-        Analysis { dead: &mut actual, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(), all: tracked.clone() }.block(&block, Live::new());
+        Analysis { dead: &mut actual, diverging: &[], loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(), all: tracked.clone() }.block(&block, Live::new());
         assert_eq!(actual.len(), expected.len());
         for (statement, live) in expected {
             assert_eq!(actual[&statement], live.intersection(&tracked).copied().collect());
@@ -305,7 +314,7 @@ mod tests {
         // iteration, so its root is not cleared.
         assert_eq!(after[&(&body.stmts[2] as *const CoreStmt as usize)], Live::new());
         let mut plain = HashMap::new();
-        Analysis { dead: &mut plain, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: false, crossing: None, definitions: Live::new(), all: (0..2).collect() }.block(&block, Live::new());
+        Analysis { dead: &mut plain, diverging: &[], loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: false, crossing: None, definitions: Live::new(), all: (0..2).collect() }.block(&block, Live::new());
         assert_eq!(plain[&(&body.stmts[2] as *const CoreStmt as usize)], [1].into());
     }
 }

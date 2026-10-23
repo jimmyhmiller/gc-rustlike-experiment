@@ -15,6 +15,8 @@ use crate::types::{Prim, Ty, TyCtx, lower_type, suffix_prim};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod match_tree;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LowerError {
     pub msg: String,
@@ -1800,7 +1802,18 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             | ExprKind::Match { .. } | ExprKind::Loop { .. } | ExprKind::Path(_));
         let to_dyn = expected.filter(|t| dyn_trait(t).is_some() && !has_var(t));
         let inner_expected = if to_dyn.is_some() && !passes_on { None } else { expected };
-        let (value, ty) = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.expr_inner(e, inner_expected))?;
+        let (mut value, mut ty) = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.expr_inner(e, inner_expected))?;
+        // Deref coercion: an `Arc<T>` where a `T` is expected is the `T`.
+        if let Some(want) = expected.filter(|w| !has_var(w) && **w != ty && !has_var(&ty) && !is_never(&ty)) {
+            let mut target = ty.clone();
+            let mut steps = 0;
+            while target != *want && steps < 4 {
+                match self.deref_target(&target) { Some(t) => { target = t; steps += 1; } None => break }
+            }
+            if target == *want {
+                for _ in 0..steps { (value, ty) = self.deref_value(value, &ty, e.span)?; }
+            }
+        }
         if let Some(target) = to_dyn {
             // A value, or another trait object (upcasting `dyn Derived` to
             // `dyn Base`), becomes the expected object.
@@ -3021,10 +3034,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 // `Option::None`.
                 if self.ctx.fns.contains_key(&path.segments.join("::")) {
                     self.function_value(path, expected, e.span)
-                } else if path.segments.len() == 2 && matches!(path.segments[0].as_str(), "Box" | "Rc" | "Arc")
+                } else if path.segments.len() == 2 && path.segments[0] == "Box"
                     && path.last() == "new" && self.ctx.canon(&path.segments[0]).is_none()
                 {
-                    // `.map(Arc::new)`: the value itself.
+                    // `.map(Box::new)`: the value itself.
                     self.forwarding_closure(path, 1, expected, e.span)
                 } else if self.ctx.variant_by_path(path).is_none() && let Some(arity) = self.assoc_fn_arity(path) {
                     // `Type::f` as a value (`.map(Value::some)`,
@@ -3498,7 +3511,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     fn field_access(&mut self, base: &Expr, field: &FieldAccess, span: Span) -> LResult<(CoreExpr, Ty)> {
-        let (cbase, bty) = self.expr(base, None)?;
+        let (mut cbase, mut bty) = self.expr(base, None)?;
+        // Auto-deref: `arc.field` is a field of the value `arc` points to.
+        while !self.has_field(&bty, field, span) && self.deref_entry(&bty).is_some() {
+            (cbase, bty) = self.deref_value(cbase, &bty, span)?;
+        }
         let fname = match field {
             FieldAccess::Named(n) => n,
             // `p.0` on a tuple struct reads its positional field `0`.
@@ -3521,6 +3538,27 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
         };
         self.field_read(cbase, &bty, fname, span)
+    }
+
+    /// Whether a value of type `ty` has `field` itself, visible at `at`
+    /// (the standard library's private fields, like `Arc`'s, are not).
+    fn has_field(&self, ty: &Ty, field: &FieldAccess, at: Span) -> bool {
+        match ty {
+            Ty::Tuple(elems) => matches!(field, FieldAccess::Tuple(i) if (*i as usize) < elems.len()),
+            Ty::Named { name, .. } => match self.ctx.structs.get(name) {
+                Some(s) => match &s.body {
+                    StructBody::Named(fields) => {
+                        let prelude = crate::compile::prelude_source();
+                        let hidden = prelude == Some(s.span.source) && prelude != Some(at.source);
+                        let name = match field { FieldAccess::Named(n) => n.clone(), FieldAccess::Tuple(i) => i.to_string() };
+                        fields.iter().any(|f| f.name == name && (f.vis || !hidden))
+                    }
+                    _ => true,
+                },
+                None => false,
+            },
+            _ => true,
+        }
     }
 
     /// Read field `fname` of the lowered struct value `cbase` of type `bty`.
@@ -3634,7 +3672,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         expected: Option<&Ty>,
         span: Span,
     ) -> LResult<(CoreExpr, Ty)> {
-        let (cscrut, sty) = self.expr(scrutinee, None)?;
+        let (mut cscrut, mut sty) = self.expr(scrutinee, None)?;
+        // `match arc { Pattern => .. }` matches what it points to (Rust
+        // writes `match *arc`).
+        let structural = arms.iter().any(|a| !matches!(a.pattern.kind, PatternKind::Wildcard | PatternKind::Binding { .. }));
+        while structural && is_shared_pointer(&sty) && self.deref_entry(&sty).is_some() {
+            (cscrut, sty) = self.deref_value(cscrut, &sty, span)?;
+        }
         if self.infer.probing && has_placeholder(&sty, &self.infer.placeholders) {
             return self.probe_match(&sty, arms, expected);
         }
@@ -3887,7 +3931,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let scrut_local = |this: &Self| CoreExpr::new(CoreExprKind::Local(sid), this.locals[sid as usize].clone());
 
         let mut result_ty: Option<Ty> = None;
-        struct Built { cond: Option<CoreExpr>, binds: Vec<(LocalId, CoreExpr)>, body: CoreExpr }
+        struct Built { cond: Option<CoreExpr>, binds: Vec<(LocalId, CoreExpr)>, guard: Option<CoreExpr>, body: CoreExpr }
         let mut built: Vec<Option<Built>> = Vec::new();
         // An arm whose type needs a later arm's (`Ok(x)` before `Err(e)`
         // fixes the error type) is lowered again once the others are.
@@ -3902,23 +3946,15 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             // The pattern's test, and the bindings to evaluate once it holds.
             let (cond, mut binds, _) =
                 self.pattern_test(&arm.pattern, &scrut_local(self), &sty, arm.pattern.span)?;
-            // A guard runs after the bindings, which it may reference:
-            // `cond && { let binds...; guard }`. The bindings then stay
-            // assigned for the body.
-            let mut full_cond = cond;
-            if let Some(g) = &arm.guard {
-                let (cg, gt) = self.expr(g, Some(&Ty::bool()))?;
-                self.check_assignable(&gt, &Ty::bool(), g.span)?;
-                let bind_stmts: Vec<CoreStmt> = std::mem::take(&mut binds).into_iter().map(|(id, init)| CoreStmt::Let(id, init)).collect();
-                let guarded = CoreExpr::new(
-                    CoreExprKind::Block(Box::new(CoreBlock { stmts: bind_stmts, tail: Some(cg) })),
-                    Repr::Scalar(ScalarRepr::Bool),
-                );
-                full_cond = Some(match full_cond {
-                    Some(c) => CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(c), Box::new(guarded)), Repr::Scalar(ScalarRepr::Bool)),
-                    None => guarded,
-                });
-            }
+            // A guard runs after the bindings, which it may reference.
+            let guard = match &arm.guard {
+                Some(g) => {
+                    let (cg, gt) = self.expr(g, Some(&Ty::bool()))?;
+                    self.check_assignable(&gt, &Ty::bool(), g.span)?;
+                    Some(cg)
+                }
+                None => None,
+            };
             let want = expected.cloned().or_else(|| result_ty.clone().filter(|ty| !is_never(ty)));
             let (body, bty) = match self.arm_body(arm, arms, &sty, want.as_ref()) {
                 Err(e) if pass == 0 && want.is_none() && e.msg.starts_with("cannot infer type arguments") => {
@@ -3936,7 +3972,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             }
             // Move bindings out for emission.
             let arm_binds = std::mem::take(&mut binds);
-            let arm_built = Built { cond: full_cond, binds: arm_binds, body };
+            let arm_built = Built { cond, binds: arm_binds, guard, body };
             if pass == 0 { built.push(Some(arm_built)); } else { built[index] = Some(arm_built); }
             self.pop_scope();
         }
@@ -3965,6 +4001,39 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 "non-exhaustive match: add a `_` wildcard or binding arm to cover all cases",
                 span,
             );
+        }
+
+        // A decision tree tests each value once (see `match_tree`).
+        let mut tree_pats = Vec::new();
+        for arm in arms {
+            match self.dpat(&arm.pattern, &sty, arm.pattern.span)? {
+                Some(p) => tree_pats.push(p),
+                None => break,
+            }
+        }
+        if tree_pats.len() == arms.len() {
+            let rty = result_ty.unwrap_or_else(Ty::unit);
+            let repr = self.repr_of(&rty, span)?;
+            let code = built.into_iter().map(|b| match_tree::ArmCode { binds: b.binds, guard: b.guard, body: b.body }).collect();
+            let tree = self.match_tree(sid, &sty, tree_pats, code, &repr, span)?;
+            let block = CoreBlock { stmts: vec![CoreStmt::Let(sid, cscrut)], tail: Some(tree) };
+            return Ok((CoreExpr::new(CoreExprKind::Block(Box::new(block)), repr), rty));
+        }
+        // Otherwise a chain of tests: a guarded arm's test is
+        // `cond && { let binds...; guard }`, its bindings then assigned for
+        // the body.
+        for b in &mut built {
+            if let Some(guard) = b.guard.take() {
+                let bind_stmts: Vec<CoreStmt> = std::mem::take(&mut b.binds).into_iter().map(|(id, init)| CoreStmt::Let(id, init)).collect();
+                let guarded = CoreExpr::new(
+                    CoreExprKind::Block(Box::new(CoreBlock { stmts: bind_stmts, tail: Some(guard) })),
+                    Repr::Scalar(ScalarRepr::Bool),
+                );
+                b.cond = Some(match b.cond.take() {
+                    Some(c) => CoreExpr::new(CoreExprKind::Bin(BinOp::And, Box::new(c), Box::new(guarded)), Repr::Scalar(ScalarRepr::Bool)),
+                    None => guarded,
+                });
+            }
         }
         // The chain's innermost else is reached only if no arm matched, which
         // exhaustiveness rules out. If the last arm is unguarded, any value
@@ -4483,9 +4552,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if let ExprKind::Range { lo, hi, inclusive } = &*idx.kind {
             return self.index_range(base, lo, hi, *inclusive, span);
         }
-        let (ca, aty) = self.expr(base, None)?;
+        let (mut ca, mut aty) = self.expr(base, None)?;
+        let mut base_src = Some(base);
+        while array_elem_ty(&aty).is_none() && self.lookup_method(&aty, "index").is_none() && self.deref_entry(&aty).is_some() {
+            (ca, aty) = self.deref_value(ca, &aty, span)?;
+            base_src = None;
+        }
         let Some(elem_ty) = array_elem_ty(&aty) else {
-            return self.trait_method_call(ca, aty, Some(base), "Index", "index", "indexing", std::slice::from_ref(idx), span);
+            return self.trait_method_call(ca, aty, base_src, "Index", "index", "indexing", std::slice::from_ref(idx), span);
         };
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
@@ -5366,6 +5440,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 self.expr(recv, Some(&expected))?
             }
         };
+        // Auto-deref, as in Rust: a method `Arc<T>` lacks is `T`'s.
+        let (mut crecv, mut recv_ty, mut recv_src) = (crecv, recv_ty, Some(recv));
+        while !self.has_method(&recv_ty, method) && self.deref_entry(&recv_ty).is_some() {
+            (crecv, recv_ty) = self.deref_value(crecv, &recv_ty, span)?;
+            recv_src = None;
+        }
+        let recv = match recv_src { Some(recv) => recv, None => return self.method_call_derefed(crecv, recv_ty, method, args, span, turbofish, expected) };
         // Tuples, arrays and `()` have no impls; their Debug output is built
         // structurally.
         if matches!(method, "to_debug_string" | "to_debug_string_pretty") && args.is_empty()
@@ -5410,6 +5491,25 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         OPERAND_TURBOFISH.with(|t| *t.borrow_mut() = turbofish);
         OPERAND_EXPECTED.with(|t| *t.borrow_mut() = expected);
         self.method_call_lowered(crecv, recv_ty, Some(recv), entry, args, span)
+    }
+
+    /// A method call on a receiver reached through `Deref` (`arc.len()`).
+    fn method_call_derefed(&mut self, crecv: CoreExpr, recv_ty: Ty, method: &str, args: &[Expr], span: Span, turbofish: Option<Vec<Ty>>, expected: Option<Ty>) -> LResult<(CoreExpr, Ty)> {
+        if let Some(elem_ty) = array_elem_ty(&recv_ty).filter(|_| self.lookup_method(&recv_ty, method).is_none()) {
+            return self.array_method(crecv, elem_ty, method, args, span);
+        }
+        if matches!(recv_ty, Ty::Tuple(_)) && self.lookup_method(&recv_ty, method).is_none() && matches!(method, "eq" | "ne" | "cmp" | "hash" | "clone" | "lt" | "le" | "gt" | "ge") {
+            return self.tuple_method(crecv, recv_ty, method, args, span);
+        }
+        if dyn_trait(&recv_ty).is_some() && self.lookup_method(&recv_ty, method).is_none() {
+            return self.dyn_method_call(crecv, recv_ty, method, args, span);
+        }
+        let entry = self.lookup_method(&recv_ty, method)
+            .ok_or_else(|| LowerError { msg: format!("no method `{}` on `{}`", method, ty_display(&recv_ty)), span })?;
+        let entry = self.pick_overload(&recv_ty, entry, args)?;
+        OPERAND_TURBOFISH.with(|t| *t.borrow_mut() = turbofish);
+        OPERAND_EXPECTED.with(|t| *t.borrow_mut() = expected);
+        self.method_call_lowered(crecv, recv_ty, None, entry, args, span)
     }
 
     /// `Array<T>` is built in: its methods lower directly to the array
@@ -5530,6 +5630,34 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     /// The impl method `method` for a receiver of type `recv_ty`, if any.
+    /// The `Deref` impl of `ty`, if it has one (`Arc<T>`).
+    fn deref_entry(&self, ty: &Ty) -> Option<crate::types::MethodEntry> {
+        self.lookup_method(ty, "deref").filter(|e| e.trait_name.as_deref() == Some("Deref"))
+    }
+
+    /// `Deref::Target` of `ty`: the type `*ty` would have in Rust.
+    fn deref_target(&self, ty: &Ty) -> Option<Ty> {
+        let entry = self.deref_entry(ty)?;
+        let (_, target) = entry.assoc_types.iter().find(|(name, _)| name == "Target")?;
+        let impl_self = lower_type(&entry.self_ty, &entry.impl_generics, self.ctx).ok()?;
+        let mut subst = HashMap::new();
+        unify_infer(&impl_self, ty, &mut subst);
+        let target = apply_subst(&lower_type(target, &entry.impl_generics, self.ctx).ok()?, &subst);
+        (!has_var(&target)).then_some(target)
+    }
+
+    /// `Deref::deref(value)`, Rust's implicit `*value` for a smart pointer.
+    fn deref_value(&mut self, value: CoreExpr, ty: &Ty, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let entry = self.deref_entry(ty).ok_or_else(|| LowerError { msg: format!("`{}` cannot be dereferenced", ty_display(ty)), span })?;
+        self.method_call_lowered(value, ty.clone(), None, entry, &[], span)
+    }
+
+    /// Whether `method` applies to `ty` without dereferencing it.
+    fn has_method(&self, ty: &Ty, method: &str) -> bool {
+        self.lookup_method(ty, method).is_some() || array_elem_ty(ty).is_some() || dyn_trait(ty).is_some()
+            || matches!(ty, Ty::Tuple(_) | Ty::Prim(_) | Ty::Fn { .. } | Ty::Var(_) | Ty::Infer(_))
+    }
+
     fn lookup_method(&self, recv_ty: &Ty, method: &str) -> Option<crate::types::MethodEntry> {
         if let Some(base) = crate::types::receiver_base(recv_ty) {
             if let Some(e) = self.ctx.methods.get(&(base, method.to_string())) { return Some(e.clone()); }
@@ -6502,6 +6630,11 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
     }
 
     fn invoke_value(&mut self, callee: CoreExpr, signature: Ty, args: &[Expr], span: Span) -> LResult<(CoreExpr, Ty)> {
+        // `f(..)` with `f: Arc<dyn Fn(..)>` calls the function it points to.
+        let (mut callee, mut signature) = (callee, signature);
+        while !matches!(signature, Ty::Fn { .. }) && self.deref_entry(&signature).is_some() {
+            (callee, signature) = self.deref_value(callee, &signature, span)?;
+        }
         let Ty::Fn { params, ret } = signature else {
             return err(format!("cannot call a value of type `{}`", ty_display(&signature)), span);
         };
@@ -6539,19 +6672,13 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // Associated (self-less) function call: `Type::func(args)`. The path's
         // second-to-last segment names the type; look up an impl item of that
         // name with NO `self`. (Methods with `self` go through `method_call`.)
-        // `Box`, `Rc`, and `Arc` are the type they point to (every heap value
-        // is a GC reference): `Box::new(x)` is `x`, and `Rc::clone(x)` shares it.
-        if path.segments.len() == 2 && matches!(path.segments[0].as_str(), "Box" | "Rc" | "Arc")
+        // `Box` is the type it points to (every heap value is a GC
+        // reference): `Box::new(x)` is `x`.
+        if path.segments.len() == 2 && path.segments[0] == "Box"
             && matches!(name, "new" | "clone") && args.len() == 1
             && self.ctx.canon(&path.segments[0]).is_none()
         {
             return self.expr(&args[0], expected);
-        }
-        // `Rc::ptr_eq(a, b)`: identity, like `std::ptr::eq`.
-        if path.segments.len() == 2 && matches!(path.segments[0].as_str(), "Rc" | "Arc") && name == "ptr_eq"
-            && args.len() == 2 && self.ctx.canon(&path.segments[0]).is_none()
-        {
-            return self.ptr_eq(args, span);
         }
         if path.segments.len() == 2 && path.segments[0] == "Array" && name == "new"
             && !self.ctx.structs.contains_key("Array")
@@ -6610,8 +6737,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 // `Type::method(x, args)`: a method called with its receiver
                 // as the first argument.
                 if !args.is_empty() {
-                    let (crecv, recv_ty) = self.expr(&args[0], None)?;
-                    return self.method_call_lowered(crecv, recv_ty, Some(&args[0]), entry, &args[1..], span);
+                    let (mut crecv, mut recv_ty) = self.expr(&args[0], None)?;
+                    // `Proto::clone(arc)`: the receiver derefs to the named type.
+                    let mut recv = Some(&args[0]);
+                    while crate::types::receiver_base(&recv_ty).as_ref() != Some(&base) && self.deref_entry(&recv_ty).is_some() {
+                        (crecv, recv_ty) = self.deref_value(crecv, &recv_ty, span)?;
+                        recv = None;
+                    }
+                    return self.method_call_lowered(crecv, recv_ty, recv, entry, &args[1..], span);
                 }
             }
             // `Trait::method(x, args)`: the method of `impl Trait for <x's type>`.
@@ -7974,4 +8107,9 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(errs[0].msg.contains("found `bool`"));
     }
+}
+
+/// `Arc<T>` or `Rc<T>`: a shared pointer that patterns see through.
+fn is_shared_pointer(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named { name, args } if matches!(name.as_str(), "Arc" | "Rc") && args.len() == 1)
 }
