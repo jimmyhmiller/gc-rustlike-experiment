@@ -201,7 +201,7 @@ fn indirect_frame_root_relocates_value_interior_ref() {
         let mut interior: u64 = child as u64;
 
         // FrameOrigin with 0 direct, 1 indirect root.
-        let origin = FrameOrigin { num_roots: 0, num_indirect: 1, name: std::ptr::null() };
+        let origin = FrameOrigin { num_roots: 0, num_indirect: 1, name: std::ptr::null(), live: std::ptr::null(), indirect_offsets: std::ptr::null() };
         // Frame memory: [parent][origin][indirect0]  (matches the #[repr(C)] Frame
         // header + trailing slots the GC walker reads).
         let frame_buf: [u64; 3] = [

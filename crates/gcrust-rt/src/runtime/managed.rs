@@ -442,7 +442,7 @@ mod tests {
             let heap = runtime.heap().clone();
             runtime.enter(|thread| unsafe {
                 let rhs = UnsafeCell::new(initial_rhs);
-                let origin = FrameOrigin { num_roots: 0, num_indirect: 2, name: std::ptr::null() };
+                let origin = FrameOrigin { num_roots: 0, num_indirect: 2, name: std::ptr::null(), live: std::ptr::null(), indirect_offsets: std::ptr::null() };
                 #[repr(C)]
                 struct ValueFrame { header: Frame, indirect: [*mut u8; 2] }
                 let mut frame = ValueFrame {

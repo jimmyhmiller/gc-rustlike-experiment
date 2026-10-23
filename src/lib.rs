@@ -38,6 +38,7 @@ mod trait_solver;
 
 mod codegen_escape;
 mod codegen_liveness;
+mod codegen_slots;
 
 mod codegen_outline;
 mod codegen_tail;

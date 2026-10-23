@@ -309,12 +309,24 @@ const _: () = {
 /// the indirect slot once to reach the real pointer and updates it in place.
 /// This is how value-with-ref locals are kept precise across collections without
 /// moving the value out of its alloca.
+///
+/// Compiled code stores a descriptor per call site that can reach a
+/// safepoint, whose `live` bitmask (bit `i` for root slot `i`, then bit
+/// `num_roots + j` for indirect slot `j`) names the slots holding values
+/// there. Slots outside the mask are never read: they need no zeroing when
+/// the frame is entered. A null mask means every slot.
 #[repr(C)]
 pub struct FrameOrigin {
     pub num_roots: u32,
     pub num_indirect: u32,
     /// Function name, NUL-terminated, for debugging / GC tracing. May be null.
     pub name: *const u8,
+    /// `ceil((num_roots + num_indirect) / 64)` words, or null for all slots.
+    pub live: *const u64,
+    /// Null when the indirect slots are cells holding the addresses of the
+    /// GC pointers. Otherwise `num_indirect` byte offsets from the frame of
+    /// the GC pointers themselves, which compiled code keeps in the frame.
+    pub indirect_offsets: *const u32,
 }
 
 impl FrameOrigin {
@@ -323,7 +335,18 @@ impl FrameOrigin {
             num_roots,
             num_indirect: 0,
             name,
+            live: std::ptr::null(),
+            indirect_offsets: std::ptr::null(),
         }
+    }
+
+    /// Does this site's frame hold a value in slot `index`?
+    ///
+    /// # Safety
+    /// A non-null `live` covers every slot.
+    #[inline]
+    pub unsafe fn is_live(&self, index: usize) -> bool {
+        self.live.is_null() || unsafe { *self.live.add(index / 64) } >> (index % 64) & 1 == 1
     }
 }
 
@@ -360,12 +383,18 @@ pub unsafe fn walk_gc_frames(jit_fp: *const u8, visitor: &mut dyn FnMut(*mut u64
             // Direct root slots start at byte offset ROOTS past the frame header.
             let slots = (frame as *const u8).add(frame_offsets::ROOTS) as *mut u64;
             for i in 0..num_roots {
-                visitor(slots.add(i));
+                if (*origin).is_live(i) { visitor(slots.add(i)); }
             }
             // Indirect slots follow the direct ones: each holds the address of a
             // GC pointer inside a value-with-ref local's alloca. Deref once, then
             // visit that pointer's slot so the collector updates it in place.
+            let offsets = if origin.is_null() { std::ptr::null() } else { (*origin).indirect_offsets };
             for j in 0..num_indirect {
+                if !(*origin).is_live(num_roots + j) { continue; }
+                if !offsets.is_null() {
+                    visitor((frame as *mut u8).add(*offsets.add(j) as usize).cast::<u64>());
+                    continue;
+                }
                 // These cells contain addresses, not encoded managed words.
                 // Load a pointer so its provenance survives the frame handoff.
                 let cell = slots.add(num_roots + j).cast::<*mut u64>();

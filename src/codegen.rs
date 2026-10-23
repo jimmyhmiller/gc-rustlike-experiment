@@ -152,6 +152,7 @@ pub fn codegen_with_debug<'ctx>(
         private_heap,
         bounded_loops,
         heap_scopes,
+        target_data: machine.get_target_data(),
         closed_world: !level.is_full(),
         physical_layouts: physical_layouts(prog),
         root_liveness,
@@ -585,6 +586,8 @@ struct Codegen<'ctx, 'p> {
     private_heap: crate::codegen_escape::PrivateHeap,
     bounded_loops: crate::codegen_loops::BoundedLoops,
     heap_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
+    /// The module's data layout, for byte offsets within GC frames.
+    target_data: inkwell::targets::TargetData,
     /// Cache of synthesized FFI callback trampolines, keyed by the gc-rust
     /// FuncId they wrap (one trampoline per referenced function).
     trampolines: HashMap<FuncId, FunctionValue<'ctx>>,
@@ -1398,14 +1401,39 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let rooted = |i: usize, r: &Repr| requires_roots && matches!(r, Repr::Ref(_))
             && (!entry_roots_only || i < incoming)
             && (i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(i as LocalId))));
+        // Traced locals whose live ranges are disjoint share one slot: one
+        // root mirror and working slot per reference, one stack aggregate per
+        // value holding references (see `codegen_slots`).
+        let value_traced = |i: usize| requires_roots
+            && (i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(i as LocalId))))
+            && matches!(&f.locals[i], Repr::Value(v) if value_has_ref(&self.prog.values, *v));
+        let shared: Vec<LocalId> = if full_debug { (0..f.locals.len() as LocalId).collect() } else {
+            crate::codegen_slots::share_slots(f, incoming, |l| {
+                let i = l as usize;
+                if rooted(i, &f.locals[i]) { Some(0) }
+                else if value_traced(i) { match &f.locals[i] { Repr::Value(v) => Some(1 + *v as u64), _ => None } }
+                else { None }
+            })
+        };
+        let owner = |i: usize| shared[i] as usize;
+        let mut sharers = vec![0u32; f.locals.len()];
+        for i in 0..f.locals.len() { sharers[owner(i)] += 1; }
+        let shared_slot: Vec<bool> = (0..f.locals.len()).map(|i| sharers[owner(i)] > 1).collect();
+        if std::env::var_os("GCR_SLOT_STATS").is_some() {
+            let pairs: Vec<String> = (0..f.locals.len()).filter(|&i| owner(i) != i).map(|i| format!("l{i}->l{}", owner(i))).collect();
+            eprintln!("slots {}: {}", f.name, pairs.join(" "));
+        }
         // Map: local id -> root index (only for Ref locals).
         let mut root_index: Vec<Option<u32>> = vec![None; f.locals.len()];
         let mut num_roots = 0usize;
         for (i, r) in f.locals.iter().enumerate() {
-            if rooted(i, r) {
+            if rooted(i, r) && owner(i) == i {
                 root_index[i] = Some(num_roots as u32);
                 num_roots += 1;
             }
+        }
+        for (i, r) in f.locals.iter().enumerate() {
+            if rooted(i, r) && owner(i) != i { root_index[i] = root_index[owner(i)]; }
         }
 
         // Value-with-ref locals: a flattened `#[value]` aggregate (in a plain
@@ -1421,6 +1449,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             .filter(|_| requires_roots)
             // As for references: only values live across a safepoint.
             .filter(|(i, _)| *i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(*i as LocalId))))
+            .filter(|(i, _)| owner(*i) == *i)
             .filter_map(|(i, r)| match r {
                 Repr::Value(vid) if value_has_ref(&self.prog.values, *vid) => {
                     let mut offs = Vec::new();
@@ -1431,6 +1460,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             })
             .collect();
         let num_indirect: usize = value_indirect.iter().map(|(_, o)| o.len()).sum();
+        if std::env::var_os("GCR_FRAME_STATS").is_some() && num_roots + num_indirect > 0 {
+            eprintln!("frame {}: {} roots, {} indirect in {} values, {} locals", f.name, num_roots, num_indirect, value_indirect.len(), f.locals.len());
+        }
         // With no incoming roots or indirect-root locals, all mirrors begin
         // null. Register the frame for the first reference assignment, before
         // any subsequent safepoint. Leaf-return paths can then optimize away
@@ -1444,14 +1476,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // working slot, keeping them all live at each such call, so only
         // functions with few roots work this way; the others store each
         // reference into its mirror as it is assigned.
+        //
+        // A *masked* frame (the default) is never zeroed: each call that may
+        // reach a safepoint first stores a descriptor whose mask names the slots
+        // of the traced locals in scope there, all written on the way, and the
+        // collector reads only those. The frame is linked at the first such
+        // call; mirrors are written as references are assigned.
         const LATE_ROOTS_LIMIT: usize = 32;
+        let masked = !full_debug && !entry_roots_only;
         let few_roots = num_roots + num_indirect <= LATE_ROOTS_LIMIT;
-        let defer_frame = (num_roots > 0 && num_indirect == 0
+        let defer_frame = if masked { num_roots > 0 || num_indirect > 0 } else {
+            (num_roots > 0 && num_indirect == 0
             && (entry_roots_only || (f.closure_captures.is_empty()
             && f.params.iter().all(|repr| !self.repr_relocates(repr))))
             || (!entry_roots_only && (num_roots > 0 || num_indirect > 0) && few_roots))
-            && !self.debug.as_ref().is_some_and(|debug| debug.full);
-        let late_roots = defer_frame && !entry_roots_only && few_roots;
+            && !self.debug.as_ref().is_some_and(|debug| debug.full)
+        };
+        let late_roots = !masked && defer_frame && !entry_roots_only && few_roots;
         let frame_active = if defer_frame {
             let active = self.builder.build_alloca(self.ctx.bool_type(), "roots.active").unwrap();
             self.builder.build_store(active, self.ctx.bool_type().const_zero()).unwrap();
@@ -1464,14 +1505,40 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // byte-identical to before.
         let i32t = self.ctx.i32_type();
         let mut deferred_frame_origin = None;
+        //
+        // A masked frame instead holds the value-with-ref locals themselves
+        // after the roots, `{ parent, origin, [num_roots x ptr], V1, V2, .. }`,
+        // and its descriptor gives the frame offsets of their references: the
+        // frame is linked with no per-call address stores.
+        let mut indirect_offsets: Vec<u32> = Vec::new();
+        let mut indirect_offsets_global = None;
         let frame = if num_roots > 0 || num_indirect > 0 {
             let roots_arr = ptr.array_type(num_roots as u32);
-            let ind_arr = ptr.array_type(num_indirect as u32);
-            let frame_ty = self
-                .ctx
-                .struct_type(&[ptr.into(), ptr.into(), roots_arr.into(), ind_arr.into()], false);
+            let ind_arr = ptr.array_type(if masked { 0 } else { num_indirect as u32 });
+            let mut fields: Vec<BasicTypeEnum> = vec![ptr.into(), ptr.into(), roots_arr.into()];
+            if masked {
+                fields.extend(value_indirect.iter()
+                    .map(|(i, _)| self.llvm_ty(&f.locals[*i]).expect("value-with-ref local has a type")));
+            } else {
+                fields.push(ind_arr.into());
+            }
+            let frame_ty = self.ctx.struct_type(&fields, false);
+            if masked {
+                for (k, (_, offs)) in value_indirect.iter().enumerate() {
+                    let base = self.target_data.offset_of_element(&frame_ty, 3 + k as u32).unwrap();
+                    indirect_offsets.extend(offs.iter().map(|&off| (base + off as u64) as u32));
+                }
+                if !indirect_offsets.is_empty() {
+                    let i32t = self.ctx.i32_type();
+                    let words = i32t.const_array(&indirect_offsets.iter().map(|&o| i32t.const_int(o as u64, false)).collect::<Vec<_>>());
+                    let g = self.module.add_global(words.get_type(), None, &format!("__indirect_{}", f.name));
+                    g.set_constant(true);
+                    g.set_initializer(&words);
+                    indirect_offsets_global = Some(g.as_pointer_value());
+                }
+            }
             let frame = self.builder.build_alloca(frame_ty, "gcframe").unwrap();
-            let origin = self.frame_origin(&f.name, num_roots as u32, num_indirect as u32);
+            let origin = self.frame_origin(&f.name, num_roots as u32, num_indirect as u32, indirect_offsets_global);
             if defer_frame { deferred_frame_origin = Some(origin); }
             else {
                 let origin_field = self.builder.build_struct_gep(frame_ty, frame, 1, "origin.f").unwrap();
@@ -1498,8 +1565,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 self.builder.build_store(slot, ptr.const_null()).unwrap();
             }
             // Zero all indirect slots (filled with alloca-interior addresses below).
-            let ind_field = self.builder.build_struct_gep(frame_ty, frame, 3, "ind.f").unwrap();
-            for k in 0..if late_roots { 0 } else { num_indirect } {
+            let ind_field = if masked { frame } else { self.builder.build_struct_gep(frame_ty, frame, 3, "ind.f").unwrap() };
+            for k in 0..if late_roots || masked { 0 } else { num_indirect } {
                 let slot = unsafe {
                     self.builder.build_in_bounds_gep(
                         ind_arr, ind_field,
@@ -1519,6 +1586,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let mut root_slots = vec![None; f.locals.len()];
         let mut slots: Vec<Option<PointerValue<'ctx>>> = Vec::with_capacity(f.locals.len());
         for (i, lr) in f.locals.iter().enumerate() {
+            if owner(i) != i {
+                // Filled from the owner's slots below.
+                slots.push(None);
+                continue;
+            }
             if let Some(ri) = root_index[i] {
                 let (_, _, roots_arr, roots_field, ..) = frame.unwrap();
                 let slot = unsafe {
@@ -1537,11 +1609,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     self.builder.build_store(private, ptr.const_null()).unwrap();
                     slots.push(Some(private));
                 }
+            } else if let Some(k) = value_indirect.iter().position(|(l, _)| *l == i).filter(|_| masked) {
+                let (frame, frame_ty, ..) = frame.unwrap();
+                slots.push(Some(self.builder.build_struct_gep(frame_ty, frame, 3 + k as u32, &format!("l{}", i)).unwrap()));
             } else {
                 match self.llvm_ty(lr) {
                     Some(t) => slots.push(Some(self.builder.build_alloca(t, &format!("l{}", i)).unwrap())),
                     None => slots.push(None),
                 }
+            }
+        }
+
+        for i in 0..f.locals.len() {
+            if owner(i) != i {
+                slots[i] = slots[owner(i)];
+                root_slots[i] = root_slots[owner(i)];
             }
         }
 
@@ -1551,13 +1633,22 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // on the stack, so these addresses are set once and the GC updates the
         // refs they point at in place.
         let mut late_indirect: Vec<(PointerValue<'ctx>, PointerValue<'ctx>)> = Vec::new();
+        // Each traced local's frame slots, as mask bits.
+        let mut local_bits: Vec<Vec<u32>> = vec![Vec::new(); f.locals.len()];
+        for (i, ri) in root_index.iter().enumerate() {
+            if let Some(ri) = ri { local_bits[i].push(*ri); }
+        }
         if let Some((_, _, _, _, ind_arr, ind_field, _)) = frame {
             let mut j = 0u32;
             for (local_idx, offs) in &value_indirect {
                 let alloca = slots[*local_idx].expect("value-with-ref local has an alloca");
-                if let Some(vty) = self.llvm_ty(&f.locals[*local_idx]) {
-                    self.builder.build_store(alloca, vty.const_zero()).unwrap();
+                if !masked {
+                    if let Some(vty) = self.llvm_ty(&f.locals[*local_idx]) {
+                        self.builder.build_store(alloca, vty.const_zero()).unwrap();
+                    }
                 }
+                local_bits[*local_idx].extend((0..offs.len() as u32).map(|k| num_roots as u32 + j + k));
+                if masked { j += offs.len() as u32; continue; }
                 for &off in offs {
                     let addr = self.obj_addr(alloca, off as u64);
                     let slot = unsafe {
@@ -1568,7 +1659,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         ).unwrap()
                     };
                     // A late frame records these addresses when it is linked.
-                    if late_roots { late_indirect.push((slot, addr)); }
+                    if late_roots || masked { late_indirect.push((slot, addr)); }
                     else { self.builder.build_store(slot, addr).unwrap(); }
                     j += 1;
                 }
@@ -1708,6 +1799,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
 
         let unlink = frame.map(|(frame_ptr, frame_ty, _, _, _, _, tf_ptr)| (frame_ptr, frame_ty, tf_ptr)
         );
+        for i in 0..f.locals.len() {
+            if owner(i) != i { local_bits[i] = local_bits[owner(i)].clone(); }
+        }
+        let scope: Vec<LocalId> = (0..incoming).filter(|&i| !local_bits[i].is_empty()).map(|i| i as LocalId).collect();
 
         let mut fcx = FnCtx {
             func,
@@ -1729,6 +1824,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             late_roots,
             late_indirect,
             subprogram,
+            masked: masked && frame.is_some(),
+            scope,
+            loop_scopes: Vec::new(),
+            once_scopes: Vec::new(),
+            shared_slot,
+            local_bits,
+            frame_dims: (f.name.clone(), num_roots as u32, num_indirect as u32, indirect_offsets_global),
+            site_origins: std::cell::RefCell::new(HashMap::new()),
         };
         let phase = self.entry_alloca(self.ctx.i8_type().as_basic_type_enum(), "copy.phase.local");
         let current = self.load_copy_phase(&fcx);
@@ -1900,7 +2003,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // A collection may run while this thread is in foreign code, so the
         // frame must be visible before `ai_ffi_enter`, not only before calls
         // that may relocate on return.
-        if fcx.late_roots && (!no_relocation || symbol == "ai_ffi_enter") { self.ensure_root_frame_linked(fcx); }
+        if (fcx.late_roots || fcx.masked) && (!no_relocation || symbol == "ai_ffi_enter") { self.ensure_root_frame_linked(fcx); }
+        if fcx.masked && (!no_relocation || symbol == "ai_ffi_enter") { self.store_site_origin(fcx); }
         // ffi_leave begins BLOCKED, after native callbacks may already have
         // moved roots. Reload unconditionally after it returns RUNNING.
         let before = if has_roots && !no_relocation && symbol != "ai_ffi_leave" {
@@ -1924,7 +2028,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.build_store(origin_field, fcx.deferred_frame_origin.unwrap()).unwrap();
             let roots = frame_ty.get_field_type_at_index(2).unwrap().into_array_type();
             let roots_field = self.builder.build_struct_gep(frame_ty, frame, 2, "roots.f").unwrap();
-            if fcx.late_roots {
+            if fcx.masked {
+                // Mirrors are already current; only the interior addresses.
+                for (slot, addr) in &fcx.late_indirect {
+                    self.builder.build_store(*slot, *addr).unwrap();
+                }
+            } else if fcx.late_roots {
                 // No safepoint has run yet: the working slots are current.
                 let ptr = self.ctx.ptr_type(AddressSpace::default());
                 for (working, mirror) in fcx.slots.iter().zip(&fcx.root_slots) {
@@ -1950,6 +2059,49 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.build_unconditional_branch(ready).unwrap();
             self.builder.position_at_end(ready);
         }
+    }
+
+    /// Record reference `v`'s new value in its traced mirror.
+    fn store_mirror(&self, fcx: &FnCtx<'ctx>, root: PointerValue<'ctx>, v: BasicValueEnum<'ctx>) {
+        if !fcx.masked { self.ensure_root_frame_linked(fcx); }
+        self.builder.build_store(root, v).unwrap();
+    }
+
+    /// Before a call that may reach a safepoint: point the frame at the
+    /// descriptor naming the slots of the traced locals now in scope.
+    fn store_site_origin(&self, fcx: &FnCtx<'ctx>) {
+        let Some((frame, frame_ty, _)) = fcx.unlink else { return };
+        let (name, roots, indirect, offsets) = &fcx.frame_dims;
+        let mut mask = vec![0u64; (*roots as usize + *indirect as usize).div_ceil(64).max(1)];
+        for local in &fcx.scope {
+            for &bit in &fcx.local_bits[*local as usize] { mask[bit as usize / 64] |= 1 << (bit % 64); }
+        }
+        let origin = *fcx.site_origins.borrow_mut().entry(mask.clone())
+            .or_insert_with(|| self.site_origin(name, *roots, *indirect, &mask, *offsets));
+        let field = self.builder.build_struct_gep(frame_ty, frame, 1, "origin.site").unwrap();
+        self.builder.build_store(field, origin).unwrap();
+    }
+
+    /// A `FrameOrigin` whose `live` mask is `mask`.
+    fn site_origin(&self, fn_name: &str, num_roots: u32, num_indirect: u32, mask: &[u64], offsets: Option<PointerValue<'ctx>>) -> PointerValue<'ctx> {
+        let i32t = self.ctx.i32_type();
+        let i64t = self.ctx.i64_type();
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let words = i64t.const_array(&mask.iter().map(|w| i64t.const_int(*w, false)).collect::<Vec<_>>());
+        let mask_global = self.module.add_global(words.get_type(), None, &format!("__live_{}", fn_name));
+        mask_global.set_constant(true);
+        mask_global.set_initializer(&words);
+        let origin_ty = self.ctx.struct_type(&[i32t.into(), i32t.into(), ptr.into(), ptr.into(), ptr.into()], false);
+        let g = self.module.add_global(origin_ty, None, &format!("__origin_{}", fn_name));
+        g.set_constant(true);
+        g.set_initializer(&origin_ty.const_named_struct(&[
+            i32t.const_int(num_roots as u64, false).into(),
+            i32t.const_int(num_indirect as u64, false).into(),
+            ptr.const_null().into(),
+            mask_global.as_pointer_value().into(),
+            offsets.unwrap_or(ptr.const_null()).into(),
+        ]));
+        g.as_pointer_value()
     }
 
     /// Restore the parent only if this function registered its frame.
@@ -1979,17 +2131,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     /// A private constant `FrameOrigin { num_roots, pad, name }` global.
-    fn frame_origin(&self, fn_name: &str, num_roots: u32, num_indirect: u32) -> PointerValue<'ctx> {
+    fn frame_origin(&self, fn_name: &str, num_roots: u32, num_indirect: u32, offsets: Option<PointerValue<'ctx>>) -> PointerValue<'ctx> {
         let i32t = self.ctx.i32_type();
         let ptr = self.ctx.ptr_type(AddressSpace::default());
-        // FrameOrigin (runtime, #[repr(C)]): { u32 num_roots, u32 num_indirect, ptr name }.
-        let origin_ty = self.ctx.struct_type(&[i32t.into(), i32t.into(), ptr.into()], false);
+        // FrameOrigin (runtime, #[repr(C)]):
+        // { u32 num_roots, u32 num_indirect, ptr name, ptr live, ptr indirect_offsets }.
+        let origin_ty = self.ctx.struct_type(&[i32t.into(), i32t.into(), ptr.into(), ptr.into(), ptr.into()], false);
         let g = self.module.add_global(origin_ty, None, &format!("__origin_{}", fn_name));
         g.set_constant(true);
         g.set_initializer(&origin_ty.const_named_struct(&[
             i32t.const_int(num_roots as u64, false).into(),
             i32t.const_int(num_indirect as u64, false).into(),
             ptr.const_null().into(),
+            ptr.const_null().into(),
+            offsets.unwrap_or(ptr.const_null()).into(),
         ]));
         g.as_pointer_value()
     }
@@ -1998,6 +2153,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let Some(dead) = self.root_liveness.dead(statement) else { return; };
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         for local in dead {
+            // A shared slot may already hold a later local: a compound
+            // statement's dead set names locals defined inside it.
+            if fcx.shared_slot[*local as usize] { continue; }
             if let Some(root) = fcx.root_slots[*local as usize] {
                 self.builder.build_store(root, ptr.const_null()).unwrap();
                 // A late frame copies working slots when it is linked.
@@ -2015,6 +2173,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         fcx: &mut FnCtx<'ctx>,
         b: &CoreBlock,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        // A `let` stays in scope past its block: later code may reuse it
+        // (field-read reuse makes Core uses non-lexical). Joins meet scopes.
+        self.gen_block_stmts(fcx, b)
+    }
+
+    fn gen_block_stmts(
+        &mut self,
+        fcx: &mut FnCtx<'ctx>,
+        b: &CoreBlock,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         for s in &b.stmts {
             match s {
                 CoreStmt::Let(local, e) => {
@@ -2022,8 +2190,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     if self.builder.get_insert_block().unwrap().get_terminator().is_some() { return Ok(None); }
                     if let (Some(slot), Some(v)) = (fcx.slots[*local as usize], v) {
                         self.builder.build_store(slot, v).unwrap();
-                        if let Some(root) = fcx.root_slots[*local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, v).unwrap(); }
+                        if let Some(root) = fcx.root_slots[*local as usize] { self.store_mirror(fcx, root, v); }
                     }
+                    if !fcx.local_bits[*local as usize].is_empty() { fcx.scope.push(*local); }
                 }
                 CoreStmt::Expr(e) => {
                     self.gen_expr(fcx, e)?;
@@ -2578,6 +2747,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if let (Some(slot), Some(bv)) = (phi_in, bv) {
                     self.builder.build_store(slot, bv).unwrap();
                 }
+                let scope = std::mem::take(&mut fcx.scope);
+                meet_scope(fcx.loop_scopes.last_mut().unwrap(), &scope);
+                fcx.scope = scope;
                 self.builder.build_unconditional_branch(cont_bb).unwrap();
                 Ok(None)
             }
@@ -2588,8 +2760,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     None => None,
                 };
                 if self.builder.get_insert_block().unwrap().get_terminator().is_some() { return Ok(None); }
-                let (_, exit, slot, (buffer_base, stack_base)) = *fcx.onces.iter().rev().find(|o| o.0 == *label)
+                let at = fcx.onces.iter().rposition(|o| o.0 == *label)
                     .ok_or_else(|| CodegenError("leave outside its once".into()))?;
+                let (_, exit, slot, (buffer_base, stack_base)) = fcx.onces[at];
+                let scope = std::mem::take(&mut fcx.scope);
+                meet_scope(&mut fcx.once_scopes[at], &scope);
+                fcx.scope = scope;
                 self.emit_ffi_cleanup(fcx, buffer_base, stack_base);
                 if let Some(e) = value { self.reload_after_cleanup(fcx, e, buffer_base, &mut v)?; }
                 if let (Some(slot), Some(v)) = (slot, v) {
@@ -2611,7 +2787,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let v = self.gen_expr(fcx, value)?;
                 if let (Some(slot), Some(v)) = (fcx.slots[*local as usize], v) {
                     self.builder.build_store(slot, v).unwrap();
-                    if let Some(root) = fcx.root_slots[*local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, v).unwrap(); }
+                    if let Some(root) = fcx.root_slots[*local as usize] { self.store_mirror(fcx, root, v); }
                 }
                 Ok(None)
             }
@@ -4524,7 +4700,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Some(rt) => rt.fn_type(&arg_tys, false),
             None => self.ctx.void_type().fn_type(&arg_tys, false),
         };
-        if fcx.late_roots { self.ensure_root_frame_linked(fcx); }
+        if fcx.late_roots || fcx.masked { self.ensure_root_frame_linked(fcx); }
+        if fcx.masked { self.store_site_origin(fcx); }
         let before = self.prepare_root_reload(fcx);
         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
         self.refresh_copy_phase(fcx);
@@ -4743,6 +4920,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(unreachable_bb);
         self.builder.build_unreachable().unwrap();
 
+        let pre = fcx.scope.clone();
+        let mut joined = None;
         for (arm, bb) in arm_blocks {
             self.builder.position_at_end(bb);
             let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
@@ -4751,17 +4930,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let value = self.load_value_enum_payload(agg, vid, field, &payload_reprs)?;
                 if let Some(slot) = fcx.slots[local as usize] {
                     self.builder.build_store(slot, value).unwrap();
-                    if let Some(root) = fcx.root_slots[local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, value).unwrap(); }
+                    if let Some(root) = fcx.root_slots[local as usize] { self.store_mirror(fcx, root, value); }
                 }
             }
+            fcx.scope.clone_from(&pre);
+            fcx.scope.extend(arm.binds.iter().copied().filter(|&b| !fcx.local_bits[b as usize].is_empty()));
             let v = self.gen_expr(fcx, &arm.body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                meet_scope(&mut joined, &fcx.scope);
                 if let (Some(slot), Some(v)) = (result_slot, v) {
                     self.builder.build_store(slot, v).unwrap();
                 }
                 self.builder.build_unconditional_branch(cont_bb).unwrap();
             }
         }
+        fcx.scope = joined.unwrap_or(pre);
         self.builder.position_at_end(cont_bb);
         match result_slot {
             Some(slot) => Ok(Some(self.builder.build_load(self.llvm_ty(repr).unwrap(), slot, "vm.v").unwrap())),
@@ -4811,6 +4994,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(unreachable_bb);
         self.builder.build_unreachable().unwrap();
 
+        let pre = fcx.scope.clone();
+        let mut joined = None;
         for (arm, bb) in arm_blocks {
             self.builder.position_at_end(bb);
             let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
@@ -4819,17 +5004,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let value = self.load_enum_payload(obj, raw_base, field, &payload_reprs)?;
                 if let Some(slot) = fcx.slots[local as usize] {
                     self.builder.build_store(slot, value).unwrap();
-                    if let Some(root) = fcx.root_slots[local as usize] { self.ensure_root_frame_linked(fcx); self.builder.build_store(root, value).unwrap(); }
+                    if let Some(root) = fcx.root_slots[local as usize] { self.store_mirror(fcx, root, value); }
                 }
             }
+            fcx.scope.clone_from(&pre);
+            fcx.scope.extend(arm.binds.iter().copied().filter(|&b| !fcx.local_bits[b as usize].is_empty()));
             let v = self.gen_expr(fcx, &arm.body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                meet_scope(&mut joined, &fcx.scope);
                 if let (Some(slot), Some(v)) = (result_slot, v) {
                     self.builder.build_store(slot, v).unwrap();
                 }
                 self.builder.build_unconditional_branch(cont_bb).unwrap();
             }
         }
+        fcx.scope = joined.unwrap_or(pre);
 
         self.builder.position_at_end(cont_bb);
         match result_slot {
@@ -5052,7 +5241,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         };
 
         self.builder.position_at_end(rhs_bb);
+        let pre = fcx.scope.clone();
         let rv = self.gen_expr(fcx, r)?.unwrap().into_int_value();
+        fcx.scope = pre;
         let rhs_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(cont_bb).unwrap();
 
@@ -5582,7 +5773,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // GC safepoint poll at the loop header: atomic acquire, volatile;
         // if non-zero, trap into ai_gc_pollcheck_slow so the mutator parks.
         if !self.bounded_loops.contains(body) { self.emit_safepoint_poll(fcx); }
+        let pre = fcx.scope.clone();
+        fcx.loop_scopes.push(None);
         self.gen_block(fcx, body)?;
+        fcx.scope = fcx.loop_scopes.pop().unwrap().unwrap_or(pre);
         // Back-edge: if the body fell through, loop again.
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
             self.builder.build_unconditional_branch(header_bb).unwrap();
@@ -5610,9 +5804,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let ty = self.llvm_ty(repr);
         let slot = ty.map(|t| self.entry_alloca(t, "once.value"));
         fcx.onces.push((label, exit, slot, (fcx.pending_ffi_buffers.len(), fcx.ffi_stack_tokens.len())));
+        let pre = fcx.scope.clone();
+        fcx.once_scopes.push(None);
         let value = self.gen_block(fcx, body)?;
         fcx.onces.pop();
+        let mut joined = fcx.once_scopes.pop().unwrap();
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+            meet_scope(&mut joined, &fcx.scope);
             match (slot, value) {
                 (Some(slot), Some(v)) => { self.builder.build_store(slot, v).unwrap(); }
                 // A value block that ends open without a value diverged.
@@ -5623,6 +5821,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 self.builder.build_unconditional_branch(exit).unwrap();
             }
         }
+        fcx.scope = joined.unwrap_or(pre);
         self.builder.position_at_end(exit);
         Ok(match (slot, ty) {
             (Some(slot), Some(t)) => Some(self.builder.build_load(t, slot, "once.result").unwrap()),
@@ -5651,6 +5850,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let wants_value = self.llvm_ty(repr).is_some();
 
         self.builder.position_at_end(then_bb);
+        let pre = fcx.scope.clone();
+        let mut joined = None;
         let tv = self.gen_block(fcx, then_b)?;
         let then_end = self.builder.get_insert_block().unwrap();
         let mut then_open = then_end.get_terminator().is_none();
@@ -5660,9 +5861,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
         if then_open {
             self.builder.build_unconditional_branch(cont_bb).unwrap();
+            meet_scope(&mut joined, &fcx.scope);
         }
 
         self.builder.position_at_end(else_bb);
+        fcx.scope.clone_from(&pre);
         let ev = self.gen_block(fcx, else_b)?;
         let else_end = self.builder.get_insert_block().unwrap();
         let mut else_open = else_end.get_terminator().is_none();
@@ -5672,7 +5875,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
         if else_open {
             self.builder.build_unconditional_branch(cont_bb).unwrap();
+            meet_scope(&mut joined, &fcx.scope);
         }
+        fcx.scope = joined.unwrap_or(pre);
 
         self.builder.position_at_end(cont_bb);
         match (self.llvm_ty(repr), then_open || else_open) {
@@ -5761,6 +5966,23 @@ struct FnCtx<'ctx> {
     /// (indirect frame slot, value-local interior address) pairs a late frame
     /// records when it is linked.
     late_indirect: Vec<(PointerValue<'ctx>, PointerValue<'ctx>)>,
+    /// A masked frame: never zeroed; each safepoint call stores the
+    /// descriptor for the traced locals in `scope` (see the prologue).
+    masked: bool,
+    /// The traced locals defined on the path being generated.
+    scope: Vec<LocalId>,
+    /// The scopes that reach each enclosing loop's exit and `Once`'s exit
+    /// (parallel to `loops` and `onces`), met over every `break`/`leave`.
+    loop_scopes: Vec<Option<Vec<LocalId>>>,
+    once_scopes: Vec<Option<Vec<LocalId>>>,
+    /// Locals whose slot another local also uses (see `codegen_slots`).
+    shared_slot: Vec<bool>,
+    /// Each local's frame slots, as mask bits (empty for untraced locals).
+    local_bits: Vec<Vec<u32>>,
+    /// (function name, root slots, indirect slots).
+    frame_dims: (String, u32, u32, Option<PointerValue<'ctx>>),
+    /// This function's call-site descriptors, by mask.
+    site_origins: std::cell::RefCell<HashMap<Vec<u64>, PointerValue<'ctx>>>,
     /// This function's DWARF `DISubprogram` scope (debugger P2) — `Some` only when
     /// emitting debug info. Debug locations for the function's nodes use it as
     /// their scope (one function = one source, so scope/file stay consistent).
@@ -8179,5 +8401,14 @@ mod tests {
                        w.inner.a + w.inner.b + w.tag \
                    }";
         assert_eq!(run_gc(src, true), 20);
+    }
+}
+
+/// Meets the scope of one path into a join: only locals defined on every
+/// path stay in scope after it.
+fn meet_scope(joined: &mut Option<Vec<LocalId>>, scope: &[LocalId]) {
+    match joined {
+        None => *joined = Some(scope.to_vec()),
+        Some(j) => j.retain(|l| scope.contains(l)),
     }
 }
