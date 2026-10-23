@@ -8,9 +8,17 @@
 //! once may stand for a racy later read. Inlining leaves many such repeats:
 //! a method reads `self.len` each time it is called.
 //!
+//! A read of an inline aggregate (`let p = x.proto`) copies all of it, where
+//! Rust would take a reference. While that read is still available, a
+//! projection of the copy (`p.code`) reads through the object instead
+//! (`x.proto.code`), so only the projected part is loaded and the copy is
+//! often dead.
+//!
 //! Each loop body starts with the reads available before the loop that its
-//! body cannot clobber; reads made inside a loop, a `Once`, or one branch do
-//! not outlive it. A read in a loop of an object the loop does not redefine,
+//! body cannot clobber; reads made inside a loop or one branch do not outlive
+//! it. A path that leaves (`return`, `break`, a panic) does not constrain
+//! what follows its join, and a `Once` is followed by what is available at
+//! every exit from it. A read in a loop of an object the loop does not redefine,
 //! of a field the loop cannot write, is made once before the loop instead
 //! (reads have no effects, and the object is initialized on entry).
 
@@ -33,7 +41,7 @@ pub fn reuse_field_reads(prog: &mut CoreProgram) {
     let writers = field_writers(prog);
     for f in &mut prog.funcs {
         if f.is_extern { continue; }
-        let mut cx = Reuse { writers: &writers, avail: HashMap::new(), locals: &mut f.locals };
+        let mut cx = Reuse { writers: &writers, avail: HashMap::new(), views: HashMap::new(), same: HashMap::new(), live: true, onces: Vec::new(), locals: &mut f.locals };
         let mut body = std::mem::replace(&mut f.body, CoreBlock { stmts: vec![], tail: None });
         cx.block(&mut body);
         f.body = body;
@@ -85,7 +93,35 @@ struct Reuse<'a> {
     writers: &'a [bool],
     /// (object local, field) → the local holding its last read.
     avail: HashMap<(LocalId, Key), LocalId>,
+    /// Aggregate locals equal to a projection of an available read: the
+    /// read, the local that made it, and the projection's expression.
+    views: HashMap<LocalId, View>,
+    /// Locals bound to a reused read, and the local whose value they hold:
+    /// reads through either are the same reads.
+    same: HashMap<LocalId, LocalId>,
+    /// Whether control reaches this point (not after a `return`, ...).
+    live: bool,
+    /// For each enclosing `Once`, by label: the reads available at every
+    /// exit from it so far.
+    onces: Vec<(u32, Option<Avail>)>,
     locals: &'a mut Vec<Repr>,
+}
+
+type Avail = HashMap<(LocalId, Key), LocalId>;
+
+/// Meets the reads available on one path into a join.
+fn meet(joined: &mut Option<Avail>, avail: &Avail) {
+    match joined {
+        None => *joined = Some(avail.clone()),
+        Some(j) => j.retain(|k, v| avail.get(k) == Some(v)),
+    }
+}
+
+#[derive(Clone)]
+struct View {
+    read: (LocalId, Key),
+    holder: LocalId,
+    expr: CoreExpr,
 }
 
 impl Reuse<'_> {
@@ -97,16 +133,28 @@ impl Reuse<'_> {
                     self.forget_local(*t);
                     let read = match e.kind.as_ref() {
                         CoreExprKind::Field { base, loc } => match base.kind.as_ref() {
-                            CoreExprKind::Local(x) => key(base, loc).map(|k| (*x, k)),
+                            CoreExprKind::Local(x) => key(base, loc).map(|k| (self.same.get(x).copied().unwrap_or(*x), k)),
                             _ => None,
                         },
                         _ => None,
                     };
                     if let Some(read) = read {
                         match self.avail.get(&read) {
-                            Some(&u) => *e.kind = CoreExprKind::Local(u),
-                            None => { self.avail.insert(read, *t); }
+                            Some(&u) => {
+                                *e.kind = CoreExprKind::Local(u);
+                                self.same.insert(*t, self.same.get(&u).copied().unwrap_or(u));
+                                if let Some(view) = self.views.get(&u).cloned() { self.views.insert(*t, view); }
+                            }
+                            None => {
+                                self.avail.insert(read, *t);
+                                if matches!(e.repr, Repr::Value(_)) {
+                                    self.views.insert(*t, View { read, holder: *t, expr: e.clone() });
+                                }
+                            }
                         }
+                    } else if let Some(view) = self.view_of(e) {
+                        // A projection forwarded through an object read.
+                        if matches!(e.repr, Repr::Value(_)) { self.views.insert(*t, View { expr: e.clone(), ..view }); }
                     }
                 }
                 CoreStmt::Expr(e) => self.expr(e),
@@ -115,32 +163,50 @@ impl Reuse<'_> {
         if let Some(t) = &mut b.tail { self.expr(t); }
     }
 
+    /// The view that projection `e` reads through, if any.
+    fn view_of(&self, e: &CoreExpr) -> Option<View> {
+        let CoreExprKind::Field { base, loc: FieldLoc::ValueField { .. } } = e.kind.as_ref() else { return None };
+        match base.kind.as_ref() {
+            CoreExprKind::Field { .. } => self.view_of(base),
+            CoreExprKind::Local(x) => self.views.get(x).filter(|v| self.avail.get(&v.read) == Some(&v.holder)).cloned(),
+            _ => None,
+        }
+    }
+
     fn expr(&mut self, e: &mut CoreExpr) {
         use CoreExprKind::*;
+        // `p.f` with `p` a view of a still-available read: read through it.
+        if let Field { base, loc: FieldLoc::ValueField { .. } } = e.kind.as_mut() {
+            if let Local(p) = base.kind.as_ref() {
+                if let Some(view) = self.views.get(p).filter(|v| self.avail.get(&v.read) == Some(&v.holder)) {
+                    **base = view.expr.clone();
+                }
+            }
+        }
         match e.kind.as_mut() {
             If(c, y, n) => {
                 self.expr(c);
-                let before = self.avail.clone();
+                let (before, live) = (self.avail.clone(), self.live);
+                let mut joined = None;
                 self.block(y);
-                let after_yes = std::mem::replace(&mut self.avail, before);
+                if self.live { meet(&mut joined, &self.avail); }
+                (self.avail, self.live) = (before, live);
                 self.block(n);
-                self.avail.retain(|k, v| after_yes.get(k) == Some(v));
+                if self.live { meet(&mut joined, &self.avail); }
+                self.join(joined);
             }
             Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
                 self.expr(scrutinee);
-                let before = self.avail.clone();
-                let mut merged: Option<HashMap<(LocalId, Key), LocalId>> = None;
+                let (before, live) = (self.avail.clone(), self.live);
+                let mut joined = None;
                 for a in arms.iter_mut() {
-                    self.avail = before.clone();
+                    (self.avail, self.live) = (before.clone(), live);
                     for b in &a.binds { self.forget_local(*b); }
                     self.expr(&mut a.body);
-                    let out = std::mem::take(&mut self.avail);
-                    merged = Some(match merged {
-                        None => out,
-                        Some(mut m) => { m.retain(|k, v| out.get(k) == Some(v)); m }
-                    });
+                    if self.live { meet(&mut joined, &self.avail); }
                 }
-                self.avail = merged.unwrap_or(before);
+                if arms.is_empty() { meet(&mut joined, &before); }
+                self.join(joined);
             }
             Block(b) => self.block(b),
             Loop(b) => {
@@ -163,7 +229,7 @@ impl Reuse<'_> {
                 }
                 let kept = self.avail.clone();
                 self.block(b);
-                self.avail = kept;
+                (self.avail, self.live) = (kept, true);
                 if !hoisted.is_empty() {
                     let repr = e.repr.clone();
                     let span = e.span;
@@ -172,41 +238,71 @@ impl Reuse<'_> {
                     return;
                 }
             }
-            Once { body: b, .. } => {
-                // Early exits: only reads the body cannot clobber stay
-                // available, inside and after it.
-                let clobbers = block_clobbers(b, self.writers);
-                self.apply(&clobbers);
-                let kept = self.avail.clone();
+            Once { label, body: b } => {
+                // What follows is reached from the end of the body and from
+                // each `leave` of it.
+                self.onces.push((*label, None));
                 self.block(b);
-                self.avail = kept;
+                let (_, mut exits) = self.onces.pop().unwrap();
+                if self.live { meet(&mut exits, &self.avail); }
+                self.join(exits);
             }
             Bin(crate::ast::BinOp::And | crate::ast::BinOp::Or, a, b) => {
                 self.expr(a);
-                let before = self.avail.clone();
+                let (before, live) = (self.avail.clone(), self.live);
+                let mut joined = None;
+                meet(&mut joined, &before);
                 self.expr(b);
-                let after = std::mem::replace(&mut self.avail, before);
-                self.avail.retain(|k, v| after.get(k) == Some(v));
+                if self.live { meet(&mut joined, &self.avail); }
+                self.live = live;
+                self.join(joined);
             }
             _ => for c in crate::copyprop::children_mut(e) { self.expr(c) },
         }
         // This node's own effect.
         match e.kind.as_ref() {
-            SetField { base, loc, .. } => if let Some(k) = key(base, loc) { self.avail.retain(|(_, f), _| *f != k); },
+            SetField { base, loc, .. } => {
+                if let Some(k) = key(base, loc) { self.avail.retain(|(_, f), _| *f != k); }
+                // An aggregate local updated in place no longer equals its read.
+                if let Local(p) = base.kind.as_ref() { self.views.remove(p); }
+            }
             Assign { local, .. } => self.forget_local(*local),
             Call(g, _) if self.writers[*g as usize] => self.avail.clear(),
             _ if clobbers_all(e) => self.avail.clear(),
             _ => {}
         }
+        // Control does not continue past these.
+        match e.kind.as_ref() {
+            Leave { label, .. } => {
+                if self.live {
+                    if let Some((_, exits)) = self.onces.iter_mut().rev().find(|(l, _)| l == label) { meet(exits, &self.avail); }
+                }
+                self.live = false;
+            }
+            Return(_) | Break(_) | Continue | Panic(_) => self.live = false,
+            _ => {}
+        }
+    }
+
+    /// Continues after a join of the paths met in `joined` (unreachable if
+    /// none reaches it).
+    fn join(&mut self, joined: Option<Avail>) {
+        match joined {
+            Some(avail) => (self.avail, self.live) = (avail, true),
+            None => self.live = false,
+        }
     }
 
     fn forget_local(&mut self, l: LocalId) {
         self.avail.retain(|(x, _), holder| *x != l && *holder != l);
+        self.views.remove(&l);
+        self.same.retain(|t, u| *t != l && *u != l);
     }
 
     fn apply(&mut self, c: &Clobbers) {
         if c.all { self.avail.clear(); return; }
         self.avail.retain(|(x, f), holder| !c.fields.contains(f) && !c.locals.contains(x) && !c.locals.contains(holder));
+        self.same.retain(|t, u| !c.locals.contains(t) && !c.locals.contains(u));
     }
 }
 

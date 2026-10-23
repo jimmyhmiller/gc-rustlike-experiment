@@ -111,13 +111,29 @@ pub enum VarLen {
 }
 
 /// The size of one array record of value `vid` and whether it starts with an
-/// initialized word (values holding references do: zeroed storage is not a
-/// valid such value).
+/// initialized word (values holding references do, unless zeroed storage is
+/// a valid such value).
 pub fn record_shape(values: &[ValueLayout], vid: ValueId) -> (u32, bool) {
     let size = (values[vid as usize].size + 7) & !7;
     let mut refs = false;
     let _ = crate::layout::visit_value_ref_offsets(values, vid, 0, &mut |_| refs = true);
-    if refs { (size + 8, true) } else { (size.max(8), false) }
+    if refs && !zero_is_valid(values, vid) { (size + 8, true) } else { (size.max(8), false) }
+}
+
+/// Whether all-zero bytes are a value of `vid`: no reference is read from
+/// them. A value enum's zero is its first variant (tag 0), and references
+/// in other variants' slots are then unused.
+pub fn zero_is_valid(values: &[ValueLayout], vid: ValueId) -> bool {
+    let v = &values[vid as usize];
+    let fields = match &v.variants {
+        Some(variants) => match variants.first() { Some(first) => &first.fields, None => return false },
+        None => &v.fields,
+    };
+    fields.iter().all(|f| match f {
+        Repr::Ref(_) => false,
+        Repr::Value(inner) => zero_is_valid(values, *inner),
+        Repr::Scalar(_) | Repr::Unit => true,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]

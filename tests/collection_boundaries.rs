@@ -25,7 +25,7 @@ fn backing_array_bounds_and_allocation_sizes_fail_before_memory_access() {
         ("header-overflow", "let a: Array<i8> = Array::new(9223372036854775807); a.len()", "allocation size overflow"),
         ("unset-reference", "let a: Array<String> = Array::new(1); a[0].len()", "uninitialized array element"),
         ("unset-optional-reference", "let a: Array<String> = Array::new(1); match a.get(0) { Option::Some(s) => s.len(), Option::None => 0 }", "uninitialized array element"),
-        ("unset-value", "let a: Array<Option<String>> = Array::new(1); match a[0] { Option::Some(s) => s.len(), Option::None => 0 }", "uninitialized array element"),
+        ("unset-value", "let a: Array<(String, i64)> = Array::new(1); a[0].0.len()", "uninitialized array element"),
         ("unset-native-join", "let a: Array<String> = Array::new(1); str_join_array(a, 1, \"|\").len()", "uninitialized array element"),
     ];
     for (name, body, diagnostic) in cases {
