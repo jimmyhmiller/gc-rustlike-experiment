@@ -4221,7 +4221,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             _ => return Err(CodegenError("array bounds check on non-array".into())),
         };
         let lay = &self.prog.layouts[lid as usize];
-        let len = if matches!(lay.varlen, crate::core::VarLen::Values) {
+        let len = if matches!(lay.varlen, crate::core::VarLen::Values | crate::core::VarLen::Records) {
             count
         } else {
             let stride = lay.elem_stride.max(1) as u64;
@@ -4306,6 +4306,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // inline: header, then its count word, then zeroed elements.
         let lay = &self.physical_layouts.layouts[layout as usize];
         let values = matches!(lay.varlen, crate::core::VarLen::Values);
+        // Values and record arrays count elements; byte arrays count bytes.
+        let counted = values || matches!(lay.varlen, crate::core::VarLen::Records);
         // Records holding references start zeroed: null references, and an
         // unset initialized word where a record has one.
         let inline = lay.ptr_fields == 0 && lay.raw_bytes == 0 && !matches!(lay.varlen, crate::core::VarLen::None);
@@ -4313,9 +4315,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             const DATA: u64 = 24;
             let max = (8192 - DATA) / stride.max(1);
             let small = self.builder.build_int_compare(IntPredicate::ULE, n64, i64t.const_int(max, false), "array.small").unwrap();
-            let varlen_len = if values { n64 } else { self.builder.build_int_mul(n64, i64t.const_int(stride, false), "array.bytes").unwrap() };
             // Bounded by `small` before use, so these cannot wrap.
-            let data_bytes = if values { self.builder.build_int_mul(n64, i64t.const_int(8, false), "array.words").unwrap() } else { varlen_len };
+            let bytes = self.builder.build_int_mul(n64, i64t.const_int(stride, false), "array.bytes").unwrap();
+            let varlen_len = if counted { n64 } else { bytes };
+            let data_bytes = if values { self.builder.build_int_mul(n64, i64t.const_int(8, false), "array.words").unwrap() } else { bytes };
             let unrounded = self.builder.build_int_add(data_bytes, i64t.const_int(DATA + 7, false), "array.size.raw").unwrap();
             let size = self.builder.build_and(unrounded, i64t.const_int(!7u64, false), "array.size").unwrap();
             let tlab = self.tlab_reserve(fcx, size, small, site);
@@ -4338,7 +4341,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let validate = self.module.get_function("ai_array_allocation_len").unwrap();
         let varlen_len = call_result(self.build_managed_call(fcx, validate, &[
             fcx.thread.into(), n64.into(), i64t.const_int(stride, false).into(),
-            i32t.const_int(traced as u64, false).into(),
+            i32t.const_int((traced || counted) as u64, false).into(),
         ], "array.allocation.len").unwrap()).into_int_value();
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
         let obj = call_result(self.build_managed_call(fcx,
@@ -4376,8 +4379,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let count = self.builder.build_load(i64t, count_addr, "cnt").unwrap().into_int_value();
         let lid = match &arr.repr { Repr::Ref(l) => *l, _ => return Err(CodegenError("array_len on non-array".into())) };
         let lay = &self.prog.layouts[lid as usize];
-        let logical = if matches!(lay.varlen, crate::core::VarLen::Values) {
-            // Values arrays store the element count directly.
+        let logical = if matches!(lay.varlen, crate::core::VarLen::Values | crate::core::VarLen::Records) {
+            // Values and record arrays store the element count directly.
             count
         } else {
             // Bytes arrays store the byte length; divide by the element stride.

@@ -56,7 +56,8 @@ pub struct TypeInfo {
 
     /// For a `Bytes` tail holding inline records (an array of value
     /// aggregates): each record's size in bytes, or 0 for plain bytes. The
-    /// tail's count is in bytes, a multiple of the stride.
+    /// tail's count is its number of records, so compiled code bounds-checks
+    /// an index against it directly.
     pub record_stride: u16,
 
     /// Offsets, within each record, of its GC references.
@@ -252,9 +253,10 @@ impl TypeInfo {
                 .checked_add(8)?
                 .checked_add(varlen_len.checked_mul(8)?)?,
             VarLenKind::Bytes => {
+                let bytes = if self.record_stride != 0 { varlen_len.checked_mul(self.record_stride as usize)? } else { varlen_len };
                 self.varlen_count_offset()
                     .checked_add(8)?
-                    .checked_add(varlen_len)?
+                    .checked_add(bytes)?
                     .checked_add(7)?
                     & !7
             }
@@ -274,8 +276,10 @@ impl TypeInfo {
                 self.varlen_count_offset() + 8 + varlen_len * 8
             }
             VarLenKind::Bytes => {
-                // count word + n bytes, aligned up
-                align8(self.varlen_count_offset() + 8 + varlen_len)
+                // count word + n bytes (n records of `record_stride` bytes
+                // for a record tail), aligned up
+                let bytes = if self.record_stride != 0 { varlen_len * self.record_stride as usize } else { varlen_len };
+                align8(self.varlen_count_offset() + 8 + bytes)
             }
         };
         let align = 1usize << self.align_log2;

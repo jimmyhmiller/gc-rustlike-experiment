@@ -29,7 +29,7 @@ pub unsafe extern "C" fn ai_array_copy(
         // Type ids and varlen counts never change, so either copy serves.
         let len = |array: *mut u8| {
             let raw = core::ptr::read(array.add(info.varlen_count_offset()) as *const u64) as usize;
-            if info.varlen == VarLenKind::Values { raw } else { raw / stride }
+            if info.varlen == VarLenKind::Values || info.record_stride != 0 { raw } else { raw / stride }
         };
         let (src_len, dst_len) = (len(src), len(dst));
         let in_bounds = |pos: i64, len: usize| pos >= 0 && count >= 0 && (pos as u128 + count as u128) <= len as u128;

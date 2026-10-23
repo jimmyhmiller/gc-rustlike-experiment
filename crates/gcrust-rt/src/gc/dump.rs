@@ -671,6 +671,10 @@ unsafe fn render_opaque(name: &str, obj: *mut u8, info: &TypeInfo) -> String {
                 let bytes = read_varlen_bytes(obj, info);
                 format!("String {:?}", String::from_utf8_lossy(bytes))
             }
+            VarLenKind::Bytes if info.record_stride != 0 => {
+                let n = read_varlen_count(obj, info);
+                format!("{name} <{n} records>")
+            }
             VarLenKind::Bytes => {
                 let n = read_varlen_count(obj, info);
                 format!("{name} <{n} bytes>")

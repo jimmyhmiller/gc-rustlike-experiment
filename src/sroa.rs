@@ -19,7 +19,110 @@ pub fn scalar_replace(prog: &mut CoreProgram) {
         if f.is_extern { continue; }
         // Replacing an object can expose the objects held in its fields.
         while replace_fn(f, &prog.layouts) {}
+        replace_values(f, &prog.values);
     }
+}
+
+/// Scalar replacement of value aggregates: a struct or tuple value bound once
+/// by `let t = MakeValue {..}` and only projected (`t.i`) is its fields, a
+/// local each, and is never built. The match on `(kind, a, b)` tests the
+/// three values, not a tuple copied into the frame.
+fn replace_values(f: &mut CoreFn, values: &[ValueLayout]) {
+    let n = f.locals.len();
+    let mut defs = vec![0u32; n];
+    let mut built = vec![false; n];
+    let mut reads = vec![0u32; n];
+    let mut projected = vec![0u32; n];
+    let incoming = f.closure_captures.len() + f.params.len();
+    for d in defs.iter_mut().take(incoming) { *d += 1; }
+    fn count_b(b: &CoreBlock, defs: &mut [u32], built: &mut [bool], reads: &mut [u32], projected: &mut [u32], values: &[ValueLayout]) {
+        for s in &b.stmts {
+            match s {
+                CoreStmt::Let(l, e) => {
+                    defs[*l as usize] += 1;
+                    if let CoreExprKind::MakeValue { value, .. } = e.kind.as_ref() {
+                        if values[*value as usize].variants.is_none() { built[*l as usize] = true; }
+                    }
+                    count_e(e, defs, built, reads, projected, values);
+                }
+                CoreStmt::Expr(e) => count_e(e, defs, built, reads, projected, values),
+            }
+        }
+        if let Some(t) = &b.tail { count_e(t, defs, built, reads, projected, values); }
+    }
+    fn count_e(e: &CoreExpr, defs: &mut [u32], built: &mut [bool], reads: &mut [u32], projected: &mut [u32], values: &[ValueLayout]) {
+        use CoreExprKind::*;
+        match e.kind.as_ref() {
+            Local(l) => reads[*l as usize] += 1,
+            Field { base, loc: FieldLoc::ValueField { .. } } if matches!(base.kind.as_ref(), Local(_)) => {
+                let Local(l) = base.kind.as_ref() else { unreachable!() };
+                reads[*l as usize] += 1;
+                projected[*l as usize] += 1;
+            }
+            Assign { local, value } => { defs[*local as usize] += 1; count_e(value, defs, built, reads, projected, values); }
+            If(c, y, z) => { count_e(c, defs, built, reads, projected, values); count_b(y, defs, built, reads, projected, values); count_b(z, defs, built, reads, projected, values); }
+            Block(b) | Loop(b) | Once { body: b, .. } => count_b(b, defs, built, reads, projected, values),
+            Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
+                count_e(scrutinee, defs, built, reads, projected, values);
+                for a in arms { for b in &a.binds { defs[*b as usize] += 1; } count_e(&a.body, defs, built, reads, projected, values); }
+            }
+            _ => for c in crate::copyprop::children(e) { count_e(c, defs, built, reads, projected, values) },
+        }
+    }
+    count_b(&f.body, &mut defs, &mut built, &mut reads, &mut projected, values);
+    let replace: Vec<bool> = (0..n).map(|l| built[l] && defs[l] == 1 && reads[l] == projected[l]).collect();
+    if !replace.iter().any(|r| *r) { return; }
+    // Each replaced aggregate's fields, as new locals.
+    let mut parts: HashMap<LocalId, Vec<LocalId>> = HashMap::new();
+    fn rewrite_b(b: &mut CoreBlock, replace: &[bool], parts: &mut HashMap<LocalId, Vec<LocalId>>, locals: &mut Vec<Repr>) {
+        let mut out = Vec::with_capacity(b.stmts.len());
+        for s in std::mem::take(&mut b.stmts) {
+            match s {
+                CoreStmt::Let(l, mut e) if replace[l as usize] => {
+                    rewrite_e(&mut e, replace, parts, locals);
+                    let CoreExprKind::MakeValue { fields, .. } = *e.kind else { unreachable!() };
+                    let mut ids = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        let id = locals.len() as LocalId;
+                        locals.push(field.repr.clone());
+                        ids.push(id);
+                        out.push(CoreStmt::Let(id, field));
+                    }
+                    parts.insert(l, ids);
+                }
+                CoreStmt::Let(l, mut e) => { rewrite_e(&mut e, replace, parts, locals); out.push(CoreStmt::Let(l, e)); }
+                CoreStmt::Expr(mut e) => { rewrite_e(&mut e, replace, parts, locals); out.push(CoreStmt::Expr(e)); }
+            }
+        }
+        b.stmts = out;
+        if let Some(t) = &mut b.tail { rewrite_e(t, replace, parts, locals); }
+    }
+    fn rewrite_e(e: &mut CoreExpr, replace: &[bool], parts: &mut HashMap<LocalId, Vec<LocalId>>, locals: &mut Vec<Repr>) {
+        use CoreExprKind::*;
+        if let Field { base, loc: FieldLoc::ValueField { index } } = e.kind.as_ref() {
+            if let Local(l) = base.kind.as_ref() {
+                if let Some(ids) = parts.get(l) {
+                    let id = ids[*index as usize];
+                    *e = CoreExpr::new(Local(id), locals[id as usize].clone());
+                    return;
+                }
+            }
+        }
+        match e.kind.as_mut() {
+            If(c, y, z) => { rewrite_e(c, replace, parts, locals); rewrite_b(y, replace, parts, locals); rewrite_b(z, replace, parts, locals); }
+            Block(b) | Loop(b) | Once { body: b, .. } => rewrite_b(b, replace, parts, locals),
+            Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
+                rewrite_e(scrutinee, replace, parts, locals);
+                for a in arms { rewrite_e(&mut a.body, replace, parts, locals); }
+            }
+            _ => for c in crate::copyprop::children_mut(e) { rewrite_e(c, replace, parts, locals) },
+        }
+    }
+    let mut body = std::mem::replace(&mut f.body, CoreBlock { stmts: vec![], tail: None });
+    rewrite_b(&mut body, &replace, &mut parts, &mut f.locals);
+    f.body = body;
+    f.local_names.resize(f.locals.len(), None);
+    for l in parts.keys() { f.locals[*l as usize] = Repr::Unit; }
 }
 
 #[derive(Default, Clone, Copy)]

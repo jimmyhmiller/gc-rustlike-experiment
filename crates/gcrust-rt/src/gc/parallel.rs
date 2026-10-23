@@ -101,7 +101,7 @@ unsafe fn reference_slots_in(obj: *mut u8, info: &TypeInfo, lo: usize, hi: usize
     }
     let stride = info.record_stride as usize;
     if stride == 0 { return; }
-    let records = raw / stride;
+    let records = raw;
     let first = lo.saturating_sub(base) / stride;
     let last = (hi.saturating_sub(base).div_ceil(stride)).min(records);
     for i in first..last {
@@ -118,7 +118,7 @@ fn traced_bytes(info: &TypeInfo, varlen_len: usize) -> usize {
         .saturating_add(if info.varlen == VarLenKind::Values {
             varlen_len
         } else if info.record_stride != 0 {
-            (varlen_len / info.record_stride as usize).saturating_mul(info.record_ptrs.len())
+            varlen_len.saturating_mul(info.record_ptrs.len())
         } else {
             0
         })
