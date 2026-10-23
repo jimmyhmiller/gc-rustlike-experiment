@@ -366,7 +366,7 @@ mod tests {
                 }
             }).expect("fixture requires distinct source/destination stripes");
             heap.object_locks.prepare();
-            heap.gc_phase.store(GcPhase::Copying as u8, Ordering::Release);
+            heap.set_gc_phase(GcPhase::Copying);
             let (ready, waiting) = std::sync::mpsc::channel();
             let (release, resume) = std::sync::mpsc::channel();
             let other = heap.clone();
@@ -391,7 +391,7 @@ mod tests {
             holder.join().unwrap();
             assert_eq!(unsafe { old.add(H::SIZE).cast::<u64>().read() }, 42);
             assert_eq!(unsafe { new.add(H::SIZE).cast::<u64>().read() }, 43);
-            heap.gc_phase.store(GcPhase::Idle as u8, Ordering::Release);
+            heap.set_gc_phase(GcPhase::Idle);
         }
         check::<Compact>();
         check::<Full>();
@@ -408,7 +408,7 @@ mod tests {
         // during the native allocation measurement. The real pressure fixture
         // separately checks tracing and final reclamation under overwrites.
         heap.satb_queue.begin_cycle::<IdentityPtrPolicy>(old, info.allocation_size(0));
-        heap.gc_phase.store(GcPhase::Copying as u8, Ordering::Release);
+        heap.set_gc_phase(GcPhase::Copying);
         let mut capacity = 0;
         while !unsafe { state.satb_buffer() }.should_flush() {
             unsafe { state.satb_buffer() }.log(old as u64);
@@ -434,7 +434,7 @@ mod tests {
         assert!(heap.satb_queue.is_empty());
         assert_eq!(heap.satb_queue.stats().unique_values, 1);
         heap.satb_queue.finish_cycle();
-        heap.gc_phase.store(GcPhase::Idle as u8, Ordering::Release);
+        heap.set_gc_phase(GcPhase::Idle);
         unsafe { heap.safe_deregister_thread(&state) };
     }
 
@@ -1290,8 +1290,7 @@ mod tests {
         // old slot first. The real-cycle test separately exercises both pauses.
         let moved_child = unsafe { heap.copy_or_forward_atomic::<IdentityPtrPolicy>(child) };
         let moved_owner = unsafe { heap.copy_or_forward_atomic::<IdentityPtrPolicy>(owner) };
-        heap.gc_phase
-            .store(GcPhase::Copying as u8, Ordering::Release);
+        heap.set_gc_phase(GcPhase::Copying);
         let slot = unsafe { &*moved_owner.add(offset).cast::<AtomicU64>() };
         assert_eq!(slot.load(Ordering::SeqCst), child as u64);
         assert_eq!(
@@ -1329,7 +1328,7 @@ mod tests {
         assert_eq!(slot.load(Ordering::SeqCst), 0);
         let logged = unsafe { state.satb_buffer().drain() };
         assert_eq!(logged, vec![child as u64, moved_owner as u64]);
-        heap.gc_phase.store(GcPhase::Idle as u8, Ordering::Release);
+        heap.set_gc_phase(GcPhase::Idle);
         unsafe { heap.safe_deregister_thread(&state) };
     }
 

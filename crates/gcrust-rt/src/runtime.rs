@@ -213,7 +213,8 @@ pub struct Thread {
     /// Older generated callers may read it atomically; v3 callers read it
     /// ordinarily while RUNNING, when coordinator writes are excluded.
     pub relocation_epoch: *const std::sync::atomic::AtomicUsize,
-    /// Heap-owned flag; generated access paths read it atomically while RUNNING.
+    /// Heap-owned access mode (bit 0: copying, bit 1: more than one
+    /// mutator); generated access paths read it while RUNNING.
     pub copying_phase: *const std::sync::atomic::AtomicU8,
     /// Heap-owned flag: nonzero once a second mutator registered.
     pub multi_mutator: *const std::sync::atomic::AtomicU8,
@@ -1960,9 +1961,10 @@ pub struct AotLayout {
 /// tenured_bytes)`. BOTH the AOT runtime ([`gcr_runtime_main`]) and the JIT
 /// driver use this so a program gets the SAME GC behavior regardless of run mode
 /// (they previously disagreed — AOT 1 MB vs JIT 16 MB nursery — so the same
-/// program had different perf/GC by run mode). Defaults: 64 MB nursery / 256 MB
+/// program had different perf/GC by run mode). Defaults: 16 MB nursery / 256 MB
 /// tenured (per space). Override with `GCR_NURSERY_MB` / `GCR_TENURED_MB`
-/// (binary MiB).
+/// (binary MiB). A larger nursery collects less often but touches more fresh
+/// pages: the faults cost a short program more than the collections it saves.
 ///
 /// The nursery is sized so ordinary workloads DO collect (not sized past the
 /// workload to dodge GC), while being large enough that a moderately-sized object
@@ -1974,7 +1976,7 @@ pub fn configured_heap_sizes() -> (usize, usize) {
     fn mb_env(key: &str, default_mb: usize) -> usize {
         heap_setting_bytes(std::env::var(key).ok().as_deref(), default_mb)
     }
-    (mb_env("GCR_NURSERY_MB", 64), mb_env("GCR_TENURED_MB", 256))
+    (mb_env("GCR_NURSERY_MB", 16), mb_env("GCR_TENURED_MB", 256))
 }
 
 fn heap_setting_bytes(value: Option<&str>, default_mb: usize) -> usize {

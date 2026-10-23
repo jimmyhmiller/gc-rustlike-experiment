@@ -124,6 +124,7 @@ pub fn record_shape(values: &[ValueLayout], vid: ValueId) -> (u32, bool) {
 /// them. A value enum's zero is its first variant (tag 0), and references
 /// in other variants' slots are then unused.
 pub fn zero_is_valid(values: &[ValueLayout], vid: ValueId) -> bool {
+    if let Some(n) = values[vid as usize].niche { return zero_is_valid(values, n.inner); }
     let v = &values[vid as usize];
     let fields = match &v.variants {
         Some(variants) => match variants.first() { Some(first) => &first.fields, None => return false },
@@ -169,6 +170,43 @@ pub struct ValueLayout {
     pub field_names: Vec<String>,
     pub size: u32,
     pub align: u32,
+    /// For a value enum laid out in another's spare tags (see `Niche`).
+    pub niche: Option<Niche>,
+}
+
+/// A value enum laid out as one variant's payload, another value enum:
+/// `Option<Value>` is a `Value`, its `None` a tag value `Value` leaves
+/// free. Each other variant has such a tag, in order from `first`, and holds
+/// at most one reference, in the payload's first pointer slot.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+pub struct Niche {
+    /// The variant whose payload is the whole value.
+    pub data: u32,
+    /// That payload's value enum, whose representation this one shares.
+    pub inner: ValueId,
+    /// The tag value of the first other variant.
+    pub first: u32,
+}
+
+/// How many tag values value enum `vid`'s representation uses.
+pub fn tag_values(values: &[ValueLayout], vid: ValueId) -> u32 {
+    let v = &values[vid as usize];
+    let count = v.variants.as_ref().map_or(0, |vs| vs.len() as u32);
+    match v.niche {
+        Some(n) => n.first + count - 1,
+        None => count,
+    }
+}
+
+/// The value enum whose layout `vid` shares (itself unless a niche).
+pub fn niche_base(values: &[ValueLayout], mut vid: ValueId) -> ValueId {
+    while let Some(n) = values[vid as usize].niche { vid = n.inner; }
+    vid
+}
+
+/// For a niche enum's variant other than its data variant: its tag value.
+pub fn niche_tag(niche: Niche, variant: u32) -> u32 {
+    niche.first + if variant < niche.data { variant } else { variant - 1 }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -222,7 +260,7 @@ mod value_enum_count_tests {
         assert_eq!(checked_value_enum_max_ptrs(&[], &[]), Some(0));
         assert_eq!(checked_value_enum_max_ptrs(&[variant(vec![Repr::Ref(0); 65535])], &[]), Some(65535));
         assert_eq!(checked_value_enum_max_ptrs(&[variant(vec![Repr::Ref(0); 65536])], &[]), None);
-        let value = ValueLayout { name: "Nested".into(), variants: None, fields: vec![Repr::Ref(0); 65535], field_names: vec![], size: 65535 * 8, align: 8 };
+        let value = ValueLayout { niche: None, name: "Nested".into(), variants: None, fields: vec![Repr::Ref(0); 65535], field_names: vec![], size: 65535 * 8, align: 8 };
         assert_eq!(checked_value_enum_max_ptrs(&[variant(vec![Repr::Value(0), Repr::Ref(0)])], &[value]), None);
     }
 }

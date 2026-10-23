@@ -51,15 +51,19 @@ pub(crate) fn dead_after(function: &CoreFn, tracked: &Live) -> HashMap<usize, Li
 /// safepointing operation other than a direct call count as live across it
 /// (an allocation stores them after collecting); a callee roots its own
 /// arguments.
-pub(crate) fn safepoint_crossing(function: &CoreFn, traced: impl Fn(&Repr) -> bool, nonrelocating: &[bool], diverging: &[bool], loops: &crate::codegen_loops::BoundedLoops, foreign: &[bool]) -> Live {
+///
+/// Also, for each node that may reach a safepoint (by address), the traced
+/// locals live across it there: only those need to be in the frame then.
+pub(crate) fn safepoint_crossing(function: &CoreFn, traced: impl Fn(&Repr) -> bool, nonrelocating: &[bool], diverging: &[bool], loops: &crate::codegen_loops::BoundedLoops, foreign: &[bool]) -> (Live, HashMap<usize, Live>) {
     let mut dead = HashMap::new();
     let mut analysis = Analysis {
         dead: &mut dead, diverging, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, definitions: Live::new(),
         all: function.locals.iter().enumerate().filter_map(|(id, repr)| traced(repr).then_some(id as LocalId)).collect(),
-        crossing: Some(Crossing { nonrelocating, loops, foreign, in_foreign: 0, set: Live::new() }),
+        crossing: Some(Crossing { nonrelocating, loops, foreign, in_foreign: 0, set: Live::new(), sites: HashMap::new() }),
     };
     analysis.block(&function.body, Live::new());
-    analysis.crossing.unwrap().set
+    let crossing = analysis.crossing.unwrap();
+    (crossing.set, crossing.sites)
 }
 
 struct Crossing<'a> {
@@ -71,6 +75,8 @@ struct Crossing<'a> {
     /// Nesting of foreign calls' argument evaluation here.
     in_foreign: u32,
     set: Live,
+    /// Each safepointing node's locals live across it (a loop's at its poll).
+    sites: HashMap<usize, Live>,
 }
 struct Analysis<'a> {
     dead: &'a mut HashMap<usize, Live>,
@@ -118,6 +124,15 @@ impl Analysis<'_> {
         match expression.kind.as_ref() {
             Panic(_) => live = Live::new(),
             Call(callee, _) if self.diverging.get(*callee as usize).copied().unwrap_or(false) => live = Live::new(),
+            // A mutable buffer argument of a foreign call is copied back into
+            // its source after the call: the source is live until then.
+            Call(callee, args) if self.crossing.as_ref().is_some_and(|c| c.foreign[*callee as usize]) => {
+                for a in args {
+                    crate::inline::visit_expr(a, &mut |e| if let AsCBytes { src, copy_out: true, .. } = e.kind.as_ref() {
+                        if let Local(l) = src.kind.as_ref() { if self.all.contains(l) { live.insert(*l); } }
+                    });
+                }
+            }
             _ => {}
         }
         if let Some(crossing) = &mut self.crossing {
@@ -131,17 +146,22 @@ impl Analysis<'_> {
                     _ => None,
                 };
                 if let Some(successor) = successor {
+                    // The exit's own site: what is live where it goes.
+                    let site = crossing.sites.entry(expression as *const CoreExpr as usize).or_default();
+                    site.extend(successor.iter().copied());
                     crossing.set.extend(successor);
                     for operand in crate::copyprop::children(expression) {
-                        if let Local(l) = operand.kind.as_ref() { if self.all.contains(l) { crossing.set.insert(*l); } }
+                        if let Local(l) = operand.kind.as_ref() { if self.all.contains(l) { crossing.set.insert(*l); site.insert(*l); } }
                     }
                 }
             }
             if crate::codegen_effects::node_may_safepoint(expression, crossing.nonrelocating) {
                 crossing.set.extend(live.iter().copied());
+                let site = crossing.sites.entry(expression as *const CoreExpr as usize).or_default();
+                site.extend(live.iter().copied());
                 if !matches!(expression.kind.as_ref(), Call(..)) {
                     for operand in crate::copyprop::children(expression) {
-                        if let Local(l) = operand.kind.as_ref() { if self.all.contains(l) { crossing.set.insert(*l); } }
+                        if let Local(l) = operand.kind.as_ref() { if self.all.contains(l) { crossing.set.insert(*l); site.insert(*l); } }
                     }
                 }
             }
@@ -220,7 +240,10 @@ impl Analysis<'_> {
                     if next == header {
                         // The header polls unless the loop is proven short.
                         if let Some(crossing) = &mut self.crossing {
-                            if !crossing.loops.contains(block) { crossing.set.extend(header.iter().copied()); }
+                            if !crossing.loops.contains(block) {
+                                crossing.set.extend(header.iter().copied());
+                                crossing.sites.entry(expression as *const CoreExpr as usize).or_default().extend(header.iter().copied());
+                            }
                         }
                         self.loop_defs.pop();
                         return header;

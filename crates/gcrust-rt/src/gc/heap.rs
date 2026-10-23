@@ -279,6 +279,9 @@ pub struct Heap {
     /// no other thread can race on an object, so generated code may access
     /// inline aggregates without a tear-free snapshot.
     multi_mutator: AtomicU8,
+    /// Compiled code's access mode, both flags in one byte: bit 0 while
+    /// copying (`gc_phase`), bit 1 once a second mutator registered.
+    access_mode: AtomicU8,
     /// Bytes the last minor collection promoted (`usize::MAX` before the
     /// first): the next one's expected evacuation work.
     pub(crate) last_minor_promoted: AtomicUsize,
@@ -397,6 +400,7 @@ impl Heap {
             gc_events: Mutex::new(GcTelemetry::new()),
             gc_phase: AtomicU8::new(GcPhase::Idle as u8),
             multi_mutator: AtomicU8::new(0),
+            access_mode: AtomicU8::new(0),
             last_minor_promoted: AtomicUsize::new(usize::MAX),
             satb_queue: SATBQueue::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
             tracer: None,
@@ -470,6 +474,7 @@ impl Heap {
             gc_events: Mutex::new(GcTelemetry::new()),
             gc_phase: AtomicU8::new(GcPhase::Idle as u8),
             multi_mutator: AtomicU8::new(0),
+            access_mode: AtomicU8::new(0),
             last_minor_promoted: AtomicUsize::new(usize::MAX),
             satb_queue: SATBQueue::with_allocator(crate::runtime::metadata_allocator::MetadataAllocator::new(&native_memory.registry)),
             tracer: None,
@@ -1158,7 +1163,10 @@ impl Heap {
         {
             let mut threads = self.threads.lock().unwrap();
             threads.push(ts.clone());
-            if threads.len() > 1 { self.multi_mutator.store(1, Ordering::SeqCst); }
+            if threads.len() > 1 {
+                self.multi_mutator.store(1, Ordering::SeqCst);
+                self.access_mode.fetch_or(2, Ordering::SeqCst);
+            }
         }
         // Keep gc_lock until every current registration is RUNNING again:
         // a collector must not start between restoring the old and new states.
@@ -2351,7 +2359,7 @@ impl Heap {
                     let bits = *slot;
                     if let Some(ptr) = P::try_decode_ptr(bits) {
                         assert!(
-                            self.from_space().contains(ptr),
+                            self.from_space().contains(ptr) || !self.contains_either(ptr),
                             "POST-SWAP: root slot {:p} points to {:p} which is NOT in from-space \
                              [{:p}..+{}). In to-space: {}. collections={}",
                             slot,
@@ -2373,10 +2381,21 @@ impl Heap {
 
     // ─── GC Phase ─────────────────────────────────────────────
 
-    /// Stable phase flag for generated access fast paths. Valid only while
-    /// this heap stays at its registered address and the mutator owns it.
+    /// Stable access-mode byte for generated access fast paths (bit 0:
+    /// copying, bit 1: more than one mutator). Valid only while this heap
+    /// stays at its registered address and the mutator owns it.
     pub(crate) fn copying_phase_ptr(&self) -> *const AtomicU8 {
-        &self.gc_phase
+        &self.access_mode
+    }
+
+    /// Enter `phase`, for the collector and compiled access paths alike.
+    pub(crate) fn set_gc_phase(&self, phase: GcPhase) {
+        self.gc_phase.store(phase as u8, Ordering::Release);
+        if matches!(phase, GcPhase::Copying) {
+            self.access_mode.fetch_or(1, Ordering::Release);
+        } else {
+            self.access_mode.fetch_and(!1, Ordering::Release);
+        }
     }
 
     /// Stable flag for generated aggregate fast paths: nonzero once more
@@ -2523,8 +2542,7 @@ impl Heap {
 
         self.trace_gc(TraceState::GcWaitingForSafepoints);
         self.satb_queue.begin_cycle::<P>(self.from_space().base(), self.from_space().size());
-        self.gc_phase
-            .store(GcPhase::Copying as u8, Ordering::Release);
+        self.set_gc_phase(GcPhase::Copying);
 
         // Snapshot thread refs and set gc_requested atomically under threads lock.
         let thread_snapshot: ThreadSnapshot<'_> = {
@@ -2723,7 +2741,7 @@ impl Heap {
                     let bits = *slot;
                     if let Some(ptr) = P::try_decode_ptr(bits) {
                         assert!(
-                            self.from_space().contains(ptr),
+                            self.from_space().contains(ptr) || !self.contains_either(ptr),
                             "CONCURRENT POST-SWAP: root slot {:p} -> {:p} NOT in from [{:p}..+{}). \
                              In to: {}. collections={}",
                             slot,
@@ -2741,7 +2759,7 @@ impl Heap {
         // Disable write barriers and resume threads
         self.trace_gc(TraceState::GcResuming);
         self.satb_queue.finish_cycle();
-        self.gc_phase.store(GcPhase::Idle as u8, Ordering::Release);
+        self.set_gc_phase(GcPhase::Idle);
         self.resume_world(&thread_snapshot, None);
         self.record_gc_timings(
             GcKind::Concurrent, first_pause + second_pause_started.elapsed(),

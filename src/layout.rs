@@ -561,7 +561,7 @@ impl<'a> LayoutRegistry<'a> {
             let (size, align) = value_size_align(&fields, &self.values)?;
             let field_names = struct_field_names(s);
             let id = self.values.len() as ValueId;
-            self.values.push(ValueLayout { name: key.clone(), variants: None, fields, field_names, size, align });
+            self.values.push(ValueLayout { niche: None, name: key.clone(), variants: None, fields, field_names, size, align });
             self.nominal_value_ids.insert(nominal, id);
             Ok(id)
         })();
@@ -582,6 +582,16 @@ impl<'a> LayoutRegistry<'a> {
                 let ptys = variant_payload_tys(v, &e.generics, args, self.ctx)?;
                 let fields: Vec<Repr> = ptys.iter().map(|t| self.repr(t)).collect::<R<_>>()?;
                 variants.push(ValueVariant { name: v.name.clone(), fields, field_names: variant_field_names(v) });
+            }
+            // `Option<E>`, `Result<E, R>` of a value enum `E`: `E` itself, the
+            // other variants in tag values `E` leaves free (see `Niche`).
+            if let Some(niche) = niche_of(&variants, &self.values) {
+                let inner = &self.values[niche.inner as usize];
+                let (size, align) = (inner.size, inner.align);
+                let id = self.values.len() as ValueId;
+                self.values.push(ValueLayout { niche: Some(niche), name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
+                self.nominal_value_ids.insert(nominal, id);
+                return Ok(id);
             }
             // Pointers-first layout (mirrors reference enums): `max_ptrs` leading GC
             // slots shared across variants, then the u32 tag, then the raw region
@@ -618,7 +628,7 @@ impl<'a> LayoutRegistry<'a> {
             }
             let size = checked_align_up(max_ptrs.checked_mul(8).and_then(|n| n.checked_add(8)).and_then(|n| n.checked_add(max_raw)).ok_or_else(layout_limit_error)?, align)?;
             let id = self.values.len() as ValueId;
-            self.values.push(ValueLayout { name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
+            self.values.push(ValueLayout { niche: None, name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
             self.nominal_value_ids.insert(nominal, id);
             Ok(id)
         })();
@@ -634,7 +644,7 @@ impl<'a> LayoutRegistry<'a> {
         let (size, align) = value_size_align(reprs, &self.values)?;
         let field_names: Vec<String> = (0..reprs.len()).map(|i| i.to_string()).collect();
         let id = self.values.len() as ValueId;
-        self.values.push(ValueLayout { name: key.clone(), variants: None, fields: reprs.to_vec(), field_names, size, align });
+        self.values.push(ValueLayout { niche: None, name: key.clone(), variants: None, fields: reprs.to_vec(), field_names, size, align });
         self.value_ids.insert(key, id);
         Ok(id)
     }
@@ -1166,7 +1176,7 @@ mod tests {
     #[test]
     fn composed_scalar_offsets_do_not_consume_reference_descriptor_range() {
         let value = |name: &str, fields, size| ValueLayout {
-            name: name.into(), variants: None, fields, field_names: vec![], size, align: 8,
+            name: name.into(), variants: None, fields, field_names: vec![], size, align: 8, niche: None,
         };
         let values = [
             value("Leaf", vec![Repr::Scalar(ScalarRepr::I64)], 8),
@@ -1189,6 +1199,7 @@ mod tests {
             field_names: vec![],
             size: 65536,
             align: 8,
+            niche: None,
         };
         let values = [nested];
         assert!(value_size_align(&[Repr::Scalar(ScalarRepr::I64), Repr::Value(0)], &values).is_ok());
@@ -1244,4 +1255,29 @@ mod tests {
         let r = reg.repr(&Ty::Named { name: "Option".into(), args: vec![Ty::Prim(Prim::I64)] }).unwrap();
         assert!(matches!(r, Repr::Ref(_)));
     }
+}
+
+/// Whether a value enum with `variants` is laid out in a niche: one variant's
+/// payload is exactly a value enum, and each other variant holds nothing or
+/// one reference (kept in that enum's first pointer slot).
+fn niche_of(variants: &[ValueVariant], values: &[ValueLayout]) -> Option<crate::core::Niche> {
+    let empty = |fields: &[Repr]| fields.iter().all(|f| matches!(f, Repr::Unit));
+    let mut data = None;
+    for (i, v) in variants.iter().enumerate() {
+        match v.fields.as_slice() {
+            [Repr::Value(inner)] if values[*inner as usize].variants.is_some() && data.is_none() => data = Some((i as u32, *inner)),
+            [Repr::Ref(_)] => {}
+            fields if empty(fields) => {}
+            _ => return None,
+        }
+    }
+    let (data, inner) = data?;
+    let others = variants.len() as u32 - 1;
+    if others == 0 { return None; }
+    let holds_ref = variants.iter().enumerate().any(|(i, v)| i as u32 != data && matches!(v.fields.as_slice(), [Repr::Ref(_)]));
+    let inner_variants = values[inner as usize].variants.as_ref()?;
+    if holds_ref && crate::core::value_enum_max_ptrs(inner_variants, values) == 0 { return None; }
+    let first = crate::core::tag_values(values, inner);
+    first.checked_add(others)?;
+    Some(crate::core::Niche { data, inner, first })
 }

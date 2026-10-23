@@ -7,11 +7,11 @@ const SOURCE: &str = r#"
 fn main() -> i64 {
     let mut i = 0;
     let mut bytes = 0;
-    while i < 1500 {
+    while i < 4500 {
         bytes = bytes + ("allocation" + "pressure").len();
         i = i + 1;
     }
-    if bytes != 27000 { return 1; }
+    if bytes != 81000 { return 1; }
     0
 }
 "#;
