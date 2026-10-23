@@ -399,6 +399,7 @@ fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProg
     crate::anf::anf_program(&mut prog);
     crate::copyprop::copy_propagate(&mut prog);
     crate::inline::inline_program(&mut prog);
+    crate::caseopt::known_constructors(&mut prog);
     crate::sroa::scalar_replace(&mut prog);
     crate::copyprop::copy_propagate(&mut prog);
     crate::fieldcse::reuse_field_reads(&mut prog);
