@@ -1,0 +1,344 @@
+// PORT: stands in for the `imbl` crate (persistent collections with
+// structural sharing). funct uses two of its types:
+//
+// - `Vector<T>`: a persistent vector. This one is Clojure's PersistentVector
+//   (a 32-way trie plus a tail chunk) where imbl has an RRB tree: O(1) clone,
+//   ~O(log32 n) get/set, amortized O(1) push_back. `insert`/`remove` in the
+//   middle rebuild (imbl's are O(log n)); funct only uses them in the
+//   `insert_at`/`remove_at` natives.
+// - `OrdMap<K, V>`: a persistent sorted map, here a `BTreeMap` shared until
+//   written (copy-on-write).
+//
+// Mutating methods take `mut self` and replace this handle's fields, so a
+// clone never observes writes made through another handle — the same value
+// semantics imbl gets from its reference counts.
+
+const BITS: i64 = 5;
+const WIDTH: i64 = 32;
+const MASK: i64 = 31;
+
+enum Node<T> {
+    Branch(Vec<Node<T>>),
+    Leaf(Vec<T>),
+}
+
+pub struct Vector<T> {
+    len: i64,
+    // bits to shift an index by at the root level
+    shift: i64,
+    root: Node<T>,
+    // the last 1..=32 elements (empty only when the vector is empty)
+    tail: Vec<T>,
+}
+
+fn pushed<T>(v: Vec<T>, x: T) -> Vec<T> {
+    let mut out = Vec::with_capacity(v.len() + 1);
+    out.extend(v);
+    out.push(x);
+    out
+}
+
+fn replaced<T>(v: Vec<T>, i: usize, x: T) -> Vec<T> {
+    let mut out = v.clone();
+    out[i] = x;
+    out
+}
+
+impl<T> Vector<T> {
+    pub fn new() -> Vector<T> {
+        Vector { len: 0, shift: BITS, root: Node::Branch(Vec::new()), tail: Vec::new() }
+    }
+
+    pub fn len(self) -> usize { self.len }
+    pub fn is_empty(self) -> bool { self.len == 0 }
+
+    fn tail_offset(self) -> i64 { self.len - self.tail.len() }
+
+    // The leaf chunk holding index `i` (which must be in the trie, not the tail).
+    fn leaf_for(self, i: i64) -> Vec<T> {
+        let mut node = self.root;
+        let mut level = self.shift;
+        loop {
+            match node {
+                Node::Branch(kids) => {
+                    node = kids[(i >> level) & MASK];
+                    level -= BITS;
+                }
+                Node::Leaf(items) => return items,
+            }
+        }
+    }
+
+    // The chunk holding index `i` and the index of its first element.
+    fn chunk_for(self, i: i64) -> (Vec<T>, i64) {
+        let off = self.tail_offset();
+        if i >= off { (self.tail, off) } else { (self.leaf_for(i), i - (i & MASK)) }
+    }
+
+    pub fn get(self, i: usize) -> Option<T> {
+        if i < 0 || i >= self.len {
+            return None;
+        }
+        let off = self.tail_offset();
+        if i >= off { Some(self.tail[i - off]) } else { Some(self.leaf_for(i)[i & MASK]) }
+    }
+
+    pub fn front(self) -> Option<T> { self.get(0) }
+    pub fn last(self) -> Option<T> { if self.len == 0 { None } else { self.get(self.len - 1) } }
+
+    pub fn push_back(mut self, x: T) {
+        if self.tail.len() < WIDTH {
+            self.tail = pushed(self.tail, x);
+            self.len += 1;
+            return;
+        }
+        // the tail is full: move it into the trie, start a new tail
+        let leaf = Node::Leaf(self.tail);
+        let tail_off = self.tail_offset();
+        if (tail_off >> BITS) >= (1 << self.shift) {
+            // the trie is full at this height: grow a new root
+            let path = new_path(self.shift, leaf);
+            self.root = Node::Branch(vec![self.root, path]);
+            self.shift += BITS;
+        } else {
+            self.root = push_leaf(self.shift, self.root, tail_off, leaf);
+        }
+        self.tail = vec![x];
+        self.len += 1;
+    }
+
+    pub fn set(mut self, i: usize, x: T) {
+        if i < 0 || i >= self.len {
+            panic!("index {} out of bounds (length {})", i, self.len);
+        }
+        let off = self.tail_offset();
+        if i >= off {
+            self.tail = replaced(self.tail, i - off, x);
+        } else {
+            self.root = set_in(self.shift, self.root, i, x);
+        }
+    }
+
+    pub fn pop_back(mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let last = self.tail[self.tail.len() - 1];
+        if self.tail.len() > 1 || self.len == 1 {
+            let mut t = self.tail.clone();
+            t.pop();
+            self.tail = t;
+            self.len -= 1;
+        } else {
+            // the tail empties: rebuild without the last element
+            let mut out = Vector::new();
+            for (k, x) in self.iter().enumerate() {
+                if k + 1 < self.len { out.push_back(x); }
+            }
+            self.assign(out);
+        }
+        Some(last)
+    }
+
+    pub fn insert(mut self, i: usize, x: T) {
+        let mut out = Vector::new();
+        let mut k = 0;
+        for y in self.iter() {
+            if k == i { out.push_back(x); }
+            out.push_back(y);
+            k += 1;
+        }
+        if i == self.len { out.push_back(x); }
+        self.assign(out);
+    }
+
+    pub fn remove(mut self, i: usize) -> T {
+        let removed = self[i];
+        let mut out = Vector::new();
+        let mut k = 0;
+        for y in self.iter() {
+            if k != i { out.push_back(y); }
+            k += 1;
+        }
+        self.assign(out);
+        removed
+    }
+
+    fn assign(mut self, other: Vector<T>) {
+        self.len = other.len;
+        self.shift = other.shift;
+        self.root = other.root;
+        self.tail = other.tail;
+    }
+
+    pub fn extend<I: IntoIterator<Item = T>>(mut self, items: I) {
+        for x in items { self.push_back(x); }
+    }
+
+    pub fn iter(self) -> Iter<T> {
+        Iter { v: self, i: 0, chunk: Vec::new(), base: 0, end: 0 }
+    }
+}
+
+// A path of single-child branches from `level` down to `leaf`.
+fn new_path<T>(level: i64, leaf: Node<T>) -> Node<T> {
+    if level == 0 { leaf } else { Node::Branch(vec![new_path(level - BITS, leaf)]) }
+}
+
+// Copy of `node` with `leaf` added as the leaf for elements starting at `index`.
+fn push_leaf<T>(level: i64, node: Node<T>, index: i64, leaf: Node<T>) -> Node<T> {
+    let kids = match node {
+        Node::Branch(kids) => kids,
+        Node::Leaf(_) => panic!("imbl::Vector: leaf above level 0"),
+    };
+    let slot = (index >> level) & MASK;
+    let child = if level == BITS {
+        leaf
+    } else if slot < kids.len() {
+        push_leaf(level - BITS, kids[slot], index, leaf)
+    } else {
+        new_path(level - BITS, leaf)
+    };
+    if slot < kids.len() { Node::Branch(replaced(kids, slot, child)) } else { Node::Branch(pushed(kids, child)) }
+}
+
+fn set_in<T>(level: i64, node: Node<T>, i: i64, x: T) -> Node<T> {
+    match node {
+        Node::Leaf(items) => Node::Leaf(replaced(items, i & MASK, x)),
+        Node::Branch(kids) => {
+            let slot = (i >> level) & MASK;
+            Node::Branch(replaced(kids, slot, set_in(level - BITS, kids[slot], i, x)))
+        }
+    }
+}
+
+pub struct Iter<T> {
+    v: Vector<T>,
+    i: i64,
+    chunk: Vec<T>,
+    base: i64,
+    end: i64,
+}
+
+impl<T> Iterator for Iter<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
+        if self.i >= self.v.len {
+            return None;
+        }
+        if self.i >= self.end {
+            let (chunk, base) = self.v.chunk_for(self.i);
+            self.chunk = chunk;
+            self.base = base;
+            self.end = base + chunk.len();
+        }
+        let x = self.chunk[self.i - self.base];
+        self.i += 1;
+        Some(x)
+    }
+}
+
+impl<T> Clone for Vector<T> {
+    fn clone(self) -> Vector<T> {
+        Vector { len: self.len, shift: self.shift, root: self.root, tail: self.tail }
+    }
+}
+
+impl<T> Default for Vector<T> {
+    fn default() -> Vector<T> { Vector::new() }
+}
+
+impl<T> Index<i64> for Vector<T> {
+    type Output = T;
+    fn index(self, i: i64) -> T {
+        match self.get(i) {
+            Some(x) => x,
+            None => panic!("index {} out of bounds (length {})", i, self.len),
+        }
+    }
+}
+
+impl<T> IndexSet<T> for Vector<T> {
+    fn index_set(mut self, i: i64, x: T) { self.set(i, x); }
+}
+
+impl<T: Eq> Eq for Vector<T> {
+    fn eq(self, other: Vector<T>) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        let mut b = other.iter();
+        for x in self.iter() {
+            if !(x == b.next().unwrap()) { return false; }
+        }
+        true
+    }
+}
+
+impl<T> FromIterator<T> for Vector<T> {
+    fn from_iter<I: Iterator<Item = T>>(iter: I) -> Vector<T> {
+        let mut v = Vector::new();
+        for x in iter { v.push_back(x); }
+        v
+    }
+}
+
+impl<T> IntoIterator for Vector<T> {
+    type Item = T;
+    type IntoIter = Iter<T>;
+    fn into_iter(self) -> Iter<T> { self.iter() }
+}
+
+pub struct OrdMap<K, V> {
+    map: BTreeMap<K, V>,
+}
+
+impl<K: Ord, V> OrdMap<K, V> {
+    pub fn new() -> OrdMap<K, V> { OrdMap { map: BTreeMap::new() } }
+    pub fn len(self) -> usize { self.map.len() }
+    pub fn is_empty(self) -> bool { self.map.is_empty() }
+    pub fn get(self, k: K) -> Option<V> { self.map.get(k) }
+    pub fn contains_key(self, k: K) -> bool { self.map.contains_key(k) }
+    pub fn insert(mut self, k: K, v: V) -> Option<V> {
+        let mut m = self.map.clone();
+        let old = m.insert(k, v);
+        self.map = m;
+        old
+    }
+    pub fn remove(mut self, k: K) -> Option<V> {
+        if !self.map.contains_key(k) {
+            return None;
+        }
+        let mut m = self.map.clone();
+        let old = m.remove(k);
+        self.map = m;
+        old
+    }
+    pub fn keys(self) -> VecIter<K> { self.map.keys() }
+    pub fn values(self) -> VecIter<V> { self.map.values() }
+    pub fn iter(self) -> VecIter<(K, V)> { self.map.iter() }
+}
+
+impl<K, V> Clone for OrdMap<K, V> {
+    fn clone(self) -> OrdMap<K, V> { OrdMap { map: self.map } }
+}
+
+impl<K: Ord, V> Default for OrdMap<K, V> {
+    fn default() -> OrdMap<K, V> { OrdMap::new() }
+}
+
+impl<K: Ord + Eq, V: Eq> Eq for OrdMap<K, V> {
+    fn eq(self, other: OrdMap<K, V>) -> bool { self.map == other.map }
+}
+
+impl<K: Ord, V> FromIterator<(K, V)> for OrdMap<K, V> {
+    fn from_iter<I: Iterator<Item = (K, V)>>(iter: I) -> OrdMap<K, V> {
+        OrdMap { map: BTreeMap::from_iter(iter) }
+    }
+}
+
+impl<K: Ord, V> IntoIterator for OrdMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = VecIter<(K, V)>;
+    fn into_iter(self) -> VecIter<(K, V)> { self.iter() }
+}

@@ -3089,6 +3089,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.ctx.void_type().fn_type(&[ptr.into()], false),
             Some(inkwell::module::Linkage::External),
         );
+        // void ai_thread_mark_daemon(ptr thread, ptr handle) — `std::thread::spawn`.
+        self.module.add_function(
+            "ai_thread_mark_daemon",
+            self.ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
+        // i64 ai_monotonic_nanos(ptr thread) — `Instant::now()`.
+        self.module.add_function(
+            "ai_monotonic_nanos",
+            i64t.fn_type(&[ptr.into()], false),
+            Some(inkwell::module::Linkage::External),
+        );
         // In-language field reflection (all thread-first; RuntimeCall-dispatched).
         // i64 ai_reflect_field_count(ptr thread, ptr obj)
         self.module.add_function(
@@ -5088,6 +5100,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Abs => "llvm.fabs",
             Floor => "llvm.floor",
             Ceil => "llvm.ceil",
+            Round => "llvm.round",
+            Trunc => "llvm.trunc",
+            Sin => "llvm.sin",
+            Cos => "llvm.cos",
+            Tan => "llvm.tan",
+            Exp => "llvm.exp",
+            Ln => "llvm.log",
+            Log10 => "llvm.log10",
+            Log2 => "llvm.log2",
         };
         let full = format!("{}.{}", intr_name, suffix);
         let f = self.module.get_function(&full).unwrap_or_else(|| {
@@ -6059,6 +6080,8 @@ fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::
         ("ai_type_name", runtime::ai_type_name as *const () as usize),
         ("ai_heap_snapshot", runtime::ai_heap_snapshot as *const () as usize),
         ("ai_reflect_field_count", runtime::ai_reflect_field_count as *const () as usize),
+        ("ai_monotonic_nanos", runtime::ai_monotonic_nanos as *const () as usize),
+        ("ai_thread_mark_daemon", runtime::ai_thread_mark_daemon as *const () as usize),
         ("ai_reflect_field_kind", runtime::ai_reflect_field_kind as *const () as usize),
         ("ai_reflect_field_i64", runtime::ai_reflect_field_i64 as *const () as usize),
         ("ai_reflect_field_name", runtime::ai_reflect_field_name as *const () as usize),
@@ -6178,6 +6201,15 @@ pub unsafe fn jit_run_i64_mode(prog: &CoreProgram, mode: GcRunMode) -> Result<i6
     unsafe { jit_run_i64_with_args(prog, mode, std::env::args_os().collect()) }
 }
 
+static EXIT_WITH_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// JIT runs are the whole process (the `gcr run` driver): when `main`
+/// returns while daemon threads (`std::thread::spawn`) still run, the
+/// process ends with `main`'s result rather than waiting for them.
+pub fn set_exit_with_main(on: bool) {
+    EXIT_WITH_MAIN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Execute with independent argv; children inherit this execution's arguments.
 ///
 /// # Safety
@@ -6249,6 +6281,11 @@ pub unsafe fn jit_run_i64_with_args(
     // Publish the current thread so FFI callback trampolines can recover it.
     let result = rt.enter(|thread| unsafe { f(thread) });
     unsafe {
+        // A program run as a process (`gcr run`) ends with its `main`, as in
+        // Rust, even while daemon threads run; an embedding waits for them.
+        if EXIT_WITH_MAIN.load(std::sync::atomic::Ordering::Relaxed) {
+            rt.exit_if_daemons_remain(result as i32);
+        }
         rt.finish_threads();
     }
     // Opt-in heap dump once the program returns (heap quiescent).

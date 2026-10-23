@@ -108,6 +108,8 @@ pub struct TyCtx {
     /// resolve to the specific item a `use` brought into scope (disambiguating
     /// same-named items across modules).
     pub use_aliases: HashMap<String, String>,
+    /// Each module's `use`s: module → short name → the items it names.
+    pub(crate) scoped_use_aliases: HashMap<String, HashMap<String, Vec<String>>>,
     pub(crate) aliases: HashMap<String, Rc<crate::type_alias::ResolvedAlias>>,
 }
 
@@ -173,7 +175,7 @@ pub(crate) fn receiver_base(ty: &Ty) -> Option<String> {
 }
 
 pub(crate) fn impl_receiver_base(imp: &crate::ast::ImplBlock, g: &crate::resolve::GlobalTable) -> TResult<String> {
-    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
+    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "", defining: "" };
     let params = imp.generics.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
     let ty = lower_type_with(&imp.self_ty, &params, &env)?;
     // A blanket impl (`impl<T: Display> Shout for T`) applies to every type
@@ -328,7 +330,7 @@ impl TyCtx {
                 let mut v = v.clone();
                 match &v.body {
                     StructBody::Tuple(tys) => {
-                        v.body = StructBody::Named(tys.iter().enumerate().map(|(i, t)| FieldDef { vis: true, name: i.to_string(), ty: t.clone(), span: t.span }).collect());
+                        v.body = StructBody::Named(tys.iter().enumerate().map(|(i, t)| FieldDef { vis: true, name: i.to_string(), ty: t.clone(), span: t.span, serde: vec![] }).collect());
                     }
                     StructBody::Unit => v.body = StructBody::Named(vec![]),
                     StructBody::Named(_) => {}
@@ -352,6 +354,7 @@ impl TyCtx {
             trait_candidates,
             ambiguous_methods,
             use_aliases: g.use_aliases.clone(),
+            scoped_use_aliases: g.scoped_use_aliases.clone(),
             aliases: g.resolved_aliases.clone(),
         }
     }
@@ -376,6 +379,20 @@ impl TyCtx {
     /// Resolve a variant through its enum's canonical path. A relative enum
     /// name may expand to its module, but an unknown qualifier is never dropped.
     pub fn variant_by_path(&self, path: &Path) -> Option<(String, u32)> {
+        // A bare variant a `use` of the current module (or an enclosing one)
+        // brings in (`use Value::*;`) is that variant.
+        if path.is_single() {
+            let module = crate::lower::current_module();
+            let mut scope = module.as_str();
+            loop {
+                if let Some(targets) = self.scoped_use_aliases.get(scope).and_then(|m| m.get(path.last())) {
+                    let found: Vec<_> = targets.iter().filter_map(|t| self.variants.get(t)).collect();
+                    if found.len() == 1 { return Some(found[0].clone()); }
+                }
+                if scope.is_empty() { break; }
+                scope = scope.rsplit_once("::").map_or("", |(parent, _)| parent);
+            }
+        }
         let written = path.segments.join("::");
         if let Some(found) = self.variants.get(&written) { return Some(found.clone()); }
         if path.segments.len() < 2 { return None; }
@@ -753,7 +770,7 @@ pub(crate) fn intrinsic_type_arity(name: &str) -> Option<usize> {
     if name == "Array" { Some(1) } else { prim_of(name).map(|_| 0) }
 }
 
-fn prim_of(name: &str) -> Option<Prim> {
+pub(crate) fn prim_of(name: &str) -> Option<Prim> {
     Some(match name {
         "i8" => Prim::I8, "i16" => Prim::I16, "i32" => Prim::I32, "i64" => Prim::I64,
         // Rust's pointer-sized integers: indices and lengths are `i64`.

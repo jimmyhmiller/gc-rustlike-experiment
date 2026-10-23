@@ -68,6 +68,7 @@ impl TypeEnvironment for DeclarationContext<'_> {
             globals: self.globals,
             resolved: &self.globals.resolved_aliases,
             module: "",
+            defining: "",
         }
         .canonical_name(name)
     }
@@ -436,7 +437,16 @@ impl<C: ProofContext> Solver<'_, C> {
             return Ok(alternatives);
         }
         // Every type is `Copy` and `Send` here (see the prelude).
-        if matches!(name, "Copy" | "Send") && args.is_empty() {
+        if matches!(name, "Copy" | "Send" | "Sized" | "Unpin") && args.is_empty() {
+            alternatives.push(vec![]);
+            return Ok(alternatives);
+        }
+        // Closures, and types with no `Clone` impl, are cloned by sharing them:
+        // in Rust such a clone is an `Rc`/`Arc` one (`Arc<dyn Fn>`,
+        // `Arc<Mutex<T>>`), and those are the value itself here.
+        if name == "Clone" && args.is_empty()
+            && (matches!(ty, Ty::Fn { .. } | Ty::Tuple(_) | Ty::Array(..)) || (alternatives.is_empty() && matches!(ty, Ty::Named { .. })))
+        {
             alternatives.push(vec![]);
             return Ok(alternatives);
         }

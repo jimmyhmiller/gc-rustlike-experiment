@@ -106,6 +106,7 @@ fn collector_registry_compaction_reference_all_owner_sweeps_leave_backing_untouc
         completions.register(
             Arc::new(JoinHandle {
                 completion_notice: false,
+                daemon: std::sync::atomic::AtomicBool::new(false),
                 native_joined: std::sync::atomic::AtomicBool::new(false),
                 pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 reaper_registration: std::sync::OnceLock::new(),

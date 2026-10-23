@@ -1027,6 +1027,7 @@ mod tests {
         for index in 0..288 {
             let record = Arc::new(super::super::JoinHandle {
                 completion_notice: false,
+                daemon: std::sync::atomic::AtomicBool::new(false),
                 native_joined: std::sync::atomic::AtomicBool::new(false),
                 pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 reaper_registration: std::sync::OnceLock::new(),
@@ -1066,6 +1067,7 @@ mod tests {
             let record = super::super::blocking_region(thread, || {
                 let record = Arc::new(super::super::JoinHandle {
                     completion_notice: false,
+                    daemon: std::sync::atomic::AtomicBool::new(false),
                     native_joined: std::sync::atomic::AtomicBool::new(false),
                     pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                     reaper_registration: std::sync::OnceLock::new(),

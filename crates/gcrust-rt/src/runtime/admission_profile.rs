@@ -6,6 +6,7 @@ use std::time::Instant;
 fn completed(value: u64, retirement: &native_retirement::Retirement) -> Arc<JoinHandle> {
     let record = Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(true),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),

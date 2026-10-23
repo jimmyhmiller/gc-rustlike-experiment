@@ -139,6 +139,16 @@ fn main() -> ExitCode {
         }
     };
     let path = &path;
+    // Like Cargo, a project build sees its directory as `CARGO_MANIFEST_DIR`
+    // (for `env!`).
+    if let Some(m) = manifest.as_ref().filter(|_| std::env::var_os("CARGO_MANIFEST_DIR").is_none()) {
+        // SAFETY: the driver is single-threaded at this point.
+        unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &m.dir); }
+    }
+
+    if cmd == "test" {
+        return run_tests(path, manifest.as_ref(), driver_args, &args[args.iter().position(|a| a == "--").map_or(args.len(), |i| i + 1)..]);
+    }
 
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -296,6 +306,7 @@ fn main() -> ExitCode {
                     program_args.extend(raw_args[separator + 1..].iter().cloned());
                 }
                 let mode = if stress { gcrust::codegen::GcRunMode::Stress } else { gcrust::codegen::GcRunMode::Generational };
+                gcrust::codegen::set_exit_with_main(true);
                 let result = unsafe { gcrust::codegen::jit_run_i64_with_args(&prog, mode, program_args) };
                 match result {
                     Ok(v) => {
@@ -377,6 +388,106 @@ fn main() -> ExitCode {
             eprintln!("gcr: unknown command `{}`", other);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `gcr test [project] [-- filter]`: build the program with its `#[test]`
+/// functions (and `tests/*.gcr`) into one runner, then run each test in its
+/// own process, so a panic fails only that test. Prints Cargo's report.
+fn run_tests(path: &str, manifest: Option<&gcrust::manifest::Manifest>, driver_args: &[String], filters: &[String]) -> ExitCode {
+    gcrust::parser::set_test_mode(true);
+    // Integration tests name the library by its package name (`funct::..`).
+    gcrust::parser::set_crate_name(manifest.map(|m| m.name.replace('-', "_")));
+    let tests_dir = manifest.map(|m| m.dir.join("tests")).filter(|d| d.is_dir());
+    let src = std::fs::read_to_string(path).unwrap_or_default();
+    let (module, sources, tests) = match gcrust::compile::parse_tests_with_prelude(std::path::Path::new(path), tests_dir.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
+            return ExitCode::FAILURE;
+        }
+    };
+    let resolved = match resolve_module(module) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut prog = match lower_program(&resolved.globals) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
+            return ExitCode::FAILURE;
+        }
+    };
+    prog.sources = sources;
+    let mut link_args = parse_link_args(driver_args);
+    if let Some(m) = manifest { link_args.extend(m.link_args()); }
+    // `GCR_TEST_BIN=path` keeps the runner there (to debug a test with
+    // `path <index>`).
+    let keep = std::env::var_os("GCR_TEST_BIN").map(std::path::PathBuf::from);
+    let bin = keep.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("gcr-test-{}", std::process::id())));
+    if let Err(e) = build_executable_level(&prog, &bin, &link_args, gcrust::codegen::DebugLevel::LineTables) {
+        eprintln!("gcr: build error: {}", e.0);
+        return ExitCode::FAILURE;
+    }
+    let selected: Vec<(usize, &gcrust::compile::TestFn)> = tests.iter().enumerate()
+        .filter(|(_, t)| filters.is_empty() || filters.iter().any(|f| t.path.contains(f.as_str())))
+        .collect();
+    println!("\nrunning {} test{}", selected.len(), if selected.len() == 1 { "" } else { "s" });
+    let mut failures = Vec::new();
+    // A test that runs past `GCR_TEST_TIMEOUT` seconds (default 120) fails.
+    let limit = std::env::var("GCR_TEST_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(120);
+    for (index, test) in &selected {
+        let (ok, text) = run_one_test(&bin, *index, std::time::Duration::from_secs(limit));
+        println!("test {} ... {}", test.path, if ok { "ok" } else { "FAILED" });
+        if !ok && keep.is_some() { println!("  (run alone: {} {index})", bin.display()); }
+        if !ok { failures.push((test.path.clone(), text)); }
+    }
+    if keep.is_none() { let _ = std::fs::remove_file(&bin); }
+    if !failures.is_empty() {
+        println!("\nfailures:");
+        for (name, text) in &failures {
+            println!("\n---- {name} ----\n{}", text.trim_end());
+        }
+    }
+    let passed = selected.len() - failures.len();
+    println!("\ntest result: {}. {} passed; {} failed\n", if failures.is_empty() { "ok" } else { "FAILED" }, passed, failures.len());
+    if failures.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Run test `index` of the runner `bin`: whether it passed, and its output.
+fn run_one_test(bin: &std::path::Path, index: usize, limit: std::time::Duration) -> (bool, String) {
+    use std::io::Read;
+    let child = std::process::Command::new(bin).arg(index.to_string())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn();
+    let mut child = match child { Ok(c) => c, Err(e) => return (false, e.to_string()) };
+    // Drain the pipes on threads so a chatty test cannot block on a full pipe.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || { let mut s = String::new(); let _ = stdout.read_to_string(&mut s); s });
+    let err = std::thread::spawn(move || { let mut s = String::new(); let _ = stderr.read_to_string(&mut s); s });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if start.elapsed() > limit => { let _ = child.kill(); let _ = child.wait(); break None; }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break None,
+        }
+    };
+    let text = format!("{}{}", out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    match status {
+        Some(s) if s.success() => (true, text),
+        Some(s) => {
+            #[cfg(unix)]
+            if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&s) {
+                return (false, format!("{text}test killed by signal {signal}"));
+            }
+            (false, format!("{text}test exited with {s}"))
+        }
+        None => (false, format!("{text}test timed out after {}s", limit.as_secs())),
     }
 }
 

@@ -65,6 +65,8 @@ pub struct FnDef {
 pub struct FnHints {
     pub inline: InlineHint,
     pub cold: bool,
+    /// `#[test]` (kept only by `gcr test`).
+    pub test: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
@@ -110,6 +112,9 @@ pub struct FieldDef {
     pub name: String,
     pub ty: Type,
     pub span: Span,
+    /// `#[serde(..)]` options for the serde derives (`default`,
+    /// `rename = "x"` as `rename=x`, `skip`).
+    pub serde: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -223,7 +228,16 @@ pub struct ModDef {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct UsePath {
     pub segments: Vec<String>,
+    /// `use a::b as c;`: the name it is known by here (else the last segment).
+    pub alias: Option<String>,
     pub span: Span,
+}
+
+impl UsePath {
+    /// The name this `use` brings into scope.
+    pub fn local_name(&self) -> Option<&String> {
+        self.alias.as_ref().or(self.segments.last())
+    }
 }
 
 // ============================================================================

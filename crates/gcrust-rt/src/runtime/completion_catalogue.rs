@@ -180,6 +180,7 @@ mod tests {
     fn record(i: usize) -> Arc<JoinHandle> {
         Arc::new(JoinHandle {
             completion_notice: false,
+            daemon: std::sync::atomic::AtomicBool::new(false),
             native_joined: std::sync::atomic::AtomicBool::new(false),
             pending_index: AtomicUsize::new(usize::MAX),
             reaper_registration: OnceLock::new(),

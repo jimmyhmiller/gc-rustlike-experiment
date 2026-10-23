@@ -29,6 +29,9 @@ pub(crate) struct AliasView<'a> {
     pub globals: &'a GlobalTable,
     pub resolved: &'a HashMap<String, Rc<ResolvedAlias>>,
     pub module: &'a str,
+    /// The alias whose target this view resolves: it cannot name itself, so
+    /// `type Result<T> = std::result::Result<T, E>` means the outer `Result`.
+    pub defining: &'a str,
 }
 impl AliasView<'_> {
     pub(crate) fn canonical_name(&self, name: &str) -> Option<String> {
@@ -72,7 +75,7 @@ impl AliasView<'_> {
             } else {
                 format!("{scope}::{name}")
             };
-            if is_declaration(&candidate) {
+            if is_declaration(&candidate) && candidate != self.defining {
                 return validate(candidate);
             }
             let mut parts = name.split("::");
@@ -84,21 +87,35 @@ impl AliasView<'_> {
                 .and_then(|imports| imports.get(head))
             {
                 let tail = parts.collect::<Vec<_>>().join("::");
-                if targets.len() != 1 {
-                    return Err(LookupFailure::Ambiguous(targets.iter().map(|target|
-                        if tail.is_empty() { target.clone() } else { format!("{target}::{tail}") }).collect()));
+                let full = |target: &String| if tail.is_empty() { target.clone() } else { format!("{target}::{tail}") };
+                // An import that names no type here (an enum variant from a
+                // `use Enum::*`) leaves the name to outer scopes.
+                let types: Vec<String> = targets.iter().map(full).filter(|t| is_declaration(t)).collect();
+                if types.len() > 1 {
+                    return Err(LookupFailure::Ambiguous(types));
                 }
-                let imported = if tail.is_empty() {
-                    targets[0].clone()
-                } else {
-                    format!("{}::{tail}", targets[0])
-                };
-                return validate(imported);
+                if let Some(imported) = types.into_iter().next() {
+                    return validate(imported);
+                }
+                if targets.len() == 1 && !tail.is_empty() {
+                    return validate(full(&targets[0]));
+                }
+                // This module's own import of a non-type (a variant) is what
+                // the name means here; an enclosing module's is not.
+                if scope == self.module {
+                    return Err(LookupFailure::Unknown);
+                }
             }
             if scope.is_empty() {
                 break;
             }
             scope = scope.rsplit_once("::").map_or("", |(parent, _)| parent);
+        }
+        // An alias that names only itself is a cycle, reported as such.
+        if !self.defining.is_empty() && self.defining.rsplit("::").next() == Some(name) && is_declaration(self.defining) {
+            let others = self.globals.structs.keys().chain(self.globals.enums.keys()).chain(self.globals.aliases.keys()).chain(self.globals.traits.keys())
+                .any(|key| key.rsplit("::").next() == Some(name) && key != self.defining);
+            if !others { return validate(self.defining.to_string()); }
         }
         if name.contains("::") {
             return Err(LookupFailure::Unknown);
@@ -110,7 +127,7 @@ impl AliasView<'_> {
             .chain(self.globals.enums.keys())
             .chain(self.globals.aliases.keys())
             .chain(self.globals.traits.keys())
-            .filter(|key| key.rsplit("::").next() == Some(name))
+            .filter(|key| key.rsplit("::").next() == Some(name) && key.as_str() != self.defining)
             .collect::<BTreeSet<_>>()
             .into_iter();
         let first = matches.next().ok_or(LookupFailure::Unknown)?;
@@ -282,6 +299,7 @@ pub(crate) fn resolve_aliases(
                 globals: g,
                 resolved: &resolved,
                 module,
+                defining: &name,
             },
         )?;
         for dependency in &found {
@@ -312,6 +330,7 @@ pub(crate) fn resolve_aliases(
                 globals: g,
                 resolved: &resolved,
                 module,
+                defining: &name,
             },
         )?;
         validate_target(&target, &params, g, alias.ty.span)?;

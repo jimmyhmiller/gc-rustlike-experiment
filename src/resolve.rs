@@ -118,12 +118,64 @@ impl GlobalTable {
     /// `use a::b::c;` maps `c` → `a::b::c`; a `use a::b::*;` maps every item
     /// directly in module `a::b` by its last segment.
     fn apply_uses(&mut self) {
-        for (module, u) in std::mem::take(&mut self.pending_scoped_uses) {
+        // A `use` whose first segment is itself brought in by a `use` of the
+        // same module (`use crate::ast::Expr; .. use Expr::*;`) is applied
+        // after the uses it builds on.
+        let mut pending = std::mem::take(&mut self.pending_scoped_uses);
+        let mut deferred = Vec::new();
+        for _round in 0..2 {
+            for (module, u) in std::mem::take(&mut pending) {
+                if !self.apply_scoped_use(&module, &u) { deferred.push((module, u)); }
+            }
+            pending = std::mem::take(&mut deferred);
+        }
+        for (module, u) in pending { self.apply_scoped_use_at(&module, &u, None); }
+        self.apply_global_uses();
+    }
+
+    /// Apply one module's `use`. False (and nothing applied) when its path
+    /// names nothing yet but starts with a name another `use` may provide.
+    fn apply_scoped_use(&mut self, module: &str, u: &UsePath) -> bool {
+        let glob = u.segments.last().is_some_and(|part| part == "*");
+        let parts = if glob { &u.segments[..u.segments.len()-1] } else { &u.segments[..] };
+        let exists = |name: &str| self.by_path.contains_key(name) || self.by_path.keys().any(|key| key.starts_with(&format!("{name}::")));
+        let written = parts.join("::");
+        let mut scope = module;
+        let mut found = exists(&written);
+        while !found && !scope.is_empty() {
+            found = exists(&format!("{scope}::{written}"));
+            scope = scope.rsplit_once("::").map_or("", |(parent,_)|parent);
+        }
+        if found || parts.is_empty() {
+            self.apply_scoped_use_at(module, u, None);
+            return true;
+        }
+        // The first segment may come from this module's `use`, or an
+        // enclosing module's (`pub use vm::Funct;` at the crate root).
+        let mut scope = module;
+        let via = loop {
+            let found = self.scoped_use_aliases.get(scope).and_then(|m| m.get(&parts[0])).filter(|t| t.len() == 1).map(|t| t[0].clone());
+            if found.is_some() || scope.is_empty() { break found; }
+            scope = scope.rsplit_once("::").map_or("", |(parent, _)| parent);
+        };
+        match via {
+            Some(target) => {
+                let full = std::iter::once(target).chain(parts[1..].iter().cloned()).collect::<Vec<_>>().join("::");
+                self.apply_scoped_use_at(module, u, Some(full));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn apply_scoped_use_at(&mut self, module: &str, u: &UsePath, resolved: Option<String>) {
+        {
+            let module = module.to_string();
             let glob = u.segments.last().is_some_and(|part| part == "*");
             let parts = if glob { &u.segments[..u.segments.len()-1] } else { &u.segments[..] };
             let written = parts.join("::");
             let exists = |name: &str| self.by_path.contains_key(name) || self.by_path.keys().any(|key| key.starts_with(&format!("{name}::")));
-            let mut full = written.clone();
+            let mut full = resolved.unwrap_or_else(|| written.clone());
             if !exists(&full) {
                 let mut scope = module.as_str();
                 while !scope.is_empty() {
@@ -135,12 +187,15 @@ impl GlobalTable {
             let members: Vec<(String,String)> = if glob {
                 let prefix = format!("{full}::");
                 self.by_path.keys().filter_map(|key|key.strip_prefix(&prefix).filter(|tail|!tail.contains("::")).map(|tail|(tail.to_string(),key.clone()))).collect()
-            } else { vec![(parts.last().cloned().unwrap_or_default(),full)] };
+            } else { vec![(u.alias.clone().or_else(|| parts.last().cloned()).unwrap_or_default(),full)] };
             for (short, full) in members {
                 let targets = self.scoped_use_aliases.entry(module.clone()).or_default().entry(short).or_default();
                 if !targets.contains(&full) { targets.push(full); targets.sort(); }
             }
         }
+    }
+
+    fn apply_global_uses(&mut self) {
         let uses = std::mem::take(&mut self.pending_uses);
         for u in &uses {
             if u.segments.last().map(|s| s.as_str()) == Some("*") {
@@ -162,8 +217,8 @@ impl GlobalTable {
                 }
             } else {
                 let full = u.segments.join("::");
-                if let Some(last) = u.segments.last() {
-                    self.use_aliases.entry(last.clone()).or_insert(full);
+                if let Some(name) = u.local_name() {
+                    self.use_aliases.entry(name.clone()).or_insert(full);
                 }
             }
         }
@@ -308,7 +363,7 @@ fn synthesize_trait_objects(g: &mut GlobalTable) {
                     continue;
                 }
                 let ty = Type { kind: TypeKind::Fn(ps.iter().map(|p| p.ty.clone()).collect(), r.clone().map(Box::new)), span };
-                fields.push(FieldDef { vis: true, name: name.clone(), ty, span });
+                fields.push(FieldDef { vis: true, name: name.clone(), ty, span, serde: vec![] });
                 methods.push(Method { name: name.clone(), params: ps, ret: r, self_is_mut, span });
             }
             per_trait.push(methods);
@@ -422,7 +477,7 @@ fn validate_supertrait_hierarchy(g: &GlobalTable) -> Result<Vec<String>, Resolve
 /// trait arguments. A where condition alone does not bind an unknown type.
 fn validate_impl_parameters(g: &GlobalTable) -> Result<(), ResolveError> {
     use crate::types::{Ty, lower_type_with};
-    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
+    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "", defining: "" };
     for imp in &g.impls {
         let params = imp.generics.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
         let mut roots = vec![lower_type_with(&imp.self_ty, &params, &env)
@@ -579,7 +634,7 @@ fn check_impl_signature(sig: &FnSig, m: &FnDef, subst: &HashMap<String, Type>, t
     }
     // Normalize each side in its own binder scope, then substitute semantic
     // types once. Internal binder names cannot capture user generic names.
-    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "" };
+    let env = crate::type_alias::AliasView { globals: g, resolved: &g.resolved_aliases, module: "", defining: "" };
     let lower = |ty: &Type, scope: &[String]| crate::types::lower_type_with(ty, scope, &env)
         .map_err(|error| ResolveError { msg: error.msg, span: error.span });
     let impl_scope: Vec<String> = imp.generics.params.iter().map(|p| p.name.clone()).collect();

@@ -152,8 +152,8 @@ fn duplicate_methods_and_unknown_attributes_are_errors() {
     assert!(msg.contains("duplicate method `get` on `P`"), "{msg}");
     let msg = compile_error("#[frobnicate]\nstruct P { x: i64 }\nfn main() -> i64 { 0 }");
     assert!(msg.contains("unknown attribute `#[frobnicate]`"), "{msg}");
-    let msg = compile_error("#[derive(Serialize)]\nstruct P { x: i64 }\nfn main() -> i64 { 0 }");
-    assert!(msg.contains("cannot derive `Serialize`"), "{msg}");
+    let msg = compile_error("#[derive(Frobnicate)]\nstruct P { x: i64 }\nfn main() -> i64 { 0 }");
+    assert!(msg.contains("cannot derive `Frobnicate`"), "{msg}");
     let msg = compile_error("#[value]\nfn main() -> i64 { 0 }");
     assert!(msg.contains("`#[value]` applies only to a struct or enum"), "{msg}");
 }

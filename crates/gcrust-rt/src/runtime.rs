@@ -645,6 +645,35 @@ impl RuntimeContext {
         });
     }
 
+    /// Root exit for a program with daemon threads (Rust's `std::thread`):
+    /// join every other child, then, if a daemon is still running, end the
+    /// process with `code` now, as Rust does when `main` returns.
+    ///
+    /// # Safety
+    /// As [`Self::finish_threads`], which callers run next when this returns.
+    pub unsafe fn exit_if_daemons_remain(&mut self, code: i32) {
+        let thread = self.thread_ptr();
+        let daemons = abort_on_cleanup_panic(|| unsafe {
+            with_current_thread(thread, || {
+                (*thread).top_frame = core::ptr::null_mut();
+                blocking_region(thread, || {
+                    loop {
+                        let next = self.heap().thread_completions.lock().unwrap().next_pending_foreground();
+                        let Some(completion) = next else { break };
+                        completion.join();
+                    }
+                    self.heap().thread_completions.lock().unwrap().daemon_running()
+                })
+            })
+        });
+        if daemons {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(code);
+        }
+    }
+
     unsafe fn drain_threads(&mut self) {
         // main has returned: its generated frames no longer exist. Keep this
         // mutator registered but BLOCKED while draining children, so their GC
@@ -780,6 +809,29 @@ impl CompletionRegistry {
         self.owned.push(key);
     }
 
+    /// Remove and return a pending completion that is not a daemon's.
+    fn next_pending_foreground(&mut self) -> Option<Arc<JoinHandle>> {
+        let records = &self.records;
+        let at = self.pending.iter().rposition(|key| {
+            !records.get(key).expect("pending completion missing").daemon.load(Ordering::Relaxed)
+        })?;
+        let key = self.pending.swap_remove(at);
+        if let Some(&moved) = self.pending.get(at) {
+            self.records.get(&moved).expect("pending completion missing").pending_index.store(at, Ordering::Relaxed);
+        }
+        let completion = self.records.get(&key).expect("pending completion missing");
+        assert_eq!(completion.pending_index.swap(usize::MAX, Ordering::Relaxed), at);
+        Some(completion.clone())
+    }
+
+    /// Is a daemon thread still running?
+    fn daemon_running(&self) -> bool {
+        self.pending.iter().any(|key| {
+            let completion = self.records.get(key).expect("pending completion missing");
+            completion.daemon.load(Ordering::Relaxed) && !completion.is_complete()
+        })
+    }
+
     fn next_pending(&mut self) -> Option<Arc<JoinHandle>> {
         let key = self.pending.pop()?;
         let completion = self.records.get(&key).expect("pending completion missing");
@@ -850,6 +902,9 @@ pub struct JoinHandle {
     // Runtime admission guarantees a body-exit notification. Legacy records
     // without that capability use GC's orphan-index fallback instead.
     completion_notice: bool,
+    // A daemon (Rust's `std::thread::spawn`) does not keep the program
+    // running: when only daemons remain at root exit, the process ends.
+    daemon: std::sync::atomic::AtomicBool,
     // Monotone publication after full OS/TLS join, not merely body exit.
     // GC can observe completed state even while a native observer holds state.
     native_joined: std::sync::atomic::AtomicBool,
@@ -1099,6 +1154,15 @@ unsafe fn blocking_region<R>(thread: *mut Thread, body: impl FnOnce() -> R) -> R
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ai_thread_join(thread: *mut Thread, handle: *mut JoinHandle) -> u64 {
     unsafe { blocking_region(thread, || (&*handle).join()) }
+}
+
+/// Make a spawned thread a daemon: it does not keep the program running.
+///
+/// # Safety
+/// `handle` is a live completion of this execution.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ai_thread_mark_daemon(_thread: *mut Thread, handle: *mut JoinHandle) {
+    unsafe { (&*handle).daemon.store(true, Ordering::Relaxed); }
 }
 
 /// `Thread.sleep(ms)`. Transitions to BLOCKED so a sleeping mutator doesn't stall
@@ -2036,6 +2100,7 @@ pub unsafe extern "C" fn gcr_runtime_main_v4(
     // Publish the current thread so FFI callback trampolines can recover it.
     let result = rt.enter(|thread| entry(thread));
     unsafe {
+        rt.exit_if_daemons_remain(result as i32);
         rt.finish_threads();
     }
     // Opt-in heap dump: render the live object graph with reflection metadata,
@@ -2183,6 +2248,14 @@ unsafe fn active_fields_canonical<'h>(heap: &'h Heap, obj: *const u8) -> &'h [cr
 /// or the active enum variant's payload). 0 for opaque/builtin objects.
 ///
 /// # Safety
+/// Nanoseconds on a monotonic clock since the first reading in this process
+/// (`std::time::Instant`). Never decreases.
+#[unsafe(no_mangle)]
+pub extern "C" fn ai_monotonic_nanos(_thread: *mut Thread) -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
+}
+
 /// `thread` is this OS thread's live RUNNING mutator; `obj` is a live object
 /// in its heap. Installed reflection metadata must match the object's layout,
 /// including field kinds, bounds and natural scalar/reference alignment.
@@ -3516,6 +3589,7 @@ mod completion_tests {
         }
         let completion = JoinHandle {
             completion_notice: false,
+            daemon: std::sync::atomic::AtomicBool::new(false),
             native_joined: std::sync::atomic::AtomicBool::new(false),
             pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
             reaper_registration: std::sync::OnceLock::new(),
@@ -3634,6 +3708,7 @@ mod completion_tests {
         let heap = context.heap().clone();
         let completion = Arc::new(JoinHandle {
             completion_notice: false,
+            daemon: std::sync::atomic::AtomicBool::new(false),
             native_joined: std::sync::atomic::AtomicBool::new(false),
             pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
             reaper_registration: std::sync::OnceLock::new(),

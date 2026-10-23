@@ -557,7 +557,7 @@ fn serialize_u128<S: serde::Serializer>(value: &u128, serializer: S) -> Result<S
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum FloatIntrinsic { Sqrt, Abs, Floor, Ceil }
+pub enum FloatIntrinsic { Sqrt, Abs, Floor, Ceil, Round, Trunc, Sin, Cos, Tan, Exp, Ln, Log10, Log2 }
 
 impl CoreExpr {
     pub fn new(kind: CoreExprKind, repr: Repr) -> Self {

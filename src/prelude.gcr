@@ -89,6 +89,8 @@ trait Sync {}
 // shared through the GC, and thread sharing is checked through `Sync`.
 trait Copy {}
 trait Send {}
+trait Sized {}
+trait Unpin {}
 
 // Conversions: `T::from(x)`, `let t: T = From::from(x)`.
 trait From<T> { fn from(value: T) -> Self; }
@@ -96,8 +98,47 @@ trait From<T> { fn from(value: T) -> Self; }
 // when `U: From<T>`, and every type converts into itself.
 trait Into<T> { fn into(self) -> T; }
 
+// Fallible conversions (`u32::try_from(x)`, `x.try_into()`).
+trait TryFrom<T> { type Error; fn try_from(value: T) -> Result<Self, Self::Error>; }
+trait TryInto<T> { type Error; fn try_into(self) -> Result<T, Self::Error>; }
+impl<T, U: TryFrom<T>> TryInto<U> for T {
+    type Error = U::Error;
+    fn try_into(self) -> Result<U, U::Error> { U::try_from(self) }
+}
+struct TryFromIntError {}
+impl Display for TryFromIntError {
+    fn fmt(self, f: Formatter) -> FmtResult { f.write_str("out of range integral type conversion attempted") }
+}
+impl Debug for TryFromIntError {
+    fn fmt(self, f: Formatter) -> FmtResult { f.write_str("TryFromIntError(())") }
+}
+macro_rules! try_from_i64 {
+    ($($t:ty),*) => {$(
+        impl TryFrom<i64> for $t {
+            type Error = TryFromIntError;
+            fn try_from(value: i64) -> Result<$t, TryFromIntError> {
+                if value < (<$t>::MIN as i64) || value > (<$t>::MAX as i64) { Result::Err(TryFromIntError {}) }
+                else { Result::Ok(value as $t) }
+            }
+        }
+    )*};
+}
+try_from_i64!(i8, i16, i32, u8, u16, u32);
+impl TryFrom<i64> for i64 {
+    type Error = TryFromIntError;
+    fn try_from(value: i64) -> Result<i64, TryFromIntError> { Result::Ok(value) }
+}
+impl TryFrom<i64> for u64 {
+    type Error = TryFromIntError;
+    fn try_from(value: i64) -> Result<u64, TryFromIntError> {
+        if value < 0 { Result::Err(TryFromIntError {}) } else { Result::Ok(value as u64) }
+    }
+}
+
 // `clone` copies a collection's storage, so the copy and the original can be
-// mutated independently. Elements are not cloned.
+// mutated independently; a `Vec`'s elements are cloned too, as in Rust. A
+// type with no `Clone` impl is cloned by sharing it (in Rust, such a clone
+// is an `Rc`/`Arc` one).
 trait Clone { fn clone(self) -> Self; }
 
 impl Ordering {
@@ -473,6 +514,25 @@ impl Sum for u128 { fn zero() -> u128 { 0 } fn one() -> u128 { 1 } }
 
 // ---- Integer and float methods -----------------------------------------------
 
+// Unsigned integer helpers (wrapping `+`/`-`/`*` detect overflow by the
+// result wrapping around).
+macro_rules! unsigned_methods {
+    ($($t:ty),*) => {$(
+        impl $t {
+            fn div_ceil(self, d: $t) -> $t { let q = self / d; if self % d != 0 { q + 1 } else { q } }
+            fn checked_add(self, o: $t) -> Option<$t> { let r = self + o; if r < self { Option::None } else { Option::Some(r) } }
+            fn checked_sub(self, o: $t) -> Option<$t> { if o > self { Option::None } else { Option::Some(self - o) } }
+            fn saturating_add(self, o: $t) -> $t { let r = self + o; if r < self { <$t>::MAX } else { r } }
+            fn saturating_sub(self, o: $t) -> $t { if o > self { 0 } else { self - o } }
+            fn wrapping_add(self, o: $t) -> $t { self + o }
+            fn wrapping_sub(self, o: $t) -> $t { self - o }
+            fn abs_diff(self, o: $t) -> $t { if self > o { self - o } else { o - self } }
+            fn is_power_of_two(self) -> bool { self != 0 && (self & (self - 1)) == 0 }
+        }
+    )*};
+}
+unsigned_methods!(u8, u16, u32, u64, u128);
+
 impl i64 {
     // The largest and smallest i64 values.
     fn max_value() -> i64 { 9223372036854775807 }
@@ -526,6 +586,38 @@ impl i64 {
         }
     }
 
+    fn checked_neg(self) -> Option<i64> { if self == i64::min_value() { Option::None } else { Option::Some(0 - self) } }
+    fn checked_abs(self) -> Option<i64> { if self == i64::min_value() { Option::None } else { Option::Some(self.abs()) } }
+    fn checked_div(self, other: i64) -> Option<i64> {
+        if other == 0 || (self == i64::min_value() && other == 0 - 1) { Option::None } else { Option::Some(self / other) }
+    }
+    fn checked_rem(self, other: i64) -> Option<i64> {
+        if other == 0 || (self == i64::min_value() && other == 0 - 1) { Option::None } else { Option::Some(self % other) }
+    }
+    fn checked_pow(self, exp: u32) -> Option<i64> {
+        let mut result: i64 = 1;
+        let mut i: u32 = 0;
+        while i < exp {
+            result = result.checked_mul(self)?;
+            i += 1;
+        }
+        Option::Some(result)
+    }
+    fn saturating_add(self, other: i64) -> i64 {
+        match self.checked_add(other) { Option::Some(v) => v, Option::None => if other > 0 { i64::max_value() } else { i64::min_value() } }
+    }
+    fn saturating_sub(self, other: i64) -> i64 {
+        match self.checked_sub(other) { Option::Some(v) => v, Option::None => if other < 0 { i64::max_value() } else { i64::min_value() } }
+    }
+    fn div_euclid(self, other: i64) -> i64 {
+        let q = self / other;
+        if self % other < 0 { if other > 0 { q - 1 } else { q + 1 } } else { q }
+    }
+    fn rem_euclid(self, other: i64) -> i64 {
+        let r = self % other;
+        if r < 0 { if other < 0 { r - other } else { r + other } } else { r }
+    }
+
     // Explicit wrapping forms (identical to `+`/`-`/`*`).
     fn wrapping_add(self, other: i64) -> i64 { self + other }
     fn wrapping_sub(self, other: i64) -> i64 { self - other }
@@ -536,15 +628,78 @@ impl i64 {
     fn is_ascii_digit(self) -> bool { self >= 48 && self <= 57 }
 }
 
+extern "C" fn pow(x: f64, y: f64) -> f64;
+extern "C" fn atan2(y: f64, x: f64) -> f64;
+extern "C" fn fmod(x: f64, y: f64) -> f64;
+
 impl f64 {
     fn min(self, other: f64) -> f64 { if self < other { self } else { other } }
     fn max(self, other: f64) -> f64 { if self > other { self } else { other } }
     fn abs(self) -> f64 { if self < 0.0 { 0.0 - self } else { self } }
+    fn sqrt(self) -> f64 { float_sqrt(self) }
+    fn floor(self) -> f64 { float_floor(self) }
+    fn ceil(self) -> f64 { float_ceil(self) }
+    // Halfway cases round away from zero.
+    fn round(self) -> f64 { float_round(self) }
+    fn trunc(self) -> f64 { float_trunc(self) }
+    fn fract(self) -> f64 { self - float_trunc(self) }
+    fn sin(self) -> f64 { float_sin(self) }
+    fn cos(self) -> f64 { float_cos(self) }
+    fn tan(self) -> f64 { float_tan(self) }
+    fn exp(self) -> f64 { float_exp(self) }
+    fn ln(self) -> f64 { float_ln(self) }
+    fn log10(self) -> f64 { float_log10(self) }
+    fn log2(self) -> f64 { float_log2(self) }
+    fn powf(self, n: f64) -> f64 { unsafe { pow(self, n) } }
+    fn powi(self, n: i32) -> f64 { unsafe { pow(self, n as f64) } }
+    fn atan2(self, x: f64) -> f64 { unsafe { atan2(self, x) } }
+    fn is_nan(self) -> bool { self != self }
+    fn is_infinite(self) -> bool { self == f64::INFINITY || self == f64::NEG_INFINITY }
+    fn is_finite(self) -> bool { !self.is_nan() && !self.is_infinite() }
+    fn signum(self) -> f64 { if self.is_nan() { self } else if self < 0.0 || (self == 0.0 && 1.0 / self < 0.0) { 0.0 - 1.0 } else { 1.0 } }
+    fn clamp(self, lo: f64, hi: f64) -> f64 { self.max(lo).min(hi) }
+    fn mul_add(self, a: f64, b: f64) -> f64 { self * a + b }
+    fn recip(self) -> f64 { 1.0 / self }
+    fn to_degrees(self) -> f64 { self * 57.2957795130823208767981548141051703 }
+    fn to_radians(self) -> f64 { self * 0.0174532925199432957692369076848861271 }
 }
 
 // ---- Option<T> and Result<T, E> ----------------------------------------------
 
+impl<T: Clone> Option<T> {
+    // `Option<&T>` → `Option<T>` in Rust; here a copy of the contents.
+    fn cloned(self) -> Option<T> { match self { Option::Some(x) => Option::Some(x.clone()), Option::None => Option::None } }
+}
+impl<T, E> Option<Result<T, E>> {
+    fn transpose(self) -> Result<Option<T>, E> {
+        match self {
+            Option::Some(Result::Ok(x)) => Result::Ok(Option::Some(x)),
+            Option::Some(Result::Err(e)) => Result::Err(e),
+            Option::None => Result::Ok(Option::None),
+        }
+    }
+}
+impl<T, E> Result<Option<T>, E> {
+    fn transpose(self) -> Option<Result<T, E>> {
+        match self {
+            Result::Ok(Option::Some(x)) => Option::Some(Result::Ok(x)),
+            Result::Ok(Option::None) => Option::None,
+            Result::Err(e) => Option::Some(Result::Err(e)),
+        }
+    }
+}
+impl<T> Option<Option<T>> {
+    fn flatten(self) -> Option<T> { match self { Option::Some(x) => x, Option::None => Option::None } }
+}
+impl<T: Default> Option<T> {
+    fn unwrap_or_default(self) -> T { match self { Option::Some(x) => x, Option::None => T::default() } }
+}
 impl<T> Option<T> {
+    // Without references, the borrowing adapters are the option itself.
+    fn as_ref(self) -> Option<T> { self }
+    fn as_mut(self) -> Option<T> { self }
+    fn as_deref(self) -> Option<T> { self }
+    fn copied(self) -> Option<T> { self }
     fn is_some(self) -> bool { match self { Option::Some(_x) => true, Option::None => false } }
     fn is_none(self) -> bool { match self { Option::Some(_x) => false, Option::None => true } }
     fn unwrap(self) -> T {
@@ -571,6 +726,31 @@ impl<T> Option<T> {
     fn ok_or_else<E>(self, err: fn() -> E) -> Result<T, E> {
         match self { Option::Some(x) => Result::Ok(x), Option::None => Result::Err(err()) }
     }
+    fn or(self, other: Option<T>) -> Option<T> { match self { Option::Some(x) => Option::Some(x), Option::None => other } }
+    fn or_else(self, f: fn() -> Option<T>) -> Option<T> { match self { Option::Some(x) => Option::Some(x), Option::None => f() } }
+    fn xor(self, other: Option<T>) -> Option<T> {
+        match (self, other) {
+            (Option::Some(x), Option::None) => Option::Some(x),
+            (Option::None, Option::Some(y)) => Option::Some(y),
+            _ => Option::None,
+        }
+    }
+    fn and<U>(self, other: Option<U>) -> Option<U> { match self { Option::Some(_x) => other, Option::None => Option::None } }
+    fn filter(self, p: fn(T) -> bool) -> Option<T> {
+        match self { Option::Some(x) => if p(x) { Option::Some(x) } else { Option::None }, Option::None => Option::None }
+    }
+    fn map_or<U>(self, default: U, f: fn(T) -> U) -> U { match self { Option::Some(x) => f(x), Option::None => default } }
+    fn map_or_else<U>(self, default: fn() -> U, f: fn(T) -> U) -> U { match self { Option::Some(x) => f(x), Option::None => default() } }
+    fn is_some_and(self, p: fn(T) -> bool) -> bool { match self { Option::Some(x) => p(x), Option::None => false } }
+    fn is_none_or(self, p: fn(T) -> bool) -> bool { match self { Option::Some(x) => p(x), Option::None => true } }
+    fn zip<U>(self, other: Option<U>) -> Option<(T, U)> {
+        match (self, other) { (Option::Some(x), Option::Some(y)) => Option::Some((x, y)), _ => Option::None }
+    }
+    fn inspect(self, f: fn(T)) -> Option<T> { match self { Option::Some(x) => { f(x); Option::Some(x) } Option::None => Option::None } }
+    // Take the value out, leaving None.
+    fn take(mut self) -> Option<T> { let v = self; self = Option::None; v }
+    fn replace(mut self, v: T) -> Option<T> { let old = self; self = Option::Some(v); old }
+    fn iter(self) -> OptionIter<T> { OptionIter { v: self } }
 }
 
 impl<T: Eq> Eq for Option<T> {
@@ -592,6 +772,18 @@ impl<T: Eq, E: Eq> Eq for Result<T, E> {
 }
 
 impl<T, E> Result<T, E> {
+    fn and_then<U>(self, f: fn(T) -> Result<U, E>) -> Result<U, E> { match self { Result::Ok(x) => f(x), Result::Err(e) => Result::Err(e) } }
+    fn or_else<F>(self, f: fn(E) -> Result<T, F>) -> Result<T, F> { match self { Result::Ok(x) => Result::Ok(x), Result::Err(e) => f(e) } }
+    fn and<U>(self, other: Result<U, E>) -> Result<U, E> { match self { Result::Ok(_x) => other, Result::Err(e) => Result::Err(e) } }
+    fn or<F>(self, other: Result<T, F>) -> Result<T, F> { match self { Result::Ok(x) => Result::Ok(x), Result::Err(_e) => other } }
+    fn unwrap_or_else(self, f: fn(E) -> T) -> T { match self { Result::Ok(x) => x, Result::Err(e) => f(e) } }
+    fn map_or<U>(self, default: U, f: fn(T) -> U) -> U { match self { Result::Ok(x) => f(x), Result::Err(_e) => default } }
+    fn map_or_else<U>(self, default: fn(E) -> U, f: fn(T) -> U) -> U { match self { Result::Ok(x) => f(x), Result::Err(e) => default(e) } }
+    fn is_ok_and(self, p: fn(T) -> bool) -> bool { match self { Result::Ok(x) => p(x), Result::Err(_e) => false } }
+    fn is_err_and(self, p: fn(E) -> bool) -> bool { match self { Result::Ok(_x) => false, Result::Err(e) => p(e) } }
+    fn inspect_err(self, f: fn(E)) -> Result<T, E> { match self { Result::Ok(x) => Result::Ok(x), Result::Err(e) => { f(e); Result::Err(e) } } }
+    fn as_ref(self) -> Result<T, E> { self }
+    fn iter(self) -> OptionIter<T> { OptionIter { v: self.ok() } }
     fn is_ok(self) -> bool { match self { Result::Ok(_x) => true, Result::Err(_e) => false } }
     fn is_err(self) -> bool { match self { Result::Ok(_x) => false, Result::Err(_e) => true } }
     fn unwrap(self) -> T {
@@ -602,6 +794,9 @@ impl<T, E> Result<T, E> {
     }
     fn unwrap_err(self) -> E {
         match self { Result::Ok(_x) => panic("called `Result::unwrap_err()` on an `Ok` value"), Result::Err(e) => e }
+    }
+    fn expect_err(self, message: String) -> E {
+        match self { Result::Ok(_x) => panic(message), Result::Err(e) => e }
     }
     fn unwrap_or(self, default: T) -> T {
         match self { Result::Ok(x) => x, Result::Err(_e) => default }
@@ -733,6 +928,42 @@ impl<T> Vec<T> {
         let tmp = self[i];
         self[i] = self[j];
         self[j] = tmp;
+    }
+
+    // Values are shared, so the mutable view of an element is the element.
+    fn last_mut(self) -> Option<T> { self.last() }
+    fn first_mut(self) -> Option<T> { self.first() }
+    fn get_mut(self, i: i64) -> Option<T> { self.get(i) }
+
+    // Split off the elements from `at` on into a new Vec.
+    fn split_off(mut self, at: i64) -> Vec<T> {
+        if at < 0 || at > self.len { panic!("`at` split index (is {}) should be <= len (is {})", at, self.len); }
+        let n = self.len - at;
+        let mut out: Vec<T> = Vec::with_capacity(n);
+        array_copy(self.data, at, out.data, 0, n);
+        out.len = n;
+        self.len = at;
+        out
+    }
+
+    // Grow to `n` elements with copies of `x`, or shorten to `n`.
+    fn resize(mut self, n: i64, x: T) {
+        if n < self.len { self.truncate(n); }
+        while self.len < n { self.push(x); }
+    }
+    // Grow to `n` elements made by `f`, or shorten to `n`.
+    fn resize_with(mut self, n: i64, f: fn() -> T) {
+        if n < self.len { self.truncate(n); }
+        while self.len < n { self.push(f()); }
+    }
+
+    // Every run of `n` consecutive elements, in order.
+    fn windows(self, n: i64) -> Vec<Vec<T>> {
+        if n <= 0 { panic("window size must be non-zero"); }
+        let mut out: Vec<Vec<T>> = Vec::new();
+        let mut i = 0;
+        while i + n <= self.len { out.push(self[i..i + n]); i += 1; }
+        out
     }
 
     // Append every element of `other`.
@@ -914,11 +1145,16 @@ impl<T> IndexSet<T> for Vec<T> {
     }
 }
 
-impl<T> Clone for Vec<T> {
+// As in Rust, each element is cloned (a `Vec<Frame>` clone is a snapshot).
+impl<T: Clone> Clone for Vec<T> {
     fn clone(self) -> Vec<T> {
         let cap = self.cap.max(1);
         let mut data: Array<T> = Array::new(cap);
-        array_copy(self.data, 0, data, 0, self.len);
+        let mut i = 0;
+        while i < self.len {
+            data[i] = self.data[i].clone();
+            i += 1;
+        }
         Vec { data: data, len: self.len, cap: cap }
     }
 }
@@ -943,6 +1179,36 @@ impl<T: Eq> Vec<T> {
             i += 1;
         }
         false
+    }
+    fn starts_with(self, prefix: Vec<T>) -> bool {
+        if prefix.len > self.len { return false; }
+        let mut i = 0;
+        while i < prefix.len {
+            if !(self.data[i] == prefix.data[i]) { return false; }
+            i += 1;
+        }
+        true
+    }
+    fn ends_with(self, suffix: Vec<T>) -> bool {
+        if suffix.len > self.len { return false; }
+        let off = self.len - suffix.len;
+        let mut i = 0;
+        while i < suffix.len {
+            if !(self.data[off + i] == suffix.data[i]) { return false; }
+            i += 1;
+        }
+        true
+    }
+    // Remove consecutive repeated elements.
+    fn dedup(mut self) {
+        if self.len < 2 { return; }
+        let mut w = 1;
+        let mut r = 1;
+        while r < self.len {
+            if !(self.data[r] == self.data[w - 1]) { self.data[w] = self.data[r]; w += 1; }
+            r += 1;
+        }
+        self.len = w;
     }
 }
 
@@ -1030,8 +1296,36 @@ impl IndexRange<String> for String {
     }
 }
 
+// What `find`, `split`, `starts_with`, ... search for: a string or a char.
+trait Pattern { fn into_needle(self) -> String; }
+impl Pattern for String { fn into_needle(self) -> String { self } }
+impl Pattern for char { fn into_needle(self) -> String { char_to_str(self as i64) } }
+
 impl String {
+    fn new() -> String { "" }
+    // Strings are immutable, so capacity is only a hint.
+    fn with_capacity(_n: i64) -> String { "" }
     fn len(self) -> i64 { str_len(self) }
+    // The lines of the text, without their `\n` (or `\r\n`) endings.
+    fn lines(self) -> VecIter<String> {
+        let mut out: Vec<String> = Vec::new();
+        let n = str_len(self);
+        let mut start = 0;
+        let mut i = 0;
+        while i < n {
+            if str_get(self, i) == 10 {
+                let end = if i > start && str_get(self, i - 1) == 13 { i - 1 } else { i };
+                out.push(str_substring(self, start, end));
+                start = i + 1;
+            }
+            i += 1;
+        }
+        if start < n {
+            let end = if str_get(self, n - 1) == 13 { n - 1 } else { n };
+            out.push(str_substring(self, start, end));
+        }
+        out.into_iter()
+    }
     fn is_empty(self) -> bool { str_len(self) == 0 }
 
     // The byte at index `i`; aborts when `i` is out of bounds.
@@ -1056,8 +1350,41 @@ impl String {
         }
         true
     }
-    fn starts_with(self, prefix: String) -> bool { self.starts_with_at(prefix, 0) }
-    fn ends_with(self, suffix: String) -> bool { self.starts_with_at(suffix, str_len(self) - str_len(suffix)) }
+    fn starts_with<P: Pattern>(self, prefix: P) -> bool { self.starts_with_at(prefix.into_needle(), 0) }
+    fn ends_with<P: Pattern>(self, suffix: P) -> bool {
+        let suffix = suffix.into_needle();
+        self.starts_with_at(suffix, str_len(self) - str_len(suffix))
+    }
+    fn strip_prefix<P: Pattern>(self, prefix: P) -> Option<String> {
+        let prefix = prefix.into_needle();
+        if self.starts_with_at(prefix, 0) { Option::Some(str_substring(self, str_len(prefix), str_len(self))) } else { Option::None }
+    }
+    fn strip_suffix<P: Pattern>(self, suffix: P) -> Option<String> {
+        let suffix = suffix.into_needle();
+        let at = str_len(self) - str_len(suffix);
+        if self.starts_with_at(suffix, at) { Option::Some(str_substring(self, 0, at)) } else { Option::None }
+    }
+    // Remove every leading (trailing) repetition of `p`.
+    fn trim_start_matches<P: Pattern>(self, p: P) -> String {
+        let needle = p.into_needle();
+        let n = str_len(needle);
+        if n == 0 { return self; }
+        let mut at = 0;
+        while self.starts_with_at(needle, at) { at += n; }
+        str_substring(self, at, str_len(self))
+    }
+    fn trim_end_matches<P: Pattern>(self, p: P) -> String {
+        let needle = p.into_needle();
+        let n = str_len(needle);
+        if n == 0 { return self; }
+        let mut end = str_len(self);
+        while end >= n && self.starts_with_at(needle, end - n) { end -= n; }
+        str_substring(self, 0, end)
+    }
+    fn trim_matches<P: Pattern>(self, p: P) -> String {
+        let needle = p.into_needle();
+        self.trim_start_matches(needle).trim_end_matches(needle)
+    }
 
     // The byte offset of the first occurrence of `needle` that starts within
     // [from, end) and ends by `end`. Bounds are clamped to the string; an
@@ -1088,8 +1415,33 @@ impl String {
         Option::None
     }
     fn find_from(self, needle: String, from: i64) -> Option<i64> { self.find_between(needle, from, str_len(self)) }
-    fn find(self, needle: String) -> Option<i64> { self.find_between(needle, 0, str_len(self)) }
-    fn contains(self, needle: String) -> bool { self.find(needle).is_some() }
+    fn find<P: Pattern>(self, needle: P) -> Option<i64> { self.find_between(needle.into_needle(), 0, str_len(self)) }
+    fn contains<P: Pattern>(self, needle: P) -> bool { self.find(needle).is_some() }
+    // The byte offset of the last occurrence of `needle`.
+    fn rfind<P: Pattern>(self, needle: P) -> Option<i64> {
+        let needle = needle.into_needle();
+        let mut i = str_len(self) - str_len(needle);
+        while i >= 0 {
+            if self.starts_with_at(needle, i) { return Option::Some(i); }
+            i -= 1;
+        }
+        Option::None
+    }
+    // Split at the first (last) occurrence of `sep`.
+    fn split_once<P: Pattern>(self, sep: P) -> Option<(String, String)> {
+        let sep = sep.into_needle();
+        match self.find(sep) {
+            Option::Some(i) => Option::Some((str_substring(self, 0, i), str_substring(self, i + str_len(sep), str_len(self)))),
+            Option::None => Option::None,
+        }
+    }
+    fn rsplit_once<P: Pattern>(self, sep: P) -> Option<(String, String)> {
+        let sep = sep.into_needle();
+        match self.rfind(sep) {
+            Option::Some(i) => Option::Some((str_substring(self, 0, i), str_substring(self, i + str_len(sep), str_len(self)))),
+            Option::None => Option::None,
+        }
+    }
 
     // Strip leading and trailing ASCII whitespace.
     fn trim(self) -> String {
@@ -1104,7 +1456,14 @@ impl String {
     // Split on every non-overlapping occurrence of `sep`. Adjacent separators
     // give empty pieces; the result always has at least one piece. An empty
     // `sep` aborts.
-    fn split(self, sep: String) -> Vec<String> {
+    // The pieces between occurrences of `sep`, last first.
+    fn rsplit<P: Pattern>(self, sep: P) -> VecIter<String> {
+        let mut parts = self.split(sep);
+        parts.reverse();
+        parts.into_iter()
+    }
+    fn split<P: Pattern>(self, sep: P) -> Vec<String> {
+        let sep = sep.into_needle();
         let sl = str_len(sep);
         if sl == 0 { panic("String::split: empty separator"); }
         let mut parts: Vec<String> = Vec::new();
@@ -1128,7 +1487,8 @@ impl String {
 
     // Replace every non-overlapping occurrence of `from` with `to`. An empty
     // `from` aborts.
-    fn replace(self, from: String, to: String) -> String {
+    fn replace<P: Pattern>(self, from: P, to: String) -> String {
+        let from = from.into_needle();
         let fl = str_len(from);
         if fl == 0 { panic("String::replace: empty pattern"); }
         let mut parts: Vec<String> = Vec::new();
@@ -1409,6 +1769,220 @@ impl<K, V> Clone for HashMap<K, V> {
     }
 }
 
+impl<K: Eq + Hash, V> HashMap<K, V> {
+    // Remove `key`; returns its value, if it was present. Later entries of
+    // the probe run move back, so every lookup still ends at an empty slot.
+    fn remove(mut self, key: K) -> Option<V> {
+        let mut hole = self.probe(key);
+        if !self.used[hole] { return Option::None; }
+        let old = self.vals[hole];
+        self.used[hole] = false;
+        self.len -= 1;
+        let mask = self.cap - 1;
+        let mut j = hole;
+        loop {
+            j = (j + 1) & mask;
+            if !self.used[j] { break; }
+            let home = self.keys[j].hash() & mask;
+            // An entry stays unless the hole lies between its home and it.
+            let stays = if hole <= j { home > hole && home <= j } else { home > hole || home <= j };
+            if !stays {
+                self.keys[hole] = self.keys[j];
+                self.vals[hole] = self.vals[j];
+                self.used[hole] = true;
+                self.used[j] = false;
+                hole = j;
+            }
+        }
+        Option::Some(old)
+    }
+    fn clear(mut self) {
+        let fresh: HashMap<K, V> = HashMap::new();
+        self.keys = fresh.keys; self.vals = fresh.vals; self.used = fresh.used;
+        self.len = 0; self.cap = fresh.cap;
+    }
+}
+
+// ---- HashSet<T> ------------------------------------------------------------
+// A `HashMap<T, ()>`: membership only. Iteration order is unspecified.
+struct HashSet<T> { map: HashMap<T, ()> }
+
+impl<T: Eq + Hash> HashSet<T> {
+    fn new() -> HashSet<T> { HashSet { map: HashMap::new() } }
+    fn with_capacity(_n: i64) -> HashSet<T> { HashSet::new() }
+    fn len(self) -> i64 { self.map.len() }
+    fn is_empty(self) -> bool { self.map.is_empty() }
+    // Add `x`; true when it was not already present.
+    fn insert(mut self, x: T) -> bool { self.map.insert(x, ()).is_none() }
+    fn contains(self, x: T) -> bool { self.map.contains_key(x) }
+    fn remove(mut self, x: T) -> bool { self.map.remove(x).is_some() }
+    fn clear(mut self) { self.map.clear(); }
+    fn iter(self) -> VecIter<T> { self.map.keys().into_iter() }
+    fn extend<I: IntoIterator<Item = T>>(mut self, items: I) {
+        let mut it = items.into_iter();
+        while let Option::Some(x) = it.next() { self.map.insert(x, ()); }
+    }
+    fn is_subset(self, other: HashSet<T>) -> bool {
+        let mut it = self.iter();
+        while let Option::Some(x) = it.next() { if !other.contains(x) { return false; } }
+        true
+    }
+}
+impl<T> Clone for HashSet<T> {
+    fn clone(self) -> HashSet<T> { HashSet { map: self.map.clone() } }
+}
+impl<T: Eq + Hash> Default for HashSet<T> { fn default() -> HashSet<T> { HashSet::new() } }
+impl<T: Eq + Hash> Eq for HashSet<T> {
+    fn eq(self, other: HashSet<T>) -> bool { self.len() == other.len() && self.is_subset(other) }
+}
+impl<T: Eq + Hash> FromIterator<T> for HashSet<T> {
+    fn from_iter<I: Iterator<Item = T>>(iter: I) -> HashSet<T> {
+        let mut set: HashSet<T> = HashSet::new();
+        set.extend(iter);
+        set
+    }
+}
+impl<T: Eq + Hash> IntoIterator for HashSet<T> {
+    type Item = T;
+    type IntoIter = VecIter<T>;
+    fn into_iter(self) -> VecIter<T> { self.iter() }
+}
+
+// ---- BTreeMap<K, V> ----------------------------------------------------------
+// An ordered map: keys kept sorted (by `Ord`) in parallel vectors, found by
+// binary search. Iteration is in key order, like Rust's.
+struct BTreeMap<K, V> { keys: Vec<K>, vals: Vec<V> }
+
+impl<K: Ord, V> BTreeMap<K, V> {
+    fn new() -> BTreeMap<K, V> { BTreeMap { keys: Vec::new(), vals: Vec::new() } }
+    fn len(self) -> i64 { self.keys.len() }
+    fn is_empty(self) -> bool { self.keys.is_empty() }
+    // `Ok(i)` when keys[i] == key, else `Err(i)` where it would go.
+    fn search(self, key: K) -> Result<i64, i64> {
+        let mut lo = 0;
+        let mut hi = self.keys.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.keys[mid].cmp(key) {
+                Ordering::Less => { lo = mid + 1; }
+                Ordering::Greater => { hi = mid; }
+                Ordering::Equal => { return Result::Ok(mid); }
+            }
+        }
+        Result::Err(lo)
+    }
+    fn insert(mut self, key: K, val: V) -> Option<V> {
+        match self.search(key) {
+            Result::Ok(i) => { let old = self.vals[i]; self.vals[i] = val; Option::Some(old) }
+            Result::Err(i) => { self.keys.insert(i, key); self.vals.insert(i, val); Option::None }
+        }
+    }
+    fn get(self, key: K) -> Option<V> {
+        match self.search(key) { Result::Ok(i) => Option::Some(self.vals[i]), Result::Err(_) => Option::None }
+    }
+    fn contains_key(self, key: K) -> bool { self.search(key).is_ok() }
+    fn remove(mut self, key: K) -> Option<V> {
+        match self.search(key) {
+            Result::Ok(i) => { self.keys.remove(i); Option::Some(self.vals.remove(i)) }
+            Result::Err(_) => Option::None,
+        }
+    }
+    fn clear(mut self) { self.keys.clear(); self.vals.clear(); }
+    fn keys(self) -> VecIter<K> { self.keys.clone().into_iter() }
+    fn values(self) -> VecIter<V> { self.vals.clone().into_iter() }
+    fn iter(self) -> VecIter<(K, V)> {
+        let mut pairs: Vec<(K, V)> = Vec::with_capacity(self.keys.len());
+        let mut i = 0;
+        while i < self.keys.len() { pairs.push((self.keys[i], self.vals[i])); i += 1; }
+        pairs.into_iter()
+    }
+    fn first_key_value(self) -> Option<(K, V)> {
+        if self.keys.is_empty() { Option::None } else { Option::Some((self.keys[0], self.vals[0])) }
+    }
+    fn last_key_value(self) -> Option<(K, V)> {
+        let n = self.keys.len();
+        if n == 0 { Option::None } else { Option::Some((self.keys[n - 1], self.vals[n - 1])) }
+    }
+    fn extend<I: IntoIterator<Item = (K, V)>>(mut self, items: I) {
+        let mut it = items.into_iter();
+        while let Option::Some(kv) = it.next() { self.insert(kv.0, kv.1); }
+    }
+}
+impl<K, V> Clone for BTreeMap<K, V> {
+    fn clone(self) -> BTreeMap<K, V> { BTreeMap { keys: self.keys.clone(), vals: self.vals.clone() } }
+}
+impl<K: Ord, V> Default for BTreeMap<K, V> { fn default() -> BTreeMap<K, V> { BTreeMap::new() } }
+impl<K: Ord + Eq, V: Eq> Eq for BTreeMap<K, V> {
+    fn eq(self, other: BTreeMap<K, V>) -> bool { self.keys == other.keys && self.vals == other.vals }
+}
+impl<K: Ord, V> FromIterator<(K, V)> for BTreeMap<K, V> {
+    fn from_iter<I: Iterator<Item = (K, V)>>(iter: I) -> BTreeMap<K, V> {
+        let mut m: BTreeMap<K, V> = BTreeMap::new();
+        m.extend(iter);
+        m
+    }
+}
+impl<K: Ord, V> IntoIterator for BTreeMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = VecIter<(K, V)>;
+    fn into_iter(self) -> VecIter<(K, V)> { self.iter() }
+}
+
+// `std::mem::drop`: values are collected when unreachable, so this only
+// ends the caller's use of `x`.
+fn drop<T>(_x: T) {}
+
+// ---- std::marker::PhantomData --------------------------------------------------
+// A zero-sized marker for a type parameter a struct has no field of.
+struct PhantomData<T>;
+
+// ---- std::error::Error --------------------------------------------------------
+// Named `StdError` here (`std::error::Error` and `use std::error::Error` name
+// it), so a program's own `Error` type keeps its name.
+trait StdError: Debug + Display {}
+
+// ---- std::any ----------------------------------------------------------------
+// Every type is `Any`. A `dyn Any` remembers its value's type, and
+// `downcast_ref::<T>()` gives the value back when it is a `T`. Types are
+// identified by name (`type_name::<T>()`).
+struct TypeId { name: String }
+impl TypeId {
+    fn of<T>() -> TypeId { TypeId { name: any_type_name::<T>() } }
+}
+impl Eq for TypeId { fn eq(self, other: TypeId) -> bool { self.name == other.name } }
+impl Hash for TypeId { fn hash(self) -> i64 { self.name.hash() } }
+impl Clone for TypeId { fn clone(self) -> TypeId { self } }
+impl Debug for TypeId {
+    fn fmt(self, f: Formatter) -> FmtResult { f.write_str("TypeId(" + self.name + ")") }
+}
+
+fn type_name<T>() -> String { any_type_name::<T>() }
+
+// A `dyn Any`'s value, boxed so that it is one heap object whatever `T` is.
+struct AnyBox<T> { value: T }
+
+trait Any {
+    fn type_id(self) -> TypeId;
+    fn any_box(self) -> AnyBox<()>;
+}
+impl<T> Any for T {
+    fn type_id(self) -> TypeId { TypeId::of::<T>() }
+    fn any_box(self) -> AnyBox<()> { unsafe { ref_cast::<AnyBox<()>>(AnyBox { value: self }) } }
+}
+impl dyn Any {
+    fn is<T>(self) -> bool { self.type_id() == TypeId::of::<T>() }
+    fn downcast_ref<T>(self) -> Option<T> {
+        if self.is::<T>() {
+            let b = unsafe { ref_cast::<AnyBox<T>>(self.any_box()) };
+            Option::Some(b.value)
+        } else {
+            Option::None
+        }
+    }
+    // Values are shared, so the mutable view is the same value.
+    fn downcast_mut<T>(self) -> Option<T> { self.downcast_ref::<T>() }
+}
+
 // ---- Thread<T> — OS-thread concurrency (see docs/threads.md) ---------------
 // `Thread::spawn(f)` runs the no-arg closure `f` on a new OS thread sharing this
 // heap; the GC stops the world across all threads when it collects. `t.join()`
@@ -1490,6 +2064,124 @@ impl AtomicI64 {
     fn store(self, v: i64) -> i64 { (unsafe { atomic_i64_store(self.cell, v) }) }
     fn fetch_add(self, delta: i64) -> i64 { (unsafe { atomic_i64_fetch_add(self.cell, delta) }) }
     fn compare_and_set(self, expected: i64, new: i64) -> bool { (unsafe { atomic_i64_cas(self.cell, expected, new) }) == 1 }
+}
+
+// ---- std::sync::atomic ----------------------------------------------------------
+// Rust's atomics, over `AtomicI64` cells. Every access is sequentially
+// consistent, which satisfies any requested `Ordering` (`std::sync::atomic::
+// Ordering` is `AtomicOrdering` here; the prelude's `Ordering` is `cmp`'s).
+enum AtomicOrdering { Relaxed, Release, Acquire, AcqRel, SeqCst }
+
+struct AtomicU64 { cell: AtomicI64 }
+impl AtomicU64 {
+    fn new(v: u64) -> AtomicU64 { AtomicU64 { cell: AtomicI64::new(v as i64) } }
+    fn load(self, _order: AtomicOrdering) -> u64 { self.cell.load() as u64 }
+    fn store(self, v: u64, _order: AtomicOrdering) { self.cell.store(v as i64); }
+    fn fetch_add(self, delta: u64, _order: AtomicOrdering) -> u64 { self.cell.fetch_add(delta as i64) as u64 }
+    fn fetch_sub(self, delta: u64, _order: AtomicOrdering) -> u64 { self.cell.fetch_add(0 - delta as i64) as u64 }
+}
+
+struct AtomicUsize { cell: AtomicI64 }
+impl AtomicUsize {
+    fn new(v: usize) -> AtomicUsize { AtomicUsize { cell: AtomicI64::new(v) } }
+    fn load(self, _order: AtomicOrdering) -> usize { self.cell.load() }
+    fn store(self, v: usize, _order: AtomicOrdering) { self.cell.store(v); }
+    fn fetch_add(self, delta: usize, _order: AtomicOrdering) -> usize { self.cell.fetch_add(delta) }
+    fn fetch_sub(self, delta: usize, _order: AtomicOrdering) -> usize { self.cell.fetch_add(0 - delta) }
+}
+
+struct AtomicBool { cell: AtomicI64 }
+impl AtomicBool {
+    fn new(v: bool) -> AtomicBool { AtomicBool { cell: AtomicI64::new(if v { 1 } else { 0 }) } }
+    fn load(self, _order: AtomicOrdering) -> bool { self.cell.load() != 0 }
+    fn store(self, v: bool, _order: AtomicOrdering) { self.cell.store(if v { 1 } else { 0 }); }
+    fn swap(self, v: bool, _order: AtomicOrdering) -> bool {
+        let new = if v { 1 } else { 0 };
+        loop {
+            let old = self.cell.load();
+            if self.cell.compare_and_set(old, new) { return old != 0; }
+        }
+    }
+}
+
+// ---- std::time::Duration ------------------------------------------------------
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+struct Duration { nanos: u128 }
+impl Duration {
+    const ZERO: Duration = Duration { nanos: 0 };
+    fn from_secs(s: u64) -> Duration { Duration { nanos: s as u128 * 1000000000 } }
+    fn from_millis(ms: u64) -> Duration { Duration { nanos: ms as u128 * 1000000 } }
+    fn from_micros(us: u64) -> Duration { Duration { nanos: us as u128 * 1000 } }
+    fn from_nanos(ns: u64) -> Duration { Duration { nanos: ns as u128 } }
+    fn from_secs_f64(s: f64) -> Duration { Duration { nanos: (s * 1000000000.0) as u128 } }
+    fn as_nanos(self) -> u128 { self.nanos }
+    fn as_micros(self) -> u128 { self.nanos / 1000 }
+    fn as_millis(self) -> u128 { self.nanos / 1000000 }
+    fn as_secs(self) -> u64 { (self.nanos / 1000000000) as u64 }
+    fn as_secs_f64(self) -> f64 { self.nanos as f64 / 1000000000.0 }
+    fn subsec_nanos(self) -> u32 { (self.nanos % 1000000000) as u32 }
+    fn is_zero(self) -> bool { self.nanos == 0 }
+}
+impl Add for Duration {
+    type Output = Duration;
+    fn add(self, other: Duration) -> Duration { Duration { nanos: self.nanos + other.nanos } }
+}
+impl Sub for Duration {
+    type Output = Duration;
+    fn sub(self, other: Duration) -> Duration { Duration { nanos: self.nanos - other.nanos } }
+}
+
+// ---- std::time::Instant -----------------------------------------------------------
+// A reading of a monotonic clock.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct Instant { nanos: i64 }
+impl Instant {
+    fn now() -> Instant { Instant { nanos: monotonic_nanos() } }
+    fn elapsed(self) -> Duration { Instant::now().duration_since(self) }
+    fn duration_since(self, earlier: Instant) -> Duration {
+        Duration { nanos: if self.nanos > earlier.nanos { (self.nanos - earlier.nanos) as u128 } else { 0 } }
+    }
+    fn checked_duration_since(self, earlier: Instant) -> Option<Duration> {
+        if self.nanos >= earlier.nanos { Option::Some(self.duration_since(earlier)) } else { Option::None }
+    }
+    fn saturating_duration_since(self, earlier: Instant) -> Duration { self.duration_since(earlier) }
+}
+impl Add<Duration> for Instant {
+    type Output = Instant;
+    fn add(self, d: Duration) -> Instant { Instant { nanos: self.nanos + d.nanos as i64 } }
+}
+impl Sub<Duration> for Instant {
+    type Output = Instant;
+    fn sub(self, d: Duration) -> Instant { Instant { nanos: self.nanos - d.nanos as i64 } }
+}
+
+// ---- std::thread ----------------------------------------------------------------
+// `std::thread::JoinHandle`: a panic ends the whole program here, so
+// `join` always gives `Ok`. Like Rust's, these threads do not keep the
+// program running once `main` returns (they are daemons).
+struct JoinHandle<T> { thread: Thread<T> }
+impl<T> JoinHandle<T> {
+    fn join(self) -> Result<T, dyn Any> { Result::Ok(self.thread.join()) }
+    fn is_finished(self) -> bool { false }
+}
+
+// `std::thread::sleep`: block this thread for at least `d`.
+fn sleep(d: Duration) { Thread::sleep(((d.nanos + 999999) / 1000000) as i64); }
+
+// `std::thread::spawn`.
+fn spawn<T>(f: fn() -> T) -> JoinHandle<T> {
+    let thread = Thread::spawn(f);
+    unsafe { thread_mark_daemon(thread.handle); }
+    JoinHandle { thread: thread }
+}
+
+// `std::thread::Builder`: names are accepted for compatibility.
+struct Builder { name: Option<String> }
+impl Builder {
+    fn new() -> Builder { Builder { name: Option::None } }
+    fn name(self, name: String) -> Builder { Builder { name: Option::Some(name) } }
+    fn stack_size(self, _size: usize) -> Builder { self }
+    fn spawn<T>(self, f: fn() -> T) -> Result<JoinHandle<T>, IoError> { Result::Ok(spawn(f)) }
 }
 
 // ---- Atom<T> — a Clojure-style atom (see docs/threads.md) ------------------
@@ -2167,6 +2859,21 @@ impl Sum for f64 { fn zero() -> f64 { 0.0 } fn one() -> f64 { 1.0 } }
 
 // Types `collect()` can build.
 trait FromIterator<A> { fn from_iter<I: Iterator<Item = A>>(iter: I) -> Self; }
+// `collect()` into a `Result`: the collection of the `Ok` values, or the
+// first `Err`.
+impl<A, E, V: FromIterator<A>> FromIterator<Result<A, E>> for Result<V, E> {
+    fn from_iter<I: Iterator<Item = Result<A, E>>>(iter: I) -> Result<V, E> {
+        let mut items: Vec<A> = Vec::new();
+        let mut it = iter;
+        while let Option::Some(r) = it.next() {
+            match r {
+                Result::Ok(x) => items.push(x),
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Result::Ok(V::from_iter(items.into_iter()))
+    }
+}
 impl<T> FromIterator<T> for Vec<T> {
     fn from_iter<I: Iterator<Item = T>>(iter: I) -> Vec<T> { iter.collect_vec() }
 }
@@ -2485,6 +3192,11 @@ impl<I: Iterator<Item = A>, A> Peekable<I, A> {
 // ---- char methods ---------------------------------------------------------------
 
 impl char {
+    // The char with code point `u`; None for surrogates and values past U+10FFFF.
+    fn from_u32(u: u32) -> Option<char> {
+        if u > 0x10FFFF || (u >= 0xD800 && u < 0xE000) { Option::None } else { Option::Some(u as char) }
+    }
+
     fn is_ascii_digit(self) -> bool { self >= '0' && self <= '9' }
     fn is_ascii_lowercase(self) -> bool { self >= 'a' && self <= 'z' }
     fn is_ascii_uppercase(self) -> bool { self >= 'A' && self <= 'Z' }
@@ -2588,6 +3300,26 @@ trait IntoIterator {
     type Item;
     type IntoIter;
     fn into_iter(self) -> Self::IntoIter;
+}
+// `Some(x)` / `Ok(x)` yield `x`; `None` / `Err(_)` yield nothing.
+struct OptionIter<T> { v: Option<T> }
+impl<T> Iterator for OptionIter<T> {
+    type Item = T;
+    fn next(mut self) -> Option<T> {
+        let v = self.v;
+        self.v = Option::None;
+        v
+    }
+}
+impl<T> IntoIterator for Option<T> {
+    type Item = T;
+    type IntoIter = OptionIter<T>;
+    fn into_iter(self) -> OptionIter<T> { OptionIter { v: self } }
+}
+impl<T, E> IntoIterator for Result<T, E> {
+    type Item = T;
+    type IntoIter = OptionIter<T>;
+    fn into_iter(self) -> OptionIter<T> { OptionIter { v: self.ok() } }
 }
 impl<T> IntoIterator for Vec<T> {
     type Item = T;

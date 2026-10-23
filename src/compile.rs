@@ -6,7 +6,7 @@
 //! them, while existing programs that DO declare their own (e.g. the examples)
 //! keep working — the user's declaration shadows the prelude's.
 
-use crate::ast::{Item, ItemKind, Module};
+use crate::ast::{Item, ItemKind, ModDef, Module};
 use crate::core::SourceEntry;
 use crate::lexer::{lex, lex_with_source, SourceId};
 use crate::parser::{ParseError, parse_module};
@@ -161,6 +161,7 @@ fn inject_prelude(user: Module, sources: &mut SourceMap) -> Module {
 /// Parse a user program (a single source string, no file modules) and inject the
 /// prelude. Used for tests and the in-memory REPL-style path.
 pub fn parse_with_prelude(user_src: &str) -> Result<(Module, SourceMap), ParseError> {
+    crate::parser::reset_exported_macros();
     let mut sources: SourceMap = Vec::new();
     add_source(&mut sources, "<input>".to_string(), user_src.to_string()); // user = id 0
     let user_tokens = lex(user_src).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
@@ -173,6 +174,7 @@ pub fn parse_with_prelude(user_src: &str) -> Result<(Module, SourceMap), ParseEr
 /// modules relative to the file's directory, then inject the prelude. This is the
 /// driver entry point for multi-file projects.
 pub fn parse_file_with_prelude(path: &Path) -> Result<(Module, SourceMap), ParseError> {
+    crate::parser::reset_exported_macros();
     let src = std::fs::read_to_string(path).map_err(|e| ParseError {
         msg: format!("cannot read `{}`: {}", path.display(), e),
         span: crate::lexer::Span::new(0, 0),
@@ -186,6 +188,95 @@ pub fn parse_file_with_prelude(path: &Path) -> Result<(Module, SourceMap), Parse
     load_file_modules(&mut user.items, dir, &mut sources)?; // mods get ids 1..
     let module = inject_prelude(user, &mut sources); // prelude gets the next id
     Ok((module, sources))
+}
+
+/// A `#[test]` function `gcr test` runs: its path and whether it returns a
+/// `Result` (an `Err` fails it).
+pub struct TestFn {
+    pub path: String,
+    pub returns_result: bool,
+}
+
+/// `gcr test`: the program at `path` plus the integration tests in
+/// `tests_dir` (each `tests/<name>.gcr` a root module `<name>`, as in Cargo),
+/// with `main` replaced by a runner that calls the `#[test]` function its
+/// first argument numbers. Parse with `parser::set_test_mode(true)`.
+pub fn parse_tests_with_prelude(path: &Path, tests_dir: Option<&Path>) -> Result<(Module, SourceMap, Vec<TestFn>), ParseError> {
+    crate::parser::reset_exported_macros();
+    let src = std::fs::read_to_string(path).map_err(|e| ParseError {
+        msg: format!("cannot read `{}`: {}", path.display(), e),
+        span: crate::lexer::Span::new(0, 0),
+    })?;
+    let mut sources: SourceMap = Vec::new();
+    add_source(&mut sources, path.display().to_string(), src.clone());
+    let tokens = lex(&src).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
+    crate::lexer::register_source_path(0, path);
+    let mut user = parse_module(&tokens)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    load_file_modules(&mut user.items, dir, &mut sources)?;
+    if let Some(tests_dir) = tests_dir {
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(tests_dir).into_iter().flatten().flatten()
+            .map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "gcr")).collect();
+        files.sort();
+        for file in files {
+            let name = file.file_stem().unwrap().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(&file).map_err(|e| ParseError {
+                msg: format!("cannot read `{}`: {}", file.display(), e),
+                span: crate::lexer::Span::new(0, 0),
+            })?;
+            let sid = add_source(&mut sources, file.display().to_string(), text.clone());
+            let toks = lex_with_source(&text, sid).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
+            crate::lexer::register_source_path(sid, &file);
+            let mut parsed = parse_module(&toks)?;
+            load_file_modules(&mut parsed.items, tests_dir, &mut sources)?;
+            user.items.push(Item {
+                kind: ItemKind::Mod(ModDef { vis: true, name, items: parsed.items, inline: true, span: crate::lexer::Span::new(0, 0) }),
+                span: crate::lexer::Span::new(0, 0),
+            });
+        }
+    }
+    // The runner calls each test, so tests and the modules holding them are
+    // made visible to it.
+    fn collect(items: &mut [Item], prefix: &str, out: &mut Vec<TestFn>) -> bool {
+        let mut any = false;
+        for item in items {
+            match &mut item.kind {
+                ItemKind::Fn(f) if f.hints.test => {
+                    f.vis = true;
+                    any = true;
+                    out.push(TestFn {
+                        path: if prefix.is_empty() { f.name.clone() } else { format!("{prefix}::{}", f.name) },
+                        returns_result: f.ret.is_some(),
+                    });
+                }
+                ItemKind::Mod(m) => {
+                    let inner = if prefix.is_empty() { m.name.clone() } else { format!("{prefix}::{}", m.name) };
+                    if collect(&mut m.items, &inner, out) { m.vis = true; any = true; }
+                }
+                _ => {}
+            }
+        }
+        any
+    }
+    let mut tests = Vec::new();
+    collect(&mut user.items, "", &mut tests);
+    // The runner replaces the program's own `main`.
+    user.items.retain(|i| !matches!(&i.kind, ItemKind::Fn(f) if f.name == "main"));
+    let mut runner = String::from("fn main() -> i64 {\n    let args = std::env::args();\n    if args.len() < 2 { return 2; }\n    let which = args[1];\n");
+    for (i, t) in tests.iter().enumerate() {
+        let call = if t.returns_result {
+            format!("match crate::{}() {{ Ok(_) => {{}} Err(e) => {{ eprintln!(\"Error: {{:?}}\", e); return 1; }} }}", t.path)
+        } else {
+            format!("crate::{}();", t.path)
+        };
+        runner.push_str(&format!("    if which == \"{i}\" {{ {call} return 0; }}\n"));
+    }
+    runner.push_str("    2\n}\n");
+    let sid = add_source(&mut sources, "<test runner>".to_string(), runner.clone());
+    let toks = lex_with_source(&runner, sid).map_err(|e| ParseError { msg: e.msg, span: e.span })?;
+    user.items.extend(parse_module(&toks)?.items);
+    let module = inject_prelude(user, &mut sources);
+    Ok((module, sources, tests))
 }
 
 #[cfg(test)]

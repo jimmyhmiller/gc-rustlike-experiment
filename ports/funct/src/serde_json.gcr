@@ -1,0 +1,611 @@
+// PORT: stands in for the `serde_json` crate: the JSON `Value` tree, text
+// parsing and printing in serde_json's formats (compact output, ryu-style
+// floats, its error messages), and `to_string`/`from_str` for any
+// `serde::Serialize`/`serde::Deserialize` type.
+
+use crate::serde::{Content, Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// serde_json's default object map (sorted by key).
+pub type Map<K, V> = BTreeMap<K, V>;
+
+#[derive(Clone, PartialEq)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Number(Number),
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum N {
+    PosInt(u64),
+    NegInt(i64),
+    Float(f64),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Number {
+    n: N,
+}
+
+impl Number {
+    /// A finite float; None for NaN and infinities (JSON has neither).
+    pub fn from_f64(f: f64) -> Option<Number> {
+        if f.is_finite() { Some(Number { n: N::Float(f) }) } else { None }
+    }
+    pub fn as_i64(self) -> Option<i64> {
+        match self.n {
+            N::PosInt(u) => if u <= i64::MAX as u64 { Some(u as i64) } else { None },
+            N::NegInt(i) => Some(i),
+            N::Float(_) => None,
+        }
+    }
+    pub fn as_u64(self) -> Option<u64> {
+        match self.n {
+            N::PosInt(u) => Some(u),
+            _ => None,
+        }
+    }
+    pub fn as_f64(self) -> Option<f64> {
+        match self.n {
+            N::PosInt(u) => Some(u as f64),
+            N::NegInt(i) => Some(i as f64),
+            N::Float(f) => Some(f),
+        }
+    }
+    pub fn is_i64(self) -> bool { self.as_i64().is_some() }
+    pub fn is_u64(self) -> bool { matches!(self.n, N::PosInt(_)) }
+    pub fn is_f64(self) -> bool { matches!(self.n, N::Float(_)) }
+}
+
+impl From<i64> for Number {
+    fn from(i: i64) -> Number {
+        if i < 0 { Number { n: N::NegInt(i) } } else { Number { n: N::PosInt(i as u64) } }
+    }
+}
+
+impl From<u64> for Number {
+    fn from(u: u64) -> Number { Number { n: N::PosInt(u) } }
+}
+
+impl fmt::Display for Number {
+    fn fmt(self, f: fmt::Formatter) -> fmt::Result {
+        match self.n {
+            N::PosInt(u) => write!(f, "{}", u),
+            N::NegInt(i) => write!(f, "{}", i),
+            N::Float(x) => f.write_str(format_float(x)),
+        }
+    }
+}
+
+impl fmt::Debug for Number {
+    fn fmt(self, f: fmt::Formatter) -> fmt::Result {
+        write!(f, "Number({})", self)
+    }
+}
+
+/// A finite float as serde_json writes it (ryu's shortest round-trip digits:
+/// `1.0`, `0.1`, `1e21`, `1.5e-7`).
+fn format_float(x: f64) -> String {
+    // `{:e}` gives the shortest round-trip digits: `d[.ddd]e<exp>`.
+    let sci = format!("{:e}", x);
+    let (mantissa, exp) = sci.split_once('e').unwrap();
+    let exp: i64 = exp.parse().unwrap();
+    let negative = mantissa.starts_with('-');
+    let digits = mantissa.trim_start_matches('-').replace('.', "");
+    let length = digits.len();
+    // the decimal point sits after `kk` digits
+    let kk = exp + 1;
+    let k = kk - length;
+    let body = if 0 <= k && kk <= 16 {
+        format!("{}{}.0", digits, "0".repeat(k))
+    } else if 0 < kk && kk <= 16 {
+        format!("{}.{}", digits[..kk], digits[kk..])
+    } else if -5 < kk && kk <= 0 {
+        format!("0.{}{}", "0".repeat(0 - kk), digits)
+    } else if length == 1 {
+        format!("{}e{}", digits, kk - 1)
+    } else {
+        format!("{}.{}e{}", digits[..1], digits[1..], kk - 1)
+    };
+    if negative { format!("-{}", body) } else { body }
+}
+
+/// A serde_json error: the message, with the position for syntax errors.
+#[derive(Clone)]
+pub struct Error {
+    msg: String,
+    line: usize,
+    column: usize,
+}
+
+impl Error {
+    fn syntax(msg: String, line: usize, column: usize) -> Error {
+        Error { msg, line, column }
+    }
+    /// A data (not syntax) error, from a `Deserialize` impl.
+    pub fn custom(msg: impl fmt::Display) -> Error {
+        Error { msg: msg.to_string(), line: 0, column: 0 }
+    }
+    pub fn line(self) -> usize { self.line }
+    pub fn column(self) -> usize { self.column }
+}
+
+impl fmt::Display for Error {
+    fn fmt(self, f: fmt::Formatter) -> fmt::Result {
+        if self.line == 0 {
+            f.write_str(self.msg)
+        } else {
+            write!(f, "{} at line {} column {}", self.msg, self.line, self.column)
+        }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(self, f: fmt::Formatter) -> fmt::Result {
+        write!(f, "Error({:?}, line: {}, column: {})", self.msg, self.line, self.column)
+    }
+}
+
+impl std::error::Error for Error {}
+
+// PORT: serde_json also has `pub type Result<T> = Result<T, Error>`; gc-rust
+// would resolve `std::result::Result` in this module to that alias.
+
+// ---------- printing ----------
+
+fn write_str_escaped(out: Vec<String>, s: String) {
+    let mut out = out;
+    out.push("\"");
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let esc = match b {
+            34 => "\\\"",
+            92 => "\\\\",
+            10 => "\\n",
+            13 => "\\r",
+            9 => "\\t",
+            8 => "\\b",
+            12 => "\\f",
+            _ if b < 32 => "",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if start < i { out.push(s[start..i].to_string()); }
+        if esc.is_empty() {
+            out.push(format!("\\u{:04x}", b));
+        } else {
+            out.push(esc.to_string());
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() { out.push(s[start..bytes.len()].to_string()); }
+    out.push("\"");
+}
+
+fn write_value(out: Vec<String>, v: Value) {
+    let mut out = out;
+    match v {
+        Value::Null => out.push("null"),
+        Value::Bool(b) => out.push(if b { "true" } else { "false" }),
+        Value::Number(n) => out.push(n.to_string()),
+        Value::String(s) => write_str_escaped(out, s),
+        Value::Array(items) => {
+            out.push("[");
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 { out.push(","); }
+                write_value(out, x);
+            }
+            out.push("]");
+        }
+        Value::Object(map) => {
+            out.push("{");
+            for (i, (k, x)) in map.iter().enumerate() {
+                if i > 0 { out.push(","); }
+                write_str_escaped(out, k);
+                out.push(":");
+                write_value(out, x);
+            }
+            out.push("}");
+        }
+    }
+}
+
+/// Compact JSON text, as `serde_json::to_string` writes it.
+impl fmt::Display for Value {
+    fn fmt(self, f: fmt::Formatter) -> fmt::Result {
+        let out: Vec<String> = Vec::new();
+        write_value(out, self);
+        f.write_str(out.join(""))
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(self, f: fmt::Formatter) -> fmt::Result {
+        match self {
+            Value::Null => f.write_str("Null"),
+            Value::Bool(b) => write!(f, "Bool({})", b),
+            Value::Number(n) => write!(f, "Number({})", n),
+            Value::String(s) => write!(f, "String({:?})", s),
+            Value::Array(items) => write!(f, "Array {:?}", items),
+            Value::Object(map) => write!(f, "Object {:?}", map),
+        }
+    }
+}
+
+// ---------- parsing ----------
+
+struct Parser {
+    src: String,
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
+impl Parser {
+    fn new(src: String) -> Parser {
+        Parser { src: src, bytes: src.as_bytes(), pos: 0 }
+    }
+
+    /// An error about the byte just looked at (`pos`), positioned the way
+    /// serde_json reports it.
+    fn err_at(self, msg: String, pos: usize) -> Error {
+        let mut line = 1;
+        let mut line_start = 0;
+        let mut i = 0;
+        while i < pos && i < self.bytes.len() {
+            if self.bytes[i] == 10 {
+                line += 1;
+                line_start = i + 1;
+            }
+            i += 1;
+        }
+        let column = if pos >= self.bytes.len() { pos - line_start } else { pos - line_start + 1 };
+        Error::syntax(msg, line, column)
+    }
+
+    fn err(self, msg: String) -> Error {
+        self.err_at(msg, self.pos)
+    }
+
+    fn peek(self) -> Option<u8> {
+        if self.pos < self.bytes.len() { Some(self.bytes[self.pos]) } else { None }
+    }
+
+    fn skip_ws(mut self) {
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                32 | 9 | 10 | 13 => self.pos += 1,
+                _ => return,
+            }
+        }
+    }
+
+    fn parse_value(mut self) -> Result<Value, Error> {
+        self.skip_ws();
+        match self.peek() {
+            None => Err(self.err("EOF while parsing a value")),
+            Some(b'n') => self.parse_ident("null", Value::Null),
+            Some(b't') => self.parse_ident("true", Value::Bool(true)),
+            Some(b'f') => self.parse_ident("false", Value::Bool(false)),
+            Some(b'"') => Ok(Value::String(self.parse_string()?)),
+            Some(b'[') => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                self.skip_ws();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    return Ok(Value::Array(items));
+                }
+                loop {
+                    items.push(self.parse_value()?);
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.peek() == Some(b']') {
+                                return Err(self.err("trailing comma"));
+                            }
+                        }
+                        Some(b']') => {
+                            self.pos += 1;
+                            return Ok(Value::Array(items));
+                        }
+                        None => return Err(self.err("EOF while parsing a list")),
+                        Some(_) => return Err(self.err("expected `,` or `]`")),
+                    }
+                }
+            }
+            Some(b'{') => {
+                self.pos += 1;
+                let mut map = Map::new();
+                self.skip_ws();
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                    return Ok(Value::Object(map));
+                }
+                loop {
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b'"') => {}
+                        None => return Err(self.err("EOF while parsing an object")),
+                        Some(_) => return Err(self.err("key must be a string")),
+                    }
+                    let key = self.parse_string()?;
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b':') => self.pos += 1,
+                        None => return Err(self.err("EOF while parsing an object")),
+                        Some(_) => return Err(self.err("expected `:`")),
+                    }
+                    let v = self.parse_value()?;
+                    map.insert(key, v);
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.peek() == Some(b'}') {
+                                return Err(self.err("trailing comma"));
+                            }
+                        }
+                        Some(b'}') => {
+                            self.pos += 1;
+                            return Ok(Value::Object(map));
+                        }
+                        None => return Err(self.err("EOF while parsing an object")),
+                        Some(_) => return Err(self.err("expected `,` or `}`")),
+                    }
+                }
+            }
+            Some(b'-') => self.parse_number(),
+            Some(b) if b >= b'0' && b <= b'9' => self.parse_number(),
+            Some(_) => Err(self.err("expected value")),
+        }
+    }
+
+    fn parse_ident(mut self, word: String, v: Value) -> Result<Value, Error> {
+        let w = word.as_bytes();
+        for i in 0..w.len() {
+            match self.peek() {
+                None => return Err(self.err("EOF while parsing a value")),
+                Some(b) if b == w[i] => self.pos += 1,
+                Some(_) => return Err(self.err("expected ident")),
+            }
+        }
+        Ok(v)
+    }
+
+    fn hex4(mut self) -> Result<u32, Error> {
+        let mut n: u32 = 0;
+        for _ in 0..4 {
+            let b = match self.peek() {
+                None => return Err(self.err("EOF while parsing a string")),
+                Some(b) => b,
+            };
+            let d = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => return Err(self.err("invalid escape")),
+            };
+            n = n * 16 + d as u32;
+            self.pos += 1;
+        }
+        Ok(n)
+    }
+
+    fn parse_string(mut self) -> Result<String, Error> {
+        // at the opening quote
+        self.pos += 1;
+        let mut out: Vec<String> = Vec::new();
+        let mut start = self.pos;
+        loop {
+            let b = match self.peek() {
+                None => return Err(self.err("EOF while parsing a string")),
+                Some(b) => b,
+            };
+            if b == b'"' {
+                out.push(self.src[start..self.pos].to_string());
+                self.pos += 1;
+                return Ok(out.join(""));
+            }
+            if b < 32 {
+                return Err(self.err("control character (\\u0000-\\u001F) found while parsing a string"));
+            }
+            if b != b'\\' {
+                self.pos += 1;
+                continue;
+            }
+            out.push(self.src[start..self.pos].to_string());
+            self.pos += 1;
+            let e = match self.peek() {
+                None => return Err(self.err("EOF while parsing a string")),
+                Some(e) => e,
+            };
+            self.pos += 1;
+            let piece = match e {
+                b'"' => "\"".to_string(),
+                b'\\' => "\\".to_string(),
+                b'/' => "/".to_string(),
+                b'b' => "\u{8}".to_string(),
+                b'f' => "\u{c}".to_string(),
+                b'n' => "\n".to_string(),
+                b'r' => "\r".to_string(),
+                b't' => "\t".to_string(),
+                b'u' => {
+                    let mut c = self.hex4()?;
+                    if c >= 0xD800 && c < 0xDC00 {
+                        // a high surrogate: its low half must follow
+                        if self.peek() != Some(b'\\') || self.pos + 1 >= self.bytes.len() || self.bytes[self.pos + 1] != b'u' {
+                            return Err(self.err("unexpected end of hex escape"));
+                        }
+                        self.pos += 2;
+                        let lo = self.hex4()?;
+                        if lo < 0xDC00 || lo >= 0xE000 {
+                            return Err(self.err("lone leading surrogate in hex escape"));
+                        }
+                        c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                    } else if c >= 0xDC00 && c < 0xE000 {
+                        return Err(self.err("lone leading surrogate in hex escape"));
+                    }
+                    match char::from_u32(c) {
+                        Some(ch) => ch.to_string(),
+                        None => return Err(self.err("invalid unicode code point")),
+                    }
+                }
+                _ => {
+                    self.pos -= 1;
+                    return Err(self.err("invalid escape"));
+                }
+            };
+            out.push(piece);
+            start = self.pos;
+        }
+    }
+
+    fn parse_number(mut self) -> Result<Value, Error> {
+        let begin = self.pos;
+        let negative = self.peek() == Some(b'-');
+        if negative { self.pos += 1; }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if let Some(b) = self.peek() {
+                    if b >= b'0' && b <= b'9' {
+                        return Err(self.err("invalid number"));
+                    }
+                }
+            }
+            Some(b) if b >= b'1' && b <= b'9' => {
+                while let Some(b) = self.peek() {
+                    if b >= b'0' && b <= b'9' { self.pos += 1; } else { break; }
+                }
+            }
+            None => return Err(self.err("EOF while parsing a value")),
+            Some(_) => return Err(self.err("invalid number")),
+        }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            let digits_start = self.pos;
+            while let Some(b) = self.peek() {
+                if b >= b'0' && b <= b'9' { self.pos += 1; } else { break; }
+            }
+            if self.pos == digits_start {
+                return Err(if self.peek().is_none() { self.err("EOF while parsing a value") } else { self.err("invalid number") });
+            }
+        }
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) { self.pos += 1; }
+            let digits_start = self.pos;
+            while let Some(b) = self.peek() {
+                if b >= b'0' && b <= b'9' { self.pos += 1; } else { break; }
+            }
+            if self.pos == digits_start {
+                return Err(if self.peek().is_none() { self.err("EOF while parsing a value") } else { self.err("invalid number") });
+            }
+        }
+        let text = self.src[begin..self.pos].to_string();
+        if !is_float {
+            if negative {
+                if let Ok(i) = text.parse::<i64>() {
+                    return Ok(Value::Number(Number { n: N::NegInt(i) }));
+                }
+            } else if let Ok(u) = text.parse::<u64>() {
+                return Ok(Value::Number(Number { n: N::PosInt(u) }));
+            }
+        }
+        match text.parse::<f64>() {
+            Ok(f) if f.is_finite() => Ok(Value::Number(Number { n: N::Float(f) })),
+            _ => Err(self.err_at("number out of range", self.pos - 1)),
+        }
+    }
+}
+
+/// Parse JSON text into a `Value`.
+pub fn parse_value(s: String) -> Result<Value, Error> {
+    let mut p = Parser::new(s);
+    let v = p.parse_value()?;
+    p.skip_ws();
+    if p.pos < p.bytes.len() {
+        return Err(p.err("trailing characters"));
+    }
+    Ok(v)
+}
+
+// ---------- serde glue ----------
+
+/// The `Value` for serde's data model.
+pub fn value_from_content(c: Content) -> Value {
+    match c {
+        Content::Unit => Value::Null,
+        Content::Bool(b) => Value::Bool(b),
+        Content::I64(i) => Value::Number(Number::from(i)),
+        Content::U64(u) => Value::Number(Number::from(u)),
+        Content::F64(f) => match Number::from_f64(f) {
+            Some(n) => Value::Number(n),
+            None => Value::Null,
+        },
+        Content::Str(s) => Value::String(s),
+        Content::Seq(items) => Value::Array(items.into_iter().map(value_from_content).collect()),
+        Content::Map(fields) => Value::Object(fields.into_iter().map(|(k, v)| (k, value_from_content(v))).collect()),
+    }
+}
+
+pub fn content_from_value(v: Value) -> Content {
+    match v {
+        Value::Null => Content::Unit,
+        Value::Bool(b) => Content::Bool(b),
+        Value::Number(n) => match n.n {
+            N::PosInt(u) => Content::U64(u),
+            N::NegInt(i) => Content::I64(i),
+            N::Float(f) => Content::F64(f),
+        },
+        Value::String(s) => Content::Str(s),
+        Value::Array(items) => Content::Seq(items.into_iter().map(content_from_value).collect()),
+        Value::Object(map) => Content::Map(map.into_iter().map(|(k, v)| (k, content_from_value(v))).collect()),
+    }
+}
+
+impl Serialize for Value {
+    fn serialize(self) -> Content { content_from_value(self) }
+}
+
+impl Deserialize for Value {
+    fn deserialize(c: Content) -> Result<Value, String> { Ok(value_from_content(c)) }
+}
+
+/// Serialize `value` as compact JSON text.
+pub fn to_string<T: Serialize>(value: T) -> Result<String, Error> {
+    Ok(value_from_content(value.serialize()).to_string())
+}
+
+/// `value` as a JSON `Value`.
+pub fn to_value<T: Serialize>(value: T) -> Result<Value, Error> {
+    Ok(value_from_content(value.serialize()))
+}
+
+/// Parse JSON text into a `T`.
+pub fn from_str<T: Deserialize>(s: String) -> Result<T, Error> {
+    let v = parse_value(s)?;
+    T::deserialize(content_from_value(v)).map_err(|m| Error::custom(m))
+}
+
+/// A `T` from a JSON `Value`.
+pub fn from_value<T: Deserialize>(v: Value) -> Result<T, Error> {
+    T::deserialize(content_from_value(v)).map_err(|m| Error::custom(m))
+}

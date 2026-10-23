@@ -7,8 +7,14 @@ impl IoError {
         IoError { operation: operation, path: path, kind: r.code, message: r.text }
     }
 }
+impl IoError {
+    // Rust's `std::io::Error`, which displays only its message.
+    fn std(self) -> IoError { IoError { operation: "", path: "", kind: self.kind, message: self.message } }
+}
 impl ToString for IoError {
-    fn to_string(self) -> String { self.operation + " " + self.path + ": " + self.message }
+    fn to_string(self) -> String {
+        if self.operation.is_empty() { self.message } else { self.operation + " " + self.path + ": " + self.message }
+    }
 }
 fn fs_read_text(path: String, max_bytes: i64) -> Result<String, IoError> {
     let r = host_io(1, path, "", max_bytes);
@@ -72,8 +78,46 @@ fn json_quote(text: String) -> String {
     parts.join("")
 }
 
+// `std::io::Result`.
+type IoResult<T> = Result<T, IoError>;
+
 // `std::fs::read_to_string`.
-fn read_to_string(path: String) -> Result<String, IoError> { fs_read_text(path, 1 << 40) }
+fn read_to_string<P: Into<PathBuf>>(path: P) -> Result<String, IoError> {
+    let p: PathBuf = path.into();
+    fs_read_text(p.s, 1 << 40).map_err(|e| e.std())
+}
+// `std::fs::write`: create or truncate the file at `path` with `text`.
+fn write<P: Into<PathBuf>>(path: P, text: String) -> Result<(), IoError> {
+    let p: PathBuf = path.into();
+    let r = host_io(10, p.s, text, 0);
+    if r.code == 0 { Ok(()) } else { Err(IoError::from_response(r, "write", p.s).std()) }
+}
+// `std::fs::create_dir_all`: the directory and any missing parents.
+fn create_dir_all<P: Into<PathBuf>>(path: P) -> Result<(), IoError> {
+    let p: PathBuf = path.into();
+    let r = host_io(11, p.s, "", 0);
+    if r.code == 0 { Ok(()) } else { Err(IoError::from_response(r, "create", p.s).std()) }
+}
+// `std::fs::remove_file`.
+fn remove_file<P: Into<PathBuf>>(path: P) -> Result<(), IoError> {
+    let p: PathBuf = path.into();
+    let r = host_io(12, p.s, "", 0);
+    if r.code == 0 { Ok(()) } else { Err(IoError::from_response(r, "remove", p.s).std()) }
+}
+// `std::env::var`: the variable's value, if it is set (and UTF-8).
+fn var(name: String) -> Result<String, IoError> {
+    let r = host_io(13, name, "", 0);
+    if r.code == 0 && r.kind == 1 { Ok(r.text) }
+    else if r.code == 0 { Err(IoError { operation: "", path: "", kind: 1, message: "environment variable not found" }) }
+    else { Err(IoError::from_response(r, "env", name).std()) }
+}
+// `std::env::temp_dir`: `$TMPDIR`, or `/tmp`.
+fn temp_dir() -> PathBuf {
+    match var("TMPDIR") { Ok(d) => PathBuf { s: d }, Err(_) => PathBuf { s: "/tmp" } }
+}
+// `std::process::id`.
+fn id() -> u32 { host_io(14, "", "", 0).kind as u32 }
+
 // `std::process::exit`: end the program with `code`.
 fn exit(code: i32) -> ! {
     host_io(9, "", "", code as i64);
@@ -82,4 +126,116 @@ fn exit(code: i32) -> ! {
 // `std::env::args`: the program name, then its arguments.
 fn args() -> Vec<String> {
     match process_args() { Ok(a) => Vec::from_array(a), Err(_e) => Vec::new() }
+}
+
+// ---- std::path / std::ffi -----------------------------------------------------
+// `Path` and `PathBuf` are one type: with no references there is no borrowed
+// form to tell apart (`Path::new(s)` and `PathBuf::from(s)` both build one).
+// Paths are POSIX strings.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+struct OsStr { s: String }
+type OsString = OsStr;
+impl OsStr {
+    fn to_str(self) -> Option<String> { Option::Some(self.s) }
+    fn to_string_lossy(self) -> String { self.s }
+    fn into_string(self) -> Result<String, OsStr> { Result::Ok(self.s) }
+    fn is_empty(self) -> bool { self.s.is_empty() }
+    fn len(self) -> i64 { self.s.len() }
+}
+impl Debug for OsStr { fn fmt(self, f: Formatter) -> FmtResult { f.write_str("\"" + fmt_escape(self.s, '"') + "\"") } }
+impl Eq<String> for OsStr { fn eq(self, other: String) -> bool { self.s == other } }
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+struct PathBuf { s: String }
+type Path = PathBuf;
+
+// What `Path::display()` returns.
+struct PathDisplay { s: String }
+impl Display for PathDisplay { fn fmt(self, f: Formatter) -> FmtResult { f.write_str(self.s) } }
+
+impl PathBuf {
+    fn new(s: String) -> PathBuf { PathBuf { s: s } }
+    fn as_path(self) -> PathBuf { self }
+    fn to_path_buf(self) -> PathBuf { self }
+    fn as_os_str(self) -> OsStr { OsStr { s: self.s } }
+    fn to_str(self) -> Option<String> { Option::Some(self.s) }
+    fn to_string_lossy(self) -> String { self.s }
+    fn display(self) -> PathDisplay { PathDisplay { s: self.s } }
+    fn join(self, name: String) -> PathBuf { PathBuf { s: path_join(self.s, name) } }
+    fn push(mut self, name: String) { self.s = path_join(self.s, name); }
+    fn is_absolute(self) -> bool { self.s.starts_with("/") }
+    // The path without its last component; None for `/` and for "".
+    fn parent(self) -> Option<PathBuf> {
+        let t = self.s.trim_end_matches("/");
+        if t.is_empty() { return Option::None; }
+        match t.rfind("/") {
+            Option::Some(0) => Option::Some(PathBuf { s: "/" }),
+            Option::Some(i) => Option::Some(PathBuf { s: t[0..i] }),
+            Option::None => Option::Some(PathBuf { s: "" }),
+        }
+    }
+    fn file_name(self) -> Option<OsStr> {
+        let t = self.s.trim_end_matches("/");
+        let name = match t.rfind("/") { Option::Some(i) => t[i + 1..t.len()], Option::None => t };
+        if name.is_empty() || name == ".." { Option::None } else { Option::Some(OsStr { s: name }) }
+    }
+    fn extension(self) -> Option<OsStr> {
+        let name = self.file_name()?.s;
+        match name.rfind(".") {
+            Option::Some(0) | Option::None => Option::None,
+            Option::Some(i) => Option::Some(OsStr { s: name[i + 1..name.len()] }),
+        }
+    }
+    fn file_stem(self) -> Option<OsStr> {
+        let name = self.file_name()?.s;
+        match name.rfind(".") {
+            Option::Some(0) | Option::None => Option::Some(OsStr { s: name }),
+            Option::Some(i) => Option::Some(OsStr { s: name[0..i] }),
+        }
+    }
+    fn exists(self) -> bool { fs_kind(self.s).is_ok() }
+    // These follow symlinks, like Rust's.
+    fn is_file(self) -> bool { fs_read_text(self.s, 0).is_ok() || matches!(fs_kind(self.s), Result::Ok(1)) }
+    fn is_dir(self) -> bool { fs_read_dir(self.s).is_ok() }
+}
+impl From<String> for PathBuf { fn from(s: String) -> PathBuf { PathBuf { s: s } } }
+impl Debug for PathBuf { fn fmt(self, f: Formatter) -> FmtResult { f.write_str("\"" + fmt_escape(self.s, '"') + "\"") } }
+
+// `std::fs::read_dir`: the entries of a directory (sorted by name here).
+struct DirEntry { dir: String, name: String }
+impl DirEntry {
+    fn path(self) -> PathBuf { PathBuf { s: path_join(self.dir, self.name) } }
+    fn file_name(self) -> OsStr { OsStr { s: self.name } }
+}
+struct ReadDir { dir: String, names: Array<String>, i: i64 }
+impl Iterator for ReadDir {
+    type Item = Result<DirEntry, IoError>;
+    fn next(mut self) -> Option<Result<DirEntry, IoError>> {
+        if self.i >= self.names.len() { return Option::None; }
+        let name = self.names[self.i];
+        self.i += 1;
+        Option::Some(Result::Ok(DirEntry { dir: self.dir, name: name }))
+    }
+}
+impl ReadDir {
+    // `Iterator::flatten`: the entries that could be read.
+    fn flatten(self) -> DirEntries { DirEntries { dir: self } }
+}
+struct DirEntries { dir: ReadDir }
+impl Iterator for DirEntries {
+    type Item = DirEntry;
+    fn next(mut self) -> Option<DirEntry> {
+        loop {
+            match self.dir.next() {
+                Option::Some(Result::Ok(e)) => { return Option::Some(e); }
+                Option::Some(Result::Err(_)) => {}
+                Option::None => { return Option::None; }
+            }
+        }
+    }
+}
+fn read_dir<P: Into<PathBuf>>(path: P) -> Result<ReadDir, IoError> {
+    let p: PathBuf = path.into();
+    let names = fs_read_dir(p.s).map_err(|e| e.std())?;
+    Result::Ok(ReadDir { dir: p.s, names: names, i: 0 })
 }

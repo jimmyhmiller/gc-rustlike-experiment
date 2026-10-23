@@ -15,6 +15,8 @@ struct Qualifier<'a> {
     /// The trait bounds on type parameters in scope, which say which trait a
     /// bare `T::Output` projects through.
     proj_bounds: std::cell::RefCell<Vec<(String, TraitRef)>>,
+    /// The alias whose target is being qualified (see `AliasView::defining`).
+    defining: &'a str,
 }
 impl Qualifier<'_> {
     fn view(&self) -> AliasView<'_> {
@@ -22,6 +24,7 @@ impl Qualifier<'_> {
             globals: self.g,
             resolved: &self.g.resolved_aliases,
             module: self.module,
+            defining: self.defining,
         }
     }
     fn visible(&self, name: &str, span: crate::lexer::Span) -> Result<(), ResolveError> {
@@ -568,16 +571,16 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
     let mut consts = g.consts.clone();
     let mut aliases = g.aliases.clone();
     for (name, f) in &mut fns {
-        Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() }
+        Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default(), defining: "" }
         .function(f, &[])?;
     }
     for (name, alias) in &mut aliases {
-        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default(), defining: name };
         let scope = q.generics(&mut alias.generics, &[])?;
         q.ty(&mut alias.ty, &scope, false)?;
     }
     for (name, s) in &mut structs {
-        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default(), defining: "" };
         let scope = q.generics(&mut s.generics, &[])?;
         match &mut s.body {
             StructBody::Named(fields) => {
@@ -594,7 +597,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, e) in &mut enums {
-        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default(), defining: "" };
         let scope = q.generics(&mut e.generics, &[])?;
         for variant in &mut e.variants {
             match &mut variant.payload {
@@ -613,7 +616,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, t) in &mut traits {
-        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default(), defining: "" };
         let scope = q.generics(&mut t.generics, &[])?;
         for bound in &mut t.supertraits {
             let me = Type { kind: TypeKind::SelfType, span: bound.span };
@@ -635,7 +638,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (index, i) in impls.iter_mut().enumerate() {
-        let q = Qualifier { g, module: g.impl_modules.get(index).map_or("", String::as_str), self_path: None, proj_bounds: Default::default() };
+        let q = Qualifier { g, module: g.impl_modules.get(index).map_or("", String::as_str), self_path: None, proj_bounds: Default::default(), defining: "" };
         let scope = q.generics(&mut i.generics, &[])?;
         q.push_bounds(&i.generics);
         q.ty(&mut i.self_ty, &scope, i.trait_ref.is_none())?;
@@ -687,7 +690,7 @@ pub(crate) fn qualify_types(g: &mut GlobalTable) -> Result<(), ResolveError> {
         }
     }
     for (name, c) in &mut consts {
-        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default() };
+        let q = Qualifier { g, module: module(name), self_path: None, proj_bounds: Default::default(), defining: "" };
         q.ty(&mut c.ty, &[], false)?;
         q.expr(&mut c.value, &[])?;
     }

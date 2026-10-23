@@ -30,6 +30,7 @@ fn assert_retired(heap: &Heap, weak: &std::sync::Weak<JoinHandle>) {
 fn complete(owner: usize, result: u64) -> Arc<JoinHandle> {
     Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),
@@ -84,6 +85,7 @@ fn ownership_case<H: ObjHeader, P: PtrPolicy>(mode: usize) {
     let (release, wait) = std::sync::mpsc::channel();
     let pending = Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),

@@ -1,0 +1,225 @@
+// PORT: stands in for the `serde` crate. A type serializes to, and
+// deserializes from, `Content` (the self-describing tree serde's data model
+// describes); `serde_json` converts `Content` to and from JSON text.
+// `#[derive(Serialize, Deserialize)]` generates impls of these traits with
+// serde's default representations (structs as maps, newtype structs as
+// their field, enums externally tagged).
+
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum Content {
+    Unit,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Str(String),
+    Seq(Vec<Content>),
+    Map(Vec<(String, Content)>),
+}
+
+impl Content {
+    /// serde's description of a value in "invalid type" errors.
+    pub fn unexpected(self) -> String {
+        match self {
+            Content::Unit => "null".to_string(),
+            Content::Bool(b) => format!("boolean `{}`", b),
+            Content::I64(i) => format!("integer `{}`", i),
+            Content::U64(u) => format!("integer `{}`", u),
+            Content::F64(f) => format!("floating point `{}`", f),
+            Content::Str(s) => format!("string {:?}", s),
+            Content::Seq(_) => "sequence".to_string(),
+            Content::Map(_) => "map".to_string(),
+        }
+    }
+
+    /// The value of field `name` of a struct's map (`Unit` when absent, so
+    /// `Option` fields may be left out).
+    pub fn field(self, name: String) -> Option<Content> {
+        match self {
+            Content::Map(fields) => fields.iter().find(|(k, _)| k == name).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+}
+
+pub fn invalid_type(found: Content, expected: String) -> String {
+    format!("invalid type: {}, expected {}", found.unexpected(), expected)
+}
+
+pub trait Serialize {
+    fn serialize(self) -> Content;
+}
+
+pub trait Deserialize {
+    fn deserialize(c: Content) -> Result<Self, String>;
+}
+
+impl Serialize for () {
+    fn serialize(self) -> Content { Content::Unit }
+}
+impl Deserialize for () {
+    fn deserialize(c: Content) -> Result<(), String> {
+        match c {
+            Content::Unit => Ok(()),
+            other => Err(invalid_type(other, "unit")),
+        }
+    }
+}
+
+impl Serialize for bool {
+    fn serialize(self) -> Content { Content::Bool(self) }
+}
+impl Deserialize for bool {
+    fn deserialize(c: Content) -> Result<bool, String> {
+        match c {
+            Content::Bool(b) => Ok(b),
+            other => Err(invalid_type(other, "a boolean")),
+        }
+    }
+}
+
+fn content_int(c: Content, what: String, lo: i128, hi: i128) -> Result<i128, String> {
+    let v: i128 = match c {
+        Content::I64(i) => i as i128,
+        Content::U64(u) => u as i128,
+        other => return Err(invalid_type(other, what)),
+    };
+    if v < lo || v > hi {
+        return Err(format!("invalid value: integer `{}`, expected {}", v, what));
+    }
+    Ok(v)
+}
+
+macro_rules! serde_signed {
+    ($($t:ty),*) => {$(
+        impl Serialize for $t {
+            fn serialize(self) -> Content { Content::I64(self as i64) }
+        }
+        impl Deserialize for $t {
+            fn deserialize(c: Content) -> Result<$t, String> {
+                Ok(content_int(c, stringify!($t), <$t>::MIN as i128, <$t>::MAX as i128)? as $t)
+            }
+        }
+    )*};
+}
+serde_signed!(i8, i16, i32, i64);
+
+macro_rules! serde_unsigned {
+    ($($t:ty),*) => {$(
+        impl Serialize for $t {
+            fn serialize(self) -> Content { Content::U64(self as u64) }
+        }
+        impl Deserialize for $t {
+            fn deserialize(c: Content) -> Result<$t, String> {
+                Ok(content_int(c, stringify!($t), 0, <$t>::MAX as i128)? as $t)
+            }
+        }
+    )*};
+}
+serde_unsigned!(u8, u16, u32, u64);
+
+impl Serialize for f64 {
+    fn serialize(self) -> Content { Content::F64(self) }
+}
+impl Deserialize for f64 {
+    fn deserialize(c: Content) -> Result<f64, String> {
+        match c {
+            Content::F64(f) => Ok(f),
+            Content::I64(i) => Ok(i as f64),
+            Content::U64(u) => Ok(u as f64),
+            other => Err(invalid_type(other, "f64")),
+        }
+    }
+}
+
+impl Serialize for String {
+    fn serialize(self) -> Content { Content::Str(self) }
+}
+impl Deserialize for String {
+    fn deserialize(c: Content) -> Result<String, String> {
+        match c {
+            Content::Str(s) => Ok(s),
+            other => Err(invalid_type(other, "a string")),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Vec<T> {
+    fn serialize(self) -> Content { Content::Seq(self.into_iter().map(|x| x.serialize()).collect()) }
+}
+impl<T: Deserialize> Deserialize for Vec<T> {
+    fn deserialize(c: Content) -> Result<Vec<T>, String> {
+        match c {
+            Content::Seq(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for x in items { out.push(T::deserialize(x)?); }
+                Ok(out)
+            }
+            other => Err(invalid_type(other, "a sequence")),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Option<T> {
+    fn serialize(self) -> Content {
+        match self {
+            Some(x) => x.serialize(),
+            None => Content::Unit,
+        }
+    }
+}
+impl<T: Deserialize> Deserialize for Option<T> {
+    fn deserialize(c: Content) -> Result<Option<T>, String> {
+        match c {
+            Content::Unit => Ok(None),
+            other => Ok(Some(T::deserialize(other)?)),
+        }
+    }
+}
+
+impl<A: Serialize, B: Serialize> Serialize for (A, B) {
+    fn serialize(self) -> Content { Content::Seq(vec![self.0.serialize(), self.1.serialize()]) }
+}
+impl<A: Deserialize, B: Deserialize> Deserialize for (A, B) {
+    fn deserialize(c: Content) -> Result<(A, B), String> {
+        match c {
+            Content::Seq(items) if items.len() == 2 => Ok((A::deserialize(items[0])?, B::deserialize(items[1])?)),
+            Content::Seq(items) => Err(format!("invalid length {}, expected a tuple of size 2", items.len())),
+            other => Err(invalid_type(other, "a tuple of size 2")),
+        }
+    }
+}
+
+impl<V: Serialize> Serialize for BTreeMap<String, V> {
+    fn serialize(self) -> Content { Content::Map(self.into_iter().map(|(k, v)| (k, v.serialize())).collect()) }
+}
+impl<V: Deserialize> Deserialize for BTreeMap<String, V> {
+    fn deserialize(c: Content) -> Result<BTreeMap<String, V>, String> {
+        match c {
+            Content::Map(fields) => {
+                let mut out = BTreeMap::new();
+                for (k, v) in fields { out.insert(k, V::deserialize(v)?); }
+                Ok(out)
+            }
+            other => Err(invalid_type(other, "a map")),
+        }
+    }
+}
+
+impl<V: Serialize> Serialize for HashMap<String, V> {
+    fn serialize(self) -> Content { Content::Map(self.into_iter().map(|(k, v)| (k, v.serialize())).collect()) }
+}
+impl<V: Deserialize> Deserialize for HashMap<String, V> {
+    fn deserialize(c: Content) -> Result<HashMap<String, V>, String> {
+        match c {
+            Content::Map(fields) => {
+                let mut out = HashMap::new();
+                for (k, v) in fields { out.insert(k, V::deserialize(v)?); }
+                Ok(out)
+            }
+            other => Err(invalid_type(other, "a map")),
+        }
+    }
+}

@@ -22,6 +22,18 @@ pub const STDOUT: u32 = 7;
 pub const STDERR_RAW: u32 = 8;
 /// End the process with status `limit`, after flushing stdout and stderr.
 pub const EXIT: u32 = 9;
+/// `std::fs::write`: create or truncate the file and write `text`.
+pub const WRITE_TEXT: u32 = 10;
+/// `std::fs::create_dir_all`.
+pub const CREATE_DIR_ALL: u32 = 11;
+/// `std::fs::remove_file`.
+pub const REMOVE_FILE: u32 = 12;
+/// The environment variable named `path`, as `text` (`kind` 1 when set).
+pub const ENV_VAR: u32 = 13;
+/// This process's id, as `kind`.
+pub const PROCESS_ID: u32 = 14;
+/// The largest operation number.
+pub const LAST: u32 = PROCESS_ID;
 
 #[derive(Debug, Default)]
 struct Outcome {
@@ -193,6 +205,16 @@ fn perform(op: u32, path: &str, text: &str, limit: i64) -> io::Result<Outcome> {
             stdout.write_all(b"\n")?;
             stdout.flush()?;
         }
+        WRITE_TEXT => fs::write(path, text)?,
+        CREATE_DIR_ALL => fs::create_dir_all(path)?,
+        REMOVE_FILE => fs::remove_file(path)?,
+        ENV_VAR => {
+            if let Some(value) = std::env::var_os(path) {
+                out.text = value.into_string().map_err(|_| invalid("environment variable is not UTF-8"))?;
+                out.kind = 1;
+            }
+        }
+        PROCESS_ID => out.kind = std::process::id() as i64,
         _ => return Err(invalid("unknown host I/O operation")),
     }
     Ok(out)

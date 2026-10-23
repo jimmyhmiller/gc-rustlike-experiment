@@ -87,6 +87,7 @@ fn finished(owner: usize) -> Arc<JoinHandle> {
     until(|| native.is_finished());
     Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),
@@ -225,6 +226,7 @@ fn blocked_exit(owner: usize) -> (Arc<JoinHandle>, Gate) {
     (
         Arc::new(JoinHandle {
             completion_notice: false,
+            daemon: std::sync::atomic::AtomicBool::new(false),
             native_joined: std::sync::atomic::AtomicBool::new(false),
             pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
             reaper_registration: std::sync::OnceLock::new(),
@@ -405,6 +407,7 @@ fn collector_orphan_reaper_skips_unfinished_threads_without_stranding_ready_ones
     let (release, wait) = std::sync::mpsc::channel();
     let blocked = Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),
@@ -465,6 +468,7 @@ fn collector_orphan_reaper_drops_native_panic_payloads_outside_collection() {
     until(|| native.is_finished());
     let record = Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),
@@ -575,6 +579,7 @@ fn collector_orphan_reaper_cleanup_panics_abort_the_process() {
     until(|| native.is_finished());
     let record = Arc::new(JoinHandle {
         completion_notice: false,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),
@@ -664,6 +669,7 @@ fn collector_orphan_reaper_shutdown_waits_for_worker_tls_and_late_descendants() 
             .unwrap()
             .register(Arc::new(JoinHandle {
                 completion_notice: false,
+                daemon: std::sync::atomic::AtomicBool::new(false),
                 native_joined: std::sync::atomic::AtomicBool::new(false),
                 pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 reaper_registration: std::sync::OnceLock::new(),
@@ -827,6 +833,7 @@ fn collector_orphan_reaper_shutdown_waits_for_worker_tls_without_blocking_gc() {
             .unwrap()
             .register(Arc::new(JoinHandle {
                 completion_notice: false,
+                daemon: std::sync::atomic::AtomicBool::new(false),
                 native_joined: std::sync::atomic::AtomicBool::new(false),
                 pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 reaper_registration: std::sync::OnceLock::new(),

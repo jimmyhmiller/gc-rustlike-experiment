@@ -159,35 +159,37 @@ impl Tail<'_> {
                 }
             }
         }
-        match e.kind.as_mut() {
+        let returns = match e.kind.as_mut() {
             If(condition, yes, no) => {
                 self.expr(condition, false, depth);
                 self.block(yes, tail, depth);
                 self.block(no, tail, depth);
+                false
             }
-            Block(block) => self.block(block, tail, depth),
+            Block(block) => { self.block(block, tail, depth); false }
             Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
                 self.expr(scrutinee, false, depth);
                 for arm in arms {
                     self.expr(&mut arm.body, tail, depth);
                 }
+                false
             }
-            Loop(block) => self.block(block, false, depth + 1),
-            Once { body, .. } => self.block(body, false, depth),
-            Return(..) | Continue | Leave { .. } => {}
-            _ if tail => {
-                // Divergent unit loops in a non-unit function cannot return.
-                if matches!(e.repr, Repr::Unit) && !matches!(self.ret, Repr::Unit) {
-                    return;
-                }
-                let value = e.clone();
-                *e = CoreExpr {
-                    kind: Box::new(Return(Some(Box::new(value)))),
-                    repr: e.repr.clone(),
-                    span: e.span,
-                };
-            }
-            _ => {}
+            // A loop or inlined body in tail position finishes the function
+            // when it ends: once the body is itself a loop, falling off its
+            // end would run it again, so it returns.
+            Loop(block) => { self.block(block, false, depth + 1); tail }
+            Once { body, .. } => { self.block(body, false, depth); tail }
+            Return(..) | Continue | Leave { .. } => false,
+            _ => tail,
+        };
+        // Divergent unit loops in a non-unit function cannot return.
+        if returns && !(matches!(e.repr, Repr::Unit) && !matches!(self.ret, Repr::Unit)) {
+            let value = e.clone();
+            *e = CoreExpr {
+                kind: Box::new(Return(Some(Box::new(value)))),
+                repr: e.repr.clone(),
+                span: e.span,
+            };
         }
     }
 }
@@ -226,5 +228,26 @@ mod tests {
             ));
         }
         assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 74);
+    }
+
+    #[test]
+    fn a_loop_in_tail_position_returns_when_it_ends() {
+        // Once the body is a loop, a tail `loop` that breaks must return
+        // rather than fall into the next iteration of the function.
+        let source = r#"
+            fn fill(n: i64, mut a: Array<i64>, i: i64) {
+                if n > 0 { fill(n - 1, a, i) } else {
+                    let mut j = i;
+                    loop { if j >= 3 { break; } array_set(a, j, j + 1); j += 1; }
+                }
+            }
+            fn main() -> i64 {
+                let a: Array<i64> = array_new(3);
+                fill(5, a, 0);
+                a[0] + a[1] * 10 + a[2] * 100
+            }
+        "#;
+        let program = lower(source);
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 321);
     }
 }

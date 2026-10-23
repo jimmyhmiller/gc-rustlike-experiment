@@ -200,6 +200,7 @@ fn collector_native_owner_indices_shrink_after_managed_bursts() {
             }
             threads.register(Arc::new(JoinHandle {
                 completion_notice: false,
+                daemon: std::sync::atomic::AtomicBool::new(false),
                 native_joined: std::sync::atomic::AtomicBool::new(false),
                 pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 reaper_registration: std::sync::OnceLock::new(),

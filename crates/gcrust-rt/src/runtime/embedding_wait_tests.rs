@@ -69,6 +69,7 @@ fn collector_embedding_idle_context_does_not_block_another_contexts_shutdown() {
         .unwrap()
         .register(Arc::new(JoinHandle {
             completion_notice: false,
+            daemon: std::sync::atomic::AtomicBool::new(false),
             native_joined: std::sync::atomic::AtomicBool::new(false),
             pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
             reaper_registration: std::sync::OnceLock::new(),
@@ -252,6 +253,7 @@ fn collector_embedding_inner_shutdown_suspends_an_active_outer_entry() {
             .unwrap()
             .register(Arc::new(JoinHandle {
                 completion_notice: false,
+                daemon: std::sync::atomic::AtomicBool::new(false),
                 native_joined: std::sync::atomic::AtomicBool::new(false),
                 pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 reaper_registration: std::sync::OnceLock::new(),

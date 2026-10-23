@@ -241,6 +241,9 @@ impl Rewrite<'_> {
             match s {
                 CoreStmt::Let(l, mut v) if self.fields.contains_key(&l) => {
                     // `let o = New { f.. }` becomes `let o.i = f.i` for each field.
+                    // A replaced object stored in a field escapes here, so it is
+                    // allocated first.
+                    self.escapes(&mut v, &mut b.stmts);
                     self.expr(&mut v);
                     let (prefix, values) = take_new(&mut v);
                     b.stmts.extend(prefix);

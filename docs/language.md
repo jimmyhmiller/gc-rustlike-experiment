@@ -134,8 +134,30 @@ These follow Rust; differences come from having no references.
   items are skipped.
 - **Paths.** `use std::...;` imports nothing (the prelude is always in scope);
   `std::collections::HashMap` and `fmt::Display` name prelude items;
-  `use a::{b, c};` groups work. `Box<T>`, `Rc<T>`, and `Arc<T>` are `T`, and
-  `Box::new(x)` is `x`.
+  `use a::{b, c};` groups work, as do `use a::b as c;`, a `use` naming
+  another `use` (`use crate::ast::Expr; .. use Expr::*;`), and a function's
+  own `use` (it applies to its module). Bare variants, functions, and
+  constants resolve in the current module first. Where a std name would
+  clash with a program's own, the prelude item has its own name and `use`
+  renames it: `std::sync::atomic::Ordering` is `AtomicOrdering`,
+  `std::error::Error` is `StdError`, `std::io::{Error, Result}` are
+  `IoError` and `IoResult`. An integration test (`tests/*.gcr`) names the
+  crate by its package name (`use funct::Funct;`). `Box<T>`, `Rc<T>`, and
+  `Arc<T>` are `T`, and `Box::new(x)` is `x`; `Rc::ptr_eq`/`std::ptr::eq`
+  compare identity.
+- **Clone.** Cloning a `Vec` clones its elements, as in Rust. A type with no
+  `Clone` impl (an atomic, a closure, a host handle) is cloned by sharing it:
+  in Rust such a clone can only be an `Rc`/`Arc` clone.
+- **Std library pieces.** `std::any` (`Any`, `TypeId`, `type_name`,
+  `downcast_ref`/`downcast_mut` on `dyn Any`), `std::path::{Path, PathBuf}`
+  (one type), `std::fs::{read_to_string, read_dir, write, create_dir_all,
+  remove_file}`, `std::env::{var, temp_dir}`, `std::process::id`,
+  `std::time::{Duration, Instant}`, `std::sync::atomic::{AtomicU64,
+  AtomicUsize, AtomicBool}`, `std::thread::{spawn, sleep, Builder,
+  JoinHandle}`, `std::mem::drop`, `TryFrom`/`TryInto`, and `f64` math
+  methods. String search methods take a `&str` or a `char` pattern.
+  `std::thread::spawn` threads are daemons: as in Rust, the program ends when
+  `main` returns, while `Thread::spawn` children are still joined.
 - **Entry point.** `fn main()` and `fn main() -> Result<(), E>` are accepted
   (an `Err` prints `Error: {e:?}` and exits 1), as is `fn main() -> i64`.
 - **Trait-qualified calls.** `Trait::method(x, ..)` and `Type::method(x, ..)`
@@ -260,7 +282,20 @@ These follow Rust; differences come from having no references.
   `item` fragments and `$(..),*`, `+`, `?` repetitions, used as expressions,
   statements, or items. A macro must be defined before its use. Names a macro
   body binds with `let` are renamed per expansion, so they neither capture nor
-  shadow the caller's names; other names are not hygienic.
+  shadow the caller's names; other names are not hygienic. A
+  `#[macro_export]` macro is usable in the files parsed after its own; macros
+  may expand to methods inside an `impl`. `env!`/`option_env!` read the
+  compile-time environment (`CARGO_MANIFEST_DIR` is the project directory).
+- **Derives for serde.** `#[derive(Serialize, Deserialize)]` (with
+  `#[serde(default, rename = "..", skip)]` on fields) generates impls of a
+  program's `serde` module's traits over its `serde::Content` data model, with
+  serde's default representations: structs as maps, newtype structs as their
+  field, tuples as sequences, enums externally tagged
+  (`ports/funct/src/serde.gcr` is such a module).
+- **Tests.** `gcr test [project] [-- filter]` builds the program with its
+  `#[test]` functions (and `#[cfg(test)]` items) plus `tests/*.gcr`, and runs
+  each test in its own process (`GCR_TEST_TIMEOUT` seconds, default 120),
+  reporting like Cargo. A test may return `Result`.
 - **Literals.** Raw strings (`r"..."`, `r#"..."#`), byte strings (`b"ab"` is a
   `[u8; 2]`), byte literals (`b'a'` is a `u8`), and `\x41` escapes.
 - **Items.** `const fn` (an ordinary function), `unsafe fn` (callable only in
@@ -289,6 +324,16 @@ fn main() -> i64 {
     make(2)(incremented)
 }
 ```
+
+A path to an associated function, method, or tuple variant is a function
+value too: `.map(Some)`, `.map_err(Error::Parse)`, `.map(Value::str)`,
+`.map(String::as_str)`.
+
+Partly known types combine: the arms of a `match` or `if` that build
+`Ok(x)` and `Err(e)` together give `Result<X, E>`, and a closure's return type
+comes from its `?` operands, `return`s, tail, and what its caller expects.
+`collect::<Result<_, E>>()` fills its holes from the expected type (a `Vec`
+otherwise), and `let v: Vec<_> = ..` takes the hole from the value.
 
 Immediate closure parameters can take their types from the call's arguments;
 annotations remain available when an argument is itself unconstrained. Calls

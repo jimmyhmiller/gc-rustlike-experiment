@@ -11,7 +11,7 @@
 use crate::ast::*;
 
 /// The derive names this module understands, in the order impls are emitted.
-pub const KNOWN: &[&str] = &["Debug", "Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default"];
+pub const KNOWN: &[&str] = &["Debug", "Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Serialize", "Deserialize"];
 
 /// The source of every impl `derives` asks for on `item` (a struct or enum).
 pub fn derive_impls(item: &ItemKind, derives: &[String]) -> Result<Vec<(&'static str, String)>, String> {
@@ -50,6 +50,10 @@ pub fn derive_impls(item: &ItemKind, derives: &[String]) -> Result<Vec<(&'static
     // (so fields may be floats); with it, `Ord` supplies `partial_cmp`.
     if has("PartialOrd") && !has("Ord") { emit("PartialOrd", partial_ord(item)); }
     if has("Default") { emit("Default", default(item)?); }
+    // serde's derives, against a `serde` module's `Serialize`/`Deserialize`
+    // traits and `Content` data model (as Rust's derives use the serde crate).
+    if has("Serialize") { emit("Serialize", serialize(item)); }
+    if has("Deserialize") { emit("Deserialize", deserialize(item)); }
     Ok(out)
 }
 
@@ -337,4 +341,133 @@ fn default(item: &ItemKind) -> Result<String, String> {
     let shape = struct_shape(&s.body);
     let values = shape_types(&shape).into_iter().map(default_value).collect::<Result<Vec<_>, _>>()?;
     Ok(format!("fn default() -> Self {{ {} }}", construct(&s.name, &shape, &values)))
+}
+
+/// A written type as source text.
+fn type_src(ty: &Type) -> String {
+    match &ty.kind {
+        // `Box<T>`, `Rc<T>`, `Arc<T>` are `T`.
+        TypeKind::Path(p, args) if p.is_single() && matches!(p.last(), "Box" | "Rc" | "Arc") && args.len() == 1 => type_src(&args[0]),
+        TypeKind::Path(p, args) => {
+            let mut segments = p.segments.clone();
+            if let Some(last) = segments.last_mut() {
+                if let Some(t) = last.strip_prefix("dyn#") { *last = format!("dyn {t}"); }
+            }
+            let path = segments.join("::");
+            if args.is_empty() { path } else { format!("{path}<{}>", args.iter().map(type_src).collect::<Vec<_>>().join(", ")) }
+        }
+        TypeKind::Tuple(tys) if tys.len() == 1 => format!("({},)", type_src(&tys[0])),
+        TypeKind::Tuple(tys) => format!("({})", tys.iter().map(type_src).collect::<Vec<_>>().join(", ")),
+        TypeKind::Array(e, n) => format!("[{}; {}]", type_src(e), match &*n.kind { ExprKind::Int(v, _) => v.to_string(), _ => "_".into() }),
+        TypeKind::Fn(ps, r) | TypeKind::ExternFn(ps, r) => format!("fn({}){}", ps.iter().map(type_src).collect::<Vec<_>>().join(", "),
+            r.as_ref().map(|r| format!(" -> {}", type_src(r))).unwrap_or_default()),
+        TypeKind::SelfType => "Self".into(),
+    }
+}
+
+/// The serialized name of a field: its `#[serde(rename = "..")]` or its own.
+fn serde_name(name: &str, opts: &[String]) -> String {
+    opts.iter().find_map(|o| o.strip_prefix("rename=")).unwrap_or(name).to_string()
+}
+
+fn field_opts<'a>(item: &'a ItemKind, variant: Option<&str>) -> Vec<&'a [String]> {
+    let fields = match item {
+        ItemKind::Struct(s) => match &s.body { StructBody::Named(fs) => Some(fs), _ => None },
+        ItemKind::Enum(e) => e.variants.iter().find(|v| Some(v.name.as_str()) == variant)
+            .and_then(|v| match &v.payload { VariantPayload::Named(fs) => Some(fs), _ => None }),
+        _ => None,
+    };
+    fields.map(|fs| fs.iter().map(|f| f.serde.as_slice()).collect()).unwrap_or_default()
+}
+
+/// serde's default representation of one struct or variant's fields:
+/// named as a map, one positional field as itself, several as a sequence.
+fn serialize_shape(shape: &Shape, values: &[String], opts: &[&[String]]) -> String {
+    match shape {
+        Shape::Unit => "serde::Content::Unit".into(),
+        Shape::Tuple(tys) if tys.len() == 1 => format!("{}.serialize()", values[0]),
+        Shape::Tuple(_) => format!("serde::Content::Seq(vec![{}])", values.iter().map(|v| format!("{v}.serialize()")).collect::<Vec<_>>().join(", ")),
+        Shape::Named(fields) => {
+            let entries: Vec<String> = fields.iter().zip(values).enumerate()
+                .filter(|(i, _)| !opts.get(*i).is_some_and(|o| o.iter().any(|x| x == "skip" || x == "skip_serializing")))
+                .map(|(i, ((n, _), v))| format!("(\"{}\".to_string(), {v}.serialize())", serde_name(n, opts.get(i).copied().unwrap_or(&[]))))
+                .collect();
+            format!("serde::Content::Map(vec![{}])", entries.join(", "))
+        }
+    }
+}
+
+fn serialize(item: &ItemKind) -> String {
+    let body = match item {
+        ItemKind::Struct(s) => {
+            let shape = struct_shape(&s.body);
+            serialize_shape(&shape, &field_values(&shape, Some("self"), ""), &field_opts(item, None))
+        }
+        // Externally tagged: `"Unit"`, `{"Variant": <fields>}`.
+        ItemKind::Enum(e) => match_arms(e, |v, shape| match shape {
+            Shape::Unit => format!("serde::Content::Str(\"{}\".to_string())", v.name),
+            _ => format!("serde::Content::Map(vec![(\"{}\".to_string(), {})])", v.name,
+                serialize_shape(shape, &field_values(shape, None, "a"), &field_opts(item, Some(&v.name)))),
+        }),
+        _ => unreachable!(),
+    };
+    format!("fn serialize(self) -> serde::Content {{ {body} }}")
+}
+
+/// Rebuild `path`'s fields from the `Content` in `c`.
+fn deserialize_shape(path: &str, what: &str, shape: &Shape, opts: &[&[String]]) -> String {
+    let de = |ty: &Type, value: &str| format!("<{} as Deserialize>::deserialize({value})?", type_src(ty));
+    match shape {
+        Shape::Unit => format!("match c {{ serde::Content::Unit => Ok({path}), other => Err(serde::invalid_type(other, \"{what}\")) }}"),
+        Shape::Tuple(tys) if tys.len() == 1 => format!("Ok({path}({}))", de(tys[0], "c")),
+        Shape::Tuple(tys) => {
+            let n = tys.len();
+            let fields: Vec<String> = tys.iter().enumerate().map(|(i, t)| de(t, &format!("items[{i}]"))).collect();
+            format!("match c {{ serde::Content::Seq(items) if items.len() == {n} => Ok({path}({})), \
+                serde::Content::Seq(items) => Err(format!(\"invalid length {{}}, expected {what}\", items.len())), \
+                other => Err(serde::invalid_type(other, \"{what}\")) }}", fields.join(", "))
+        }
+        Shape::Named(fields) => {
+            let inits: Vec<String> = fields.iter().enumerate().map(|(i, (n, t))| {
+                let o = opts.get(i).copied().unwrap_or(&[]);
+                let key = serde_name(n, o);
+                // A missing field is its default with `#[serde(default)]`,
+                // and otherwise what `null` gives (`None` for an `Option`).
+                let missing = if o.iter().any(|x| x == "default" || x == "skip" || x == "skip_deserializing") {
+                    format!("<{} as Default>::default()", type_src(t))
+                } else {
+                    format!("<{} as Deserialize>::deserialize(serde::Content::Unit).map_err(|_e| \"missing field `{key}`\".to_string())?", type_src(t))
+                };
+                format!("{n}: match c.field(\"{key}\") {{ Some(v) => {}, None => {missing} }}", de(t, "v"))
+            }).collect();
+            format!("match c {{ serde::Content::Map(_m) => Ok({path} {{ {} }}), other => Err(serde::invalid_type(other, \"{what}\")) }}", inits.join(", "))
+        }
+    }
+}
+
+fn deserialize(item: &ItemKind) -> String {
+    let body = match item {
+        ItemKind::Struct(s) => {
+            let shape = struct_shape(&s.body);
+            deserialize_shape(&s.name, &format!("struct {}", s.name), &shape, &field_opts(item, None))
+        }
+        ItemKind::Enum(e) => {
+            let mut arms: Vec<String> = Vec::new();
+            for v in &e.variants {
+                let shape = variant_shape(&v.payload);
+                let path = format!("{}::{}", e.name, v.name);
+                match shape {
+                    Shape::Unit => arms.push(format!("serde::Content::Str(tag) if tag == \"{}\" => Ok({path})", v.name)),
+                    _ => {
+                        let inner = deserialize_shape(&path, &format!("variant {path}"), &shape, &field_opts(item, Some(&v.name)));
+                        arms.push(format!("serde::Content::Map(entries) if entries.len() == 1 && entries[0].0 == \"{}\" => {{ let c = entries[0].1.clone(); {inner} }}", v.name));
+                    }
+                }
+            }
+            arms.push(format!("other => Err(format!(\"unknown variant of enum {} in {{}}\", other.unexpected()))", e.name));
+            format!("match c {{ {} }}", arms.join(", "))
+        }
+        _ => unreachable!(),
+    };
+    format!("fn deserialize(c: serde::Content) -> Result<Self, String> {{ {body} }}")
 }

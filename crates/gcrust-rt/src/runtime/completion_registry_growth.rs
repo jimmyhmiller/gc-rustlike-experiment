@@ -33,6 +33,7 @@ pub(super) fn new_record(
     checkpoint(_heap_id, Phase::Record);
     let record = Arc::new(JoinHandle {
         completion_notice: true,
+        daemon: std::sync::atomic::AtomicBool::new(false),
         native_joined: std::sync::atomic::AtomicBool::new(false),
         pending_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
         reaper_registration: std::sync::OnceLock::new(),
@@ -328,6 +329,7 @@ mod tests {
     fn record(value: u64, owner: usize) -> Arc<JoinHandle> {
         Arc::new(JoinHandle {
             completion_notice: false,
+            daemon: std::sync::atomic::AtomicBool::new(false),
             native_joined: std::sync::atomic::AtomicBool::new(false),
             pending_index: AtomicUsize::new(usize::MAX),
             reaper_registration: std::sync::OnceLock::new(),
