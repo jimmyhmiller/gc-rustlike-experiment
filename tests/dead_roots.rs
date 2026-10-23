@@ -4,11 +4,13 @@ use std::process::Command;
 mod support;
 #[test]
 fn snapshots_exclude_dead_roots_and_keep_later_reads_live() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     let dir = std::env::temp_dir().join(format!("gcr-dead-roots-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("main.gcr");
     std::fs::write(&source, r#"
-        #[heap] struct Item { n: i64 }
+        struct Item { n: i64 }
         fn main() -> i64 {
             let dead = Item { n: 0 };
             let live = Item { n: 42 };
@@ -22,7 +24,7 @@ fn snapshots_exclude_dead_roots_and_keep_later_reads_live() {
         let binary = dir.join(mode);
         if mode != "jit" {
             let mut build = Command::new(env!("CARGO_BIN_EXE_gcr"));
-            build.arg("build").arg(&source).arg("-o").arg(&binary)
+            build.arg("build").arg(&source).arg("--no-opt").arg("-o").arg(&binary)
                 .env("GCRUST_RUNTIME_LIB", support::runtime_staticlib());
             if mode == "debug" { build.arg("--debug"); }
             let output = support::run_with_timeout(&mut build, 60);
@@ -33,7 +35,7 @@ fn snapshots_exclude_dead_roots_and_keep_later_reads_live() {
             std::fs::create_dir_all(&snapshots).unwrap();
             let mut run = if mode == "jit" {
                 let mut run = Command::new(env!("CARGO_BIN_EXE_gcr"));
-                run.arg("run").arg(&source).arg("--jit"); run
+                run.arg("run").arg(&source).arg("--jit").arg("--no-opt"); run
             } else { Command::new(&binary) };
             run.env("GCR_GC_STRESS", if stress { "1" } else { "0" })
                 .env("GCR_GC_VERIFY", "1").env("GCR_GC_WORKERS", "4")

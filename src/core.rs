@@ -90,10 +90,6 @@ pub struct Layout {
     /// `gc::TypeInfo::interior_ptrs` so the collector traces them. Empty for the
     /// common case (no value-with-ref fields).
     pub interior_ptrs: Vec<u16>,
-    /// Declared `#[heap]`: every value is a real heap object, never replaced
-    /// by locals (`crate::sroa`), so heap inspection sees each one.
-    #[serde(skip)]
-    pub pinned: bool,
     /// Runtime reflection metadata (nominal type/field names + field types) for
     /// this layout. Travels 1:1 with the layout so the JIT/AOT paths and the
     /// `emit reflect` view all read the same source of truth. Skipped in the

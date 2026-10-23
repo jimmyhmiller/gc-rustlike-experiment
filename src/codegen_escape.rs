@@ -697,9 +697,11 @@ mod tests {
 
     #[test]
     fn private_reference_arrays_and_fields_keep_mutation_and_aliasing_correct() {
+    // Inspects heap layout: every struct a heap object as written.
+    crate::compile::set_optimize(false);
         let source = "
-            #[heap] struct Item { x: i64 }
-            #[heap] struct Holder { items: Array<Item> }
+            struct Item { x: i64 }
+            struct Holder { items: Array<Item> }
             fn update(h: Holder) -> i64 {
                 let mut items = h.items;
                 let mut first = items[0];

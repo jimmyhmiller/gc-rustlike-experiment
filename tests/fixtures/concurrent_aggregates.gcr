@@ -1,10 +1,10 @@
-#[heap] struct Leaf { n: i64 }
+struct Leaf { n: i64 }
 #[value] struct Pair { left: Leaf, right: Leaf, sequence: i64 }
 struct Holder { pair: Pair, scalar: i64, late: Array<Leaf> }
 // Pair/scalar use managed synchronization; late is immutable after publication.
 impl Sync for Holder {}
-#[heap] struct Container { holder: Holder }
-#[heap] struct Graph { live: Array<Leaf> }
+struct Container { holder: Holder }
+struct Graph { live: Array<Leaf> }
 // Published after initialization; readers never mutate this graph.
 impl Sync for Graph {}
 impl Sync for Container {}

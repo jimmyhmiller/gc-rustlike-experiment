@@ -62,6 +62,8 @@ static AOT_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn build(src: &str, out: &Path, runtime_lib: &Path) {
     let _guard = AOT_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Allocation sites are counted as written.
+    gcrust::compile::set_optimize(false);
     unsafe {
         std::env::set_var("GCRUST_RUNTIME_LIB", runtime_lib);
     }
@@ -81,8 +83,8 @@ fn aot_alloc_profile_reports_sites() {
     let out = tmp("shapes");
     // examples/shapes.gcr with its types kept on the heap, so it allocates.
     let source = include_str!("../examples/shapes.gcr")
-        .replace("struct Point", "#[heap] struct Point")
-        .replace("enum Shape", "#[heap] enum Shape");
+        .replace("struct Point", "struct Point")
+        .replace("enum Shape", "enum Shape");
     build(&source, &out, &lib);
 
     let output = Command::new(&out)
@@ -129,12 +131,12 @@ fn alloc_profile_line_col_distinguishes_same_type_same_function() {
     let srcp = dir.join("loc.gcr");
     std::fs::write(
         &srcp,
-        "#[heap] struct P { a: i64, b: i64 }\nfn main() -> i64 {\n  let x = P { a: 1, b: 2 };\n  let y = P { a: 3, b: 4 };\n  x.a + y.b\n}\n",
+        "struct P { a: i64, b: i64 }\nfn main() -> i64 {\n  let x = P { a: 1, b: 2 };\n  let y = P { a: 3, b: 4 };\n  x.a + y.b\n}\n",
     )
     .unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_gcr"))
-        .args(["run", srcp.to_str().unwrap()])
+        .args(["run", srcp.to_str().unwrap(), "--no-opt"])
         .env("GCR_ALLOC_PROFILE", "1")
         .output()
         .expect("run gcr");
@@ -182,7 +184,7 @@ fn alloc_profile_prelude_allocs_resolve_to_std_even_in_large_files() {
     let p = srcp.to_string_lossy();
 
     let out = Command::new(env!("CARGO_BIN_EXE_gcr"))
-        .args(["run", srcp.to_str().unwrap()])
+        .args(["run", srcp.to_str().unwrap(), "--no-opt"])
         .env("GCR_ALLOC_PROFILE", "1")
         .output()
         .expect("run gcr");
@@ -218,12 +220,12 @@ fn alloc_profile_module_alloc_resolves_to_module_file() {
     std::fs::write(dir.join("main.gcr"), "mod thing;\nfn main() -> i64 { thing::make() }\n").unwrap();
     std::fs::write(
         dir.join("thing.gcr"),
-        "#[heap] pub struct T { a: i64 }\npub fn make() -> i64 {\n  let t = T { a: 42 };\n  t.a\n}\n",
+        "pub struct T { a: i64 }\npub fn make() -> i64 {\n  let t = T { a: 42 };\n  t.a\n}\n",
     )
     .unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_gcr"))
-        .args(["run", dir.join("main.gcr").to_str().unwrap()])
+        .args(["run", dir.join("main.gcr").to_str().unwrap(), "--no-opt"])
         .env("GCR_ALLOC_PROFILE", "1")
         .output()
         .expect("run gcr");

@@ -27,7 +27,7 @@ fn type_id_and_name_consistent() {
     // Encode the two type names' first bytes + whether the ids differ into the
     // returned i64 so a wrong answer (not just a crash) fails the test.
     let r = run(r#"
-        #[heap] struct Point { x: i64, y: i64 }
+        struct Point { x: i64, y: i64 }
         struct Other { a: i64 }
         fn main() -> i64 {
             let p = Point { x: 1, y: 2 };
@@ -86,8 +86,10 @@ fn in_language_field_iteration() {
 /// types; `layouts_to_type_meta` stamps the `type_id` from table position.
 #[test]
 fn struct_metadata_has_named_typed_fields() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     let prog = lower(r#"
-        #[heap] struct Point { x: i64, y: i64 }
+        struct Point { x: i64, y: i64 }
         fn main() -> i64 { let p = Point { x: 1, y: 2 }; p.x }
     "#);
     let metas = layouts_to_type_meta(&prog);
@@ -248,9 +250,9 @@ fn value_struct_field_roundtrips_in_heap() {
 #[test]
 fn value_struct_with_ref_works_as_heap_field() {
     let r = run(r#"
-        #[heap] struct Node { n: i64 }
+        struct Node { n: i64 }
         #[value] struct Holder { node: Node, k: i64 }
-        #[heap] struct Outer { h: Holder }
+        struct Outer { h: Holder }
         fn main() -> i64 {
             let o = Outer { h: Holder { node: Node { n: 5 }, k: 7 } };
             o.h.node.n + o.h.k
@@ -267,9 +269,9 @@ fn value_struct_with_ref_works_as_heap_field() {
 fn value_enum_with_ref_heap_field_works_and_survives_gc() {
     use gcrust::codegen::{jit_run_i64_mode, GcRunMode};
     let prog = lower(r#"
-        #[heap] struct Node { n: i64 }
+        struct Node { n: i64 }
         #[value] enum Cell { Empty, Full(Node) }
-        #[heap] struct Board { c: Cell }
+        struct Board { c: Cell }
         fn main() -> i64 {
             let b = Board { c: Cell::Full(Node { n: 1234 }) };
             // Churn garbage to force collections while `b` (holding a value-enum
@@ -291,7 +293,7 @@ fn value_enum_with_ref_heap_field_works_and_survives_gc() {
 fn value_enum_ref_local_survives_gc() {
     use gcrust::codegen::{jit_run_i64_mode, GcRunMode};
     let prog = lower(r#"
-        #[heap] struct Node { n: i64 }
+        struct Node { n: i64 }
         #[value] enum Cell { Empty, Full(Node) }
         fn churn(n: i64) -> i64 { let mut i = 0; while i < n { let g = Node { n: i }; i = i + 1; } i }
         fn main() -> i64 {
@@ -308,10 +310,12 @@ fn value_enum_ref_local_survives_gc() {
 /// Cell's ref slot (offset 16 = header for a single value field).
 #[test]
 fn value_enum_ref_interior_ptr_offset() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     let prog = lower(r#"
-        #[heap] struct Node { n: i64 }
+        struct Node { n: i64 }
         #[value] enum Cell { Empty, Full(Node) }
-        #[heap] struct Board { c: Cell }
+        struct Board { c: Cell }
         fn main() -> i64 { let b = Board { c: Cell::Full(Node { n: 1 }) }; 0 }
     "#);
     let board = prog.layouts.iter().find(|l| l.name == "Board").expect("Board layout");
@@ -322,10 +326,12 @@ fn value_enum_ref_interior_ptr_offset() {
 /// flattens Holder at the header, so `node`'s ref sits at offset 16.
 #[test]
 fn interior_ptrs_locate_embedded_ref() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     let prog = lower(r#"
-        #[heap] struct Node { n: i64 }
+        struct Node { n: i64 }
         #[value] struct Holder { node: Node, k: i64 }
-        #[heap] struct Outer { h: Holder }
+        struct Outer { h: Holder }
         fn main() -> i64 { let o = Outer { h: Holder { node: Node { n: 1 }, k: 2 } }; o.h.k }
     "#);
     let outer = prog.layouts.iter().find(|l| l.name == "Outer").expect("Outer layout");

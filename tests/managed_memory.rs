@@ -199,11 +199,13 @@ fn snapshot_path_check_accepts_reordered_blocks_and_rejects_collecting_paths() {
 
 #[test]
 fn scalar_and_reference_slots_keep_phase_checked_scoped_fallbacks() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     use gcrust::compile::parse_with_prelude;
     use gcrust::lower::lower_program;
     use gcrust::resolve::resolve_module;
     let (module, _) = parse_with_prelude(r#"
-        #[heap] struct Item { byte: i8, word: i16, wide: i32, number: i64, text: String }
+        struct Item { byte: i8, word: i16, wide: i32, number: i64, text: String }
         fn main() -> i64 {
             let mut item = Item { byte: 1 as i8, word: 2 as i16, wide: 3 as i32, number: 4, text: "a" };
             item.byte = item.byte + 1 as i8;
@@ -236,11 +238,13 @@ fn scalar_and_reference_slots_keep_phase_checked_scoped_fallbacks() {
 
 #[test]
 fn native_aggregate_snapshot_uses_target_layout_before_optimization() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     use gcrust::{compile::parse_with_prelude, lower::lower_program, resolve::resolve_module};
     let (module, _) = parse_with_prelude(r#"
-        #[heap] struct Leaf { n: i64 }
+        struct Leaf { n: i64 }
         #[value] struct Mixed { tag: i32, wide: i64, leaf: Leaf }
-        #[heap] struct Holder { mixed: Mixed }
+        struct Holder { mixed: Mixed }
         fn main() -> i64 {
             let holder = Holder { mixed: Mixed { tag: 7 as i32, wide: 123456789, leaf: Leaf { n: 42 } } };
             let observed = holder.mixed;

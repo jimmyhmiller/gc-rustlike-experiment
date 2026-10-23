@@ -1,6 +1,6 @@
-// A struct, an enum with payloads, and pattern matching. As in Rust, both
-// are plain values here (stored inline, nothing allocated); `#[heap]` would
-// make either a GC-managed heap object.
+// A struct, an enum with payloads, and pattern matching. The compiler lays
+// out small structs and enums inline (nothing allocated); larger or
+// recursive ones are GC-managed heap objects.
 
 struct Point { x: i64, y: i64 }
 

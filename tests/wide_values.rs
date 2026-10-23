@@ -4,6 +4,8 @@ mod support;
 
 #[test]
 fn wide_scalar_records_compile_without_tracking_scalar_root_lifetimes() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     let root = std::env::temp_dir().join(format!("gcr-wide-values-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     for (count, reference) in [(8190, false), (4096, true)] {
@@ -23,7 +25,7 @@ fn wide_scalar_records_compile_without_tracking_scalar_root_lifetimes() {
         } else {
             "wide.f0"
         };
-        std::fs::write(&source, format!("#[heap] struct Node {{n:i64}} #[value] struct Wide {{{prefix}{fields}}} fn main()->i64 {{let wide=Wide {{{initializer}{arguments}}}; {tail}}}")).unwrap();
+        std::fs::write(&source, format!("struct Node {{n:i64}} #[value] struct Wide {{{prefix}{fields}}} fn main()->i64 {{let wide=Wide {{{initializer}{arguments}}}; {tail}}}")).unwrap();
         let output = support::run_with_timeout(
             Command::new(env!("CARGO_BIN_EXE_gcr"))
                 .arg("emit")
@@ -47,7 +49,7 @@ fn wide_scalar_records_compile_without_tracking_scalar_root_lifetimes() {
                 let output = support::run_with_timeout(
                     Command::new("python3").arg(checker)
                         .args(["--max-rss-bytes", "1073741824", "--timeout-seconds", "30", "--"])
-                        .arg(env!("CARGO_BIN_EXE_gcr")).arg("run").arg(&source).arg("--jit")
+                        .arg(env!("CARGO_BIN_EXE_gcr")).arg("run").arg(&source).arg("--jit").arg("--no-opt")
                         .env("GCR_GC_STRESS", "1").env("GCR_GC_VERIFY", "1"),
                     40,
                 );
@@ -59,7 +61,7 @@ fn wide_scalar_records_compile_without_tracking_scalar_root_lifetimes() {
             } else {
                 let output = support::run_with_timeout(
                     Command::new(env!("CARGO_BIN_EXE_gcr"))
-                        .arg("run").arg(&source).arg("--jit")
+                        .arg("run").arg(&source).arg("--jit").arg("--no-opt")
                         .env("GCR_GC_STRESS", "1").env("GCR_GC_VERIFY", "1"), 30);
                 assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
                 assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42\n0");

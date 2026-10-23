@@ -293,7 +293,7 @@ impl<'a> LayoutRegistry<'a> {
     /// and lowering can still require a reference (`force_reference_struct`).
     fn auto_value_struct(&mut self, name: &str, s: &crate::ast::StructDef, args: &[Ty]) -> R<Option<ValueId>> {
         const AUTO_VALUE_STRUCT_BYTES: u32 = 64;
-        if s.is_heap || !INLINE_BY_DEFAULT.with(|i| i.get()) { return Ok(None); }
+        if !INLINE_BY_DEFAULT.with(|i| i.get()) { return Ok(None); }
         if crate::compile::prelude_source() == Some(s.span.source) { return Ok(None); }
         if FORCED_REFERENCES.with(|f| f.borrow().contains(name)) { return Ok(None); }
         let short = name.rsplit("::").next().unwrap_or(name);
@@ -326,7 +326,7 @@ impl<'a> LayoutRegistry<'a> {
     /// `AUTO_VALUE_ENUM_BYTES`. Each enum type is decided once.
     fn auto_value_enum(&mut self, name: &str, e: &crate::ast::EnumDef, args: &[Ty]) -> R<Option<ValueId>> {
         const AUTO_VALUE_ENUM_BYTES: u32 = 64;
-        if e.is_heap || !INLINE_BY_DEFAULT.with(|i| i.get()) { return Ok(None); }
+        if !INLINE_BY_DEFAULT.with(|i| i.get()) { return Ok(None); }
         if FORCED_REFERENCES.with(|f| f.borrow().contains(name)) { return Ok(None); }
         let nominal = Ty::Named { name: name.to_string(), args: args.to_vec() };
         if let Some(id) = self.nominal_value_ids.get(&nominal) { return Ok(Some(*id)); }
@@ -415,8 +415,7 @@ impl<'a> LayoutRegistry<'a> {
 
         let field_tys = struct_field_tys(s, args, self.ctx)?;
         let field_names = struct_field_names(s);
-        let mut layout = self.build_ref_layout(&key, &field_names, &field_tys)?;
-        layout.pinned = s.is_heap;
+        let layout = self.build_ref_layout(&key, &field_names, &field_tys)?;
         self.layouts[id as usize] = layout;
         Ok(id)
     }
@@ -479,7 +478,6 @@ impl<'a> LayoutRegistry<'a> {
             name: key,
             elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
-            pinned: false,
             meta,
         };
         self.layouts[id as usize] = layout;
@@ -543,7 +541,6 @@ impl<'a> LayoutRegistry<'a> {
             name: key,
             elem_stride: 0, element_box: None,
             interior_ptrs: vec![],
-            pinned: false,
             meta,
         };
         self.layouts[id as usize] = layout;
@@ -647,7 +644,7 @@ impl<'a> LayoutRegistry<'a> {
         self.intern_ref("String", Layout {
             ptr_fields: 0, raw_bytes: 0, varlen: VarLen::Bytes,
             field_map: vec![], name: "String".into(), elem_stride: 0, element_box: None,
-            interior_ptrs: vec![], pinned: false,
+            interior_ptrs: vec![],
             meta: opaque_meta("String"),
         })
     }
@@ -667,7 +664,7 @@ impl<'a> LayoutRegistry<'a> {
             ],
             name: if traced { format!("{key}#traced") } else { key.clone() },
             elem_stride: 0, element_box: None,
-            interior_ptrs: vec![], pinned: false,
+            interior_ptrs: vec![],
             meta: opaque_meta(&key),
         }
     }
@@ -710,7 +707,7 @@ impl<'a> LayoutRegistry<'a> {
             self.layouts[id as usize] = Layout {
                 ptr_fields: 0, raw_bytes: 0, varlen: VarLen::Records,
                 field_map: vec![], name: key.clone(), elem_stride: stride,
-                element_box: None, interior_ptrs: record_ptrs, pinned: false, meta: opaque_meta(&key),
+                element_box: None, interior_ptrs: record_ptrs, meta: opaque_meta(&key),
             };
             self.ref_ids.insert(key, id);
             return Ok(());
@@ -722,7 +719,7 @@ impl<'a> LayoutRegistry<'a> {
             ptr_fields: 0, raw_bytes: 0,
             varlen: if traced { VarLen::Values } else { VarLen::Bytes },
             field_map: vec![], name: key.clone(), elem_stride: stride,
-            element_box, interior_ptrs: vec![], pinned: false, meta: opaque_meta(&key),
+            element_box, interior_ptrs: vec![], meta: opaque_meta(&key),
         };
         self.ref_ids.insert(key, id);
         Ok(())
@@ -764,7 +761,7 @@ impl<'a> LayoutRegistry<'a> {
         let id = self.layouts.len() as LayoutId;
         self.layouts.push(Layout { ptr_fields, raw_bytes, varlen: VarLen::None,
             field_map: vec![], name: key.to_string(), elem_stride: 0, element_box: None,
-            interior_ptrs, pinned: false, meta: opaque_meta(key) });
+            interior_ptrs, meta: opaque_meta(key) });
         Ok(id)
     }
 
@@ -894,7 +891,6 @@ impl<'a> LayoutRegistry<'a> {
             name: name.to_string(),
             elem_stride: 0, element_box: None,
             interior_ptrs,
-            pinned: false,
             meta,
         })
     }
@@ -970,7 +966,7 @@ impl<'a> LayoutRegistry<'a> {
 // ---- free helpers ----------------------------------------------------------
 
 fn placeholder_layout(name: &str) -> Layout {
-    Layout { ptr_fields: 0, raw_bytes: 0, varlen: VarLen::None, field_map: vec![], name: name.to_string(), elem_stride: 0, element_box: None, interior_ptrs: vec![], pinned: false, meta: opaque_meta(name) }
+    Layout { ptr_fields: 0, raw_bytes: 0, varlen: VarLen::None, field_map: vec![], name: name.to_string(), elem_stride: 0, element_box: None, interior_ptrs: vec![], meta: opaque_meta(name) }
 }
 
 /// Source-order field names of a struct, for reflection metadata. Tuple structs
@@ -1227,7 +1223,9 @@ mod tests {
 
     #[test]
     fn generic_struct_monomorphizes_layout() {
-        let c = ctx("#[heap] struct Pair<A, B> { a: A, b: B }");
+    // Inspects heap layout: every struct a heap object as written.
+    crate::compile::set_optimize(false);
+        let c = ctx("struct Pair<A, B> { a: A, b: B }");
         let mut reg = LayoutRegistry::new(&c);
         let r = reg.repr(&Ty::Named {
             name: "Pair".into(),

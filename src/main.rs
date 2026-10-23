@@ -28,6 +28,13 @@ fn main() -> ExitCode {
             }
         }
     }
+    // `--no-opt`: no inlining, scalar replacement or automatic value layout,
+    // so every struct is a heap object as written (heap tooling and tests).
+    if let Some(at) = args.iter().take(separator).position(|a| a == "--no-opt") {
+        gcrust::compile::set_optimize(false);
+        // `emit llvm --no-opt` also skips LLVM's optimizer.
+        if args.get(1).map(String::as_str) != Some("emit") { args.remove(at); }
+    }
     if args.len() < 2 {
         eprintln!("usage: gcr <new|check|parse|run|build|emit|eval|heap|heap-diff> [file.gcr | project-dir]");
         return ExitCode::FAILURE;
@@ -305,7 +312,7 @@ fn main() -> ExitCode {
         }
         "build" => {
             // Full debug info describes heap objects, so keep declared layouts.
-            if driver_args.iter().any(|a| a == "--debug") { gcrust::layout::set_inline_by_default(false); gcrust::inline::set_enabled(false); }
+            if driver_args.iter().any(|a| a == "--debug") { gcrust::compile::set_optimize(false); }
             // Linker args: the project manifest's `[link]` section (libs / paths
             // / frameworks), plus any `--link-arg <arg>` (repeatable) from the CLI.
             // A project build needs no CLI link flags at all.

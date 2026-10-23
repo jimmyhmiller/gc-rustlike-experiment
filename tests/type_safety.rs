@@ -339,11 +339,13 @@ fn inline_cycles_are_rejected_but_reference_cycles_and_nested_generics_are_valid
 
 #[test]
 fn failed_layout_registration_rolls_back_placeholders_and_worklists() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     use gcrust::{
         layout::LayoutRegistry,
         types::{Ty, TyCtx},
     };
-    let source = "#[value] struct Bad { next: Bad } struct Holder { bad: Bad } #[heap] struct Good { n: i64 } fn main() -> i64 { 0 }";
+    let source = "#[value] struct Bad { next: Bad } struct Holder { bad: Bad } struct Good { n: i64 } fn main() -> i64 { 0 }";
     let resolved = resolve_module(parse_with_prelude(source).unwrap().0).unwrap();
     let ctx = TyCtx::from_globals(&resolved.globals);
     let mut layouts = LayoutRegistry::new(&ctx);

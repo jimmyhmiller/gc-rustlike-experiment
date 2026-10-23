@@ -1867,7 +1867,7 @@ pub struct AotLayout {
 /// tenured_bytes)`. BOTH the AOT runtime ([`gcr_runtime_main`]) and the JIT
 /// driver use this so a program gets the SAME GC behavior regardless of run mode
 /// (they previously disagreed — AOT 1 MB vs JIT 16 MB nursery — so the same
-/// program had different perf/GC by run mode). Defaults: 16 MB nursery / 256 MB
+/// program had different perf/GC by run mode). Defaults: 64 MB nursery / 256 MB
 /// tenured (per space). Override with `GCR_NURSERY_MB` / `GCR_TENURED_MB`
 /// (binary MiB).
 ///
@@ -1881,7 +1881,7 @@ pub fn configured_heap_sizes() -> (usize, usize) {
     fn mb_env(key: &str, default_mb: usize) -> usize {
         heap_setting_bytes(std::env::var(key).ok().as_deref(), default_mb)
     }
-    (mb_env("GCR_NURSERY_MB", 16), mb_env("GCR_TENURED_MB", 256))
+    (mb_env("GCR_NURSERY_MB", 64), mb_env("GCR_TENURED_MB", 256))
 }
 
 fn heap_setting_bytes(value: Option<&str>, default_mb: usize) -> usize {

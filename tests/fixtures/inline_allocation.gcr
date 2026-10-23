@@ -1,6 +1,6 @@
 // Alternate compiled fixed allocation with runtime variable-sized allocation.
 // Retained values must survive nursery reset, buffer reuse, and child allocation.
-#[heap] struct Item { sequence: i64, text: String }
+struct Item { sequence: i64, text: String }
 
 fn work(seed: i64) -> i64 {
     let mut keep: Array<Item> = Array::new(8);

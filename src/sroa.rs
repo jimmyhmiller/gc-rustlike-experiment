@@ -6,8 +6,6 @@
 //! The allocation disappears, each field read becomes a local read and each
 //! field write an assignment. Inlining (`crate::inline`) exposes these: a
 //! method call on a local object becomes field accesses on that local.
-//! Objects of `#[heap]` structs are always allocated.
-//!
 //! An object may also escape at its last use (stored in another object,
 //! passed to a call, returned): there it is allocated from the current field
 //! values, so only the paths that let it escape pay for it.
@@ -64,7 +62,7 @@ fn replace_fn(f: &mut CoreFn, layouts: &[Layout]) -> bool {
     for (&object, reprs) in &shapes {
         let Repr::Ref(layout) = f.locals[object as usize] else { continue };
         let shape = &layouts[layout as usize];
-        if shape.pinned || shape.field_map.len() != reprs.len() { continue; }
+        if shape.field_map.len() != reprs.len() { continue; }
         let base = f.locals.len() as LocalId;
         f.local_names.resize(f.locals.len(), None);
         let name = f.local_names.get(object as usize).cloned().flatten();

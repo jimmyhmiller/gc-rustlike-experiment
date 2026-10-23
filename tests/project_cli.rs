@@ -10,11 +10,10 @@ impl Project {
         std::fs::write(
             dir.join("src/main.gcr"),
             r#"
-            #[heap] struct Cell { n: i64 }
             fn main() -> i64 {
                 let mut i = 0;
                 let mut total = 0;
-                while i < 10 { let c = Cell { n: i }; total = total + c.n; i = i + 1; }
+                while i < 10 { let c: Vec<i64> = vec![i]; total = total + c[0]; i = i + 1; }
                 total
             }
         "#,

@@ -89,10 +89,12 @@ fn extern_accepts_value_struct_of_scalars() {
 
 #[test]
 fn extern_rejects_heap_struct_param() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     // A non-value (heap `Ref`) struct must NOT cross — its address would move
     // under GC. Only stack-resident value structs are allowed.
     let src = r#"
-        #[heap] struct Heapy { a: i64 }
+        struct Heapy { a: i64 }
         extern "C" fn bad(h: Heapy) -> i64;
         fn main() -> i64 { let h = Heapy { a: 1 }; (unsafe { bad(h) }) }
     "#;

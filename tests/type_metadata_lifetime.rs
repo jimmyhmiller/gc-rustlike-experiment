@@ -51,6 +51,8 @@ extern "C" fn native_entry(thread: *mut Thread) -> i64 {
 
 #[test]
 fn dynamic_layout_offsets_are_freed_after_repeated_executions() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     const CHILD: &str = "GCR_METADATA_LIFETIME_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
@@ -74,7 +76,7 @@ fn dynamic_layout_offsets_are_freed_after_repeated_executions() {
 
     let source = r#"
         #[value] struct Inline { text: String, number: i64 }
-        #[heap] struct Holder { value: Inline }
+        struct Holder { value: Inline }
         fn main() -> i64 {
             let holder = Holder { value: Inline { text: "owned", number: 42 } };
             holder.value.number

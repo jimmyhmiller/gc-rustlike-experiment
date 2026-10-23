@@ -9,7 +9,7 @@ use std::process::Command;
 fn heap_snapshot_intrinsic_captures_live_roots_midexec() {
     // x and y are live (rooted on the stack) when heap_snapshot() runs.
     let src = "\
-#[heap] struct Box3 { a: i64, b: i64, c: i64 }
+struct Box3 { a: i64, b: i64, c: i64 }
 fn main() -> i64 {
     let x = Box3 { a: 1, b: 2, c: 3 };
     let y = Box3 { a: 4, b: 5, c: 6 };
@@ -23,7 +23,7 @@ fn main() -> i64 {
     std::fs::write(&srcp, src).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_gcr"))
-        .args(["run", srcp.to_str().unwrap()])
+        .args(["run", srcp.to_str().unwrap(), "--no-opt"])
         .env("GCR_HEAP_SNAPSHOT_DIR", &dir)
         .output()
         .expect("run gcr");
@@ -62,12 +62,12 @@ fn heap_snapshot_renders_compiled_inline_enum_variants_and_payloads() {
     std::fs::create_dir_all(&root).unwrap();
     let source = root.join("main.gcr");
     std::fs::write(&source, r#"
-        #[heap] struct Node { n: i64 }
+        struct Node { n: i64 }
         #[value] struct Pair { left: Node, right: Node, n: i64 }
         #[value] enum Nested { Empty, Full(Node), Pair(Pair) }
         #[value] enum Cell { Empty, Full(Node), Pair(Pair), Nested(Nested), Named { node: Node, n: i64 } }
-        #[heap] struct Board { c: Cell }
-        #[heap] enum BoxChoice { Empty, Full(Pair) }
+        struct Board { c: Cell }
+        enum BoxChoice { Empty, Full(Pair) }
         fn main() -> i64 {
             let empty = Board { c: Cell::Empty };
             let full = Board { c: Cell::Full(Node { n: 42 }) };
@@ -87,7 +87,7 @@ fn heap_snapshot_renders_compiled_inline_enum_variants_and_payloads() {
     "#).unwrap();
     let binary = root.join("program");
     let built = support::run_with_timeout(Command::new(env!("CARGO_BIN_EXE_gcr"))
-        .arg("build").arg(&source).arg("-o").arg(&binary)
+        .arg("build").arg(&source).arg("--no-opt").arg("-o").arg(&binary)
         .env("GCRUST_RUNTIME_LIB", support::runtime_staticlib()), 60);
     assert!(built.status.success(), "{built:?}");
     for (mode, native, stress) in [("jit-normal", false, false), ("jit-stress", false, true),
@@ -96,7 +96,7 @@ fn heap_snapshot_renders_compiled_inline_enum_variants_and_payloads() {
         std::fs::create_dir(&directory).unwrap();
         let mut command = if native { Command::new(&binary) } else {
             let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
-            command.args(["run", source.to_str().unwrap(), "--jit"]);
+            command.args(["run", source.to_str().unwrap(), "--jit", "--no-opt"]);
             if stress { command.arg("--gc-stress"); }
             command
         };

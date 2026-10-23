@@ -5,6 +5,8 @@ mod support;
 
 #[test]
 fn inline_and_runtime_allocations_preserve_roots_and_exact_counters() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     let dir = std::env::temp_dir().join(format!("gcr-inline-allocation-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14,6 +16,7 @@ fn inline_and_runtime_allocations_preserve_roots_and_exact_counters() {
     build
         .arg("build")
         .arg(&source)
+        .arg("--no-opt")
         .arg("-o")
         .arg(&binary)
         .env("GCRUST_RUNTIME_LIB", support::runtime_staticlib());
@@ -30,7 +33,7 @@ fn inline_and_runtime_allocations_preserve_roots_and_exact_counters() {
                 let metrics = dir.join(format!("metrics-{jit}-{stress}-{workers}.json"));
                 let mut command = if jit {
                     let mut command = Command::new(env!("CARGO_BIN_EXE_gcr"));
-                    command.arg("run").arg(&source).arg("--jit");
+                    command.arg("run").arg(&source).arg("--jit").arg("--no-opt");
                     command
                 } else {
                     Command::new(&binary)
@@ -144,6 +147,8 @@ fn collecting_foreign_callback_refreshes_caller_roots_and_copy_out() {
 
 #[test]
 fn emitted_inline_headers_keep_numeric_words_on_both_byte_orders() {
+    // Inspects heap layout: every struct a heap object as written.
+    gcrust::compile::set_optimize(false);
     use gcrust::{
         codegen::codegen, compile::parse_with_prelude, lower::lower_program,
         resolve::resolve_module,
@@ -153,7 +158,7 @@ fn emitted_inline_headers_keep_numeric_words_on_both_byte_orders() {
         targets::TargetData,
         values::{InstructionOpcode, StructValue},
     };
-    let source = "#[heap] struct First { n: i64 } #[heap] struct Second { first: First, n: i64 } fn make() -> Second { Second { first: First { n: 17 }, n: 25 } } fn main() -> i64 { let b = make(); b.first.n + b.n }";
+    let source = "struct First { n: i64 } struct Second { first: First, n: i64 } fn make() -> Second { Second { first: First { n: 17 }, n: 25 } } fn main() -> i64 { let b = make(); b.first.n + b.n }";
     let (module, _) = parse_with_prelude(source).unwrap();
     let resolved = resolve_module(module).unwrap();
     let program = lower_program(&resolved.globals).unwrap();

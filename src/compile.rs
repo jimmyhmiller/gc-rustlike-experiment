@@ -649,3 +649,12 @@ mod tests {
         assert_eq!(run(src), 438);
     }
 }
+
+/// Turn the layout and Core optimizations on or off for this thread: automatic
+/// inline (value) layout of small structs and enums, inlining, and scalar
+/// replacement. Off, every struct is a heap object as written, which heap
+/// inspection and debug builds want.
+pub fn set_optimize(on: bool) {
+    crate::layout::set_inline_by_default(on);
+    crate::inline::set_enabled(on);
+}

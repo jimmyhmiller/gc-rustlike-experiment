@@ -91,8 +91,6 @@ pub struct Param {
 pub struct StructDef {
     pub vis: bool,
     pub is_value: bool,
-    /// `#[heap]`: always a reference, never laid out inline.
-    pub is_heap: bool,
     pub name: String,
     pub generics: Generics,
     pub body: StructBody,
@@ -118,8 +116,6 @@ pub struct FieldDef {
 pub struct EnumDef {
     pub vis: bool,
     pub is_value: bool,
-    /// `#[heap]`: always a reference, never laid out inline.
-    pub is_heap: bool,
     pub name: String,
     pub generics: Generics,
     pub variants: Vec<VariantDef>,

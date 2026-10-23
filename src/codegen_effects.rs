@@ -221,9 +221,11 @@ mod tests {
 
     #[test]
     fn inline_memory_reads_are_safe_but_boxing_and_snapshot_locks_are_not() {
+    // Inspects heap layout: every struct a heap object as written.
+    crate::compile::set_optimize(false);
         let source = r#"
             #[value] struct Pair { x: i64 }
-            #[heap] struct Holder { x: i64, pair: Pair }
+            struct Holder { x: i64, pair: Pair }
             fn inspect(values: Array<Pair>, refs: Array<Holder>, h: Holder) -> i64 {
                 values[0].x + refs[0].x + h.x
             }

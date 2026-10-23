@@ -541,8 +541,6 @@ impl Parser {
         }
         // `#[value]` selects the inline value-type representation on a struct/enum.
         let is_value = attrs.iter().any(|a| a.name == "value");
-        // `#[heap]` keeps a struct or enum a heap reference (never inline).
-        let is_heap = attrs.iter().any(|a| a.name == "heap");
         let skip = attrs_skip(&attrs);
         let hints = fn_hints(&attrs);
         let derives: Vec<(String, Span)> = attrs.iter().filter(|a| a.name == "derive").flat_map(|a| a.args.clone()).collect();
@@ -559,8 +557,8 @@ impl Parser {
             _ if self.fn_qualified_ahead(0) => ItemKind::Fn(FnDef { hints, ..self.qualified_fn(vis)? }),
             TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Impl)) => { self.bump(); ItemKind::Impl(self.impl_block()?) }
             TokKind::Keyword(Kw::Unsafe) if matches!(self.peek_at(1), TokKind::Keyword(Kw::Trait)) => { self.bump(); ItemKind::Trait(self.trait_def(vis)?) }
-            TokKind::Keyword(Kw::Struct) => ItemKind::Struct(StructDef { is_heap, ..self.struct_def(vis, is_value)? }),
-            TokKind::Keyword(Kw::Enum) => ItemKind::Enum(EnumDef { is_heap, ..self.enum_def(vis, is_value)? }),
+            TokKind::Keyword(Kw::Struct) => ItemKind::Struct(self.struct_def(vis, is_value)?),
+            TokKind::Keyword(Kw::Enum) => ItemKind::Enum(self.enum_def(vis, is_value)?),
             TokKind::Keyword(Kw::Trait) => ItemKind::Trait(self.trait_def(vis)?),
             TokKind::Keyword(Kw::Impl) => {
                 let imp = self.impl_block()?;
@@ -640,7 +638,7 @@ impl Parser {
             let mut args = Vec::new();
             match name.as_str() {
                 "async_trait" => self.skip_attr_args()?,
-                "value" | "heap" | "test" => {
+                "value" | "test" => {
                     if self.at(&TokKind::LParen) {
                         return Err(self.error(format!("`#[{}]` takes no arguments", name)));
                     }
@@ -1001,7 +999,7 @@ impl Parser {
                 StructBody::Unit => {}
             }
         }
-        Ok(StructDef { vis, is_value, is_heap: false, name, generics, body, span: start.to(self.prev_span()) })
+        Ok(StructDef { vis, is_value, name, generics, body, span: start.to(self.prev_span()) })
     }
 
     fn field_def(&mut self) -> PResult<FieldDef> {
@@ -1071,7 +1069,7 @@ impl Parser {
                 VariantPayload::None => {}
             }
         }
-        Ok(EnumDef { vis, is_value, is_heap: false, name, generics, variants, span: start.to(self.prev_span()) })
+        Ok(EnumDef { vis, is_value, name, generics, variants, span: start.to(self.prev_span()) })
     }
 
     fn trait_def(&mut self, vis: bool) -> PResult<TraitDef> {

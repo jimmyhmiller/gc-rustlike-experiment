@@ -13,8 +13,7 @@ use std::process::Command;
 
 fn lower_named(src: &str, path: &str) -> gcrust::core::CoreProgram {
     // As `gcr build --debug`: full debug info describes heap layouts.
-    gcrust::layout::set_inline_by_default(false);
-    gcrust::inline::set_enabled(false);
+    gcrust::compile::set_optimize(false);
     let (module, sources) = parse_with_prelude(src).expect("parse");
     let resolved = resolve_module(module).expect("resolve");
     let mut prog = lower_program(&resolved.globals).expect("lower");

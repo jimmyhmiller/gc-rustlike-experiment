@@ -6996,6 +6996,8 @@ mod tests {
 
     #[test]
     fn generated_aggregate_access_survives_active_concurrent_cycles() {
+    // Inspects heap layout: every struct a heap object as written.
+    crate::compile::set_optimize(false);
         if std::env::var_os("GCR_GENERATED_CONCURRENT_CHILD").is_none() {
             let log = std::env::temp_dir().join(format!(
                 "gcr-generated-concurrent-{}.log",
@@ -7173,10 +7175,10 @@ mod tests {
         // Keep a substantial reference graph alive while fresh aggregates and
         // scalar slots change. The collector runs independently of allocations.
         let source = r#"
-            #[heap] struct Leaf { n: i64 }
+            struct Leaf { n: i64 }
             #[value] struct Pair { left: Leaf, right: Leaf, total: i64 }
             struct Holder { pair: Pair, scalar: i64 }
-            #[heap] struct Container { holder: Holder }
+            struct Container { holder: Holder }
             fn main() -> i64 {
                 let mut live: Array<Leaf> = Array::new(120000);
                 for i in 0..120000 { live[i] = Leaf { n: i }; }
@@ -7412,9 +7414,11 @@ mod tests {
 
     #[test]
     fn generated_allocation_counters_saturate_at_unsigned_limits() {
+    // Inspects heap layout: every struct a heap object as written.
+    crate::compile::set_optimize(false);
         use crate::runtime::{self, RuntimeContext};
         use crate::gc::SiteCounter;
-        let src = "#[heap] struct Point { x: i64, y: i64 } \
+        let src = "struct Point { x: i64, y: i64 } \
                    fn mk() -> Point { Point { x: 3, y: 4 } } \
                    fn main() -> i64 { let p = mk(); p.x + p.y }";
         let module = parse_module(&lex(src).unwrap()).unwrap();

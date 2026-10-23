@@ -12,8 +12,10 @@ fn gcr_bin() -> &'static str {
 
 /// Run `example` and return (stdout result line, "M minor + N major" stats).
 fn run_with_stats(example: &str) -> (String, usize, usize) {
+    // The examples exercise heap objects (barriers on heap fields), so no
+    // structs are laid out inline.
     let out = Command::new(gcr_bin())
-        .args(["run", example])
+        .args(["run", example, "--no-opt"])
         .env("GCR_GC_STATS", "1")
         .output()
         .expect("run gcr");
