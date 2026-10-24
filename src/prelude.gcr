@@ -843,7 +843,7 @@ fn vec_grow<T>(data: Array<T>, len: i64, cap: i64) -> Array<T> {
 }
 
 impl<T> Vec<T> {
-    fn new() -> Vec<T> { Vec { data: Array::new(4), len: 0, cap: 4 } }
+    fn new() -> Vec<T> { Vec { data: Array::new(0), len: 0, cap: 0 } }
 
     // A Vec that takes over `a` as its storage (`vec![a, b, c]`).
     fn from_array(a: Array<T>) -> Vec<T> {
@@ -1148,7 +1148,8 @@ impl<T> IndexSet<T> for Vec<T> {
 // As in Rust, each element is cloned (a `Vec<Frame>` clone is a snapshot).
 impl<T: Clone> Clone for Vec<T> {
     fn clone(self) -> Vec<T> {
-        let cap = self.cap.max(1);
+        // Exactly the elements, as Rust's: an empty clone allocates nothing.
+        let cap = self.len;
         let mut data: Array<T> = Array::new(cap);
         let mut i = 0;
         while i < self.len {

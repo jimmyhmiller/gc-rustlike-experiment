@@ -4465,6 +4465,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         ptr
     }
 
+    /// The static empty array of `layout`: a Full header (type id
+    /// `layout`) and a zero count, as `ai_gc_alloc_varlen` would lay it out.
+    fn static_empty_array(&self, layout: LayoutId) -> PointerValue<'ctx> {
+        let key = (String::from("\0array"), layout);
+        if let Some(g) = self.static_strings.borrow().get(&key) { return *g; }
+        let i64t = self.ctx.i64_type();
+        let ty = self.ctx.struct_type(&[i64t.into(), i64t.into(), i64t.into()], false);
+        let value = ty.const_named_struct(&[i64t.const_zero().into(), i64t.const_int(layout as u64, false).into(), i64t.const_zero().into()]);
+        let g = self.module.add_global(ty, None, "__gcr_empty_array");
+        g.set_linkage(inkwell::module::Linkage::Private);
+        g.set_alignment(8);
+        g.set_initializer(&value);
+        let ptr = g.as_pointer_value();
+        self.static_strings.borrow_mut().insert(key, ptr);
+        ptr
+    }
+
     fn gen_array_new(
         &mut self,
         fcx: &mut FnCtx<'ctx>,
@@ -4473,13 +4490,53 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         elem: &Repr,
         span: crate::core::SpanId,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        let i32t = self.ctx.i32_type();
         let i64t = self.ctx.i64_type();
         let (stride, traced) = self.elem_stride_of(elem);
+        // An empty array has no storage to write: every `Array::new(0)` of a
+        // layout is one static object (as a literal is), so `Vec::new()`
+        // allocates no backing store.
+        let plain = { let lay = &self.physical_layouts.layouts[layout as usize]; lay.ptr_fields == 0 && lay.raw_bytes == 0 && !matches!(lay.varlen, crate::core::VarLen::None) };
+        if plain && matches!(len.kind.as_ref(), CoreExprKind::ConstInt(0, _)) && !self.debug.as_ref().is_some_and(|d| d.full) {
+            self.gen_expr(fcx, len)?;
+            return Ok(Some(self.static_empty_array(layout).into()));
+        }
         let n = self.gen_expr(fcx, len)?.unwrap().into_int_value();
         let n64 = if n.get_type().get_bit_width() < 64 {
             self.builder.build_int_s_extend(n, i64t, "n64").unwrap()
         } else { n };
+        let empty = (plain && !self.debug.as_ref().is_some_and(|d| d.full)).then(|| {
+            let zero = self.builder.build_int_compare(IntPredicate::EQ, n64, i64t.const_zero(), "array.empty").unwrap();
+            let shared = self.ctx.append_basic_block(fcx.func, "array.shared_empty");
+            let fresh = self.ctx.append_basic_block(fcx.func, "array.fresh");
+            let done = self.ctx.append_basic_block(fcx.func, "array.done");
+            self.builder.build_conditional_branch(zero, shared, fresh).unwrap();
+            self.builder.position_at_end(shared);
+            self.builder.build_unconditional_branch(done).unwrap();
+            self.builder.position_at_end(fresh);
+            (shared, done)
+        });
+        let Some((shared, done)) = empty else { return self.gen_array_alloc(fcx, layout, n64, stride, traced, span) };
+        let fresh = self.gen_array_alloc(fcx, layout, n64, stride, traced, span)?.unwrap();
+        let fresh_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(done).unwrap();
+        self.builder.position_at_end(done);
+        let phi = self.builder.build_phi(self.ctx.ptr_type(AddressSpace::default()), "arr").unwrap();
+        phi.add_incoming(&[(&self.static_empty_array(layout), shared), (&fresh, fresh_end)]);
+        Ok(Some(phi.as_basic_value()))
+    }
+
+    /// Allocate an array of `n64` elements of `layout`.
+    fn gen_array_alloc(
+        &mut self,
+        fcx: &mut FnCtx<'ctx>,
+        layout: LayoutId,
+        n64: IntValue<'ctx>,
+        stride: u64,
+        traced: bool,
+        span: crate::core::SpanId,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        let i32t = self.ctx.i32_type();
+        let i64t = self.ctx.i64_type();
         let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
         // A small array of a plain layout (no fixed fields) is reserved
         // inline: header, then its count word, then zeroed elements.

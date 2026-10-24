@@ -1,7 +1,8 @@
 //! Inlining over Core IR.
 //!
-//! A call to a small function, a `#[inline]` function, or a function called
-//! from exactly one place is replaced by a copy of the callee's body: its
+//! A call to a small function, a `#[inline]` function, a function called
+//! from exactly one place, or one with few call sites called from a small
+//! function's own loop (a dispatch loop) is replaced by a copy of the callee's body: its
 //! parameters become locals bound to the arguments, its locals are renumbered
 //! into the caller's, and each `return` becomes a `Leave` of the `Once` block
 //! that holds the copy. A recursive function is inlined only at its one call
@@ -31,6 +32,12 @@ const HINTED: usize = 400;
 const SINGLE_SITE: usize = 20000;
 /// Stop growing a caller past this many nodes (except `#[inline(always)]`).
 const CALLER_LIMIT: usize = 60000;
+/// A caller of at most this many nodes whose own loop calls a function with
+/// at most `LOOP_SITES` call sites gets a copy of it, however large: a
+/// dispatch loop (an interpreter's `loop { step() }`) then skips a call,
+/// its frame and its result's encoding on every iteration.
+const LOOP_CALLER: usize = 400;
+const LOOP_SITES: usize = 4;
 
 thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(true) };
@@ -74,7 +81,7 @@ pub fn inline_program(prog: &mut CoreProgram) {
         let known = known_variants(&caller);
         let closures = known_closures(&caller);
         let defs = definition_counts(&caller);
-        let mut cx = Inliner { funcs: &prog.funcs, candidate: &candidate, recursive: &recursive, caller: id, sizes: &sizes, sites: &sites, size: sizes[id], label: max_label(&caller.body) + 1, local_objects, known, closures, defs, chain: Vec::new() };
+        let mut cx = Inliner { funcs: &prog.funcs, candidate: &candidate, recursive: &recursive, caller: id, sizes: &sizes, sites: &sites, size: sizes[id], caller_size: sizes[id], loops: 0, label: max_label(&caller.body) + 1, local_objects, known, closures, defs, chain: Vec::new() };
         let mut body = std::mem::replace(&mut caller.body, CoreBlock { stmts: vec![], tail: None });
         cx.block(&mut body, &mut caller);
         caller.body = body;
@@ -94,6 +101,10 @@ struct Inliner<'a> {
     sites: &'a [usize],
     /// The caller's current size.
     size: usize,
+    /// The caller's size before inlining.
+    caller_size: usize,
+    /// How many of the caller's loops enclose the current position.
+    loops: u32,
     /// The caller's next unused `Once` label.
     label: u32,
     /// Caller locals bound to an object allocated in the caller.
@@ -113,6 +124,10 @@ impl Inliner<'_> {
         let g = g as usize;
         if !self.candidate[g] || g == self.caller || self.chain.contains(&g) { return false; }
         let size = self.sizes[g];
+        // In the caller's own loop (not a body copied into it).
+        let dispatch = self.loops > 0 && self.chain.is_empty() && self.caller_size <= LOOP_CALLER
+            && self.sites[g] <= LOOP_SITES && self.size + size <= CALLER_LIMIT;
+        if dispatch { return true; }
         if self.recursive[g] {
             // Copying a recursive function is bounded by `chain`: only its
             // one call site, or a copy specialized down to a few nodes.
@@ -167,7 +182,8 @@ impl Inliner<'_> {
     fn expr(&mut self, e: &mut CoreExpr, caller: &mut CoreFn) {
         match e.kind.as_mut() {
             CoreExprKind::If(c, y, n) => { self.expr(c, caller); self.block(y, caller); self.block(n, caller); }
-            CoreExprKind::Block(b) | CoreExprKind::Loop(b) | CoreExprKind::Once { body: b, .. } => self.block(b, caller),
+            CoreExprKind::Loop(b) => { self.loops += 1; self.block(b, caller); self.loops -= 1; }
+            CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => self.block(b, caller),
             CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
                 self.expr(scrutinee, caller);
                 for a in arms { self.expr(&mut a.body, caller); }
