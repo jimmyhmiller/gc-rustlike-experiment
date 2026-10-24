@@ -25,8 +25,8 @@ gcr test ports/funct                # funct's test suite (264 tests)
 
 ## Differences from the Rust original
 
-- `Arc<T>` is `T` and shared mutable slots (`Lock`) are atoms, so `Value`
-  holds its parts directly.
+- `Arc<T>` is gc-rust's shared box (no reference count; the collector frees
+  it) and shared mutable slots (`Lock`) are atoms.
 - The atom registry holds atoms strongly (gc-rust has no weak references), so
   `capture_atoms` also sees unreachable atoms.
 - The deadline ticker thread is a `std::thread` daemon; with no destructors
@@ -34,22 +34,21 @@ gcr test ports/funct                # funct's test suite (264 tests)
 - Host values (`Value::Native`) are `dyn Any` boxes; `with_mut` gives the
   shared value itself.
 
-## Timing (Apple Silicon, hyperfine, whole process)
+## Timing (Apple Silicon M2 Max, whole process, median)
 
 | Benchmark | Rust funct | port | port / Rust |
 |---|---|---|---|
-| `fib(30)` | 331 ms | 7.74 s | 23.4× |
-| `loops` (2000×2000) | 370 ms | 13.2 s | 35.7× |
-| `collatz` (1..100k) | 1.62 s | 58.7 s | 36.2× |
-| `list` (10k map/filter/fold) | 18.9 ms | 191 ms | 10.1× |
-| startup (`println(1)`) | 2.3 ms | 4.2 ms | 1.8× |
-| `examples/demo.ft` | 2.6 ms | 4.7 ms | 1.8× |
-| `funct test examples` | 29.4 ms | 109 ms | 3.7× |
-| lex `chess.ft` | 0.78 ms | 0.87 ms | 1.11× |
-| lex + parse `chess.ft` | 1.79 ms | 1.86 ms | 1.04× |
+| `fib(30)` | 331 ms | 346 ms | 1.05× |
+| `loops` (2000×2000) | 372 ms | 398 ms | 1.07× |
+| `collatz` (1..100k) | 1.61 s | 1.70 s | 1.06× |
+| `list` (10k map/filter/fold) | 18.6 ms | 14.8 ms | 0.79× |
+| startup (`println(1)`) | 2.31 ms | 2.48 ms | 1.07× |
+| `examples/demo.ft` | 2.44 ms | 2.66 ms | 1.09× |
+| `funct test examples` | 28.8 ms | 29.3 ms | 1.02× |
+| lex `chess.ft` | 0.78 ms | 0.80 ms | 1.03× |
+| lex + parse `chess.ft` | 1.74 ms | 1.40 ms | 0.81× |
 
-The front end is at parity; the VM is not. Each interpreted instruction
-calls `step_inner`, a single large `match`, and gc-rust's codegen gives that
-function a 19 KB frame whose 833 GC root slots are zeroed on every call
-(6.6 KB of `bzero` per instruction). Sharing root slots between mutually
-exclusive match arms is the next compiler improvement to make.
+The VM rows were measured with hyperfine. Startup and `demo.ft` are within
+the noise of process launch, so they come from runs interleaved in random
+order. The lex rows are per pass (`lexbench`/`parsebench`). In retired
+instructions the VM is 1.07× (fib), 1.08× (loops) and 1.08× (collatz).
