@@ -285,11 +285,11 @@ impl<'a> Anf<'a> {
                 let end = self.boxed(end, pending);
                 CoreExprKind::StrSubstring { layout, s, start, end }
             }
-            CoreExprKind::ArraySet { array, index, value, elem } => {
+            CoreExprKind::ArraySet { array, index, value, elem, in_bounds } => {
                 let array = self.boxed(array, pending);
                 let index = self.boxed(index, pending);
                 let value = self.boxed(value, pending);
-                CoreExprKind::ArraySet { array, index, value, elem }
+                CoreExprKind::ArraySet { array, index, value, elem, in_bounds }
             }
             CoreExprKind::AtomCas { atom, old, new } => {
                 let atom = self.boxed(atom, pending);

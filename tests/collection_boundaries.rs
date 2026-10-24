@@ -18,7 +18,6 @@ fn backing_array_bounds_and_allocation_sizes_fail_before_memory_access() {
         ("unit-past-end-write", "let mut a: Array<()> = Array::new(1); a[1] = (); 42", "array index out of bounds"),
         ("negative-index", "let a: Array<i64> = Array::new(1); a[0 - 1]", "array index out of bounds"),
         ("past-end", "let a: Array<i64> = Array::new(1); a[1]", "array index out of bounds"),
-        ("metadata-mismatch", "let mut v: Vec<i64> = Vec::new(); v.len = 10; match v.get(9) { Option::Some(n) => n, Option::None => 0 }", "array index out of bounds"),
         ("negative-length", "let a: Array<i64> = Array::new(0 - 1); a.len()", "invalid array length"),
         ("wrapped-byte-length", "let a: Array<i64> = Array::new(2305843009213693952); a.len()", "invalid array length"),
         ("traced-overflow", "let a: Array<String> = Array::new(2305843009213693952); a.len()", "invalid array length"),
@@ -66,6 +65,21 @@ fn backing_array_bounds_and_allocation_sizes_fail_before_memory_access() {
                 );
             }
         }
+    }
+    // A `Vec`'s length and storage cannot be made to disagree: its fields
+    // cannot be written or built outside the standard library.
+    for (name, body) in [
+        ("metadata-mismatch", "let mut v: Vec<i64> = Vec::new(); v.len = 10; match v.get(9) { Option::Some(n) => n, Option::None => 0 }"),
+        ("metadata-literal", "let v: Vec<i64> = Vec { data: Array::new(1), len: 10, cap: 1 }; v[9]"),
+    ] {
+        let source = dir.join(format!("{name}.gcr"));
+        std::fs::write(&source, format!("fn main() -> i64 {{ {body} }}")).unwrap();
+        let mut build = Command::new(env!("CARGO_BIN_EXE_gcr"));
+        build.arg("build").arg(&source).arg("-o").arg(dir.join(name))
+            .env("GCRUST_RUNTIME_LIB", support::runtime_staticlib());
+        let output = support::run_with_timeout(&mut build, 60);
+        assert!(!output.status.success(), "{name}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("of `Vec` is private"), "{name}: {}", String::from_utf8_lossy(&output.stderr));
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

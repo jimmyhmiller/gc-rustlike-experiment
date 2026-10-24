@@ -598,35 +598,30 @@ impl<'a> LayoutRegistry<'a> {
             // (scalar + value payloads with references split into the leading slots). Embedded refs land at fixed offsets
             // (`0, 8, …`) regardless of the active variant, so the GC can trace them
             // with a static interior-pointer list. `max_ptrs == 0` degenerates to the
-            // compact `{ tag, padding, raw }` form. Raw payloads are 8-aligned.
+            // compact `{ tag, raw }` form. Raw payloads pack from the tag's padding.
             let max_ptrs = checked_value_enum_max_ptrs(&variants, &self.values)
                 .ok_or_else(layout_limit_error)? as u32;
             // Every canonical reference offset is stored in a u16 GC descriptor.
             // Reject shapes that cannot describe their final leading slot before
             // codegen can overflow its offset arithmetic (including bare locals).
             if max_ptrs != 0 { layout_offset((max_ptrs - 1) * 8)?; }
-            let mut max_raw = 0u32;
-            let mut align = 8;
+            // Each variant's raw fields pack after the tag word (see
+            // `core::value_variant_offsets`); pointer slots force 8-alignment.
+            let mut max_raw = 4u32;
+            let mut align = if max_ptrs != 0 { 8 } else { 4 };
             for vv in &variants {
-                let mut raw = 0u32;
+                let (_, end) = crate::core::checked_value_variant_offsets(&vv.fields, &self.values)
+                    .ok_or_else(layout_limit_error)?;
+                max_raw = max_raw.max(end);
                 for f in &vv.fields {
                     match f {
+                        Repr::Scalar(s) => align = align.max((s.bits().max(8) / 8).max(1)),
+                        Repr::Value(vid) => align = align.max(self.values[*vid as usize].align),
                         Repr::Ref(_) | Repr::Unit => {}
-                        Repr::Scalar(s) => {
-                            let b = (s.bits().max(8) / 8).max(1);
-                            raw = checked_align_up(raw, b)?.checked_add(b).ok_or_else(layout_limit_error)?;
-                            align = align.max(b);
-                        }
-                        Repr::Value(vid) => {
-                            let v = &self.values[*vid as usize];
-                            raw = checked_align_up(raw, v.align)?.checked_add(v.size).ok_or_else(layout_limit_error)?;
-                            align = align.max(v.align);
-                        }
                     }
                 }
-                max_raw = max_raw.max(raw);
             }
-            let size = checked_align_up(max_ptrs.checked_mul(8).and_then(|n| n.checked_add(8)).and_then(|n| n.checked_add(max_raw)).ok_or_else(layout_limit_error)?, align)?;
+            let size = checked_align_up(max_ptrs.checked_mul(8).and_then(|n| n.checked_add(max_raw)).ok_or_else(layout_limit_error)?, align)?;
             let id = self.values.len() as ValueId;
             self.values.push(ValueLayout { niche: None, name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
             self.nominal_value_ids.insert(nominal, id);

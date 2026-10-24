@@ -210,8 +210,7 @@ fn string_scans_reload_caller_roots_after_runtime_calls() {
         assert!(ir.lines().any(|line| line.contains("icmp ule i64") && line.contains(&gcrust::runtime::STRING_SCAN_LEAF_BYTES.to_string())), "missing bounded scan guard");
         let call = ir.lines().position(|line| line.contains("call i64") && line.contains(&format!("@{symbol}("))).unwrap();
         let after: String = ir.lines().skip(call + 1).take_while(|line| !line.contains("call i64 @ai_str_get(")).collect::<Vec<_>>().join("\n");
-        assert!(after.contains("gc.relocated"), "{symbol} must check relocation before reusing caller roots:\n{after}");
-        assert!(after.contains("roots.reload"), "{symbol}: missing caller root reload");
+        assert!(after.contains("root.relocated"), "{symbol} must reload caller roots before reusing them:\n{after}");
     }
 }
 
@@ -240,7 +239,7 @@ fn float_parse_call_guards_and_reloads_typed_results() {
     assert!(ir.lines().any(|line| line.contains("icmp ule i64") && line.contains(&gcrust::runtime::STRING_SCAN_LEAF_BYTES.to_string())), "missing bounded float-parse guard");
     let call = ir.lines().position(|line| line.contains("call double @ai_str_to_float_v2(")).unwrap();
     let after: String = ir.lines().skip(call+1).take_while(|line| !line.contains("call i64 @ai_str_get(")).collect::<Vec<_>>().join("\n");
-    assert!(after.contains("gc.relocated") && after.contains("roots.reload"), "float parse must reload caller roots: {after}");
+    assert!(after.contains("root.relocated"), "float parse must reload caller roots: {after}");
     assert!(ir.lines().any(|line| line.contains("phi double") && line.contains("%strtof")), "float parse merge must preserve f64 ABI");
     assert_eq!(run(source), 51);
 }

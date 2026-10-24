@@ -57,7 +57,8 @@ pub fn native_intrinsic_requires_unsafe(name: &str) -> bool {
         | "atom_load" | "atom_cas"
         | "chan_bind_owner" | "chan_new" | "chan_send" | "chan_recv" | "chan_close"
         | "chan_sender_clone" | "chan_sender_drop"
-        | "chan_waiting_senders" | "chan_waiting_receivers")
+        | "chan_waiting_senders" | "chan_waiting_receivers"
+        | "array_get_in_bounds" | "array_set_in_bounds")
 }
 
 /// Levenshtein edit distance between two short identifiers (for "did you mean?"
@@ -399,6 +400,7 @@ fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProg
     crate::anf::anf_program(&mut prog);
     crate::copyprop::copy_propagate(&mut prog);
     crate::inline::inline_program(&mut prog);
+    crate::caseopt::identity_matches(&mut prog);
     crate::caseopt::known_constructors(&mut prog);
     crate::sroa::scalar_replace(&mut prog);
     crate::copyprop::copy_propagate(&mut prog);
@@ -2233,7 +2235,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
             let result = self.expr(&lit, Some(&cell_ty));
             self.scope = saved;
             let (cell, _) = result?;
-            stmts.push(CoreStmt::Expr(CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(local()), index: Box::new(int(i)), value: Box::new(cell), elem: elem.clone() }, Repr::Unit)));
+            stmts.push(CoreStmt::Expr(CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(local()), index: Box::new(int(i)), value: Box::new(cell), elem: elem.clone(), in_bounds: false }, Repr::Unit)));
         }
         Ok((CoreExpr::new(CoreExprKind::Block(Box::new(CoreBlock { stmts, tail: None })), Repr::Unit), Ty::unit()))
     }
@@ -3163,7 +3165,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         let arr = self.fresh_local(Repr::Ref(layout), ty.clone());
         let local = |id: LocalId, repr: Repr| CoreExpr::new(CoreExprKind::Local(id), repr);
         let set = |index: CoreExpr, value: CoreExpr| CoreStmt::Expr(CoreExpr::new(
-            CoreExprKind::ArraySet { array: Box::new(local(arr, Repr::Ref(layout))), index: Box::new(index), value: Box::new(value), elem: elem.clone() },
+            CoreExprKind::ArraySet { array: Box::new(local(arr, Repr::Ref(layout))), index: Box::new(index), value: Box::new(value), elem: elem.clone(), in_bounds: false },
             Repr::Unit,
         ));
         let mut stmts = Vec::new();
@@ -3294,6 +3296,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         // order independently of that observable evaluation order.
         let mut seen = std::collections::HashSet::new();
         for init in fields {
+            self.check_field_write(&s, &init.name, init.span)?;
             if !def_fields.iter().any(|df| df.name == init.name) {
                 return err(format!("unknown field `{}`", init.name), span);
             }
@@ -3541,6 +3544,20 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.field_read(cbase, &bty, fname, span)
     }
 
+    /// Code outside the standard library cannot write the private fields of a
+    /// prelude struct whose invariant keeps memory safe, or build one with a
+    /// literal: a `Vec`'s length bounds its storage (see `array_get_in_bounds`).
+    fn check_field_write(&self, s: &StructDef, fname: &str, span: Span) -> LResult<()> {
+        const SEALED: &[&str] = &["Vec"];
+        let prelude = crate::compile::prelude_source();
+        if !SEALED.contains(&s.name.as_str()) || prelude != Some(s.span.source) || prelude == Some(span.source) { return Ok(()); }
+        let StructBody::Named(fields) = &s.body else { return Ok(()) };
+        if fields.iter().any(|f| f.name == fname && !f.vis) {
+            return err(format!("field `{fname}` of `{}` is private", s.name), span);
+        }
+        Ok(())
+    }
+
     /// Whether a value of type `ty` has `field` itself, visible at `at`
     /// (the standard library's private fields, like `Arc`'s, are not).
     fn has_field(&self, ty: &Ty, field: &FieldAccess, at: Span) -> bool {
@@ -3615,6 +3632,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         if s.is_value {
             return err("value structs are immutable; rebuild instead of assigning a field", span);
         }
+        self.check_field_write(&s, fname, span)?;
         let StructBody::Named(def_fields) = &s.body else {
             return err("field assignment on a non-record struct", span);
         };
@@ -4568,15 +4586,20 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         Ok((CoreExpr::new(CoreExprKind::ArrayGetChecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
     }
 
-    /// Legacy `array_get_unchecked(a, i)` returns T directly, with backend
-    /// validation of backing bounds and initialized reference/value storage.
-    fn array_get_unchecked_op(&mut self, arr: &Expr, idx: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+    /// `array_get_in_bounds(a, i)` (unsafe): `a[i]` where the caller has
+    /// checked `i` against a bound on `a`'s length that holds while no other
+    /// thread runs, as a `Vec` checks its length (see `ArrayGetUnchecked`).
+    /// (Legacy `array_get_unchecked`, `trusted` false, is plain `a[i]`.)
+    fn array_get_unchecked_op(&mut self, arr: &Expr, idx: &Expr, trusted: bool, span: Span) -> LResult<(CoreExpr, Ty)> {
         let (ca, aty) = self.expr(arr, None)?;
         let elem_ty = array_elem_ty(&aty).ok_or_else(|| LowerError { msg: "array_get_unchecked on a non-array".into(), span })?;
         let elem = self.repr_of(&elem_ty, span)?;
         let (ci, it) = self.expr(idx, Some(&Ty::i64()))?;
         self.check_assignable(&it, &Ty::i64(), idx.span)?;
-        Ok((CoreExpr::new(CoreExprKind::ArrayGetUnchecked { array: Box::new(ca), index: Box::new(ci), elem: elem.clone() }, elem), elem_ty))
+        let (array, index) = (Box::new(ca), Box::new(ci));
+        let kind = if trusted { CoreExprKind::ArrayGetUnchecked { array, index, elem: elem.clone() } }
+            else { CoreExprKind::ArrayGetChecked { array, index, elem: elem.clone() } };
+        Ok((CoreExpr::new(kind, elem), elem_ty))
     }
 
     /// `base[lo..hi]` (either bound may be omitted; `lo..=hi` includes `hi`):
@@ -4675,7 +4698,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.check_assignable(&vt, &ty, span)?;
         let store = if elem_ty.is_some() {
             let elem = self.repr_of(&ty, span)?;
-            CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(array), index: Box::new(index), value: Box::new(value), elem }, Repr::Unit)
+            CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(array), index: Box::new(index), value: Box::new(value), elem, in_bounds: false }, Repr::Unit)
         } else {
             let entry = self.required_trait_method(&aty, "IndexSet", "index_set", "indexed assignment", span)?;
             let (call, ret) = self.method_call_operands(array, aty, Some(base), entry,
@@ -4692,6 +4715,14 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.check_mutable_root(arr, "element of", span)?;
         let (ca, aty) = self.expr(arr, None)?;
         self.array_store(ca, aty, idx, val, span)
+    }
+
+    /// `array_set_in_bounds(a, i, v)` (unsafe): `a[i] = v` where the caller
+    /// has checked `i` as for `array_get_in_bounds`.
+    fn array_set_in_bounds_op(&mut self, arr: &Expr, idx: &Expr, val: &Expr, span: Span) -> LResult<(CoreExpr, Ty)> {
+        let (store, ty) = self.array_set_op(arr, idx, val, span)?;
+        let CoreExprKind::ArraySet { array, index, value, elem, .. } = *store.kind else { unreachable!() };
+        Ok((CoreExpr::new(CoreExprKind::ArraySet { array, index, value, elem, in_bounds: true }, Repr::Unit), ty))
     }
 
     /// `array_copy(src, src_pos, dst, dst_pos, n)`: copy `n` elements, as
@@ -4725,7 +4756,7 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
         self.check_assignable(&it, &Ty::i64(), idx.span)?;
         let (cv, vt) = self.expr(val, Some(&elem_ty))?;
         self.check_assignable(&vt, &elem_ty, val.span)?;
-        Ok((CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(ca), index: Box::new(ci), value: Box::new(cv), elem }, Repr::Unit), Ty::unit()))
+        Ok((CoreExpr::new(CoreExprKind::ArraySet { array: Box::new(ca), index: Box::new(ci), value: Box::new(cv), elem, in_bounds: false }, Repr::Unit), Ty::unit()))
     }
 
     /// Lower the built-in `String` intrinsics. Each argument must be a `String`.
@@ -6814,8 +6845,10 @@ impl<'a, 'r, 'm> FnLowerer<'a, 'r, 'm> {
                 "array_new" if args.len() == 1 => return self.array_new(&args[0], expected, span),
                 "array_len" if args.len() == 1 => return self.array_len_op(&args[0], span),
                 "array_get" if args.len() == 2 => return self.array_get_op(&args[0], &args[1], span),
-                "array_get_unchecked" if args.len() == 2 => return self.array_get_unchecked_op(&args[0], &args[1], span),
+                "array_get_unchecked" if args.len() == 2 => return self.array_get_unchecked_op(&args[0], &args[1], false, span),
+                "array_get_in_bounds" if args.len() == 2 => return self.array_get_unchecked_op(&args[0], &args[1], true, span),
                 "array_set" if args.len() == 3 => return self.array_set_op(&args[0], &args[1], &args[2], span),
+                "array_set_in_bounds" if args.len() == 3 => return self.array_set_in_bounds_op(&args[0], &args[1], &args[2], span),
                 "array_copy" if args.len() == 5 => return self.array_copy_op(args, span),
                 // `any_type_name::<T>()`: the name of `T`, for `std::any`.
                 "any_type_name" if args.is_empty() => {

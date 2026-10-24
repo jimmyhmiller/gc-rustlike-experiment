@@ -865,6 +865,7 @@ mod alias_tests {
                 .unwrap();
         assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 26);
         let ir = crate::codegen::emit_llvm_ir(&program, true).unwrap();
-        assert!(!ir.contains("!invariant.load"));
+        // Only the thread's access-mode pointer is invariant, never array data.
+        assert!(!ir.lines().any(|line| line.contains("!invariant.load") && !line.contains("access.mode.ptr")), "{ir}");
     }
 }

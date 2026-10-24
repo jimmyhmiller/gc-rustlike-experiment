@@ -631,31 +631,26 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let v = &self.prog.values[vid as usize];
         if let Some(niche) = v.niche { return self.value_struct_ty(niche.inner); }
         if let Some(variants) = &v.variants {
+            // `{ [max_ptrs x ptr], i32 tag, raw }` (no pointer array when
+            // `max_ptrs == 0`). Ref payloads share the leading slots across
+            // variants (fixed offsets, GC-traceable); scalars/POD-values pack
+            // into the bytes from the tag word on (`value_variant_offsets`).
+            // The raw words only give the aggregate its size and alignment.
             let max_ptrs = crate::core::value_enum_max_ptrs(variants, &self.prog.values) as u32;
-            if max_ptrs == 0 {
-                // Compact value enum: `{ i32 tag, [payload bytes] }`.
-                let payload_bytes = v.size.saturating_sub(8) / 8;
-                return self.ctx.struct_type(
-                    &[
-                        self.ctx.i32_type().as_basic_type_enum(),
-                        self.ctx.i64_type().array_type(payload_bytes).as_basic_type_enum(),
-                    ],
-                    false,
-                );
+            let i32t = self.ctx.i32_type().as_basic_type_enum();
+            let mut fields = Vec::new();
+            if max_ptrs != 0 {
+                fields.push(self.ctx.ptr_type(AddressSpace::default()).array_type(max_ptrs).as_basic_type_enum());
             }
-            // Pointers-first value enum: `{ [max_ptrs x ptr], i32 tag, [raw] }`.
-            // Ref payloads share the leading slots across variants (fixed offsets,
-            // GC-traceable); scalars/POD-values go in the raw byte region.
-            let ptr = self.ctx.ptr_type(AddressSpace::default());
-            let raw_bytes = v.size.saturating_sub(max_ptrs * 8 + 8) / 8;
-            return self.ctx.struct_type(
-                &[
-                    ptr.array_type(max_ptrs).as_basic_type_enum(),
-                    self.ctx.i32_type().as_basic_type_enum(),
-                    self.ctx.i64_type().array_type(raw_bytes).as_basic_type_enum(),
-                ],
-                false,
-            );
+            fields.push(i32t);
+            let rest = v.size - max_ptrs * 8 - 4;
+            if v.align >= 8 {
+                fields.push(i32t);
+                fields.push(self.ctx.i64_type().array_type((rest - 4) / 8).as_basic_type_enum());
+            } else {
+                fields.push(self.ctx.i32_type().array_type(rest / 4).as_basic_type_enum());
+            }
+            return self.ctx.struct_type(&fields, false);
         }
         let fields: Vec<BasicTypeEnum> = v.fields.iter()
             .filter_map(|r| self.llvm_ty(r))
@@ -947,8 +942,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         // The heap keeps both bits in one byte (see `Heap::copying_phase_ptr`).
         let address = self.obj_addr(fcx.thread, crate::runtime::thread_offsets::COPYING_PHASE as u64);
-        let flag = self.builder.build_load(ptr, address, "access.mode.ptr").unwrap().into_pointer_value();
-        let mode = self.builder.build_load(i8t, flag, "access.mode").unwrap();
+        let flag = self.builder.build_load(ptr, address, "access.mode.ptr").unwrap();
+        // The thread's pointer to its heap's byte never changes.
+        flag.as_instruction_value().unwrap().set_metadata(self.ctx.metadata_node(&[]), self.ctx.get_kind_id("invariant.load")).unwrap();
+        let mode = self.builder.build_load(i8t, flag.into_pointer_value(), "access.mode").unwrap();
         mode.as_instruction_value().unwrap().set_alignment(1).unwrap();
         mode
     }
@@ -1719,7 +1716,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     let addr = self.obj_addr(env, cap.offset);
                     let v = self.builder.build_load(lty, addr, "cap").unwrap();
                     self.builder.build_store(slot, v).unwrap();
-                    if !entry_roots_only && !late_roots { if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); } }
+                    if !entry_roots_only && !late_roots && !masked { if let Some(root) = root_slots[cap.local as usize] { self.builder.build_store(root, v).unwrap(); } }
                 }
             }
         }
@@ -1730,7 +1727,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 if let Some(slot) = slots[local] {
                     let arg = func.get_nth_param(llvm_idx).unwrap();
                     self.builder.build_store(slot, arg).unwrap();
-                    if !entry_roots_only && !late_roots { if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); } }
+                    if !entry_roots_only && !late_roots && !masked { if let Some(root) = root_slots[local] { self.builder.build_store(root, arg).unwrap(); } }
                 }
                 llvm_idx += 1;
             }
@@ -2009,6 +2006,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         self.builder.position_at_end(ready);
     }
 
+    /// How many 8-byte words reloading `spilled` reads.
+    fn spilled_words(&self, fcx: &FnCtx<'ctx>, spilled: &[LocalId]) -> u64 {
+        spilled.iter().map(|&l| match &fcx.local_reprs[l as usize] {
+            Repr::Value(v) if fcx.value_homes[l as usize].is_some() => (self.prog.values[*v as usize].size as u64).div_ceil(8),
+            _ => 1,
+        }).sum()
+    }
+
     /// After a collection moved objects: the traced locals spilled for the
     /// call (`store_site_origin`) again from their frame slots.
     fn reload_spilled(&self, fcx: &FnCtx<'ctx>, spilled: &[LocalId]) {
@@ -2087,6 +2092,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let spilled = if fcx.masked && (!no_relocation || symbol == "ai_ffi_enter") {
             Some(self.store_site_origin(fcx, symbol != "ai_ffi_leave"))
         } else { None };
+        // A few spilled words are cheaper to read back than to compare the
+        // relocation epoch around the call.
+        if let Some(spilled) = spilled.as_deref().filter(|s| has_roots && !no_relocation && symbol != "ai_ffi_leave" && self.spilled_words(fcx, s) <= 3) {
+            let call = self.builder.build_call(callee, args, name)?;
+            self.refresh_copy_phase(fcx);
+            self.reload_spilled(fcx, spilled);
+            return Ok(call);
+        }
         // ffi_leave begins BLOCKED, after native callbacks may already have
         // moved roots. Reload unconditionally after it returns RUNNING.
         let before = if has_roots && !no_relocation && symbol != "ai_ffi_leave" {
@@ -3104,7 +3117,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 self.gen_array_get_unchecked(fcx, array, index, elem)}
             CoreExprKind::ArrayGetChecked { array, index, elem } => {
                 self.gen_array_get_checked(fcx, array, index, elem)}
-            CoreExprKind::ArraySet { array, index, value, elem } => self.gen_array_set(fcx, array, index, value, elem),
+            CoreExprKind::ArraySet { array, index, value, elem, in_bounds } => self.gen_array_set(fcx, array, index, value, elem, *in_bounds),
             CoreExprKind::MakeClosure { code, env, captures } => self.gen_make_closure(fcx, *code, *env, captures, e.span),
             CoreExprKind::CallClosure { callee, args } => {
                 self.gen_call_closure(fcx, callee, args, &e.repr)}
@@ -4157,58 +4170,33 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             return agg.into();
         }
-        let max_ptrs = crate::core::value_enum_max_ptrs(
-            self.prog.values[value as usize].variants.as_ref().unwrap(), &self.prog.values,
-        ) as u32;
+        let variants = self.prog.values[value as usize].variants.as_ref().unwrap();
+        let (offsets, _) = crate::core::value_variant_offsets(&variants[tag as usize].fields, &self.prog.values);
         let slot = self.entry_alloca(sty, "ve");
         self.builder.build_store(slot, sty.const_zero()).unwrap();
 
-        if max_ptrs == 0 {
-            // Compact `{ i32 tag, [payload bytes] }`: tag field 0, payload field 1.
-            let tag_addr = self.builder.build_struct_gep(sty, slot, 0, "ve.tag").unwrap();
-            self.builder.build_store(tag_addr, i32t.const_int(tag as u64, false)).unwrap();
-            if sty.count_fields() > 1 {
-                let payload_addr = self.builder.build_struct_gep(sty, slot, 1, "ve.pl").unwrap();
-                let mut off = 0u64;
-                for (v, repr) in vals {
-                    let (sz, align) = self.repr_size_align(repr);
-                    off = align_up64(off, align);
-                    let field_addr = self.payload_field_addr(payload_addr, off);
-                    self.builder.build_store(field_addr, *v).unwrap();
-                    off += sz;
-                }
-            }
-        } else {
-            // Pointers-first `{ [max_ptrs x ptr], i32 tag, [raw] }`: ref payloads
-            // into the shared leading slots (field 0), tag (field 1), scalars/
-            // POD-values into the raw region (field 2). Mirrors the reference-enum
-            // heap layout so embedded refs sit at fixed, GC-traceable offsets.
+        // `{ [max_ptrs x ptr], i32 tag, raw }`: ref payloads into the shared
+        // leading slots, scalars/POD-values at their offsets from the tag word.
+        // Mirrors the reference-enum heap layout so embedded refs sit at fixed,
+        // GC-traceable offsets.
+        let tag_addr = self.builder.build_struct_gep(sty, slot, self.value_tag_index(value), "ve.tag").unwrap();
+        self.builder.build_store(tag_addr, i32t.const_int(tag as u64, false)).unwrap();
+        {
             let ptr = self.ctx.ptr_type(AddressSpace::default());
-            let ptr_arr_ty = ptr.array_type(max_ptrs);
-            let ptr_arr = self.builder.build_struct_gep(sty, slot, 0, "ve.ptrs").unwrap();
-            let tag_addr = self.builder.build_struct_gep(sty, slot, 1, "ve.tag").unwrap();
-            self.builder.build_store(tag_addr, i32t.const_int(tag as u64, false)).unwrap();
-            let raw_addr = self.builder.build_struct_gep(sty, slot, 2, "ve.raw").unwrap();
+            let ptr_arr = slot;
             let mut ptr_slot = 0u64;
-            let mut raw_off = 0u64;
-            for (v, repr) in vals {
+            // `vals` has no unit fields: pair them with the other offsets.
+            let reprs = &variants[tag as usize].fields;
+            let raw_offsets = (0..reprs.len()).filter(|&i| !matches!(reprs[i], Repr::Unit)).map(|i| offsets[i]);
+            for ((v, repr), raw_off) in vals.iter().zip(raw_offsets) {
                 match repr {
                     Repr::Ref(_) => {
-                        let elem = unsafe {
-                            self.builder.build_in_bounds_gep(
-                                ptr_arr_ty, ptr_arr,
-                                &[i32t.const_zero(), i32t.const_int(ptr_slot, false)],
-                                "ve.pslot",
-                            ).unwrap()
-                        };
+                        let elem = self.payload_field_addr(ptr_arr, ptr_slot * 8);
                         ptr_slot += 1;
                         self.builder.build_store(elem, *v).unwrap();
                     }
                     _ => {
-                        let (sz, align) = self.repr_size_align(repr);
-                        raw_off = align_up64(raw_off, align);
-                        let field_addr = self.payload_field_addr(raw_addr, raw_off);
-                        raw_off += sz;
+                        let field_addr = self.payload_field_addr(tag_addr, raw_off.expect("a raw field") as u64);
                         self.builder.build_store(field_addr, *v).unwrap();
                         if let Repr::Value(id) = repr {
                             let mut offsets = Vec::new();
@@ -4372,6 +4360,29 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Emit an inlined bounds check: if `idx64 >=u len` (unsigned, so negative
     /// indices wrap large and also trap) call `ai_bounds_fail` (noreturn) on a
     /// cold out-of-line path; otherwise fall through to the in-bounds block.
+    /// Check `idx64` against array `obj`'s length. An `in_bounds` index
+    /// (`array_get_in_bounds`/`array_set_in_bounds`) was checked by its
+    /// caller against a bound that holds while nothing races it, so it is
+    /// checked only when another mutator or a copy may be running: a race
+    /// may pair a new length with an old array.
+    fn emit_array_bounds_check(&self, fcx: &FnCtx<'ctx>, obj: PointerValue<'ctx>, array: &CoreExpr, idx64: IntValue<'ctx>, in_bounds: bool) -> Result<(), CodegenError> {
+        if !in_bounds {
+            let len = self.known_array_len(obj, array)?;
+            self.emit_bounds_check(fcx, idx64, len);
+            return Ok(());
+        }
+        let direct = self.aggregate_direct(fcx);
+        let check = self.ctx.append_basic_block(fcx.func, "in_bounds.check");
+        let ready = self.ctx.append_basic_block(fcx.func, "in_bounds.ready");
+        self.builder.build_conditional_branch(direct, ready, check).unwrap();
+        self.builder.position_at_end(check);
+        let len = self.known_array_len(obj, array)?;
+        self.emit_bounds_check(fcx, idx64, len);
+        self.builder.build_unconditional_branch(ready).unwrap();
+        self.builder.position_at_end(ready);
+        Ok(())
+    }
+
     fn emit_bounds_check(&self, fcx: &FnCtx<'ctx>, idx64: IntValue<'ctx>, len: IntValue<'ctx>) {
         let oob = self.builder.build_int_compare(IntPredicate::UGE, idx64, len, "oob").unwrap();
         let fail_bb = self.ctx.append_basic_block(fcx.func, "bounds.fail");
@@ -4680,8 +4691,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(Some(phi.as_basic_value()))
     }
 
-    /// Legacy direct-return indexing validates the actual backing array. A
-    /// caller's earlier metadata check may be invalidated by a racing mutation.
+    /// `array_get_in_bounds` (see `emit_array_bounds_check`).
     fn gen_array_get_unchecked(
         &mut self,
         fcx: &mut FnCtx<'ctx>,
@@ -4692,8 +4702,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.known_array_len(obj, array)?;
-        self.emit_bounds_check(fcx, idx64, len);
+        self.emit_array_bounds_check(fcx, obj, array, idx64, true)?;
         if matches!(elem, Repr::Unit) { return Ok(None); }
         let v = self.load_array_element(fcx, obj, idx64, elem, array)?;
         Ok(Some(v))
@@ -4725,24 +4734,23 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         index: &CoreExpr,
         value: &CoreExpr,
         elem: &Repr,
+        in_bounds: bool,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let idx = self.gen_expr(fcx, index)?.unwrap().into_int_value();
         if let Repr::Value(vid) = elem {
-            return self.gen_record_set(fcx, array, idx, value, *vid);
+            return self.gen_record_set(fcx, array, idx, value, *vid, in_bounds);
         }
         // ANF has evaluated operands in source order.
         let val = if matches!(elem, Repr::Unit) {
             self.gen_expr(fcx, value)?;
             let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
             let idx64 = self.idx_to_i64(idx);
-            let len = self.known_array_len(obj, array)?;
-            self.emit_bounds_check(fcx, idx64, len);
+            self.emit_array_bounds_check(fcx, obj, array, idx64, in_bounds)?;
             return Ok(None);
         } else { self.gen_expr(fcx, value)?.unwrap() };
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.known_array_len(obj, array)?;
-        self.emit_bounds_check(fcx, idx64, len);
+        self.emit_array_bounds_check(fcx, obj, array, idx64, in_bounds)?;
         let (stride, _) = Self::elem_stride(elem);
         let offset = self.array_elem_offset(idx64, stride);
         self.managed_store(fcx, obj, offset, val, elem, matches!(elem, Repr::Ref(_)), array)?;
@@ -4759,13 +4767,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         idx: IntValue<'ctx>,
         value: &CoreExpr,
         vid: crate::core::ValueId,
+        in_bounds: bool,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let (stride, _) = self.elem_stride_of(&Repr::Value(vid));
         let (rty, flagged) = self.record_ty(vid);
         let obj = self.gen_expr(fcx, array)?.unwrap().into_pointer_value();
         let idx64 = self.idx_to_i64(idx);
-        let len = self.known_array_len(obj, array)?;
-        self.emit_bounds_check(fcx, idx64, len);
+        self.emit_array_bounds_check(fcx, obj, array, idx64, in_bounds)?;
         let offset = self.array_elem_offset(idx64, stride);
         let mut refs = Vec::new();
         value_interior_offsets(&self.prog.values, vid, if flagged { 8 } else { 0 }, &mut refs);
@@ -5066,11 +5074,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } else {
             None
         };
+        // Raw fields sit at their offsets from the tag word.
         let raw = self
             .builder
-            .build_struct_gep(ty, slot, if max_ptrs > 0 { 2 } else { 1 }, "vp.raw")
+            .build_struct_gep(ty, slot, if max_ptrs > 0 { 1 } else { 0 }, "vp.raw")
             .unwrap();
-        let mut raw_offset = 0;
+        let (raw_offsets, _) = crate::core::value_variant_offsets(reprs, &self.prog.values);
         let mut pointer_slot = 0;
         for (index, repr) in reprs.iter().enumerate() {
             let mut interiors = Vec::new();
@@ -5086,11 +5095,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 pointer_slot += 1;
                 addr
             } else {
-                let (size, align) = self.repr_size_align(repr);
-                raw_offset = align_up64(raw_offset, align);
-                let addr = self.payload_field_addr(raw, raw_offset);
-                raw_offset += size;
-                addr
+                self.payload_field_addr(raw, raw_offsets[index].unwrap_or(4) as u64)
             };
             if index == field {
                 let ty = self
@@ -6455,10 +6460,10 @@ pub fn layouts_to_value_meta(prog: &CoreProgram) -> Result<Vec<crate::gc::ValueM
         } else if let Some(variants) = &value.variants {
             let tag = crate::core::value_enum_max_ptrs(variants, &prog.values) as u32 * 8;
             let tag_offset = offset(tag)?;
-            let raw_base = tag.checked_add(8).ok_or_else(error)?;
-            let variants = variants.iter().enumerate().map(|(tag, variant)| {
+            let variants = variants.iter().enumerate().map(|(tag_value, variant)| {
                 let mut pointer = 0u32;
-                let mut raw = 0u32;
+                let (raw, _) = crate::core::value_variant_offsets(&variant.fields, &prog.values);
+                let raw_at = |index: usize| tag.checked_add(raw[index].unwrap()).ok_or_else(error);
                 let mut fields = Vec::new();
                 for (index, repr) in variant.fields.iter().enumerate() {
                     let (at, ty) = match repr {
@@ -6468,18 +6473,9 @@ pub fn layouts_to_value_meta(prog: &CoreProgram) -> Result<Vec<crate::gc::ValueM
                             pointer += 1;
                             (at, FieldTy::Ref(u16::try_from(*id).map_err(|_| error())?))
                         }
-                        Repr::Scalar(scalar) => {
-                            let size = (scalar.bits().max(8) / 8).max(1);
-                            raw = align_up(raw, size)?;
-                            let at = raw_base.checked_add(raw).ok_or_else(error)?;
-                            raw = raw.checked_add(size).ok_or_else(error)?;
-                            (at, FieldTy::Scalar(crate::layout::scalar_kind(*scalar)))
-                        }
+                        Repr::Scalar(scalar) => (raw_at(index)?, FieldTy::Scalar(crate::layout::scalar_kind(*scalar))),
                         Repr::Value(id) => {
-                            let nested = &prog.values[*id as usize];
-                            raw = align_up(raw, nested.align)?;
-                            let at = raw_base.checked_add(raw).ok_or_else(error)?;
-                            raw = raw.checked_add(nested.size).ok_or_else(error)?;
+                            let at = raw_at(index)?;
                             let mut interiors = Vec::new();
                             value_interior_offsets(&prog.values, *id, 0, &mut interiors);
                             let value_id = u16::try_from(*id).map_err(|_| error())?;
@@ -6496,7 +6492,7 @@ pub fn layouts_to_value_meta(prog: &CoreProgram) -> Result<Vec<crate::gc::ValueM
                     };
                     fields.push(FieldMeta { name: variant.field_names.get(index).cloned().unwrap_or_else(|| index.to_string()), offset: offset(at)?, ty });
                 }
-                Ok(VariantMeta { name: variant.name.clone(), tag: u32::try_from(tag).map_err(|_| error())?, fields })
+                Ok(VariantMeta { name: variant.name.clone(), tag: u32::try_from(tag_value).map_err(|_| error())?, fields })
             }).collect::<Result<Vec<_>, CodegenError>>()?;
             TypeKind::Enum { tag_offset, variants }
         } else {

@@ -319,3 +319,110 @@ fn count_constructor_fields(e: &CoreExpr, tag: u32, counts: &mut Counts) {
         _ => {}
     }
 }
+
+/// `match s { K(xs) => K(xs), .. }`: every arm rebuilds the variant it
+/// matched from its own payload, as an inlined derived `Clone` of a value
+/// enum does once each payload's clone is the payload itself (a `String`,
+/// an `Arc`, a scalar). Such a match is its scrutinee.
+pub fn identity_matches(prog: &mut CoreProgram) {
+    if !crate::inline::enabled() { return; }
+    let CoreProgram { funcs, values, .. } = prog;
+    for f in funcs.iter_mut().filter(|f| !f.is_extern) { identity_block(&mut f.body, values); }
+}
+
+fn identity_block(b: &mut CoreBlock, values: &[ValueLayout]) {
+    for s in &mut b.stmts { match s { CoreStmt::Let(_, e) | CoreStmt::Expr(e) => identity_expr(e, values) } }
+    if let Some(t) = &mut b.tail { identity_expr(t, values); }
+}
+
+fn identity_expr(e: &mut CoreExpr, values: &[ValueLayout]) {
+    use CoreExprKind::*;
+    match e.kind.as_mut() {
+        If(c, y, n) => { identity_expr(c, values); identity_block(y, values); identity_block(n, values); }
+        Block(b) | Loop(b) | Once { body: b, .. } => identity_block(b, values),
+        Match { scrutinee, arms } | ValueMatch { scrutinee, arms } => {
+            identity_expr(scrutinee, values);
+            for a in arms.iter_mut() { identity_expr(&mut a.body, values); }
+        }
+        _ => for c in crate::copyprop::children_mut(e) { identity_expr(c, values) },
+    }
+    let ValueMatch { scrutinee, arms } = e.kind.as_mut() else { return };
+    let Repr::Value(v) = scrutinee.repr else { return };
+    if e.repr != scrutinee.repr || arms.is_empty() { return; }
+    let identity: Vec<bool> = arms.iter().map(|a| rebuilds(a, v, values)).collect();
+    if identity.iter().all(|&i| i) {
+        let s = std::mem::replace(scrutinee.as_mut(), CoreExpr::new(CoreExprKind::Unit, Repr::Unit));
+        *e = s;
+        return;
+    }
+    // Otherwise the identity arms become one default arm yielding the
+    // scrutinee, so the switch tests only the variants that do work.
+    let CoreExprKind::Local(s) = *scrutinee.kind else { return };
+    if identity.iter().filter(|&&i| i).count() < 2 || arms.iter().any(|a| a.tag == u32::MAX) { return; }
+    let mut kept: Vec<CoreArm> = std::mem::take(arms).into_iter().zip(identity).filter(|(_, i)| !i).map(|(a, _)| a).collect();
+    kept.push(CoreArm { tag: u32::MAX, binds: vec![], body: CoreExpr::new(CoreExprKind::Local(s), scrutinee.repr.clone()) });
+    *arms = kept;
+}
+
+/// Whether `arm`'s body is `MakeValueVariant` of its own tag of `v` from
+/// exactly its bound payload, through pure `let`s.
+fn rebuilds(arm: &CoreArm, v: ValueId, values: &[ValueLayout]) -> bool {
+    let mut lets = std::collections::HashMap::new();
+    let Some(body) = through_lets(&arm.body, &mut lets) else { return false };
+    let CoreExprKind::MakeValueVariant { value, tag, fields } = body.kind.as_ref() else { return false };
+    *value == v && *tag == arm.tag && fields.len() == arm.binds.len()
+        && fields.iter().zip(&arm.binds).all(|(f, &b)| same(f, b, &mut Vec::new(), &mut lets, values))
+}
+
+/// `e` without enclosing blocks whose statements are pure `let`s, which go
+/// into `lets`.
+fn through_lets<'e>(mut e: &'e CoreExpr, lets: &mut std::collections::HashMap<LocalId, &'e CoreExpr>) -> Option<&'e CoreExpr> {
+    while let CoreExprKind::Block(b) = e.kind.as_ref() {
+        for s in &b.stmts {
+            let CoreStmt::Let(l, d) = s else { return None };
+            if !pure(d) { return None; }
+            lets.insert(*l, d);
+        }
+        e = b.tail.as_ref()?;
+    }
+    Some(e)
+}
+
+fn pure(e: &CoreExpr) -> bool {
+    use CoreExprKind::*;
+    match e.kind.as_ref() {
+        Local(_) => true,
+        Field { base, loc: FieldLoc::ValueField { .. } } => pure(base),
+        MakeValue { fields, .. } => fields.iter().all(pure),
+        Block(b) => b.stmts.iter().all(|s| matches!(s, CoreStmt::Let(_, d) if pure(d))) && b.tail.as_ref().is_some_and(pure),
+        _ => false,
+    }
+}
+
+/// Whether `e` is the value at field path `path` of local `root`.
+fn same<'e>(e: &'e CoreExpr, root: LocalId, path: &mut Vec<u32>, lets: &mut std::collections::HashMap<LocalId, &'e CoreExpr>, values: &[ValueLayout]) -> bool {
+    use CoreExprKind::*;
+    let Some(e) = through_lets(e, lets) else { return false };
+    match e.kind.as_ref() {
+        Local(l) if *l == root && path.is_empty() => true,
+        Local(l) => match lets.get(l).copied() { Some(d) => same(d, root, path, lets, values), None => false },
+        Field { base, loc: FieldLoc::ValueField { index } } => {
+            if path.last() != Some(index) { return false; }
+            let last = path.pop().unwrap();
+            let ok = same(base, root, path, lets, values);
+            path.push(last);
+            ok
+        }
+        MakeValue { value, fields } => {
+            let layout = &values[*value as usize];
+            if layout.variants.is_some() || layout.fields.iter().any(|r| matches!(r, Repr::Unit)) || fields.len() != layout.fields.len() { return false; }
+            fields.iter().enumerate().all(|(i, f)| {
+                path.push(i as u32);
+                let ok = same(f, root, path, lets, values);
+                path.pop();
+                ok
+            })
+        }
+        _ => false,
+    }
+}

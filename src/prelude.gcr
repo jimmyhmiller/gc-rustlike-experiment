@@ -866,7 +866,7 @@ impl<T> Vec<T> {
     // Bounds-checked access: Some(element) when 0 <= i < len, otherwise None.
     #[inline]
     fn get(self, i: i64) -> Option<T> {
-        if i < 0 || i >= self.len { Option::None } else { Option::Some(self.data[i]) }
+        if i < 0 || i >= self.len { Option::None } else { Option::Some(unsafe { array_get_in_bounds(self.data, i) }) }
     }
     fn first(self) -> Option<T> { self.get(0) }
     fn last(self) -> Option<T> { self.get(self.len - 1) }
@@ -877,7 +877,7 @@ impl<T> Vec<T> {
             self.cap = (self.cap * 2).max(4);
             self.data = vec_grow(self.data, self.len, self.cap);
         }
-        self.data[self.len] = x;
+        unsafe { array_set_in_bounds(self.data, self.len, x); }
         self.len += 1;
     }
 
@@ -889,7 +889,7 @@ impl<T> Vec<T> {
             Option::None
         } else {
             self.len -= 1;
-            Option::Some(self.data[self.len])
+            Option::Some(unsafe { array_get_in_bounds(self.data, self.len) })
         }
     }
 
@@ -1120,7 +1120,7 @@ impl<T> Index<i64> for Vec<T> {
     #[inline]
     fn index(self, i: i64) -> T {
         if i < 0 || i >= self.len { vec_index_fail(i, self.len); }
-        self.data[i]
+        unsafe { array_get_in_bounds(self.data, i) }
     }
 }
 
@@ -2937,7 +2937,7 @@ macro_rules! step_ints {
 step_ints!(i8 i16 i32 i64 i128 u8 u16 u32 u64 u128);
 
 // `lo..hi` used as a value; `lo..=hi` ends one later.
-struct Range<T> { start: T, end: T }
+struct Range<T> { pub start: T, pub end: T }
 impl<T: Step> Iterator for Range<T> {
     type Item = T;
     fn next(mut self) -> Option<T> {
@@ -2955,7 +2955,7 @@ impl<T: Step> Range<T> {
     fn is_empty(self) -> bool { self.start >= self.end }
 }
 // `lo..` used as a value: counts up without end.
-struct RangeFrom<T> { start: T }
+struct RangeFrom<T> { pub start: T }
 impl<T: Step> Iterator for RangeFrom<T> {
     type Item = T;
     fn next(mut self) -> Option<T> {

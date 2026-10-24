@@ -124,6 +124,7 @@ fn expression_is_nonrelocating(expression: &CoreExpr, calls: &mut Vec<FuncId>) -
             index,
             value,
             elem,
+            ..
         } => {
             !matches!(elem, crate::core::Repr::Value(_))
                 && expression_is_nonrelocating(array, calls)
@@ -273,9 +274,11 @@ mod tests {
                 .unwrap()
                 .print_to_string()
                 .to_string();
+            // `unsafe_user` spills nothing across its call, so it needs a
+            // frame but has nothing to reload.
             assert_eq!(ir.contains("gcframe"), must_check, "{ir}");
-            assert_eq!(ir.contains("gc.epoch"), must_check, "{ir}");
-            assert_eq!(ir.contains("roots.reload"), must_check, "{ir}");
+            assert!(!ir.contains("gc.epoch"), "{ir}");
+            assert!(!ir.contains("roots.reload") && !ir.contains("relocated"), "{ir}");
         }
     }
 
@@ -435,6 +438,7 @@ pub(crate) fn body_nonrelocating(
                 index,
                 value,
                 elem,
+                ..
             } => {
                 !matches!(elem, crate::core::Repr::Value(_))
                     && expression_safe(array, callees, loops)

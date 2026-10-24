@@ -251,6 +251,46 @@ pub fn checked_value_enum_max_ptrs(variants: &[ValueVariant], values: &[ValueLay
     variants.iter().try_fold(0u16, |maximum, variant| Some(maximum.max(fields(&variant.fields, values)?)))
 }
 
+/// Where a value-enum variant's non-reference fields live, as byte offsets
+/// from the start of the u32 tag word (references take the leading pointer
+/// slots and get `None`, as do units). Fields are placed first-fit, widest
+/// alignment first, starting right after the tag, so small scalars fill the
+/// tag word's padding: `MatchPat { pat: u32, fail: u32 }` is 12 bytes, not
+/// 24. Also returns where the variant's bytes end. `None` on overflow.
+pub fn checked_value_variant_offsets(fields: &[Repr], values: &[ValueLayout]) -> Option<(Vec<Option<u32>>, u32)> {
+    let size_align = |repr: &Repr| match repr {
+        Repr::Scalar(s) => {
+            let bytes = (s.bits().max(8) / 8).max(1);
+            Some((bytes, bytes))
+        }
+        Repr::Value(id) => Some((values[*id as usize].size, values[*id as usize].align.max(1))),
+        Repr::Ref(_) | Repr::Unit => None,
+    };
+    let align_up = |n: u32, a: u32| n.checked_add(a - 1).map(|n| n & !(a - 1));
+    let mut order: Vec<usize> = (0..fields.len()).filter(|&i| size_align(&fields[i]).is_some()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(size_align(&fields[i]).unwrap().1));
+    let mut taken: Vec<(u32, u32)> = vec![(0, 4)];
+    let mut offsets = vec![None; fields.len()];
+    let mut end = 4u32;
+    for i in order {
+        let (size, align) = size_align(&fields[i]).unwrap();
+        let mut at = align_up(4, align)?;
+        while let Some(&(_, e)) = taken.iter().find(|&&(s, e)| at < e && s < at.saturating_add(size)) {
+            at = align_up(e, align)?;
+        }
+        let stop = at.checked_add(size)?;
+        taken.push((at, stop));
+        offsets[i] = Some(at);
+        end = end.max(stop);
+    }
+    Some((offsets, end))
+}
+
+/// [`checked_value_variant_offsets`] for a layout already validated.
+pub fn value_variant_offsets(fields: &[Repr], values: &[ValueLayout]) -> (Vec<Option<u32>>, u32) {
+    checked_value_variant_offsets(fields, values).expect("value enum offsets must be validated during layout construction")
+}
+
 #[cfg(test)]
 mod value_enum_count_tests {
     use super::*;
@@ -481,16 +521,21 @@ pub enum CoreExprKind {
     /// out of bounds). The CoreExpr's repr is the `Option<T>` value enum; `elem`
     /// is the element repr used for the in-bounds load.
     ArrayGet { array: Box<CoreExpr>, index: Box<CoreExpr>, elem: Repr },
-    /// Legacy direct-return read. Validates backing-array bounds and initialized
-    /// reference/value slots; invalid access aborts with a diagnostic.
+    /// `array_get_in_bounds`: a read whose index the caller checked against a
+    /// bound on the array's length that holds while no other thread runs (a
+    /// `Vec`'s length). With one mutator and no copy in progress the backing
+    /// bounds check is skipped; otherwise it is checked like `ArrayGetChecked`.
+    /// Initialized reference/value slots are validated either way.
     ArrayGetUnchecked { array: Box<CoreExpr>, index: Box<CoreExpr>, elem: Repr },
     /// Checked element read for the `a[i]` index operator: bounds-checked, yields
     /// `T` directly, and aborts (clear error) on out-of-bounds — Rust-like
     /// indexing. (`array_get` the function returns `Option<T>` instead.) Repr is
     /// the element repr.
     ArrayGetChecked { array: Box<CoreExpr>, index: Box<CoreExpr>, elem: Repr },
-    /// Write `value` to element `index` of an array. Yields unit.
-    ArraySet { array: Box<CoreExpr>, index: Box<CoreExpr>, value: Box<CoreExpr>, elem: Repr },
+    /// Write `value` to element `index` of an array. Yields unit. `in_bounds`
+    /// (`array_set_in_bounds`) skips the bounds check as `ArrayGetUnchecked`
+    /// does.
+    ArraySet { array: Box<CoreExpr>, index: Box<CoreExpr>, value: Box<CoreExpr>, elem: Repr, in_bounds: bool },
     /// Numeric conversion: trunc / sext / zext / fp<->int / fp resize.
     Cast { value: Box<CoreExpr>, from: Repr, to: Repr },
 
