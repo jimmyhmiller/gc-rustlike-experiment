@@ -10,7 +10,7 @@ impl Phase {
     pub fn new(name: &'static str) -> Self {
         let setting = std::env::var_os("GCR_COMPILE_TIMINGS");
         let enabled = setting.as_ref().is_some_and(|value| value != "summary"
-            || !matches!(name, "LLVM IR emission" | "LLVM module emission"));
+            || !matches!(name, "LLVM IR emission" | "LLVM module emission" | "LLVM unit optimization"));
         Self { start: enabled.then(Instant::now), name }
     }
 }

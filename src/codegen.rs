@@ -174,9 +174,15 @@ enum StaticDataKey { String(LayoutId, String), EmptyArray(LayoutId) }
 
 /// All functions, literals, and allocation-site IDs are fixed before eager
 /// parallel compilation. No materialization work remains when execution starts.
+/// The same partitions are JIT materialization units and AOT object files.
 pub(crate) struct EagerProgram {
     prepared: PreparedCodegen,
+    level: DebugLevel,
+    /// Function labels for allocation sites and module names.
     names: Vec<String>,
+    /// Link symbols. AOT objects export every managed function to the other
+    /// objects, so a reserved prefix keeps them off C and runtime symbols.
+    symbol_names: Vec<String>,
     callbacks: HashMap<FuncId, String>,
     symbols: Vec<(String, u64)>,
     groups: HashMap<FuncId, Vec<FuncId>>,
@@ -189,12 +195,20 @@ pub(crate) struct EagerProgram {
 impl EagerProgram {
     pub(crate) fn new(prog: &CoreProgram) -> Result<Box<Self>, CodegenError> {
         let _phase = crate::timing::Phase::new("JIT preparation");
+        Self::plan(prog, DebugLevel::None, false)
+    }
+    fn for_aot(prog: &CoreProgram, level: DebugLevel) -> Result<Box<Self>, CodegenError> {
+        let _phase = crate::timing::Phase::new("AOT partitioning");
+        Self::plan(prog, level, true)
+    }
+    fn plan(prog: &CoreProgram, level: DebugLevel, aot: bool) -> Result<Box<Self>, CodegenError> {
+        if level.is_full() { return Err(CodegenError("full-debug builds are not partitioned".into())); }
         if prog.layouts.len() > u16::MAX as usize + 1 || prog.values.len() > u16::MAX as usize + 1 {
             return Err(CodegenError("layout/type count exceeds representable ID limit".into()));
         }
         if prog.entry.is_none() { return Err(CodegenError("no entry".into())); }
         let reachable = crate::reachable::from_entry(prog);
-        let prepared = PreparedCodegen::new(&reachable, DebugLevel::None)?;
+        let prepared = PreparedCodegen::new(&reachable, level)?;
         let (names, mut occupied) = {
             let context = Context::create();
             let names = std::cell::RefCell::new(Vec::new());
@@ -259,9 +273,12 @@ impl EagerProgram {
             }
         }
         finish_group(&mut small, &mut groups, &mut owners);
+        // C identifiers and runtime symbols never contain `.`.
+        let symbol_names: Vec<String> = prepared.program.funcs.iter().zip(&names).map(|(function, name)|
+            if aot && !function.is_extern { format!("gcr.{name}") } else { name.clone() }).collect();
         let mut symbols = Vec::new();
         for (id, function) in prepared.program.funcs.iter().enumerate() {
-            if !function.is_extern { symbols.push((names[id].clone(), owners[id] as u64)); }
+            if !function.is_extern { symbols.push((symbol_names[id].clone(), owners[id] as u64)); }
         }
         let mut callback_ids: Vec<_> = callbacks.keys().copied().collect();
         callback_ids.sort();
@@ -325,9 +342,9 @@ impl EagerProgram {
                 }
             });
         }
-        Ok(Box::new(Self { prepared, names, callbacks, symbols, groups, literal_bytes, literal_offsets, pool_name, sites, site_ids }))
+        Ok(Box::new(Self { prepared, level, names, symbol_names, callbacks, symbols, groups, literal_bytes, literal_offsets, pool_name, sites, site_ids }))
     }
-    pub(crate) fn entry(&self) -> &str { &self.names[self.prepared.program.entry.unwrap() as usize] }
+    pub(crate) fn entry(&self) -> &str { &self.symbol_names[self.prepared.program.entry.unwrap() as usize] }
     pub(crate) fn symbols(&self) -> &[(String, u64)] { &self.symbols }
     pub(crate) fn sites(&self) -> Vec<crate::gc::AllocSite> { self.sites.clone() }
 
@@ -356,7 +373,7 @@ impl EagerProgram {
                 global.set_initializer(&value);
                 module
             } else {
-                let Compiled { module, .. } = emit_prepared(&context, &self.prepared, DebugLevel::None,
+                let Compiled { module, .. } = emit_prepared(&context, &self.prepared, self.level,
                     Emission::Function { plan: self, id, callback: kind == 1 })?;
                 module
             };
@@ -476,7 +493,7 @@ fn emit_prepared<'ctx>(ctx: &'ctx Context, prepared: &PreparedCodegen, level: De
         if !f.is_extern && selected.as_ref().is_some_and(|ids| !ids.contains(&(i as FuncId))) { continue; }
         let fv = if f.is_extern { cg.funcs[&(i as FuncId)] } else { cg.declare_fn(i as FuncId, f) };
         if let Some(plan) = partition {
-            if !f.is_extern { fv.as_global_value().set_name(&plan.names[i]); }
+            if !f.is_extern { fv.as_global_value().set_name(&plan.symbol_names[i]); }
         }
         if !f.is_extern && (level.is_full() || !cg.acyclic[i]) {
             // Backend-created recursive loops would bypass Core safepoint
@@ -3495,6 +3512,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// Keep source allocation labels when a branch has a synthesized helper.
     fn current_fn_name(&self, fcx: &FnCtx<'ctx>) -> String {
         self.outlined_helpers.get(&fcx.id).cloned()
+            .or_else(|| self.partition.map(|plan| plan.names[fcx.id as usize].clone()))
             .unwrap_or_else(|| self.funcs[&fcx.id].get_name().to_string_lossy().into_owned())
     }
 
@@ -6958,7 +6976,10 @@ fn float_pred(op: BinOp) -> FloatPredicate {
 /// in place: mem2reg, inlining, instcombine, GVN, loop opts, etc. This is where
 /// monomorphized gc-rust code gets its speed.
 fn optimize_module(module: &Module) -> Result<(), CodegenError> {
-    let _phase = crate::timing::Phase::new("LLVM optimization");
+    optimize_module_as(module, "LLVM optimization")
+}
+fn optimize_module_as(module: &Module, phase: &'static str) -> Result<(), CodegenError> {
+    let _phase = crate::timing::Phase::new(phase);
     use inkwell::OptimizationLevel;
     use inkwell::passes::PassBuilderOptions;
     use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
@@ -7565,8 +7586,6 @@ pub fn codegen_aot_object_level(
     obj_path: &std::path::Path,
     level: DebugLevel,
 ) -> Result<(), CodegenError> {
-    use inkwell::targets::FileType;
-
     let ctx = Context::create();
     // AOT: emit DWARF (debugger P2/P3) — it lands in the object where
     // lldb / llvm-dwarfdump read it.
@@ -7582,7 +7601,23 @@ pub fn codegen_aot_object_level(
         .ok_or_else(|| {
         CodegenError(format!("entry `{}` not found in module", compiled.entry_name))})?;
     entry_fn.as_global_value().set_name("gcrust_entry");
+    emit_aot_main(&ctx, module, prog, entry_fn.as_global_value().as_pointer_value(), &compiled.alloc_sites)?;
 
+    module
+        .verify()
+        .map_err(|e| CodegenError(format!("AOT module verify failed: {}", e.to_string())))?;
+    write_aot_object(&ctx, module, level, obj_path)
+}
+
+/// The per-program layout table and reflection blob, and a native
+/// `int main()` that hands them and `entry` to the runtime.
+fn emit_aot_main<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    prog: &CoreProgram,
+    entry_ptr: PointerValue<'ctx>,
+    alloc_sites: &[crate::gc::AllocSite],
+) -> Result<(), CodegenError> {
     let i16t = ctx.i16_type();
     let i8t = ctx.i8_type();
     let i32t = ctx.i32_type();
@@ -7634,7 +7669,7 @@ pub fn codegen_aot_object_level(
         &layouts_to_type_meta(prog),
         &layouts_to_value_meta(prog)?,
         &interior,
-        &compiled.alloc_sites,
+        alloc_sites,
     ).map_err(|error| CodegenError(error.to_string()))?;
     let meta_vals: Vec<_> = meta_bytes
         .iter()
@@ -7668,7 +7703,6 @@ pub fn codegen_aot_object_level(
     let builder = ctx.create_builder();
     let bb = ctx.append_basic_block(main_fn, "entry");
     builder.position_at_end(bb);
-    let entry_ptr = entry_fn.as_global_value().as_pointer_value();
     let call = builder
         .build_call(
             runtime_main,
@@ -7686,11 +7720,15 @@ pub fn codegen_aot_object_level(
     // Truncate the i64 program result to the process exit code (i32).
     let code = builder.build_int_truncate(result, i32t, "code").unwrap();
     builder.build_return(Some(&code)).unwrap();
+    Ok(())
+}
 
-    module
-        .verify()
-        .map_err(|e| CodegenError(format!("AOT module verify failed: {}", e.to_string())))?;
-
+/// Optimize, optionally instrument, and write one AOT object.
+fn write_aot_object(ctx: &Context, module: &Module, level: DebugLevel, obj_path: &std::path::Path) -> Result<(), CodegenError> {
+    write_aot_object_as(ctx, module, level, obj_path, "LLVM optimization")
+}
+fn write_aot_object_as(ctx: &Context, module: &Module, level: DebugLevel, obj_path: &std::path::Path, phase: &'static str) -> Result<(), CodegenError> {
+    use inkwell::targets::FileType;
     // ---- Optimize then emit the object ------------------------------------
     // Full-debug builds (P3) skip optimization so locals/allocas survive for
     // `frame variable`. Line-table builds (P2) optimize as usual — debug
@@ -7701,7 +7739,7 @@ pub fn codegen_aot_object_level(
     let machine = if level.is_full() {
         host_target_machine_opt(OptimizationLevel::None)?
     } else {
-        optimize_module(module)?;
+        optimize_module_as(module, phase)?;
         host_target_machine()?
     };
     if std::env::var_os("GCR_CODEGEN_TSAN").is_some_and(|v| v != "0" && !v.is_empty()) {
@@ -7723,9 +7761,69 @@ pub fn codegen_aot_object_level(
     Ok(())
 }
 
+/// Compile `prog` into one object per native partition, plus the process
+/// entry, on parallel workers. Partitions are the eager JIT's units: the same
+/// O3 pipeline runs on each, and calls between them go through the linker.
+fn codegen_aot_objects(prog: &CoreProgram, dir: &std::path::Path, level: DebugLevel) -> Result<Vec<std::path::PathBuf>, CodegenError> {
+    let plan = EagerProgram::for_aot(prog, level)?;
+    let _phase = crate::timing::Phase::new("AOT machine compilation");
+    // `symbols` lists the costliest partitions first; several share a unit.
+    let mut units = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, token) in plan.symbols() {
+        if seen.insert(*token) { units.push(*token); }
+    }
+    let objects: Vec<_> = (0..units.len()).map(|i| dir.join(format!("unit{i}.o"))).collect();
+    let threads = crate::eager_jit::compile_threads()?.min(units.len().max(1));
+    inkwell::targets::Target::initialize_native(&inkwell::targets::InitializationConfig::default())
+        .map_err(|e| CodegenError(format!("target init failed: {e}")))?;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failure = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if index >= units.len() || failure.lock().unwrap().is_some() { break; }
+                if let Err(error) = compile_aot_unit(&plan, units[index], level, &objects[index]) {
+                    failure.lock().unwrap().get_or_insert(error);
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(error) = failure.into_inner().unwrap() { return Err(error); }
+
+    let ctx = Context::create();
+    let module = ctx.create_module("gcr.main");
+    module.set_triple(&inkwell::targets::TargetTriple::create(&plan.prepared.triple));
+    let data = inkwell::targets::TargetData::create(&plan.prepared.data_layout);
+    module.set_data_layout(&data.get_data_layout());
+    // Only the entry's address is taken; its definition is in a partition.
+    let entry = module.add_function(plan.entry(), ctx.void_type().fn_type(&[], false), Some(inkwell::module::Linkage::External));
+    emit_aot_main(&ctx, &module, prog, entry.as_global_value().as_pointer_value(), &plan.sites())?;
+    module.verify().map_err(|e| CodegenError(format!("AOT entry module verify failed: {e}")))?;
+    let main = dir.join("main.o");
+    write_aot_object(&ctx, &module, DebugLevel::None, &main)?;
+    let mut objects = objects;
+    objects.push(main);
+    Ok(objects)
+}
+
+fn compile_aot_unit(plan: &EagerProgram, token: u64, level: DebugLevel, path: &std::path::Path) -> Result<(), CodegenError> {
+    let (raw_module, raw_context) = plan.render(token)?;
+    // Both take ownership; the module is dropped before its context.
+    let context = unsafe { Context::new(raw_context) };
+    let module = unsafe { Module::new(raw_module) };
+    let result = write_aot_object_as(&context, &module, level, path, "LLVM unit optimization");
+    drop(module);
+    result
+}
+
 /// AOT-compile `prog` into a standalone native executable at `out_path`.
 ///
-/// Emits a native object (via [`codegen_aot_object`]) into a temp file, then
+/// Emits native objects (via [`codegen_aot_objects`], or the single
+/// unoptimized [`codegen_aot_object_level`] module for full debug) into a
+/// directory next to the output, then
 /// links it against the gc-rust runtime staticlib (`libgcrust_rt.a`, built by
 /// cargo as a `staticlib` crate type) using the system `cc`. The runtime
 /// provides the `ai_gc_*` / `ai_print_*` externs and `gcr_runtime_main`.
@@ -7746,9 +7844,24 @@ pub fn build_executable_level(
     extra_link_args: &[String],
     level: DebugLevel,
 ) -> Result<(), CodegenError> {
-    // Emit the object next to the output so cleanup is easy and paths are stable.
-    let obj_path = out_path.with_extension("o");
-    codegen_aot_object_level(prog, &obj_path, level)?;
+    // Emit the objects next to the output so cleanup is easy and paths are stable.
+    let mut name = out_path.file_name()
+        .ok_or_else(|| CodegenError(format!("output path {} has no file name", out_path.display())))?.to_owned();
+    name.push(".gcr-objects");
+    let obj_dir = out_path.with_file_name(name);
+    if obj_dir.exists() {
+        std::fs::remove_dir_all(&obj_dir)
+            .map_err(|e| CodegenError(format!("cannot clear {}: {e}", obj_dir.display())))?;
+    }
+    std::fs::create_dir_all(&obj_dir)
+        .map_err(|e| CodegenError(format!("cannot create {}: {e}", obj_dir.display())))?;
+    let objects = if level.is_full() {
+        let obj_path = obj_dir.join("program.o");
+        codegen_aot_object_level(prog, &obj_path, level)?;
+        vec![obj_path]
+    } else {
+        codegen_aot_objects(prog, &obj_dir, level)?
+    };
 
     let staticlib = locate_runtime_staticlib()?;
 
@@ -7772,7 +7885,7 @@ pub fn build_executable_level(
     let status = linker
         .arg("-o")
         .arg(out_path)
-        .arg(&obj_path)
+        .args(&objects)
         .arg(&staticlib.path)
         .args(["-lpthread", "-ldl", "-lm"])
         .args(extra_link_args)
@@ -7802,8 +7915,8 @@ pub fn build_executable_level(
         }
     }
 
-    // Remove the intermediate object on success.
-    let _ = std::fs::remove_file(&obj_path);
+    // Remove the intermediate objects on success.
+    let _ = std::fs::remove_dir_all(&obj_dir);
     Ok(())
 }
 

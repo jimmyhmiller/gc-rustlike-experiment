@@ -37,7 +37,10 @@ Runtime build failures stop compilation.
 
 A bare-file `run` without a discovered manifest JIT-executes and prints the
 integer result. A project `run` builds a native executable and forwards its exit
-status. JIT and AOT use full eager LLVM O3 compilation.
+status. JIT and AOT use full eager LLVM O3 compilation. Both split native code
+into the same bounded units and compile them on parallel workers
+(`GCR_COMPILE_THREADS`, default: all cores). AOT writes one object per unit and
+links them; `build --debug` emits one unoptimized object.
 `run <project> --jit -- <args>` explicitly selects JIT with matching
 arguments, stdout, and exit-status behavior. The result of native `main` becomes the process exit status, rather than
 the extra result line printed by the JIT driver.

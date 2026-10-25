@@ -315,10 +315,13 @@ sets remain potentially aliased; this is not a noalias claim on Thread pointers
 or function arguments. Runtime calls and collector/root memory carry no such
 metadata. Immutable array lengths are propagated only when every possible origin
 has the same proven constant length and none is null or unknown. Integer
-constants likewise require complete compatible dataflow. Optimized whole-program
-helpers have internal linkage; the execution entry remains externally callable,
-and foreign declarations keep their C ABI. Full-debug code disables these proofs
-and retains editable generic roots.
+constants likewise require complete compatible dataflow. Native code is compiled
+in partitions, so helpers are linked across JIT units or AOT objects. Their only
+callers are the program's own code: AOT symbols carry a `gcr.` prefix that no C
+identifier can name, and the executable exports only `main`. Address-taken
+functions and the execution entry have unknown origins, and foreign declarations
+keep their C ABI. Full-debug code disables these proofs and retains editable
+generic roots.
 
 Array-length loads no longer use invariant.load metadata. A managed object's
 length is immutable, but a collector can recycle the physical memory location

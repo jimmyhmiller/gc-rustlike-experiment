@@ -97,3 +97,55 @@ fn aot_arithmetic_edges_match_jit_contract() {
     assert_eq!(run_exit_code(&out), 42);
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn aot_partitions_link_and_keep_managed_names_off_c_symbols() {
+    // Enough separately compiled functions to span several native objects,
+    // with value roots crossing object boundaries. The managed `write` and
+    // `malloc` must not satisfy the runtime's (or libc's) references to the C
+    // functions of the same names: printing and allocation still work.
+    let lib = ensure_runtime_lib();
+    unsafe {
+        std::env::set_var("GCRUST_RUNTIME_LIB", &lib);
+    }
+    let functions = (0..100).map(|i| format!(r#"
+        #[inline(never)] fn store{i}(mut a: Array<i64>, prefix: Prefix) {{
+            let text = str_concat("x", "y");
+            a[0] += prefix.code + str_len(prefix.name) + str_len(text);
+        }}
+    "#)).collect::<String>();
+    let calls = (0..100).map(|i| format!("store{i}(a, prefix);")).collect::<String>();
+    let src = format!(r#"
+        #[value] struct Prefix {{ code: i64, name: String }}
+        #[inline(never)] fn write(fd: i64, buffer: i64, count: i64) -> i64 {{ fd + buffer + count }}
+        #[inline(never)] fn malloc(size: i64) -> i64 {{ size + 1 }}
+        {functions}
+        fn main() -> i64 {{
+            let prefix = Prefix {{ code: 40, name: str_concat("r", "s") }};
+            let a: Array<i64> = array_new(1);
+            {calls}
+            println!("total {{}}", a[0]);
+            a[0] + write(1, 1, 1) + malloc(1)
+        }}
+    "#);
+    let (module, sources) = gcrust::compile::parse_with_prelude(&src).unwrap();
+    let resolved = resolve_module(module).unwrap();
+    let mut prog = lower_program(&resolved.globals).unwrap();
+    // As `gcr build`: line tables, so each object appears in the debug map.
+    prog.sources = sources;
+    let out = tmp("partitions");
+    build_executable(&prog, &out, &[]).expect("build_executable failed");
+    let run = Command::new(&out).env("GCR_GC_STRESS", "1").output().expect("failed to run AOT binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "total 4400\n");
+    assert_eq!(run.status.code(), Some((4400 + 3 + 2) & 0xFF));
+    #[cfg(target_os = "macos")]
+    {
+        // The debug map names each linked object: several partitions + entry.
+        let symbols = Command::new("nm").arg("-ap").arg(&out).output().unwrap();
+        let objects = String::from_utf8_lossy(&symbols.stdout).lines()
+            .filter(|line| line.contains(" OSO ") && line.contains(".gcr-objects")).count();
+        assert!(objects > 3, "expected several native objects, found {objects}");
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(out.with_extension("dSYM"));
+}

@@ -247,3 +247,43 @@ fn main() -> i64 {\n  let p = Point { x: 42, y: 7 };\n  let mut total = 0;\n  le
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn lldb_line_breakpoints_resolve_in_partitioned_release_build() {
+    // The default `gcr build` compiles native partitions to separate objects.
+    // Each object carries its own line table; dsymutil must collect them all.
+    if !lldb_available() {
+        eprintln!("skipping: xcrun lldb unavailable");
+        return;
+    }
+    let lib = ensure_runtime_lib();
+    unsafe {
+        std::env::set_var("GCRUST_RUNTIME_LIB", &lib);
+    }
+    let dir = std::env::temp_dir().join(format!("gcr_lldb_lines_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("lineprog");
+    // Line 1 is `last`'s body; the filler functions spread the program over
+    // several objects.
+    let mut src = String::from("#[inline(never)] fn last(a: Array<i64>) -> i64 { a[0] + str_len(str_concat(\"p\", \"q\")) }\n");
+    for i in 0..60 {
+        src.push_str(&format!("#[inline(never)] fn fill{i}(mut a: Array<i64>) {{ a[0] += str_len(str_concat(\"x\", \"y\")); }}\n"));
+    }
+    src.push_str("fn main() -> i64 {\n  let a: Array<i64> = array_new(1);\n");
+    for i in 0..60 {
+        src.push_str(&format!("  fill{i}(a);\n"));
+    }
+    src.push_str("  last(a)\n}\n");
+    let (module, sources) = parse_with_prelude(&src).expect("parse");
+    let resolved = resolve_module(module).expect("resolve");
+    let mut prog = lower_program(&resolved.globals).expect("lower");
+    let mut sources = sources;
+    sources[0].path = "prog.gcr".to_string();
+    prog.sources = sources;
+    build_executable_level(&prog, &bin, &[], DebugLevel::LineTables).expect("build");
+
+    let out = lldb_run(&bin, "breakpoint set --file prog.gcr --line 1\nrun\nbt 1\nquit\n");
+    assert!(out.contains("stop reason = breakpoint"), "breakpoint did not stop:\n{out}");
+    assert!(out.contains("prog.gcr:1"), "stop is not on the source line:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

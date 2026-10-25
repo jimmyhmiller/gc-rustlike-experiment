@@ -19,6 +19,16 @@ unsafe extern "C" {
     fn gcr_eager_error_free(error: *mut c_char);
 }
 
+/// Native compilation workers for JIT and AOT builds.
+pub(crate) fn compile_threads() -> Result<usize, CodegenError> {
+    match std::env::var("GCR_COMPILE_THREADS") {
+        Ok(value) => value.parse::<usize>().ok().filter(|&n| n > 0)
+            .ok_or_else(|| CodegenError("GCR_COMPILE_THREADS must be a positive integer".into())),
+        Err(std::env::VarError::NotPresent) => Ok(std::thread::available_parallelism().map_or(1, |n| n.get())),
+        Err(_) => Err(CodegenError("GCR_COMPILE_THREADS is not UTF-8".into())),
+    }
+}
+
 pub(crate) struct EagerJit {
     raw: NonNull<c_void>,
     // LLVM workers and engine are destroyed before their immutable render input.
@@ -26,14 +36,8 @@ pub(crate) struct EagerJit {
 }
 impl EagerJit {
     pub(crate) fn new(program: Box<EagerProgram>, symbols: &[(&str, usize)]) -> Result<Self, CodegenError> {
-        let threads = match std::env::var("GCR_COMPILE_THREADS") {
-            Ok(value) => value.parse::<u32>().ok().filter(|&n| n > 0)
-                .ok_or_else(|| CodegenError("GCR_COMPILE_THREADS must be a positive integer".into()))?,
-            Err(std::env::VarError::NotPresent) => std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
-            Err(_) => return Err(CodegenError("GCR_COMPILE_THREADS is not UTF-8".into())),
-        };
         let partitions = program.symbols().iter().map(|(_, token)| *token).collect::<std::collections::BTreeSet<_>>().len();
-        let threads = threads.min(partitions.max(1) as u32);
+        let threads = compile_threads()?.min(partitions.max(1)) as u32;
         let names: Vec<_> = symbols.iter().map(|(name, _)| CString::new(*name).unwrap()).collect();
         let symbols: Vec<_> = symbols.iter().zip(&names).map(|((_, address), name)|
             Symbol { name: name.as_ptr(), address: *address }).collect();
