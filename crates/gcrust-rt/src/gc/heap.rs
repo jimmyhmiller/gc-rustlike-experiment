@@ -1163,15 +1163,28 @@ impl Heap {
         {
             let mut threads = self.threads.lock().unwrap();
             threads.push(ts.clone());
-            if threads.len() > 1 {
-                self.multi_mutator.store(1, Ordering::SeqCst);
-                self.access_mode.fetch_or(2, Ordering::SeqCst);
-            }
+            if threads.len() > 1 { self.mark_multi_mutator(); }
         }
         // Keep gc_lock until every current registration is RUNNING again:
         // a collector must not start between restoring the old and new states.
         callers.restore();
         (ts, id)
+    }
+
+    /// Record that more than one mutator exists (or is about to). Never
+    /// cleared: generated code's unordered single-mutator paths end here.
+    ///
+    /// Generated code reads the bit relaxed, so it must be set before a second
+    /// mutator can share objects with compiled code. Compiled mutators come
+    /// only from a heap's first runtime context and from `ai_thread_spawn`,
+    /// whose parent marks the heap before its child exists: the parent sees
+    /// the bit in program order, the child from thread start. Rust-side
+    /// registrations are marked here, but a compiled mutator may not observe
+    /// that until its next safepoint-capable call: Rust code must not race
+    /// running compiled code on an object without a synchronizing operation.
+    pub(crate) fn mark_multi_mutator(&self) {
+        self.multi_mutator.store(1, Ordering::SeqCst);
+        self.access_mode.fetch_or(2, Ordering::SeqCst);
     }
 
     /// Run `f` while holding the threads lock, but only if no collection

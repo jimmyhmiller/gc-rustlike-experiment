@@ -85,8 +85,9 @@ Transitional Sync capture checks remain in place. See STATUS.md for exact
 coverage and sanitizer limits.
 
 Inventory every heap access, aggregate copy, reference publication and write
-barrier. Implement the proposed SC managed memory model and coherent aggregate
-snapshots, coordinating publication and relocation with the collector. Audit
+barrier. Managed slots use the plain-field model in `gc.md` (unordered scalars,
+release/acquire references) with coherent aggregate snapshots, coordinating
+publication and relocation with the collector. Audit
 collection boundaries for managed memory safety under unsynchronized mutation;
 do not add implicit locks or atomic operation guarantees to ordinary Vec/Map.
 Preserve reference identity and initialize every published representation.

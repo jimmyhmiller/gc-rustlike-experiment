@@ -14,6 +14,7 @@ docker run --rm --entrypoint /bin/sh \
   -v "$repo_root/crates/gcrust-rt:/source:ro" \
   -v "$repo_root/target/big-endian-runtime:/target" \
   -v "$repo_root/target/big-endian-runtime/vendor:/vendor:ro" \
+  -v "$repo_root/crates/vendor/hashbrown:/hashbrown:ro" \
   "$image_name" -ec '
     mkdir -p /work/runtime
     cp -a /source/. /work/runtime/

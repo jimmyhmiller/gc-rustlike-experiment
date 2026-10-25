@@ -69,6 +69,33 @@ fn generated_accesses_are_atomic_or_proven_private_and_snapshots_cannot_collect(
         assert!(ir.contains("load atomic i64") && ir.contains("store atomic i64"));
         assert!(ir.contains("load atomic i8") && ir.contains("store atomic i8"));
         assert!(ir.contains("load atomic double") && ir.contains("store atomic double"));
+        // Shared references publish their objects once a second mutator
+        // exists: release stores, acquire loads.
+        let ref_accesses: Vec<_> = ir.lines().filter(|line| line.contains("load atomic ptr") || line.contains("store atomic ptr")).collect();
+        assert!(ref_accesses.iter().any(|line| line.contains("load atomic ptr") && line.contains(" acquire")), "missing acquire reference load");
+        assert!(ref_accesses.iter().any(|line| line.contains("store atomic ptr") && line.contains(" release")), "missing release reference store");
+        if !optimize {
+            // An unordered shared reference access is only reachable with
+            // access mode zero: one mutator and no copy in progress.
+            let mut block = "";
+            let mut blocks = std::collections::HashMap::new();
+            for line in ir.lines() {
+                let label = llvm_label(line);
+                if !label.is_empty() && line[label.len()..].starts_with(':') { block = label; }
+                if (line.contains("load atomic ptr") || line.contains("store atomic ptr")) && line.contains(" unordered") {
+                    *blocks.entry(block).or_insert(0) += 1;
+                }
+            }
+            assert!(!blocks.is_empty(), "missing single-mutator reference paths");
+            for line in ir.lines() {
+                let label = llvm_label(line);
+                if label.is_empty() || !line[label.len()..].starts_with(':') { continue; }
+                if !blocks.contains_key(label) { continue; }
+                let solo = ir.lines().any(|branch| branch.contains("br i1 %access.solo")
+                    && branch.split(", label %").nth(1).is_some_and(|target| llvm_label(target) == label));
+                assert!(solo, "unordered shared reference access outside a single-mutator block {label}");
+            }
+        }
         assert!(check_snapshot_paths(&ir) > 0, "missing aggregate regions");
         assert!(ir.lines().any(|line| line.contains("call i8 @ai_managed_try_write(")), "missing nonparking aggregate attempt: {ir}");
         assert!(ir.contains("aggregate.contended"), "missing rooted contention fallback: {ir}");

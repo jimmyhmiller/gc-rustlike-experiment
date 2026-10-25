@@ -1249,11 +1249,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
-    /// Load one mutable managed slot. Shared slots use LLVM `unordered`
-    /// atomics: Java plain-field semantics (no tearing, no ordering; DRF-SC
-    /// through the synchronizing operations). Bool has
+    /// Load one mutable managed slot. Shared scalar slots use LLVM
+    /// `unordered` atomics: Java plain-field semantics (no tearing, no
+    /// ordering; DRF-SC through the synchronizing operations). Once a second
+    /// mutator exists (`multi`), shared reference slots load with acquire,
+    /// pairing with the release store that published them, so a racing reader
+    /// never sees the referenced object's initialization incomplete. Bool has
     /// byte storage even though its SSA representation is i1.
-    fn managed_load_idle(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    fn managed_load_idle(&self, addr: PointerValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr, multi: bool) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let storage = if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.ctx.i8_type().as_basic_type_enum()
         } else { self.llvm_ty(repr).ok_or_else(|| CodegenError("invalid managed scalar load".into()))? };
@@ -1267,13 +1270,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
         let private = self.private_heap.contains(owner);
         self.set_heap_alias_metadata(instruction, owner)?;
-        if !private { instruction.set_atomic_ordering(AtomicOrdering::Unordered).map_err(|e| CodegenError(e.to_string()))?; }
+        if !private { instruction.set_atomic_ordering(shared_slot_ordering(repr, true, multi)).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(if *repr == Repr::Scalar(ScalarRepr::Bool) {
             self.builder.build_int_truncate(value.into_int_value(), self.ctx.bool_type(), "managed.bool").unwrap().into()
         } else { value })
     }
 
-    fn managed_store_idle(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, owner: &CoreExpr) -> Result<(), CodegenError> {
+    fn managed_store_idle(&self, addr: PointerValue<'ctx>, value: BasicValueEnum<'ctx>, repr: &Repr, owner: &CoreExpr, multi: bool) -> Result<(), CodegenError> {
         let (stored, alignment) = match repr {
             Repr::Scalar(ScalarRepr::Bool) => (
                 self.builder.build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "managed.bool.byte").unwrap().into(), 1,
@@ -1286,14 +1289,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         instruction.set_alignment(alignment).map_err(|e| CodegenError(e.to_string()))?;
         let private = self.private_heap.contains(owner);
         self.set_heap_alias_metadata(instruction, owner)?;
-        if !private { instruction.set_atomic_ordering(AtomicOrdering::Unordered).map_err(|e| CodegenError(e.to_string()))?; }
+        if !private { instruction.set_atomic_ordering(shared_slot_ordering(repr, false, multi)).map_err(|e| CodegenError(e.to_string()))?; }
         Ok(())
     }
 
     /// Select the non-safepointing scoped path while concurrent copying is active.
-    /// Read the heap's copying phase. A plain load: copying can only start
+    /// Read the heap's copying phase. A relaxed load: copying can only start
     /// in a pause, so an idle phase stays idle until the next safepoint. A
-    /// stale "active" only takes the slow path, correct in either phase.
+    /// stale "active" only takes the slow path, correct in either phase. The
+    /// byte is still atomic: a registering thread sets its mutator bit while
+    /// other mutators run.
     ///
     /// The result packs two bits: 1 while copying, 2 once more than one
     /// mutator exists. Inline aggregates are accessed directly only when
@@ -1307,7 +1312,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // The thread's pointer to its heap's byte never changes.
         flag.as_instruction_value().unwrap().set_metadata(self.ctx.metadata_node(&[]), self.ctx.get_kind_id("invariant.load")).unwrap();
         let mode = self.builder.build_load(i8t, flag.into_pointer_value(), "access.mode").unwrap();
-        mode.as_instruction_value().unwrap().set_alignment(1).unwrap();
+        let load = mode.as_instruction_value().unwrap();
+        load.set_alignment(1).unwrap();
+        load.set_atomic_ordering(AtomicOrdering::Monotonic).unwrap();
         mode
     }
 
@@ -1347,6 +1354,32 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         (idle, copying, merge)
     }
 
+    /// Is this a shared pointer slot, ordered only once a second mutator exists?
+    fn publishes(&self, repr: &Repr, owner: &CoreExpr) -> bool {
+        slot_publishes(repr) && !self.private_heap.contains(owner)
+    }
+
+    /// One dispatch on the access mode for a publishing slot: (solo, shared,
+    /// copying, merge). Mode zero (one mutator, no copy) keeps the single
+    /// test of the scalar path; the heap marks a second mutator before it
+    /// can touch any object.
+    fn publishing_access_blocks(&self, fcx: &FnCtx<'ctx>) -> (inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>) {
+        let i8t = self.ctx.i8_type();
+        let mode = self.access_mode(fcx);
+        let quiet = self.builder.build_int_compare(IntPredicate::EQ, mode, i8t.const_zero(), "access.solo").unwrap();
+        let solo = self.ctx.append_basic_block(fcx.func, "access.idle");
+        let contended = self.ctx.append_basic_block(fcx.func, "access.contended");
+        let shared = self.ctx.append_basic_block(fcx.func, "access.shared");
+        let copying = self.ctx.append_basic_block(fcx.func, "access.copying");
+        let merge = self.ctx.append_basic_block(fcx.func, "access.merge");
+        self.builder.build_conditional_branch(quiet, solo, contended).unwrap();
+        self.builder.position_at_end(contended);
+        let phase = self.builder.build_and(mode, i8t.const_int(1, false), "copy.phase.bit").unwrap();
+        let active = self.builder.build_int_compare(IntPredicate::NE, phase, i8t.const_zero(), "copy.active").unwrap();
+        self.builder.build_conditional_branch(active, copying, shared).unwrap();
+        (solo, shared, copying, merge)
+    }
+
     fn managed_load(&self, fcx: &FnCtx<'ctx>, object: PointerValue<'ctx>, offset: IntValue<'ctx>, repr: &Repr, name: &str, owner: &CoreExpr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         // A 128-bit scalar is two 64-bit slots, low half first.
         if let Repr::Scalar(scalar) = repr { if scalar.bits() == 128 {
@@ -1362,11 +1395,24 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } }
         let width = match repr { Repr::Scalar(s) => s.bits().max(8), Repr::Ref(_) => 64,
             _ => return Err(CodegenError("aggregate must use a managed snapshot".into())) };
-        let (idle, copying, merge) = self.managed_access_blocks(fcx);
-        self.builder.position_at_end(idle);
-        let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
-        let fast = self.managed_load_idle(addr, repr, name, owner)?;
-        self.builder.build_unconditional_branch(merge).unwrap();
+        let mut incoming = Vec::new();
+        let (copying, merge) = if self.publishes(repr, owner) {
+            let (solo, shared, copying, merge) = self.publishing_access_blocks(fcx);
+            for (block, multi) in [(solo, false), (shared, true)] {
+                self.builder.position_at_end(block);
+                let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
+                incoming.push((self.managed_load_idle(addr, repr, name, owner, multi)?, self.builder.get_insert_block().unwrap()));
+                self.builder.build_unconditional_branch(merge).unwrap();
+            }
+            (copying, merge)
+        } else {
+            let (idle, copying, merge) = self.managed_access_blocks(fcx);
+            self.builder.position_at_end(idle);
+            let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
+            incoming.push((self.managed_load_idle(addr, repr, name, owner, true)?, self.builder.get_insert_block().unwrap()));
+            self.builder.build_unconditional_branch(merge).unwrap();
+            (copying, merge)
+        };
         self.builder.position_at_end(copying);
         let function = self.module.get_function(&format!("ai_slot_bits{width}_load")).unwrap();
         let bits = call_result(self.build_managed_call(fcx, function, &[fcx.thread.into(), object.into(), offset.into()], "slot.scoped").unwrap()).into_int_value();
@@ -1376,10 +1422,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Repr::Scalar(ScalarRepr::Ptr) | Repr::Ref(_) => self.builder.build_int_to_ptr(bits, self.ctx.ptr_type(AddressSpace::default()), "slot.pointer").unwrap().into(),
             _ => bits.into(),
         };
+        incoming.push((slow, self.builder.get_insert_block().unwrap()));
         self.builder.build_unconditional_branch(merge).unwrap();
         self.builder.position_at_end(merge);
-        let phi = self.builder.build_phi(fast.get_type(), name).unwrap();
-        phi.add_incoming(&[(&fast, idle), (&slow, copying)]);
+        let phi = self.builder.build_phi(slow.get_type(), name).unwrap();
+        for (value, block) in &incoming { phi.add_incoming(&[(value, *block)]); }
         Ok(phi.as_basic_value())
     }
 
@@ -1397,12 +1444,15 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } }
         let width = match repr { Repr::Scalar(s) => s.bits().max(8), Repr::Ref(_) => 64,
             _ => return Err(CodegenError("aggregate must use a managed snapshot".into())) };
-        let (idle, copying, merge) = self.managed_access_blocks(fcx);
-        self.builder.position_at_end(idle);
-        let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
-        self.managed_store_idle(addr, value, repr, owner)?;
-        if traced { self.emit_write_barrier(fcx, object, addr, value); }
-        self.builder.build_unconditional_branch(merge).unwrap();
+        let (copying, merge) = if self.publishes(repr, owner) {
+            let (solo, shared, copying, merge) = self.publishing_access_blocks(fcx);
+            self.store_idle_paths(fcx, &[(solo, false), (shared, true)], object, offset, value, repr, traced, owner, merge)?;
+            (copying, merge)
+        } else {
+            let (idle, copying, merge) = self.managed_access_blocks(fcx);
+            self.store_idle_paths(fcx, &[(idle, true)], object, offset, value, repr, traced, owner, merge)?;
+            (copying, merge)
+        };
         self.builder.position_at_end(copying);
         if traced {
             let function = self.module.get_function("ai_slot_ref_store").unwrap();
@@ -1419,6 +1469,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
         self.builder.build_unconditional_branch(merge).unwrap();
         self.builder.position_at_end(merge);
+        Ok(())
+    }
+
+    /// The non-copying stores of `managed_store`, one per (block, multi).
+    #[allow(clippy::too_many_arguments)]
+    fn store_idle_paths(&self, fcx: &FnCtx<'ctx>, paths: &[(inkwell::basic_block::BasicBlock<'ctx>, bool)], object: PointerValue<'ctx>, offset: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>, repr: &Repr, traced: bool, owner: &CoreExpr, merge: inkwell::basic_block::BasicBlock<'ctx>) -> Result<(), CodegenError> {
+        for &(block, multi) in paths {
+            self.builder.position_at_end(block);
+            let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), object, &[offset], "fld.slot.idle").unwrap() };
+            self.managed_store_idle(addr, value, repr, owner, multi)?;
+            if traced { self.emit_write_barrier(fcx, object, addr, value); }
+            self.builder.build_unconditional_branch(merge).unwrap();
+        }
         Ok(())
     }
 
@@ -2462,12 +2526,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // A collection may run while this thread is in foreign code, so the
         // frame must be visible before `ai_ffi_enter`, not only before calls
         // that may relocate on return.
-        if (fcx.late_roots || fcx.masked) && (!no_relocation || symbol == "ai_ffi_enter") { self.ensure_root_frame_linked(fcx); }
-        // A foreign call's locals stay in the frame until it leaves; on
-        // leaving, the frame may hold relocated values, so it is read, not
-        // written.
-        let spilled = if fcx.masked && (!no_relocation || symbol == "ai_ffi_enter") {
-            Some(self.store_site_origin(fcx, symbol != "ai_ffi_leave"))
+        // `ai_ffi_enter` linked it; leaving must not touch the published frame.
+        if (fcx.late_roots || fcx.masked) && symbol != "ai_ffi_leave" && (!no_relocation || symbol == "ai_ffi_enter") { self.ensure_root_frame_linked(fcx); }
+        // A foreign call's locals stay in the frame until it leaves. The
+        // collector may walk that published frame until `ai_ffi_leave`
+        // returns RUNNING, so leaving reads the frame and writes nothing,
+        // not even the origin: `ai_ffi_enter` already stored this site's.
+        let spilled = if fcx.masked && symbol != "ai_ffi_leave" && (!no_relocation || symbol == "ai_ffi_enter") {
+            Some(self.store_site_origin(fcx))
         } else { None };
         // A few spilled words are cheaper to read back than to compare the
         // relocation epoch around the call.
@@ -2558,10 +2624,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     }
 
     /// Before a call that may reach a safepoint: copy the traced locals live
-    /// across it (see `site_locals`) to their frame slots (unless `spill` is
-    /// false: the frame already holds them), and point the frame at the
-    /// descriptor naming those slots. Returns the locals in the frame.
-    fn store_site_origin(&self, fcx: &FnCtx<'ctx>, spill: bool) -> Vec<LocalId> {
+    /// across it (see `site_locals`) to their frame slots, and point the frame
+    /// at the descriptor naming those slots. Returns the locals in the frame.
+    fn store_site_origin(&self, fcx: &FnCtx<'ctx>) -> Vec<LocalId> {
         let Some((frame, frame_ty, _)) = fcx.unlink else { return Vec::new() };
         let (name, roots, indirect, offsets) = &fcx.frame_dims;
         let spilled = self.site_locals(fcx);
@@ -2569,8 +2634,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let mut mask = vec![0u64; (*roots as usize + *indirect as usize).div_ceil(64).max(1)];
         for &local in &spilled {
             let l = local as usize;
-            if !spill {
-            } else if let (Some(working), Some(root)) = (fcx.slots[l], fcx.root_slots[l]) {
+            if let (Some(working), Some(root)) = (fcx.slots[l], fcx.root_slots[l]) {
                 let value = self.builder.build_load(ptr, working, "root.spill").unwrap();
                 self.builder.build_store(root, value).unwrap();
             } else if let (Some(working), Some(home)) = (fcx.slots[l], fcx.value_homes[l]) {
@@ -2701,14 +2765,19 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         fcx: &mut FnCtx<'ctx>,
         e: &CoreExpr,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        // A node that may reach a safepoint: its calls spill what is live
-        // across it (see `store_site_origin`).
-        let key = e as *const CoreExpr as usize;
-        if !fcx.masked || !fcx.sites.contains_key(&key) { return self.gen_expr_node(fcx, e); }
-        fcx.site_stack.push(key);
-        let result = self.gen_expr_node(fcx, e);
-        fcx.site_stack.pop();
-        result
+        // Native partitions are emitted on compiler worker threads, whose
+        // stacks are smaller than the main thread's; nesting depth is the
+        // program's, so grow the stack instead of assuming one.
+        stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+            // A node that may reach a safepoint: its calls spill what is live
+            // across it (see `store_site_origin`).
+            let key = e as *const CoreExpr as usize;
+            if !fcx.masked || !fcx.sites.contains_key(&key) { return self.gen_expr_node(fcx, e); }
+            fcx.site_stack.push(key);
+            let result = self.gen_expr_node(fcx, e);
+            fcx.site_stack.pop();
+            result
+        })
     }
 
     fn gen_expr_node(
@@ -5607,7 +5676,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             None => self.ctx.void_type().fn_type(&arg_tys, false),
         };
         if fcx.late_roots || fcx.masked { self.ensure_root_frame_linked(fcx); }
-        let spilled = fcx.masked.then(|| self.store_site_origin(fcx, true));
+        let spilled = fcx.masked.then(|| self.store_site_origin(fcx));
         let simple = spilled.as_deref().filter(|locals| self.spilled_words(fcx, locals) <= UNCONDITIONAL_RELOAD_WORDS);
         let before = if simple.is_none() { self.prepare_root_reload(fcx) } else { None };
         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
@@ -6955,6 +7024,24 @@ fn int_pred(op: BinOp, signed: bool) -> IntPredicate {
         Ge => {
             if signed { IntPredicate::SGE } else { IntPredicate::UGE }},
         _ => unreachable!(),
+    }
+}
+
+/// Pointer slots publish what they point to. Reference fields and elements
+/// are loaded as `Ptr` scalars as well as `Ref`s.
+fn slot_publishes(repr: &Repr) -> bool {
+    matches!(repr, Repr::Ref(_) | Repr::Scalar(ScalarRepr::Ptr))
+}
+
+/// Ordering of a slot access that another mutator may race. With a second
+/// mutator (`multi`), a pointer store releases everything that initialized
+/// what it publishes and a pointer load acquires it; other scalars need only
+/// freedom from tearing.
+fn shared_slot_ordering(repr: &Repr, load: bool, multi: bool) -> AtomicOrdering {
+    match (slot_publishes(repr) && multi, load) {
+        (true, true) => AtomicOrdering::Acquire,
+        (true, false) => AtomicOrdering::Release,
+        (false, _) => AtomicOrdering::Unordered,
     }
 }
 

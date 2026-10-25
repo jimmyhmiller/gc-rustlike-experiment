@@ -100,3 +100,19 @@ fn unresolved_eager_units_fail_before_user_entry() {
     assert!(output.stdout.is_empty(), "{}", String::from_utf8_lossy(&output.stdout));
     assert!(String::from_utf8_lossy(&output.stderr).contains(&symbol), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn deeply_nested_functions_compile_on_worker_threads() {
+    // Native partitions are emitted on compiler worker threads with smaller
+    // stacks than the main thread. Expression nesting is the program's own.
+    let depth = 30;
+    let mut source = String::from("#[inline(never)] fn nest(x: i64) -> i64 {\n");
+    for level in 0..depth { source.push_str(&format!("if x > {level} {{ 1 + {{\n")); }
+    source.push_str("0\n");
+    for _ in 0..depth { source.push_str("} } else { 0 }\n"); }
+    source.push_str(&format!("}}\nfn main() -> i64 {{ nest(1000) - {depth} + 42 }}\n"));
+    let (module, _) = gcrust::compile::parse_with_prelude(&source).unwrap();
+    let resolved = gcrust::resolve::resolve_module(module).unwrap();
+    let program = gcrust::lower::lower_program(&resolved.globals).unwrap();
+    assert_eq!(unsafe { gcrust::codegen::jit_run_i64(&program) }.unwrap(), 42);
+}

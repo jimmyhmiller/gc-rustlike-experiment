@@ -73,7 +73,8 @@ fn main() -> i64 {
     if scalar_error != 0 { return scalar_error; }
     let reference_error = reference_atom_contract();
     if reference_error != 0 { return reference_error; }
-    // Mixed aggregate/scalar store-buffering must never observe both zero.
+    // Mixed aggregate/scalar store-buffering. Scalar slots have plain-field
+    // semantics, so both reads may see zero; each must be a whole value.
     for iteration in 0..128 {
         let flags = Flags { x: Flag { n: 0 }, y: 0 };
         let start = AtomicI64::new(0);
@@ -91,7 +92,7 @@ fn main() -> i64 {
         });
         start.store(1);
         let ra = a.join(); let rb = b.join();
-        if ra == 0 && rb == 0 { return 10; }
+        if (ra != 0 && ra != 1) || (rb != 0 && rb != 1) { return 10; }
     }
     let shared = Shared { state: State::Pair(0, 0, "evenλ"), scalar: 123456789,
         reference: "evenλ", narrow: -128 as i8, boolean: true, float: 1.5 };

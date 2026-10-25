@@ -1071,6 +1071,10 @@ pub unsafe extern "C" fn ai_thread_spawn(
         "spawn requires an active runtime entry"
     );
     let heap = unsafe { clone_thread_heap(&*parent) };
+    // Before the child can run: the parent then observes a second mutator in
+    // program order, and the child from thread start, so neither takes a
+    // single-mutator unordered path on objects they share.
+    heap.mark_multi_mutator();
     // Hand off the env object via a GLOBAL ROOT slot. This runs on the PARENT
     // thread while `env` is still live in the parent's frame, so registering it
     // as a global root keeps it alive and relocated across any GC during the

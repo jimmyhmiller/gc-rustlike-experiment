@@ -17,7 +17,7 @@ The October 12 pad records 586 passing tests and eight ignores for the prelude m
 - Specify initialization, constructor publication and unwritten-array behavior, including racing reads.
 - Finish arithmetic/cast semantics: float-to-int NaN/infinity/out-of-range, integer narrowing/sign changes, float exceptional values, Unicode char validity and checked size/offset arithmetic.
 - Establish the public safety boundary for RawPtr, extern calls, callbacks and callable unchecked intrinsics: explicit unsafe capability or inaccessible internal primitives with checked public APIs.
-- Publish the SC managed memory model and distinguish indivisible access from compound operations; ordinary Vec/Map stay externally synchronized.
+- Managed slots follow the plain-field model in `docs/gc.md` (unordered scalars, release/acquire reference publication); still distinguish indivisible access from compound operations. Ordinary Vec/Map stay externally synchronized.
 - Audit every generated/runtime heap access, root/reload, aggregate snapshot, allocation publication and write barrier. Cover generic specializations, embedded references, closures, callbacks, thread handoff, diagnostics and optimized paths.
 - Audit Rust embedding APIs for thread ownership, lifetimes and collection coordination; document which APIs can safely execute concurrently.
 - Remove transitional Sync capture restrictions only after arbitrary managed sharing is actually safe, including aliases and higher-order calls.

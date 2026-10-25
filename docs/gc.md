@@ -160,8 +160,21 @@ The earlier proposal to put all managed accesses behind a heap-wide mutex was
 withdrawn before implementation. Independent mutators need independent hot paths:
 thread-local allocation buffers, atomic scalar/reference publication and card
 marking, and coherent aggregate snapshots. TLAB initialized extents and unused
-tails are now explicit metadata consumed by heap walkers. Scalar/reference and
-aggregate managed memory semantics remain implementation work.
+tails are now explicit metadata consumed by heap walkers.
+
+Managed slots follow Java's plain-field model: programs without data races are
+sequentially consistent through the synchronizing operations (atoms, channels,
+joins). A racy program may observe reordering, so scalar store buffering can
+read both zeros, but it never observes a torn value or a partly built object.
+A slot another mutator may race is an LLVM `unordered` atomic for scalars. Once a
+heap has a second mutator, a reference store is a release and a reference load an
+acquire, so whatever initialized the referenced object, and transitively its
+immutable fields, is visible to the reader. With one mutator nothing can race:
+the access-mode byte is zero and reference slots take the same unordered path as
+scalars. `Thread::spawn` marks the heap before its child exists, so neither
+thread can take that path on objects they share. Slots the escape analysis proves
+private stay plain. Inline aggregates use the direct or snapshot paths described
+below.
 
 Parallel stop-the-world evacuation is the selected target. Its worker queue,
 forwarding ownership/publication and termination protocol are implemented above.

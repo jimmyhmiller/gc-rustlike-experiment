@@ -940,8 +940,9 @@ mod tests {
         ";
         let ir = function_ir(source, "update");
         assert!(!ir.contains("store atomic"), "{ir}");
+        // Only the heap's access-mode byte, never private data, is atomic.
         for line in ir.lines().filter(|line| line.contains("load atomic")) {
-            assert!(line.contains("copy.phase") && line.contains("load atomic i8"),
+            assert!((line.contains("copy.phase") || line.contains("access.mode")) && line.contains("load atomic i8"),
                 "private data access became atomic: {line}\n{ir}");
         }
         assert!(ir.lines().any(|line| line.contains(" = load ") && line.contains("!alias.scope")),
