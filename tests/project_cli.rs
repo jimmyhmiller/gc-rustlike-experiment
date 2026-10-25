@@ -127,7 +127,7 @@ fn jit_project_arguments_and_exit_status_match_native() {
     }
     fn main() -> i64 { let worker = Thread::spawn(argument_score); argument_score() + worker.join() }
     "#).unwrap();
-    for options in [vec!["run", "--", "λ", "--gc-stress"], vec!["run", "--jit", "--", "λ", "--gc-stress"], vec!["run", "--jit", "--gc-stress", "--", "λ", "--gc-stress"]] {
+    for options in [vec!["run", "--", "λ", "--gc-stress"], vec!["run", "--jit", "--", "λ", "--gc-stress"], vec!["run", "--jit", "--gc-stress", "--", "λ", "--gc-stress"], vec!["run", "--no-opt", "--", "λ", "--gc-stress"], vec!["run", "--jit", "--no-opt", "--", "λ", "--gc-stress"]] {
         let output = p.command().args(options).output().unwrap();
         assert_eq!(output.status.code(), Some(14), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(output.stdout.is_empty());

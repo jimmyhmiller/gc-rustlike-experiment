@@ -6,17 +6,137 @@
 //! transitively escape their contents, including cyclic graphs. Closures,
 //! native/unknown calls and unsupported aggregates stay conservative.
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::core::{CoreBlock, CoreExpr, CoreExprKind, CoreProgram, CoreStmt, Repr};
 
 type Node = usize;
 
-#[derive(Default)]
+/// Dense allocation IDs make a word set substantially cheaper than allocating
+/// a tree node for every points-to fact propagated through the constraint graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct AllocationSet(Vec<u64>);
+impl AllocationSet {
+    fn insert(&mut self, allocation: usize) -> bool {
+        let word = allocation / 64;
+        self.0.resize(self.0.len().max(word + 1), 0);
+        let bit = 1u64 << (allocation % 64);
+        let changed = self.0[word] & bit == 0;
+        self.0[word] |= bit;
+        changed
+    }
+    fn is_empty(&self) -> bool { self.0.is_empty() }
+    fn is_disjoint(&self, other: &Self) -> bool {
+        self.0.iter().zip(&other.0).all(|(a, b)| a & b == 0)
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ { self.into_iter() }
+}
+struct WordAllocations { base: usize, bits: u64 }
+impl Iterator for WordAllocations {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.bits == 0 { return None; }
+        let bit = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits - 1;
+        Some(self.base + bit)
+    }
+}
+fn word_allocations((word, bits): (usize, u64)) -> WordAllocations {
+    WordAllocations { base: word * 64, bits }
+}
+impl IntoIterator for AllocationSet {
+    type Item = usize;
+    type IntoIter = std::iter::FlatMap<std::iter::Enumerate<std::vec::IntoIter<u64>>, WordAllocations, fn((usize, u64)) -> WordAllocations>;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_iter().enumerate().flat_map(word_allocations) }
+}
+impl<'a> IntoIterator for &'a AllocationSet {
+    type Item = usize;
+    type IntoIter = std::iter::FlatMap<std::iter::Enumerate<std::iter::Copied<std::slice::Iter<'a, u64>>>, WordAllocations, fn((usize, u64)) -> WordAllocations>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter().copied().enumerate().flat_map(word_allocations) }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Points {
-    allocations: BTreeSet<usize>,
+    allocations: AllocationSet,
     unknown: bool,
     nullable: bool,
-    integers: BTreeSet<u64>,
+    integer: Integer,
+}
+
+// Constant propagation only needs to distinguish no facts, one constant and
+// conflicting constants. Keeping every conflicting value makes joins grow
+// without providing any additional optimization proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Integer {
+    #[default]
+    Empty,
+    Constant(u64),
+    Varying,
+}
+impl Integer {
+    fn join(&mut self, other: Self) -> bool {
+        let next = match (*self, other) {
+            (Self::Empty, value) | (value, Self::Empty) => value,
+            (Self::Constant(a), Self::Constant(b)) if a == b => *self,
+            _ => Self::Varying,
+        };
+        let changed = next != *self;
+        *self = next;
+        changed
+    }
+}
+
+#[derive(Default)]
+struct Delta {
+    allocations: Vec<usize>,
+    integer: Integer,
+    unknown: bool,
+    nullable: bool,
+}
+struct Work {
+    pending: Vec<Delta>,
+    queue: VecDeque<Node>,
+    queued: Vec<bool>,
+}
+impl Work {
+    fn new(points: &[Points]) -> Self {
+        Self {
+            pending: points.iter().map(|p| Delta {
+                allocations: p.allocations.iter().collect(),
+                integer: p.integer, unknown: p.unknown, nullable: p.nullable,
+            }).collect(),
+            queue: (0..points.len()).collect(),
+            queued: vec![true; points.len()],
+        }
+    }
+    fn merge(&mut self, destination: Node, point: &mut Points, delta: &Delta) {
+        let pending = &mut self.pending[destination];
+        let mut changed = false;
+        for &allocation in &delta.allocations {
+            if point.allocations.insert(allocation) {
+                pending.allocations.push(allocation);
+                changed = true;
+            }
+        }
+        if point.integer.join(delta.integer) {
+            pending.integer = point.integer;
+            changed = true;
+        }
+        if delta.unknown && !point.unknown {
+            point.unknown = true;
+            pending.unknown = true;
+            changed = true;
+        }
+        if delta.nullable && !point.nullable {
+            point.nullable = true;
+            pending.nullable = true;
+            changed = true;
+        }
+        if changed && !self.queued[destination] {
+            self.queued[destination] = true;
+            self.queue.push_back(destination);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -24,7 +144,8 @@ pub(crate) struct PrivateHeap {
     expressions: BTreeSet<usize>,
     lengths: HashMap<usize, u64>,
     integers: HashMap<usize, u64>,
-    origins: HashMap<usize, BTreeSet<usize>>,
+    origins: HashMap<usize, Arc<BTreeSet<usize>>>,
+    origin_sets: Vec<Arc<BTreeSet<usize>>>,
 }
 
 impl PrivateHeap {
@@ -50,14 +171,23 @@ impl PrivateHeap {
     }
 
     pub(crate) fn origins(&self, expression: &CoreExpr) -> Option<&BTreeSet<usize>> {
-        self.origins.get(&(expression as *const CoreExpr as usize))
+        self.origins.get(&(expression as *const CoreExpr as usize)).map(Arc::as_ref)
     }
 
-    pub(crate) fn origin_sets(&self) -> BTreeSet<BTreeSet<usize>> {
-        self.origins.values().cloned().collect()
+    pub(crate) fn origin_sets_for(&self, function: &crate::core::CoreFn) -> Vec<Arc<BTreeSet<usize>>> {
+        let mut sets = BTreeSet::new();
+        crate::inline::visit_block(&function.body, &mut |expression| {
+            if let Some(origins) = self.origins.get(&(expression as *const CoreExpr as usize)) { sets.insert(origins.clone()); }
+        });
+        sets.into_iter().collect()
+    }
+
+    pub(crate) fn origin_sets(&self) -> impl Iterator<Item = Arc<BTreeSet<usize>>> + '_ {
+        self.origin_sets.iter().cloned()
     }
 }
 
+#[derive(Clone)]
 struct Analysis<'p> {
     program: &'p CoreProgram,
     points: Vec<Points>,
@@ -66,6 +196,7 @@ struct Analysis<'p> {
     returns: Vec<Node>,
     expressions: HashMap<usize, Node>,
     escaping: BTreeSet<Node>,
+    clobbers: Vec<Node>,
     allocation_lengths: Vec<Option<Node>>,
     contents: Vec<Node>,
     stores: Vec<(Node, Node)>,
@@ -85,6 +216,7 @@ impl<'p> Analysis<'p> {
             returns: Vec::new(),
             expressions: HashMap::new(),
             escaping: BTreeSet::new(),
+            clobbers: Vec::new(),
             allocation_lengths: Vec::new(),
             contents: Vec::new(),
             stores: Vec::new(),
@@ -129,6 +261,33 @@ impl<'p> Analysis<'p> {
         if let Some(node) = node {
             self.escaping.insert(node);
         }
+    }
+
+    fn clobber(&mut self, value: Option<Node>) {
+        self.escape(value);
+        if let Some(value) = value { self.clobbers.push(value); }
+    }
+
+    // An opaque operation can replace any field reachable from its arguments.
+    // Escape alone prevents private-allocation proofs, but does not invalidate
+    // constants or array origins loaded from a mutated container. Resolve the
+    // known heap graph first, invalidate that memory transitively, then propagate
+    // the unknown facts through loads. Unknown facts add no allocation origins,
+    // so the first fixed point already contains every reachable memory node.
+    fn invalidate_opaque_memory(&mut self) {
+        let mut queue: VecDeque<Node> = self.clobbers.iter().copied().collect();
+        let mut visited = BTreeSet::new();
+        let mut changed = false;
+        while let Some(node) = queue.pop_front() {
+            if !visited.insert(node) { continue; }
+            for allocation in self.points[node].allocations.clone() {
+                let contents = self.contents[allocation];
+                changed |= !self.points[contents].unknown;
+                self.points[contents].unknown = true;
+                queue.push_back(contents);
+            }
+        }
+        if changed { self.solve(); }
     }
 
     fn external_entry(&mut self, id: usize) {
@@ -184,7 +343,7 @@ impl<'p> Analysis<'p> {
                     if matches!(repr, Repr::Ref(_)) {
                         self.points[result].nullable = true;
                     } else {
-                        self.points[result].integers.insert(0);
+                        self.points[result].integer.join(Integer::Constant(0));
                     }
                 }
             }
@@ -200,7 +359,7 @@ impl<'p> Analysis<'p> {
                     } else {
                         *value
                     };
-                    self.points[result].integers.insert(value);
+                    self.points[result].integer.join(Integer::Constant(value));
                 }
             }
             ArrayNew { len, elem, .. } => {
@@ -233,7 +392,7 @@ impl<'p> Analysis<'p> {
                 for (index, arg) in args.iter().enumerate() {
                     let value = self.expression(id, arg);
                     if external {
-                        self.escape(value);
+                        self.clobber(value);
                     } else {
                         self.flow(value, Some(self.locals[callee][start + index]));
                     }
@@ -318,7 +477,7 @@ impl<'p> Analysis<'p> {
                     self.store(owner, reference);
                 }
                 if let Some(result) = result {
-                    self.points[result].integers.insert(0);
+                    self.points[result].integer.join(Integer::Constant(0));
                 }
             }
             Field { base, loc } => {
@@ -376,7 +535,7 @@ impl<'p> Analysis<'p> {
                 self.external_entry(*code as usize);
                 for capture in captures {
                     let value = self.expression(id, capture);
-                    self.escape(value);
+                    self.clobber(value);
                 }
                 if let Some(result) = result {
                     self.points[result].unknown = true;
@@ -485,85 +644,76 @@ impl<'p> Analysis<'p> {
     ) {
         for operand in operands {
             let value = self.expression(id, operand);
-            self.escape(value);
+            self.clobber(value);
         }
         self.unknown(result);
     }
 
+    // Inclusion constraints use semi-naive propagation: an origin traverses
+    // each edge once. An owner gaining an origin activates just its own memory
+    // constraints; a newly added edge receives its source's existing facts.
+    // This avoids restarting the entire graph after every memory refinement.
+    fn solve(&mut self) {
+        let mut stores = vec![Vec::new(); self.points.len()];
+        let mut loads = vec![Vec::new(); self.points.len()];
+        for &(owner, value) in &self.stores { stores[owner].push(value); }
+        for &(owner, result) in &self.loads { loads[owner].push(result); }
+        let mut work = Work::new(&self.points);
+        while let Some(source) = work.queue.pop_front() {
+            work.queued[source] = false;
+            let delta = std::mem::take(&mut work.pending[source]);
+            for &destination in &self.edges[source] {
+                work.merge(destination, &mut self.points[destination], &delta);
+            }
+            if delta.unknown {
+                for &value in &stores[source] { self.escape(Some(value)); }
+                for &result in &loads[source] {
+                    work.merge(result, &mut self.points[result], &Delta { unknown: true, ..Default::default() });
+                }
+            }
+            for &allocation in &delta.allocations {
+                let contents = self.contents[allocation];
+                for &value in &stores[source] {
+                    self.activate_edge(value, contents, &mut work);
+                }
+                for &result in &loads[source] {
+                    self.activate_edge(contents, result, &mut work);
+                }
+            }
+        }
+    }
+
+    fn activate_edge(&mut self, source: Node, destination: Node, work: &mut Work) {
+        if self.link(source, destination) {
+            let point = &self.points[source];
+            let delta = Delta {
+                allocations: point.allocations.iter().collect(),
+                integer: point.integer, unknown: point.unknown, nullable: point.nullable,
+            };
+            work.merge(destination, &mut self.points[destination], &delta);
+        }
+    }
+
     fn finish(mut self) -> PrivateHeap {
         for (id, function) in self.program.funcs.iter().enumerate() {
-            if !function.is_extern {
+            if !function.is_extern  {
                 let value = self.block(id, &function.body);
                 self.flow(value, Some(self.returns[id]));
             }
         }
-        loop {
-            let mut queued = vec![true; self.points.len()];
-            let mut queue: VecDeque<_> = (0..self.points.len()).collect();
-            while let Some(source) = queue.pop_front() {
-                queued[source] = false;
-                for &destination in &self.edges[source] {
-                    let mut changed = false;
-                    if self.points[source].unknown && !self.points[destination].unknown {
-                        self.points[destination].unknown = true;
-                        changed = true;
-                    }
-                    if self.points[source].nullable && !self.points[destination].nullable {
-                        self.points[destination].nullable = true;
-                        changed = true;
-                    }
-                    let integers: Vec<_> = self.points[source].integers.iter().copied().collect();
-                    for integer in integers {
-                        changed |= self.points[destination].integers.insert(integer);
-                    }
-                    let values: Vec<_> = self.points[source].allocations.iter().copied().collect();
-                    for allocation in values {
-                        changed |= self.points[destination].allocations.insert(allocation);
-                    }
-                    if changed && !queued[destination] {
-                        queued[destination] = true;
-                        queue.push_back(destination);
-                    }
-                }
-            }
-            // Refine memory-flow edges as owner origins become known. Reads
-            // and writes are flow-insensitive, including cycles and stores
-            // occurring after reads in source order.
-            let mut changed = false;
-            for (owner, value) in self.stores.clone() {
-                if self.points[owner].unknown {
-                    self.escape(Some(value));
-                }
-                let allocations: Vec<_> = self.points[owner].allocations.iter().copied().collect();
-                for allocation in allocations {
-                    changed |= self.link(value, self.contents[allocation]);
-                }
-            }
-            for (owner, result) in self.loads.clone() {
-                if self.points[owner].unknown && !self.points[result].unknown {
-                    self.points[result].unknown = true;
-                    changed = true;
-                }
-                let allocations: Vec<_> = self.points[owner].allocations.iter().copied().collect();
-                for allocation in allocations {
-                    changed |= self.link(self.contents[allocation], result);
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        let mut escaped = BTreeSet::new();
+        self.solve();
+        self.invalidate_opaque_memory();
+        let mut escaped = AllocationSet::default();
         let mut queue = VecDeque::new();
         for &node in &self.escaping {
-            for &allocation in &self.points[node].allocations {
+            for allocation in &self.points[node].allocations {
                 if escaped.insert(allocation) {
                     queue.push_back(allocation);
                 }
             }
         }
         while let Some(allocation) = queue.pop_front() {
-            for &child in &self.points[self.contents[allocation]].allocations {
+            for child in &self.points[self.contents[allocation]].allocations {
                 if escaped.insert(child) {
                     queue.push_back(child);
                 }
@@ -571,8 +721,10 @@ impl<'p> Analysis<'p> {
         }
         let known_integer = |node: Node| {
             let points = &self.points[node];
-            (!points.unknown && points.integers.len() == 1)
-                .then(|| *points.integers.first().unwrap())
+            match points.integer {
+                Integer::Constant(value) if !points.unknown => Some(value),
+                _ => None,
+            }
         };
         let mut lengths = HashMap::new();
         let mut integers = HashMap::new();
@@ -586,7 +738,7 @@ impl<'p> Analysis<'p> {
             }
             let mut common = None;
             let mut compatible = true;
-            for &allocation in &points.allocations {
+            for allocation in &points.allocations {
                 let length = self.allocation_lengths[allocation].and_then(known_integer);
                 match length {
                     Some(length)
@@ -606,33 +758,28 @@ impl<'p> Analysis<'p> {
                 }
             }
         }
-        let origins = self
-            .expressions
-            .iter()
-            .filter_map(|(&expression, &node)| {
-                let points = &self.points[node];
-                (!points.unknown
-                    && !points.allocations.is_empty()
-                    && points.allocations.is_disjoint(&escaped))
-                .then(|| (expression, points.allocations.clone()))
-            })
-            .collect();
-        let expressions = self
-            .expressions
-            .into_iter()
-            .filter_map(|(expression, node)| {
-                let points = &self.points[node];
-                (!points.unknown
-                    && !points.allocations.is_empty()
-                    && points.allocations.is_disjoint(&escaped))
-                .then_some(expression)
-            })
-            .collect();
+        let mut interned: HashMap<AllocationSet, Arc<BTreeSet<usize>>> = HashMap::new();
+        let mut origins = HashMap::new();
+        for (&expression, &node) in &self.expressions {
+            let points = &self.points[node];
+            if points.unknown || points.allocations.is_empty() || !points.allocations.is_disjoint(&escaped) { continue; }
+            let set = if let Some(set) = interned.get(&points.allocations) { set.clone() }
+                else {
+                    let set = Arc::new(points.allocations.iter().collect::<BTreeSet<_>>());
+                    interned.insert(points.allocations.clone(), set.clone());
+                    set
+                };
+            origins.insert(expression, set);
+        }
+        let expressions = origins.keys().copied().collect();
+        let mut origin_sets: Vec<_> = interned.into_values().collect();
+        origin_sets.sort();
         PrivateHeap {
             expressions,
             lengths,
             integers,
             origins,
+            origin_sets,
         }
     }
 }
@@ -644,6 +791,79 @@ mod tests {
     use crate::lower::lower_program;
     use crate::resolve::resolve_module;
     use inkwell::values::AnyValue;
+
+    // A deliberately simple full-sweep solver is an independent oracle for
+    // the incremental solver, including memory edges discovered after a cycle.
+    fn reference_solve(a: &mut super::Analysis<'_>) {
+        loop {
+            let mut changed = false;
+            for source in 0..a.points.len() {
+                for destination in a.edges[source].clone() {
+                    let from = a.points[source].clone();
+                    let to = &mut a.points[destination];
+                    for allocation in from.allocations {
+                        changed |= to.allocations.insert(allocation);
+                    }
+                    changed |= to.integer.join(from.integer);
+                    if from.unknown && !to.unknown { to.unknown = true; changed = true; }
+                    if from.nullable && !to.nullable { to.nullable = true; changed = true; }
+                }
+            }
+            for (owner, value) in a.stores.clone() {
+                if a.points[owner].unknown { a.escape(Some(value)); }
+                for allocation in a.points[owner].allocations.clone() {
+                    changed |= a.link(value, a.contents[allocation]);
+                }
+            }
+            for (owner, result) in a.loads.clone() {
+                if a.points[owner].unknown && !a.points[result].unknown {
+                    a.points[result].unknown = true;
+                    changed = true;
+                }
+                for allocation in a.points[owner].allocations.clone() {
+                    changed |= a.link(a.contents[allocation], result);
+                }
+            }
+            if !changed { break; }
+        }
+    }
+
+    #[test]
+    fn delta_solver_matches_full_sweep_with_cycles_and_late_memory_edges() {
+        let program = crate::core::CoreProgram::default();
+        let mut seed = 0x76543210u64;
+        let mut random = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            seed as usize
+        };
+        for _ in 0..256 {
+            let mut a = super::Analysis::new(&program);
+            for _ in 0..20 { a.node(); }
+            a.contents.resize(196, 16);
+            for allocation in 0..4 {
+                let id = allocation * 65;
+                a.contents[id] = 16 + allocation;
+                a.points[random() % 16].allocations.insert(id);
+            }
+            for _ in 0..40 {
+                let source = random() % 20;
+                let destination = random() % 20;
+                a.flow(Some(source), Some(destination));
+            }
+            for _ in 0..12 {
+                a.stores.push((random() % 16, random() % 20));
+                a.loads.push((random() % 16, random() % 20));
+            }
+            a.points[random() % 20].unknown = true;
+            a.points[random() % 20].nullable = true;
+            for value in 0..5 { a.points[random() % 20].integer.join(super::Integer::Constant(value)); }
+            let mut reference = a.clone();
+            reference_solve(&mut reference);
+            a.solve();
+            assert_eq!(a.points, reference.points);
+            assert_eq!(a.escaping, reference.escaping);
+        }
+    }
 
     // Each function is analyzed as written: inlining would fold the
     // callees under test into `main`.

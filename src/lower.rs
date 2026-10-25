@@ -127,6 +127,7 @@ struct InstantiationKey {
 #[derive(Clone, PartialEq)]
 struct Mono {
     ids: HashMap<InstantiationKey, FuncId>,
+    id_log: Vec<InstantiationKey>,
     worklist: Vec<(FuncId, Job)>,
     /// Fully-formed lifted closure functions, keyed by their FuncId, to be
     /// installed into `prog.funcs` by the driver.
@@ -145,7 +146,7 @@ struct Mono {
 
 /// `Mono`'s contents at a point in time; see [`Mono::snapshot`].
 struct MonoSnapshot {
-    ids: HashMap<InstantiationKey, FuncId>,
+    ids: usize,
     worklist: usize,
     closures: usize,
     spans: usize,
@@ -153,16 +154,18 @@ struct MonoSnapshot {
 
 impl Mono {
     fn new() -> Self {
-        Mono { ids: HashMap::new(), worklist: Vec::new(), closures: Vec::new(), spans: Vec::new(), opaque: HashMap::new(), opaque_pending: Default::default() }
+        Mono { ids: HashMap::new(), id_log: Vec::new(), worklist: Vec::new(), closures: Vec::new(), spans: Vec::new(), opaque: HashMap::new(), opaque_pending: Default::default() }
     }
     /// Record the monomorphizer so a discarded lowering attempt can be undone.
-    /// Everything but the interning map is append-only.
+    /// Interning records inserted keys, so checkpoints do not copy the map.
     fn snapshot(&self) -> MonoSnapshot {
-        MonoSnapshot { ids: self.ids.clone(), worklist: self.worklist.len(), closures: self.closures.len(), spans: self.spans.len() }
+        MonoSnapshot { ids: self.id_log.len(), worklist: self.worklist.len(), closures: self.closures.len(), spans: self.spans.len() }
     }
     /// Drop every instantiation, closure, and span added since `snap`.
     fn restore(&mut self, snap: MonoSnapshot) {
-        self.ids = snap.ids;
+        while self.id_log.len() > snap.ids {
+            self.ids.remove(&self.id_log.pop().unwrap());
+        }
         self.worklist.truncate(snap.worklist);
         self.closures.truncate(snap.closures);
         self.spans.truncate(snap.spans);
@@ -196,6 +199,7 @@ impl Mono {
         }
         let id = *count;
         *count += 1;
+        self.id_log.push(key.clone());
         self.ids.insert(key, id);
         self.worklist.push((id, job));
         id
@@ -333,9 +337,36 @@ pub(crate) fn current_module() -> String {
 /// out to need a reference is made one, and the program is lowered again.
 pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
     crate::layout::reset_forced_references();
+    lower_with_layouts(globals)
+}
+
+/// Validate the complete program, then lower it using the same layout proofs.
+/// Independent compilations still reset the thread's layout decisions at the
+/// start of checking; retries within this compilation only add reference proofs.
+pub fn check_and_lower(globals: &crate::resolve::GlobalTable) -> Result<CoreProgram, Vec<LowerError>> {
+    let mut ctx = crate::timing::measure("check", || {
+        let ctx = TyCtx::from_globals(globals);
+        check_with_context(&ctx).map(|()| ctx)
+    })?;
+    crate::timing::measure("lower", || {
+        wrap_entry(&mut ctx)?;
+        wrap_statics(&mut ctx);
+        lower_with_context(&ctx)
+    }).map_err(|error| vec![error])
+}
+
+fn lower_with_layouts(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
+    let mut ctx = TyCtx::from_globals(globals);
+    wrap_entry(&mut ctx)?;
+    wrap_statics(&mut ctx);
+    lower_with_context(&ctx)
+}
+
+fn lower_with_context(ctx: &TyCtx) -> LResult<CoreProgram> {
     loop {
         NEEDS_REFERENCE.with(|n| n.borrow_mut().take());
-        match lower_program_once(globals) {
+        let _attempt = crate::timing::Phase::new("lower attempt");
+        match lower_program_once(ctx) {
             Err(error) => {
                 let retry = NEEDS_REFERENCE.with(|n| n.borrow_mut().take())
                     .is_some_and(|name| crate::layout::force_reference_struct(&name));
@@ -346,11 +377,7 @@ pub fn lower_program(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgr
     }
 }
 
-fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProgram> {
-    let mut ctx = TyCtx::from_globals(globals);
-    wrap_entry(&mut ctx)?;
-    wrap_statics(&mut ctx);
-    let ctx = ctx;
+fn lower_program_once(ctx: &TyCtx) -> LResult<CoreProgram> {
     let _normalizer = crate::types::enter_normalizer(&ctx);
     let mut reg = LayoutRegistry::new(&ctx);
     let mut prog = CoreProgram::default();
@@ -397,15 +424,20 @@ fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProg
     prog.spans = std::mem::take(&mut mono.spans);
     // GC-safety normalization: let-bind every GC temporary so the collector can
     // find it (no live pointer is ever stranded in a register across a safepoint).
-    crate::anf::anf_program(&mut prog);
-    crate::copyprop::copy_propagate(&mut prog);
-    crate::inline::inline_program(&mut prog);
-    crate::caseopt::identity_matches(&mut prog);
-    crate::caseopt::known_constructors(&mut prog);
-    crate::sroa::scalar_replace(&mut prog);
-    crate::copyprop::copy_propagate(&mut prog);
-    crate::fieldcse::reuse_field_reads(&mut prog);
-    crate::copyprop::copy_propagate(&mut prog);
+    crate::timing::measure("Core anf_program", || crate::anf::anf_program(&mut prog));
+    crate::timing::measure("Core copy_propagate", || crate::copyprop::copy_propagate(&mut prog));
+    crate::timing::measure("Core inline_program", || crate::inline::inline_program(&mut prog));
+    crate::timing::measure("Core identity_matches", || crate::caseopt::identity_matches(&mut prog));
+    crate::timing::measure("Core known_constructors", || crate::caseopt::known_constructors(&mut prog));
+    crate::timing::measure("Core scalar_replace", || crate::sroa::scalar_replace(&mut prog));
+    crate::timing::measure("Core copy_propagate", || crate::copyprop::copy_propagate(&mut prog));
+    crate::timing::measure("Core reuse_field_reads", || crate::fieldcse::reuse_field_reads(&mut prog));
+    crate::timing::measure("Core copy_propagate", || crate::copyprop::copy_propagate(&mut prog));
+    crate::timing::measure("Core constant arguments", || crate::const_variants::propagate(&mut prog));
+    let outlined_start = prog.funcs.len();
+    crate::timing::measure("Core outline branches", || crate::outline::branches(&mut prog));
+    crate::timing::measure("Core compact locals", || crate::locals::compact(&mut prog));
+    crate::timing::measure("Core merge helpers", || crate::outline::merge_helpers(&mut prog, outlined_start));
     Ok(prog)
 }
 
@@ -421,10 +453,15 @@ fn lower_program_once(globals: &crate::resolve::GlobalTable) -> LResult<CoreProg
 /// `lower_program` still reports any error reachable only through a generic
 /// instantiation.
 pub fn check_program(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<LowerError>> {
+    let ctx = TyCtx::from_globals(globals);
+    check_with_context(&ctx)
+}
+
+fn check_with_context(ctx: &TyCtx) -> Result<(), Vec<LowerError>> {
     crate::layout::reset_forced_references();
     loop {
         NEEDS_REFERENCE.with(|n| n.borrow_mut().take());
-        match check_program_once(globals) {
+        match check_program_once(ctx) {
             Err(errors) => {
                 let retry = NEEDS_REFERENCE.with(|n| n.borrow_mut().take())
                     .is_some_and(|name| crate::layout::force_reference_struct(&name));
@@ -435,8 +472,7 @@ pub fn check_program(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<Lo
     }
 }
 
-fn check_program_once(globals: &crate::resolve::GlobalTable) -> Result<(), Vec<LowerError>> {
-    let ctx = TyCtx::from_globals(globals);
+fn check_program_once(ctx: &TyCtx) -> Result<(), Vec<LowerError>> {
     let _normalizer = crate::types::enter_normalizer(&ctx);
     let mut errors = Vec::new();
 
@@ -8122,6 +8158,35 @@ mod tests {
                    fn main() -> i64 { 0 }";
         let errs = check_errs(src);
         assert_eq!(errs.len(), 3, "expected 3 errors, got: {:?}", errs.iter().map(|e| &e.msg).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn monomorphization_checkpoints_restore_nested_interning() {
+        let module = parse_module(&lex("fn a() -> i64 { 1 } fn b() -> i64 { 2 } fn c() -> i64 { 3 } fn main() -> i64 { 0 }").unwrap()).unwrap();
+        let ctx = TyCtx::from_globals(&resolve_module(module).unwrap().globals);
+        let job = |name: &str| Job { f: ctx.fns[name].clone(), subst: HashMap::new(), mangled: name.into(), self_ty: None };
+        let mut mono = Mono::new();
+        let mut count = 0;
+        let a = mono.intern(job("a"), &mut count);
+        let outer = mono.snapshot();
+        let b = mono.intern(job("b"), &mut count);
+        let inner = mono.snapshot();
+        mono.intern(job("c"), &mut count);
+        mono.restore(inner);
+        assert_eq!(mono.ids.len(), 2);
+        assert_eq!(mono.intern(job("b"), &mut count), b);
+        mono.restore(outer);
+        assert_eq!(mono.ids.len(), 1);
+        assert_eq!(mono.intern(job("a"), &mut count), a);
+        assert_eq!(mono.worklist.len(), 1);
+    }
+
+    #[test]
+    fn checked_lowering_preserves_unreachable_function_diagnostics() {
+        let module = parse_module(&lex("fn bad() -> i64 { true } fn other() -> i64 { false } fn main() -> i64 { 0 }").unwrap()).unwrap();
+        let resolved = resolve_module(module).unwrap();
+        let errors = check_and_lower(&resolved.globals).unwrap_err();
+        assert_eq!(errors.len(), 2);
     }
 
     #[test]

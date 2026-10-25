@@ -1,0 +1,3502 @@
+{
+  "environment": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "git": "3b359948a9c4468512091f48d47f2970af48a3ce",
+    "git_dirty": true,
+    "rust_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "funct_git": "ac9350732c83d136f5bce3e55100a75eb27a3099",
+    "funct_dirty": true,
+    "sha256": {
+      "/Users/jimmyhmiller/Documents/Code/funct/src/ast.rs": "7464dac7e43efbdc3a02ce9ce35ebe975841b0680c3e62a94abd606b013d859d",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/bytecode.rs": "acb0a519e041f7e41f4e02a2a2b439ef0acb22cff00c1050f896ad5b3db1f649",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/compiler.rs": "261f7c9267b98110345c9340271472b46a1db643b58277b7e241fc13b4cfa7b0",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/interop.rs": "cd217f7a47fa137b2992b34936c841bf41ca278a2334ad1b41b79eb0b07a8d84",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/json.rs": "cf5421fecd0d55392ef49b11f9318333da214228aa01d2bd4e95bb87b01e87d5",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/lexer.rs": "6ef439b23cf7f7777042061cdce7d4006c209d422e2ed36e03bcabcd4a154d3d",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/lib.rs": "e2bed19d7ee34861ba1fc9068c3828bbaa73ec91598a1b6e6a3b48ce7830b81c",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/main.rs": "164f315e586d4d2b6b7c716575a1a9e51ea7cf75b7b679de8b61ab49d2aaa013",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/parser.rs": "8f225d0e1c1094310da7233799432b375319296c841d78a69941a1dc9d04cbd6",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/prelude.rs": "fd73ef4a7bf987d2302988e61f1466cca2a2fbd85639e6cde076cc4d557d5a50",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/snapshot.rs": "fc96e4ea545f7c1cddd14334b67680ce91e7562d19ecf54026ff3495a363557e",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/testing.rs": "52ed9056bb1d683e141956b971dce05a320733d0e959c06742460e4e42047e48",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/value.rs": "93deff0e217ad34559fd323f481b1cd4a3260720681020c8dab4497a0bf540ea",
+      "/Users/jimmyhmiller/Documents/Code/funct/src/vm.rs": "b02913866bc339820a2bbbebbdd22523f6088b622c85a3168ae76cefc15b93e7",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/run.py": "9174df0be0693c6e0660c6d3b78b15bf0e4dce1220ceb38fb780e9a652f29456",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft": "244fe1cc49be26d1a14e81f09fc0ea08998105e1e65faa7b0c01a09128e83722",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft": "0bd240a3855c3f3a19bda1d1872e87dd9165ec0f9071d195848e7c644822f7cf",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft": "e836a8f0f31a758536e6f42c33c0f493ca23505e8d86823530d8ab24aa2a6d09",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft": "0b5b23e124184d7652a36773ce390f20c170bbdcde5cee761a9ce989a323f723",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft": "5f8ccfecb3c128fe5a9809b31e1dce033f0f702e89cd576199233a735ed4e2d0",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft": "b848c2786c3b6cb4d50af4606ba336f099f2ade371c44d02d94073be28139d93",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft": "c059acef90b2736b517dca2cfd69419a81404100270441fdc0900d9d33515960",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft": "1f9f3ac4ed961156f13feb03492b2698084d5364ab2ef5dd2c52c59b624c35b5",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft": "705d76de3344421d7191f67fafcb24d21b579b03ab090feda8d4c2e1a641e321",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/glow.ft": "7a475c93b2e10d1ded0bf590c7f2e70942242824397d66ae8e3c65ad8b4846d4",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/host.ft": "574b56c81ae18f56605d198923991418712f3bc732a0e60f2bbd634ca3fbe772",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/reference/src/main.rs": "aba954545c5caa748f8e36abee272e577323ab8dfbf67a83ad6998b151f4d339",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/ast.gcr": "6d121f4ab0f8ced631430e22f2fd9d47930e82591975ab57420997f22f2ea7b5",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/bytecode.gcr": "c8e0adb33ec264fe13e7055b32daf1b76ed5d80b7406987dea8460811da0d1f3",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/compiler.gcr": "de36dcc84f29ebdb80fe9ceb132ad7d02cb4a903eb6fbc65d9bb7b07a6f2a4e7",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/imbl.gcr": "fbbe079a7457b0abe0248e46431259302fc965c4ff06d4facacd365a347fdfd3",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/interop.gcr": "6096172ddf5f969a39253d72f6e7d66c72a5aff4f248a06fa92bfc5fa2f2bdf1",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/json.gcr": "d6ed62d644eda419cfb23e02d79cb10c8fb9e9d20a3aaed1c44a1b828c6ec14c",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/lexer.gcr": "6e39ac001740335ddd59c4264426dedf3400504402210acecbbeccfcfdae50f8",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/main.gcr": "0acec3eebe08bf76f3c75fc879e9a0b1471b99bb0edbe12a6604ab8ad0f571c7",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/parser.gcr": "e3bdcc335d90258b2f4dc8566ff21a3ecdefae12c2eaf8441ef0f476f2c5b937",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/prelude.gcr": "8a5a48adf38bd65d553357ab5d14b7ea615e4a5c04327cfb9fc71c9b5a1a6ffe",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/serde.gcr": "5e60e0b01c7edf2085db6075afc1c3e269abf7a20aa49cbcf777ef9873b8599b",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/serde_json.gcr": "33056ab044eaf7f42d817d0846d55949103333b86aa7fdb103165967ab01dd55",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/snapshot.gcr": "4148c5c2588739edc0ae23290fdc29440457fbc768d76d728671888f45fce567",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/testing.gcr": "ec33a6255c6bdfcaf445f87856b93edc5e35b4b93050b95e0496a89a5389a512",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/value.gcr": "9466111185adb08b65bced1d0fcda02b6b0bca1bcb8f513e5b4e2736f4594ec0",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/src/vm.gcr": "e465d7955a208d191717472f78395ef530b7eba71c5ac6ea0cf4ff02a604596e"
+    },
+    "binaries_sha256": {
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/release/gcr": "5cacbaa96652c464d6ce849519006d66cd8ba7685423f3c0efe14df43ecc7736",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/reference/target/release/funct-reference": "adc2bdf44240f5d402a8c09346be0bc0a1eaa67d9fdbc79f05f5d56e117dbf3d",
+      "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/funct-batch-aot": "50ef233cf7077e1474375c32835851bd8ccc42a9c1320d4111de46a82846a9d1"
+    },
+    "runtime_environment": {
+      "GCR_GC_WORKERS": "1",
+      "GCR_NURSERY_MB": "16",
+      "GCR_TENURED_MB": "256"
+    },
+    "warmup": 1,
+    "samples": 5,
+    "forks": 3,
+    "order_seed": 20261023,
+    "scope": "Fresh VM per eval; file IO, output and Rust drop included. JIT compilation excluded from workload intervals; included in process wall time."
+  },
+  "cases": [
+    "fib",
+    "loops",
+    "collatz",
+    "list",
+    "startup",
+    "demo",
+    "tests",
+    "lex-chess",
+    "parse-chess"
+  ],
+  "processes": [
+    {
+      "language": "rust",
+      "fork": 0,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/reference/target/release/funct-reference",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 14.630808499990962,
+      "outside_workload_s": 0.2827034189909625,
+      "peak_rss_bytes": 10469376,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 328362250,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 327708625,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 326693042,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 325924584,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 327983500,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 328576417,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 384668958,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 383823250,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 380751333,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 381386542,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 380561166,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 380727000,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1637814917,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1637293292,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1636370042,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1639242542,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1636098083,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1637265750,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 16583375,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 15699083,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 15881166,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 15787250,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 16002958,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 16549375,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 232583,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 105583,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 95417,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 98792,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 87625,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 86417,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 273500,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 196542,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 174208,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 177042,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 169875,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 174958,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 26523625,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 25166709,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 25711417,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 25086125,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 25146166,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 24897083,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 884041,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 903791,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 819791,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 812750,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 812000,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 799542,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1789042,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 1799667,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1822083,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1900250,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1792666,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1811291,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "       14.62 real        14.11 user         0.21 sys\n            10469376  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 808  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   1  voluntary context switches\n                5467  involuntary context switches\n        289193403866  instructions retired\n         47713127964  cycles elapsed\n             9077048  peak memory footprint\n"
+    },
+    {
+      "language": "jit",
+      "fork": 0,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/release/gcr",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct",
+        "--jit",
+        "--",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 111.89702383294934,
+      "outside_workload_s": 95.93155574594934,
+      "peak_rss_bytes": 2058649600,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 362695125,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 357021625,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 357504791,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 362133042,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 360543417,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 356988625,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 430692167,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 424847375,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 428482417,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 427299875,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 426377083,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 429081709,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1823011083,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1821881459,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1819747875,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1828829916,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1859621125,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1859930708,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 10745333,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 13096875,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 10542333,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 10446667,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 10267875,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 10215167,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 181209,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 82583,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 62542,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 64959,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 67292,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 59833,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 291709,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 159167,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 140875,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 134708,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 128500,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 128459,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 24999125,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 25813084,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 23237208,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 23590333,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 24068667,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 25982125,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 862959,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 801750,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 774167,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 791125,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 1193958,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 760333,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1267000,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 2064917,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1247708,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1292167,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1372375,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1843583,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "      111.89 real       110.35 user         1.35 sys\n          2058649600  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              140181  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n               27904  involuntary context switches\n       1334029239297  instructions retired\n        373751637984  cycles elapsed\n          1334281824  peak memory footprint\n",
+      "gc": {
+        "gc_minor": 477,
+        "gc_major": 1,
+        "gc_pause_total_ms": 37.572,
+        "gc_pause_max_ms": 2.8227,
+        "gc_pause_p50_ms": 0.0284,
+        "gc_pause_p99_ms": 1.0638,
+        "gc_elapsed_total_ms": 37.572,
+        "gc_reclaimed_bytes": 7951727120,
+        "gc_promoted_bytes": 44253744,
+        "peak_heap_bytes": 48171184,
+        "alloc_objects": 196465041,
+        "alloc_bytes": 7980803760,
+        "gc_events_retained": 478,
+        "gc_pause_quantile_error_ratio": 0,
+        "native_buffer_bytes": 0,
+        "native_buffer_peak_bytes": 0,
+        "native_registry_bytes": 1669957,
+        "native_registry_peak_bytes": 1959133,
+        "native_pressure_collections": 1,
+        "process_collector_scratch_bytes": 24576,
+        "process_collector_scratch_peak_bytes": 24576
+      }
+    },
+    {
+      "language": "aot",
+      "fork": 0,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/funct-batch-aot",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 15.007169667049311,
+      "outside_workload_s": 0.24238449704931142,
+      "peak_rss_bytes": 70664192,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 348634459,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 338645833,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 337380125,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 338181750,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 337712916,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 338954750,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 396143167,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 390414875,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 390559750,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 394149584,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 392840750,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 394387500,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1690425375,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1687542250,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1689265000,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1707600666,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1667927542,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1698357125,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 10545500,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 10130958,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 10531500,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 9867917,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 10309917,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 10113083,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 231792,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 106917,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 75333,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 70416,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 67042,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 55792,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 461625,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 199625,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 147000,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 140125,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 136667,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 134250,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 24450584,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 24594042,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 25084959,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 25121625,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 24594833,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 24537959,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 794250,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 803375,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 786042,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 1354250,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 876041,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 854625,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1390250,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 1525292,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1349500,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1274666,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1648042,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1295959,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "       15.00 real        14.61 user         0.11 sys\n            70664192  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4472  page reclaims\n                  10  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                5335  involuntary context switches\n        306726771025  instructions retired\n         49046847085  cycles elapsed\n            67158400  peak memory footprint\n",
+      "gc": {
+        "gc_minor": 476,
+        "gc_major": 0,
+        "gc_pause_total_ms": 36.1142,
+        "gc_pause_max_ms": 1.5105,
+        "gc_pause_p50_ms": 0.028,
+        "gc_pause_p99_ms": 1.031,
+        "gc_elapsed_total_ms": 36.1142,
+        "gc_reclaimed_bytes": 7936000392,
+        "gc_promoted_bytes": 45483096,
+        "peak_heap_bytes": 61088992,
+        "alloc_objects": 196465047,
+        "alloc_bytes": 7980803936,
+        "gc_events_retained": 476,
+        "gc_pause_quantile_error_ratio": 0,
+        "native_buffer_bytes": 0,
+        "native_buffer_peak_bytes": 0,
+        "native_registry_bytes": 2026273,
+        "native_registry_peak_bytes": 2146006,
+        "native_pressure_collections": 0,
+        "process_collector_scratch_bytes": 24576,
+        "process_collector_scratch_peak_bytes": 24576
+      }
+    },
+    {
+      "language": "jit",
+      "fork": 1,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/release/gcr",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct",
+        "--jit",
+        "--",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 111.97878133400809,
+      "outside_workload_s": 96.61618412300808,
+      "peak_rss_bytes": 2080931840,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 345015042,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 348195583,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 351467583,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 352457250,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 349771167,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 349047500,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 410608125,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 408687666,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 410660709,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 410331792,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 412653916,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 413812500,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1766859000,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1767077250,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1756999542,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1743378541,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1744406625,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1786507917,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 10998333,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 13170125,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 10426792,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 10701166,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 10293125,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 10774334,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 170333,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 72583,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 60292,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 55542,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 58000,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 52084,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 327416,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 168417,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 143708,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 142584,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 128583,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 140209,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 25945500,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 26425334,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 25974625,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 24225375,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 23488959,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 25753916,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 895834,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 907292,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 883583,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 874667,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 1352208,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 878334,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1351583,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 2231000,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1306375,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1303125,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1269792,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1708375,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "      111.97 real       110.50 user         1.23 sys\n          2080931840  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              141331  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n               31196  involuntary context switches\n       1333497653533  instructions retired\n        373323346646  cycles elapsed\n          1335805512  peak memory footprint\n",
+      "gc": {
+        "gc_minor": 477,
+        "gc_major": 1,
+        "gc_pause_total_ms": 37.9831,
+        "gc_pause_max_ms": 2.9338,
+        "gc_pause_p50_ms": 0.0271,
+        "gc_pause_p99_ms": 1.1619,
+        "gc_elapsed_total_ms": 37.9831,
+        "gc_reclaimed_bytes": 7951727120,
+        "gc_promoted_bytes": 44253744,
+        "peak_heap_bytes": 48171184,
+        "alloc_objects": 196465041,
+        "alloc_bytes": 7980803760,
+        "gc_events_retained": 478,
+        "gc_pause_quantile_error_ratio": 0,
+        "native_buffer_bytes": 0,
+        "native_buffer_peak_bytes": 0,
+        "native_registry_bytes": 1669957,
+        "native_registry_peak_bytes": 1959133,
+        "native_pressure_collections": 1,
+        "process_collector_scratch_bytes": 24576,
+        "process_collector_scratch_peak_bytes": 24576
+      }
+    },
+    {
+      "language": "aot",
+      "fork": 1,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/funct-batch-aot",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 14.835796167026274,
+      "outside_workload_s": 0.008847291026274462,
+      "peak_rss_bytes": 71073792,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 342134417,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 339335833,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 339071875,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 342141208,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 341380667,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 342334292,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 392141500,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 388833208,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 391310542,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 391825958,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 391437083,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 395941458,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1690509084,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1689493083,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1699439709,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1695136583,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1698056042,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1728678166,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 10397042,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 9789084,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 10666459,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 10654166,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 10166666,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 10305916,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 261666,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 108958,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 80167,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 72542,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 67042,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 61958,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 280125,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 170375,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 158208,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 152583,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 146459,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 150583,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 24802542,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 24945959,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 25488334,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 24608375,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 25363167,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 24982000,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 898333,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 924667,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 915750,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 1421042,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 828833,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 802417,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1341875,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 1394958,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1257709,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1310541,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1529750,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1241917,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "       14.83 real        14.65 user         0.15 sys\n            71073792  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4497  page reclaims\n                  10  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                5185  involuntary context switches\n        306735600182  instructions retired\n         49294625568  cycles elapsed\n            67568000  peak memory footprint\n",
+      "gc": {
+        "gc_minor": 476,
+        "gc_major": 0,
+        "gc_pause_total_ms": 36.3407,
+        "gc_pause_max_ms": 1.6684,
+        "gc_pause_p50_ms": 0.0291,
+        "gc_pause_p99_ms": 1.0881,
+        "gc_elapsed_total_ms": 36.3407,
+        "gc_reclaimed_bytes": 7936000392,
+        "gc_promoted_bytes": 45483096,
+        "peak_heap_bytes": 61088992,
+        "alloc_objects": 196465047,
+        "alloc_bytes": 7980803936,
+        "gc_events_retained": 476,
+        "gc_pause_quantile_error_ratio": 0,
+        "native_buffer_bytes": 0,
+        "native_buffer_peak_bytes": 0,
+        "native_registry_bytes": 2026273,
+        "native_registry_peak_bytes": 2146006,
+        "native_pressure_collections": 0,
+        "process_collector_scratch_bytes": 24576,
+        "process_collector_scratch_peak_bytes": 24576
+      }
+    },
+    {
+      "language": "rust",
+      "fork": 1,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/reference/target/release/funct-reference",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 14.268901708011981,
+      "outside_workload_s": 0.00642999901198138,
+      "peak_rss_bytes": 10305536,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 329730500,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 327418542,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 329387334,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 332180125,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 329795917,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 328070334,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 380181625,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 377844500,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 379622875,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 379840375,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 380744250,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 379291417,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1628314084,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1633214709,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1616032083,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1620358417,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1619287542,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1629088791,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 16212792,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 16277250,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 15823917,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 15594750,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 15611500,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 15580416,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 190959,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 106250,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 85417,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 82708,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 85541,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 94250,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 261958,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 198500,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 226875,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 229916,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 199250,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 183291,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 25670042,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 25033708,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 24768417,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 24664750,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 24565833,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 24556250,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 807250,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 831083,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 842250,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 840958,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 819709,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 791375,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1773875,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 1919666,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1823625,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1782791,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1784583,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1746584,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "       14.26 real        14.11 user         0.13 sys\n            10305536  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 798  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   1  voluntary context switches\n                5043  involuntary context switches\n        289130161570  instructions retired\n         47372074054  cycles elapsed\n             8913208  peak memory footprint\n"
+    },
+    {
+      "language": "jit",
+      "fork": 2,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/release/gcr",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct",
+        "--jit",
+        "--",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 113.43632495898055,
+      "outside_workload_s": 97.70249320698055,
+      "peak_rss_bytes": 2095104000,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 361279667,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 353880417,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 354502625,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 357152917,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 355424333,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 378075625,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 427355708,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 419816750,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 418489209,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 421924000,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 420867292,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 416350791,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1774706250,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1786006041,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1815075541,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1809093667,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1804459417,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1826500834,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 10508917,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 13458333,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 10785542,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 10351000,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 10575375,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 10242250,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 236583,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 98583,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 68666,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 63875,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 63875,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 63625,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 331458,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 159500,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 159583,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 180000,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 214750,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 173792,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 25809209,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 25404542,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 24099459,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 24521875,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 23803041,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 26552667,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 876125,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 812459,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 787792,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 786500,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 1199208,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 828917,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1361625,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 2538666,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1352333,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1313209,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1311917,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1775417,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "      113.43 real       112.18 user         1.02 sys\n          2095104000  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n              143363  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n               34372  involuntary context switches\n       1333847707428  instructions retired\n        377266732213  cycles elapsed\n          1336870832  peak memory footprint\n",
+      "gc": {
+        "gc_minor": 477,
+        "gc_major": 1,
+        "gc_pause_total_ms": 38.334,
+        "gc_pause_max_ms": 3.4763,
+        "gc_pause_p50_ms": 0.0287,
+        "gc_pause_p99_ms": 1.1024,
+        "gc_elapsed_total_ms": 38.334,
+        "gc_reclaimed_bytes": 7951727120,
+        "gc_promoted_bytes": 44253744,
+        "peak_heap_bytes": 48171184,
+        "alloc_objects": 196465041,
+        "alloc_bytes": 7980803760,
+        "gc_events_retained": 478,
+        "gc_pause_quantile_error_ratio": 0,
+        "native_buffer_bytes": 0,
+        "native_buffer_peak_bytes": 0,
+        "native_registry_bytes": 1669957,
+        "native_registry_peak_bytes": 1959133,
+        "native_pressure_collections": 1,
+        "process_collector_scratch_bytes": 24576,
+        "process_collector_scratch_peak_bytes": 24576
+      }
+    },
+    {
+      "language": "aot",
+      "fork": 2,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/performance-comparison/funct-batch-aot",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 15.102041666978039,
+      "outside_workload_s": 0.008943997978038354,
+      "peak_rss_bytes": 70778880,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 341761167,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 339146959,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 336756291,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 338684125,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 339107000,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 340034792,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 394305083,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 392964667,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 392716750,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 404190542,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 396078750,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 398295542,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1722502334,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1717142500,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1716011208,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1713094625,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1737861916,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1811011250,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 10627625,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 10373542,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 10700541,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 11519458,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 10872375,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 10510917,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 238958,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 90083,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 70125,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 61417,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 57584,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 55375,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 251875,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 155000,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 143083,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 137625,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 131292,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 131625,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 25748917,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 26699167,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 33456459,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 29908042,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 38911084,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 26449875,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 856333,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 848958,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 831625,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 1386541,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 841750,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 837875,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1359542,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 1475791,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1320834,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1379333,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1663792,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1327750,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "       15.09 real        14.95 user         0.08 sys\n            70778880  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4479  page reclaims\n                  10  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                6495  involuntary context switches\n        306701828853  instructions retired\n         49600207269  cycles elapsed\n            67289496  peak memory footprint\n",
+      "gc": {
+        "gc_minor": 476,
+        "gc_major": 0,
+        "gc_pause_total_ms": 40.4342,
+        "gc_pause_max_ms": 2.8535,
+        "gc_pause_p50_ms": 0.0275,
+        "gc_pause_p99_ms": 1.3558,
+        "gc_elapsed_total_ms": 40.4342,
+        "gc_reclaimed_bytes": 7936000392,
+        "gc_promoted_bytes": 45483096,
+        "peak_heap_bytes": 61088992,
+        "alloc_objects": 196465047,
+        "alloc_bytes": 7980803936,
+        "gc_events_retained": 476,
+        "gc_pause_quantile_error_ratio": 0,
+        "native_buffer_bytes": 0,
+        "native_buffer_peak_bytes": 0,
+        "native_registry_bytes": 2026273,
+        "native_registry_peak_bytes": 2146006,
+        "native_pressure_collections": 0,
+        "process_collector_scratch_bytes": 24576,
+        "process_collector_scratch_peak_bytes": 24576
+      }
+    },
+    {
+      "language": "rust",
+      "fork": 2,
+      "command": [
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/reference/target/release/funct-reference",
+        "bench",
+        "1",
+        "5",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/fib.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/loops.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/collatz.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/list.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/bench/funct/workloads/startup.ft",
+        "run",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/demo.ft",
+        "test",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples",
+        "lex",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft",
+        "parse",
+        "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft"
+      ],
+      "wall_s": 14.38782991701737,
+      "outside_workload_s": 0.005999000017370193,
+      "peak_rss_bytes": 8650752,
+      "records": [
+        {
+          "case": "fib",
+          "index": 0,
+          "ns": 334054208,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 1,
+          "ns": 331814166,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 2,
+          "ns": 332356750,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 3,
+          "ns": 335843083,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 4,
+          "ns": 332139000,
+          "output": "832040\n"
+        },
+        {
+          "case": "fib",
+          "index": 5,
+          "ns": 351875959,
+          "output": "832040\n"
+        },
+        {
+          "case": "loops",
+          "index": 0,
+          "ns": 390180250,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 1,
+          "ns": 380104292,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 2,
+          "ns": 378478375,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 3,
+          "ns": 382153250,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 4,
+          "ns": 380504792,
+          "output": "10282281\n"
+        },
+        {
+          "case": "loops",
+          "index": 5,
+          "ns": 381848000,
+          "output": "10282281\n"
+        },
+        {
+          "case": "collatz",
+          "index": 0,
+          "ns": 1632082000,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 1,
+          "ns": 1632345875,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 2,
+          "ns": 1633839083,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 3,
+          "ns": 1640607375,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 4,
+          "ns": 1637310208,
+          "output": "10753840\n"
+        },
+        {
+          "case": "collatz",
+          "index": 5,
+          "ns": 1638462083,
+          "output": "10753840\n"
+        },
+        {
+          "case": "list",
+          "index": 0,
+          "ns": 15864292,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 1,
+          "ns": 15712750,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 2,
+          "ns": 15932583,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 3,
+          "ns": 16080667,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 4,
+          "ns": 16624792,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "list",
+          "index": 5,
+          "ns": 16266708,
+          "output": "166716670000\n"
+        },
+        {
+          "case": "startup",
+          "index": 0,
+          "ns": 268834,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 1,
+          "ns": 113500,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 2,
+          "ns": 89875,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 3,
+          "ns": 83667,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 4,
+          "ns": 79167,
+          "output": "1\n"
+        },
+        {
+          "case": "startup",
+          "index": 5,
+          "ns": 82791,
+          "output": "1\n"
+        },
+        {
+          "case": "demo",
+          "index": 0,
+          "ns": 242541,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 1,
+          "ns": 205833,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 2,
+          "ns": 181959,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 3,
+          "ns": 175375,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 4,
+          "ns": 171958,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "demo",
+          "index": 5,
+          "ns": 168583,
+          "output": "total area: 7.9269875\nhits: 0 -> 1\nhits: 1 -> 2\nsum = 7\ndone with 2 hits\n"
+        },
+        {
+          "case": "tests",
+          "index": 0,
+          "ns": 24458125,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 1,
+          "ns": 24004250,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 2,
+          "ns": 23582916,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 3,
+          "ns": 23522709,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 4,
+          "ns": 23460709,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "tests",
+          "index": 5,
+          "ns": 23464208,
+          "output": "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry.ft\n  test square_area_is_side_squared ... ok\n  test circle_area_is_pi_r_squared ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/geometry_test.ft\n  test areas_pipe_through_stdlib ... ok\n  test pattern_matching_on_shapes ... ok\n  test shapes_are_structural_values ... ok\n/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/ports/funct/examples/widgets/chess.ft\n  test initial_fen_is_the_standard_position ... ok\n  test pawns_get_double_push_only_from_home ... ok\n  test en_passant_is_generated_and_captures ... ok\n  test castling_through_check_is_illegal ... ok\n  test checkmate_is_detected_with_san_suffix ... ok\n  test engine_move_parsing_round_trips ... ok\n  test info_score_lines_parse ... ok\n\ntest result: ok. 12 passed; 0 failed\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 0,
+          "ns": 784541,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 1,
+          "ns": 772375,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 2,
+          "ns": 776125,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 3,
+          "ns": 771000,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 4,
+          "ns": 767542,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "lex-chess",
+          "index": 5,
+          "ns": 768708,
+          "output": "tokens=16748\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 0,
+          "ns": 1712292,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 1,
+          "ns": 1718834,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 2,
+          "ns": 1740709,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 3,
+          "ns": 1733458,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 4,
+          "ns": 1740250,
+          "output": "items=81\n"
+        },
+        {
+          "case": "parse-chess",
+          "index": 5,
+          "ns": 1707542,
+          "output": "items=81\n"
+        }
+      ],
+      "stderr": "       14.38 real        14.20 user         0.14 sys\n             8650752  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 697  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   2  voluntary context switches\n                5892  involuntary context switches\n        289159527926  instructions retired\n         47531920899  cycles elapsed\n             7258424  peak memory footprint\n"
+    }
+  ],
+  "median_ms": {
+    "fib": {
+      "rust": 329.387334,
+      "aot": 339.071875,
+      "jit": 355.424333
+    },
+    "loops": {
+      "rust": 380.561166,
+      "aot": 392.84075,
+      "jit": 419.81675
+    },
+    "collatz": {
+      "rust": 1636.098083,
+      "aot": 1699.439709,
+      "jit": 1809.093667
+    },
+    "list": {
+      "rust": 15.881166,
+      "aot": 10.373542,
+      "jit": 10.542333
+    },
+    "startup": {
+      "rust": 0.087625,
+      "aot": 0.070125,
+      "jit": 0.063875
+    },
+    "demo": {
+      "rust": 0.181959,
+      "aot": 0.146459,
+      "jit": 0.143708
+    },
+    "tests": {
+      "rust": 24.66475,
+      "aot": 25.121625,
+      "jit": 24.521875
+    },
+    "lex-chess": {
+      "rust": 0.812,
+      "aot": 0.848958,
+      "jit": 0.828917
+    },
+    "parse-chess": {
+      "rust": 1.784583,
+      "aot": 1.3495,
+      "jit": 1.352333
+    }
+  }
+}

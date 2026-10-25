@@ -35,4 +35,23 @@ fn main() {
         std::env::var("TARGET").unwrap()
     );
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/jit_bridge.cpp");
+    let llvm_config = std::env::var_os("DEP_LLVM_21_CONFIG_PATH")
+        .expect("llvm-sys supplies its matching llvm-config path");
+    let output = std::process::Command::new(llvm_config).arg("--cxxflags")
+        .output().expect("execute llvm-config --cxxflags");
+    assert!(output.status.success(), "llvm-config --cxxflags failed");
+    let flags = String::from_utf8(output.stdout).expect("LLVM compiler flags are UTF-8");
+    let mut bridge = cc::Build::new();
+    bridge.cpp(true).file("src/jit_bridge.cpp");
+    let words = shlex::split(&flags).expect("LLVM compiler flags have valid shell quoting");
+    let mut words = words.iter();
+    while let Some(flag) = words.next() {
+        if flag == "-I" {
+            bridge.flag("-isystem").flag(words.next().expect("LLVM -I has an include path"));
+        } else if let Some(include) = flag.strip_prefix("-I") {
+            bridge.flag("-isystem").flag(include);
+        } else { bridge.flag(flag); }
+    }
+    bridge.std("c++17").compile("gcr_eager_bridge");
 }

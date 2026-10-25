@@ -11,27 +11,6 @@ use std::collections::{BTreeSet, HashMap};
 use crate::core::*;
 type Live = BTreeSet<LocalId>;
 
-#[derive(Default)]
-pub(crate) struct RootLiveness { dead: HashMap<usize, Live> }
-impl RootLiveness {
-    pub(crate) fn analyze(program: &CoreProgram) -> Self {
-        let mut result = Self::default();
-        let diverging = crate::codegen_effects::diverging_functions(program);
-        for function in &program.funcs {
-            if function.is_extern { continue; }
-            let mut analysis = Analysis {
-                dead: &mut result.dead, diverging: &diverging, loops: Vec::new(), onces: Vec::new(), loop_defs: Vec::new(), keep_loop_defs: true, crossing: None, definitions: Live::new(),
-                all: function.locals.iter().enumerate().filter_map(|(id, repr)| matches!(repr, Repr::Ref(_)).then_some(id as LocalId)).collect(),
-            };
-            analysis.block(&function.body, Live::new());
-        }
-        result
-    }
-    pub(crate) fn dead(&self, statement: &CoreStmt) -> Option<&Live> {
-        self.dead.get(&(statement as *const CoreStmt as usize))
-    }
-}
-
 /// For each statement of `function` (by address), the `tracked` locals live
 /// before it but not after it.
 pub(crate) fn dead_after(function: &CoreFn, tracked: &Live) -> HashMap<usize, Live> {

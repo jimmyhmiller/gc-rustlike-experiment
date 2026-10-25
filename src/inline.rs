@@ -27,8 +27,9 @@ const FOLDED: usize = 24;
 /// The size limit for a `#[inline]` callee, or one given an object the
 /// caller allocated (which inlining may let `crate::sroa` replace).
 const HINTED: usize = 400;
-/// The size limit for a callee with one call site (inlining it copies
-/// nothing, so this only bounds the caller's size).
+/// Bound single-use inlining as well as duplicated inlining. Even one copy
+/// of a large body can make optimization and register allocation quadratic.
+/// Hot dispatch loops have their separate state-sensitive budget below.
 const SINGLE_SITE: usize = 20000;
 /// Stop growing a caller past this many nodes (except `#[inline(always)]`).
 const CALLER_LIMIT: usize = 60000;
@@ -59,11 +60,17 @@ pub fn inline_program(prog: &mut CoreProgram) {
     let n = prog.funcs.len();
     let mut calls: Vec<Vec<FuncId>> = vec![Vec::new(); n];
     let mut sites = vec![0usize; n];
+    let mut string_layouts = std::collections::BTreeSet::new();
     for (id, f) in prog.funcs.iter().enumerate() {
         if f.is_extern { continue; }
         visit_block(&f.body, &mut |e| if let CoreExprKind::Call(g, _) = e.kind.as_ref() {
             calls[id].push(*g);
             sites[*g as usize] += 1;
+        });
+        visit_block(&f.body, &mut |e| {
+            if matches!(e.kind.as_ref(), CoreExprKind::ConstStr(_)) {
+                if let Repr::Ref(layout) = e.repr { string_layouts.insert(layout); }
+            }
         });
     }
     let recursive = recursive_functions(&calls);
@@ -81,7 +88,8 @@ pub fn inline_program(prog: &mut CoreProgram) {
         let known = known_variants(&caller);
         let closures = known_closures(&caller);
         let defs = definition_counts(&caller);
-        let mut cx = Inliner { funcs: &prog.funcs, candidate: &candidate, recursive: &recursive, caller: id, sizes: &sizes, sites: &sites, size: sizes[id], caller_size: sizes[id], loops: 0, label: max_label(&caller.body) + 1, local_objects, known, closures, defs, chain: Vec::new() };
+        let loop_locals = loop_locals(&caller);
+        let mut cx = Inliner { string_layouts: &string_layouts, funcs: &prog.funcs, candidate: &candidate, recursive: &recursive, caller: id, sizes: &sizes, sites: &sites, size: sizes[id], caller_size: sizes[id], loops: 0, conditional_depth: 0, loop_conditionals: Vec::new(), loop_locals, label: max_label(&caller.body) + 1, local_objects, known, closures, defs, chain: Vec::new() };
         let mut body = std::mem::replace(&mut caller.body, CoreBlock { stmts: vec![], tail: None });
         cx.block(&mut body, &mut caller);
         caller.body = body;
@@ -92,6 +100,7 @@ pub fn inline_program(prog: &mut CoreProgram) {
 }
 
 struct Inliner<'a> {
+    string_layouts: &'a std::collections::BTreeSet<LayoutId>,
     funcs: &'a [CoreFn],
     candidate: &'a [bool],
     recursive: &'a [bool],
@@ -105,6 +114,9 @@ struct Inliner<'a> {
     caller_size: usize,
     /// How many of the caller's loops enclose the current position.
     loops: u32,
+    conditional_depth: usize,
+    loop_conditionals: Vec<usize>,
+    loop_locals: Vec<bool>,
     /// The caller's next unused `Once` label.
     label: u32,
     /// Caller locals bound to an object allocated in the caller.
@@ -124,14 +136,40 @@ impl Inliner<'_> {
         let g = g as usize;
         if !self.candidate[g] || g == self.caller || self.chain.contains(&g) { return false; }
         let size = self.sizes[g];
-        // In the caller's own loop (not a body copied into it).
-        let dispatch = self.loops > 0 && self.chain.is_empty() && self.caller_size <= LOOP_CALLER
+        // A large single-use body is profitable on repeated paths (inside
+        // loops or recursive components), but copying a one-shot initializer
+        // only grows the optimization unit. Keep its call boundary.
+        // A large conditional helper in a small dispatch shell creates a
+        // large join region without removing repeated call overhead. Keep it
+        // separate; unconditional dispatch-loop calls still get their full
+        // budget, and explicit inline hints / variant specialization remain.
+        let single_site = self.sites[g] == 1 && size <= SINGLE_SITE
+            && (size <= HINTED || self.loops > 0 || self.recursive[g])
+            && (self.conditional_depth == 0 || self.caller_size > LOOP_CALLER || size <= HINTED);
+        // Spend the large dispatch budget only when a call exposes evolving
+        // loop state. Repeated factories and immutable-string workers do not
+        // benefit from copying their large bodies into a surrounding driver.
+        // Scalar induction locals and mutable reference receivers do.
+        // This is the caller's own loop, not a body copied into it.
+        let loop_state = args.iter().any(|arg| match arg.kind.as_ref() {
+            CoreExprKind::ConstInt(..) | CoreExprKind::ConstFloat(..) | CoreExprKind::ConstBool(..)
+            | CoreExprKind::ConstChar(..) | CoreExprKind::ConstStr(..) | CoreExprKind::ConstZero(..) | CoreExprKind::Unit => false,
+            CoreExprKind::Local(local) => match arg.repr {
+                Repr::Ref(layout) => !self.string_layouts.contains(&layout),
+                Repr::Scalar(_) => self.defs.get(*local as usize).is_some_and(|&n| n > 1)
+                    || self.loop_locals.get(*local as usize).copied().unwrap_or(true),
+                Repr::Value(_) => true,
+                Repr::Unit => false,
+            },
+            _ => true,
+        });
+        let dispatch = loop_state && self.loops > 0 && self.loop_conditionals.last() == Some(&self.conditional_depth) && self.chain.is_empty() && self.caller_size <= LOOP_CALLER
             && self.sites[g] <= LOOP_SITES && self.size + size <= CALLER_LIMIT;
         if dispatch { return true; }
         if self.recursive[g] {
             // Copying a recursive function is bounded by `chain`: only its
             // one call site, or a copy specialized down to a few nodes.
-            return (self.sites[g] == 1 && size <= SINGLE_SITE && self.size + size <= CALLER_LIMIT)
+            return (single_site && self.size + size <= CALLER_LIMIT)
                 || self.folded_size(g, args).is_some_and(|folded| folded <= FOLDED);
         }
         let hint = self.funcs[g].hints.inline;
@@ -139,13 +177,18 @@ impl Inliner<'_> {
         if self.size + size > CALLER_LIMIT { return false; }
         size <= SMALL
             || ((hint == InlineHint::Hint || args.iter().any(|a| self.is_local_object(a))) && size <= HINTED)
-            || (self.sites[g] == 1 && size <= SINGLE_SITE)
+            || single_site
             || self.folded_size(g, args).is_some_and(|folded| folded <= FOLDED)
     }
 
     /// The size of `g`'s body once its matches on the arguments that are
     /// known variants are decided, if any argument is one.
     fn folded_size(&self, g: usize, args: &[CoreExpr]) -> Option<usize> {
+        // Most calls have no known-variant arguments. Avoid walking the
+        // entire callee to collect assignments when no specialization can fire.
+        if !args.iter().any(|a| matches!(a.kind.as_ref(), CoreExprKind::Local(l) if self.known.contains_key(l))) {
+            return None;
+        }
         let callee = &self.funcs[g];
         let assigned = assigned_locals(callee);
         let known: HashMap<LocalId, u32> = args.iter().enumerate().filter_map(|(i, a)| match a.kind.as_ref() {
@@ -181,12 +224,25 @@ impl Inliner<'_> {
 
     fn expr(&mut self, e: &mut CoreExpr, caller: &mut CoreFn) {
         match e.kind.as_mut() {
-            CoreExprKind::If(c, y, n) => { self.expr(c, caller); self.block(y, caller); self.block(n, caller); }
-            CoreExprKind::Loop(b) => { self.loops += 1; self.block(b, caller); self.loops -= 1; }
+            CoreExprKind::If(c, y, n) => {
+                self.expr(c, caller);
+                self.conditional_depth += 1;
+                self.block(y, caller); self.block(n, caller);
+                self.conditional_depth -= 1;
+            }
+            CoreExprKind::Loop(b) => {
+                self.loops += 1;
+                self.loop_conditionals.push(self.conditional_depth);
+                self.block(b, caller);
+                self.loop_conditionals.pop();
+                self.loops -= 1;
+            }
             CoreExprKind::Block(b) | CoreExprKind::Once { body: b, .. } => self.block(b, caller),
             CoreExprKind::Match { scrutinee, arms } | CoreExprKind::ValueMatch { scrutinee, arms } => {
                 self.expr(scrutinee, caller);
+                self.conditional_depth += 1;
                 for a in arms { self.expr(&mut a.body, caller); }
+                self.conditional_depth -= 1;
             }
             _ => for c in crate::copyprop::children_mut(e) { self.expr(c, caller) },
         }
@@ -437,6 +493,31 @@ fn known_closures(f: &CoreFn) -> HashMap<LocalId, (FuncId, Vec<CoreExpr>)> {
 
 /// How many times each local of `f` is defined (parameters and captures
 /// once on entry, then `let`s, assignments and match bindings).
+/// A static definition inside a loop is evaluated anew on each iteration.
+/// ANF introduces such one-definition temporaries for loop-carried arguments.
+fn loop_locals(function: &CoreFn) -> Vec<bool> {
+    let mut locals = vec![false; function.locals.len()];
+    fn block(block: &CoreBlock, locals: &mut [bool]) {
+        for statement in &block.stmts {
+            if let CoreStmt::Let(local, _) = statement { locals[*local as usize] = true; }
+        }
+    }
+    visit_block(&function.body, &mut |expression| {
+        if let CoreExprKind::Loop(body) = expression.kind.as_ref() {
+            block(body, &mut locals);
+            visit_block(body, &mut |expression| match expression.kind.as_ref() {
+                CoreExprKind::Block(body) | CoreExprKind::Once { body, .. } | CoreExprKind::Loop(body) => block(body, &mut locals),
+                CoreExprKind::If(_, yes, no) => { block(yes, &mut locals); block(no, &mut locals); }
+                CoreExprKind::Match { arms, .. } | CoreExprKind::ValueMatch { arms, .. } => {
+                    for arm in arms { for local in &arm.binds { locals[*local as usize] = true; } }
+                }
+                _ => {},
+            });
+        }
+    });
+    locals
+}
+
 fn definition_counts(f: &CoreFn) -> Vec<u32> {
     let mut defs = vec![0u32; f.locals.len()];
     for d in defs.iter_mut().take(f.closure_captures.len() + f.params.len()) { *d += 1; }
@@ -604,7 +685,7 @@ fn max_label(b: &CoreBlock) -> u32 {
 }
 
 /// Functions on a call-graph cycle (including direct self-calls).
-fn recursive_functions(calls: &[Vec<FuncId>]) -> Vec<bool> {
+pub(crate) fn recursive_functions(calls: &[Vec<FuncId>]) -> Vec<bool> {
     // Tarjan's strongly connected components, iteratively.
     let n = calls.len();
     let mut index = vec![usize::MAX; n];
@@ -670,4 +751,41 @@ fn postorder(calls: &[Vec<FuncId>]) -> Vec<usize> {
         }
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_dispatch_calls_are_inlined_only_when_unconditional_in_the_loop() {
+        let operations = "x += 1;".repeat(220);
+        let source = format!(r#"
+            fn step(mut x: i64) -> i64 {{ {operations} x }}
+            #[inline(never)] fn direct(mut x: i64) -> i64 {{
+                loop {{ x = step(x); if x > 9 {{ return x; }} }}
+            }}
+            #[inline(never)] fn conditional(c: bool, mut x: i64) -> i64 {{
+                loop {{ if c {{ x = step(x); }} if x > 9 {{ return x; }} }}
+            }}
+            fn main() -> i64 {{ direct(0) + conditional(true, 0) }}
+        "#);
+        let (module, _) = crate::compile::parse_with_prelude(&source).unwrap();
+        let globals = crate::resolve::resolve_module(module).unwrap().globals;
+        set_enabled(false);
+        let lowered = crate::lower::lower_program(&globals);
+        set_enabled(true);
+        let mut program = lowered.unwrap();
+        let step = program.funcs.iter().position(|f| f.name == "step").unwrap() as FuncId;
+        inline_program(&mut program);
+        let calls_step = |name: &str| {
+            let body = &program.funcs.iter().find(|f| f.name == name).unwrap().body;
+            let mut found = false;
+            visit_block(body, &mut |expression| { found |= matches!(expression.kind.as_ref(), CoreExprKind::Call(id, _) if *id == step); });
+            found
+        };
+        assert!(!calls_step("direct"));
+        assert!(calls_step("conditional"));
+        assert_eq!(unsafe { crate::codegen::jit_run_i64(&program) }.unwrap(), 440);
+    }
 }

@@ -6,6 +6,12 @@
 //!
 //! Later phases add `build` (AOT) and `run` (JIT).
 
+// Keep the allocator choice at the CLI boundary. Embedders of gcrust retain
+// their own allocator, and LLVM continues to own its compilation contexts.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+
 use std::process::ExitCode;
 
 use gcrust::ast::ItemKind;
@@ -164,6 +170,7 @@ fn main() -> ExitCode {
     // `module` + the SourceMap (one entry per source: user / mod files / prelude),
     // attached to the lowered program (run/build) so spans resolve to their real
     // file:line:col.
+    let parse_phase = gcrust::timing::Phase::new("parse");
     let (module, sources) = if cmd == "parse" {
         let tokens = match lex(&src) {
             Ok(t) => t,
@@ -190,6 +197,7 @@ fn main() -> ExitCode {
         }
     };
 
+    drop(parse_phase);
     match cmd.as_str() {
         "parse" => {
             for item in &module.items {
@@ -214,7 +222,7 @@ fn main() -> ExitCode {
             // checked independently), so it can report ALL broken functions at
             // once, then the demand-driven lower pass to catch anything reachable
             // only through a generic instantiation.
-            let resolved = match resolve_module(module) {
+            let resolved = match gcrust::timing::measure("resolve", || resolve_module(module)) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
@@ -222,11 +230,11 @@ fn main() -> ExitCode {
                 }
             };
             let nsyms = resolved.globals.by_path.len();
-            if let Err(errs) = gcrust::lower::check_program(&resolved.globals) {
+            if let Err(errs) = gcrust::timing::measure("check", || gcrust::lower::check_program(&resolved.globals)) {
                 report_errors(path, &src, &errs);
                 return ExitCode::FAILURE;
             }
-            match lower_program(&resolved.globals) {
+            match gcrust::timing::measure("lower", || lower_program(&resolved.globals)) {
                 Ok(_) => {
                     println!("ok: {} top-level symbols, type-checks", nsyms);
                     ExitCode::SUCCESS
@@ -238,21 +246,17 @@ fn main() -> ExitCode {
             }
         }
         "run" => {
-            let resolved = match resolve_module(module) {
+            let resolved = match gcrust::timing::measure("resolve", || resolve_module(module)) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(errs) = gcrust::lower::check_program(&resolved.globals) {
-                report_errors(path, &src, &errs);
-                return ExitCode::FAILURE;
-            }
-            let mut prog = match lower_program(&resolved.globals) {
+            let mut prog = match gcrust::lower::check_and_lower(&resolved.globals) {
                 Ok(p) => p,
-                Err(e) => {
-                    eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
+                Err(errors) => {
+                    report_errors(path, &src, &errors);
                     return ExitCode::FAILURE;
                 }
             };
@@ -282,7 +286,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 let mut command = std::process::Command::new(&out);
-                if let Some(separator) = args.iter().position(|a| a == "--") {
+                if args.iter().any(|a| a == "--") {
                     command.args(&raw_args[separator + 1..]);
                 }
                 if driver_args.iter().any(|a| a == "--gc-stress") {
@@ -302,7 +306,7 @@ fn main() -> ExitCode {
                 let stress = driver_args.iter().any(|a| a == "--gc-stress")
                     || gcrust::runtime::configured_gc_stress();
                 let mut program_args = vec![std::ffi::OsString::from(path)];
-                if let Some(separator) = args.iter().position(|a| a == "--") {
+                if args.iter().any(|a| a == "--") {
                     program_args.extend(raw_args[separator + 1..].iter().cloned());
                 }
                 let mode = if stress { gcrust::codegen::GcRunMode::Stress } else { gcrust::codegen::GcRunMode::Generational };
@@ -345,21 +349,17 @@ fn main() -> ExitCode {
             };
             let out = out.unwrap_or_else(|| default_output(path, manifest.as_ref(), project_mode));
 
-            let resolved = match resolve_module(module) {
+            let resolved = match gcrust::timing::measure("resolve", || resolve_module(module)) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(errs) = gcrust::lower::check_program(&resolved.globals) {
-                report_errors(path, &src, &errs);
-                return ExitCode::FAILURE;
-            }
-            let mut prog = match lower_program(&resolved.globals) {
+            let mut prog = match gcrust::lower::check_and_lower(&resolved.globals) {
                 Ok(p) => p,
-                Err(e) => {
-                    eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
+                Err(errors) => {
+                    report_errors(path, &src, &errors);
                     return ExitCode::FAILURE;
                 }
             };
@@ -407,14 +407,14 @@ fn run_tests(path: &str, manifest: Option<&gcrust::manifest::Manifest>, driver_a
             return ExitCode::FAILURE;
         }
     };
-    let resolved = match resolve_module(module) {
+    let resolved = match gcrust::timing::measure("resolve", || resolve_module(module)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
             return ExitCode::FAILURE;
         }
     };
-    let mut prog = match lower_program(&resolved.globals) {
+    let mut prog = match gcrust::timing::measure("lower", || lower_program(&resolved.globals)) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}", gcrust::diag::render(path, &src, e.span, &e.msg));
@@ -674,18 +674,18 @@ fn run_emit(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let resolved = match resolve_module(module) {
+            let resolved = match gcrust::timing::measure("resolve", || resolve_module(module)) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", gcrust::diag::render(&path, &src, e.span, &e.msg));
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(errs) = gcrust::lower::check_program(&resolved.globals) {
+            if let Err(errs) = gcrust::timing::measure("check", || gcrust::lower::check_program(&resolved.globals)) {
                 report_errors(&path, &src, &errs);
                 return ExitCode::FAILURE;
             }
-            let prog = match lower_program(&resolved.globals) {
+            let prog = match gcrust::timing::measure("lower", || lower_program(&resolved.globals)) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{}", gcrust::diag::render(&path, &src, e.span, &e.msg));
@@ -695,8 +695,10 @@ fn run_emit(args: &[String]) -> ExitCode {
             // `llvm` is raw IR text (not JSON): default to the optimized IR that
             // actually runs; `--no-opt` shows the naive pre-O2 IR.
             if stage == "llvm" {
-                let optimize = !args.iter().any(|a| a == "--no-opt");
-                return match gcrust::codegen::emit_llvm_ir(&prog, optimize) {
+                let optimize = !args.iter().any(|a| a == "--no-opt" || a == "--no-llvm-opt");
+                return match if args.iter().any(|a| a == "--entry-only") {
+                    gcrust::codegen::emit_executable_llvm_ir(&prog, optimize)
+                } else { gcrust::codegen::emit_llvm_ir(&prog, optimize) } {
                     Ok(ir) => {
                         println!("{ir}");
                         ExitCode::SUCCESS
@@ -1312,7 +1314,7 @@ fn wrap_expr(head: &str, expr: &str) -> String {
 fn compile_and_run(src: &str, stress: bool) -> Result<i64, (String, String)> {
     let (module, _) = gcrust::compile::parse_with_prelude(src).map_err(|e| ("parse".into(), e.msg))?;
     let resolved = resolve_module(module).map_err(|e| ("resolve".into(), e.msg))?;
-    if let Err(errs) = gcrust::lower::check_program(&resolved.globals) {
+    if let Err(errs) = gcrust::timing::measure("check", || gcrust::lower::check_program(&resolved.globals)) {
         let msg = errs.iter().map(|e| e.msg.clone()).collect::<Vec<_>>().join("; ");
         return Err(("typecheck".into(), msg));
     }

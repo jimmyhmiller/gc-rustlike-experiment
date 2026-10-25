@@ -1,4 +1,4 @@
-# Release AOT comparison against Rust and the JVM
+# Release AOT and JIT comparison against Rust and the JVM
 
 Run from the repository root:
 
@@ -7,7 +7,7 @@ cargo build --workspace --release
 python3 bench/comparison/run.py
 ```
 
-Requires macOS (`/usr/bin/time -l` RSS units are bytes), Python 3, clang,
+Requires macOS (`/usr/bin/time -l` RSS units are bytes), Python 3,
 rustc, javac, and java. No language workloads run concurrently. Generated
 sources and binaries live under `target/performance-comparison`.
 
@@ -36,9 +36,9 @@ build with its release runtime. Java uses OpenJDK with `-Xms16m -Xmx512m
 -XX:+UseG1GC` and an English locale. gc-rust uses a 16 MiB nursery, 256 MiB
 per tenured semispace, and one collector worker. These are explicit configurations,
 not identical memory budgets. Inherited GCR runtime settings are cleared for
-execution. Build time is excluded. The clock C shim uses CLOCK_MONOTONIC through
-FFI, with both clock calls outside the workload body. It changes no runtime
-memory semantics.
+execution. AOT build time is excluded. Both gc-rust modes use the built-in monotonic
+`Instant` clock, with both clock calls outside the workload body. Historical
+results used a C clock shim; new results record the clock implementation.
 
 ## Interpretation limits
 
@@ -85,3 +85,24 @@ and the changed compiler/runtime separately in
 gc-rust, preserving the original nbody benchmark. It helps distinguish source
 layout choices from compiler/runtime improvements; its results must be labeled
 separately.
+
+## JIT comparison
+
+```sh
+cargo build --workspace --release
+python3 bench/comparison/run.py --languages gcr gcr-jit rust --output bench/comparison/jit-results.json
+```
+
+`gcr` remains AOT; `gcr-jit` executes the same generated source through
+`gcr run --jit`. Both modes compile eagerly with LLVM O3 before user entry.
+The workload medians exclude compilation. `wall_s` includes the
+entire process, including JIT compilation, startup, all warmup and measured
+iterations, and shutdown. `outside_workload_s` subtracts all recorded workload
+intervals from process wall time: it includes compilation, driver and runtime
+setup, timing output, and shutdown, and is **not** isolated compilation time.
+JIT RSS includes the compiler and LLVM as well as the workload. Signatures must
+match across AOT, JIT and Rust on every iteration. The JIT driver's final zero
+return-value line is checked separately from workload output.
+
+The checked-in `jit-results.json` records the original eager O3 JIT.
+Write new comparisons to a separate output file.

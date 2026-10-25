@@ -267,9 +267,13 @@ fn scheduler_matches_scan_model_for_random_dags_zero_durations_and_ties() {
         let workers = 1 + seed % 5;
         let w = workers.to_string();
         let expected = plan_model(&tasks, workers);
-        assert_eq!(value(run(1, &[&path, &w, "-"], false, seed < 2)), expected);
+        let native = run(1, &[&path, &w, "-"], false, seed < 2);
+        assert!(native.status.success(), "scheduler seed {seed} AOT: {}", String::from_utf8_lossy(&native.stderr));
+        assert_eq!(value(native), expected);
         if seed < 2 {
-            assert_eq!(value(run(1, &[&path, &w, "-"], true, true)), expected);
+            let jit = run(1, &[&path, &w, "-"], true, true);
+            assert!(jit.status.success(), "scheduler seed {seed} JIT: {}", String::from_utf8_lossy(&jit.stderr));
+            assert_eq!(value(jit), expected);
         }
     }
     let empty = f.write("empty.csv", "task,duration,depends\n");

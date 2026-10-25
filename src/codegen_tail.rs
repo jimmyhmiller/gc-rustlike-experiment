@@ -3,6 +3,31 @@
 //! an allocation-free mutator invisible to a pending collection.
 use crate::core::*;
 
+
+/// LLVM may tail-call between acyclic functions without introducing a
+/// recursive backedge after safepoint analysis. Include every possible lifted
+/// closure target for indirect calls; recursive components remain disabled.
+pub(crate) fn acyclic_functions(program: &CoreProgram) -> Vec<bool> {
+    let mut closures = std::collections::BTreeSet::new();
+    for function in &program.funcs {
+        crate::inline::visit_block(&function.body, &mut |e| {
+            if let CoreExprKind::MakeClosure { code, .. } = e.kind.as_ref() { closures.insert(*code); }
+        });
+    }
+    let calls: Vec<_> = program.funcs.iter().map(|function| {
+        let mut calls = Vec::new();
+        crate::inline::visit_block(&function.body, &mut |e| match e.kind.as_ref() {
+            CoreExprKind::Call(id, _) => calls.push(*id),
+            CoreExprKind::CallClosure { .. } => calls.extend(closures.iter().copied()),
+            _ => {}
+        });
+        calls.sort_unstable();
+        calls.dedup();
+        calls
+    }).collect();
+    crate::inline::recursive_functions(&calls).into_iter().map(|recursive| !recursive).collect()
+}
+
 pub(crate) fn eliminate(program: &mut CoreProgram) {
     for (id, function) in program.funcs.iter_mut().enumerate() {
         if function.is_extern

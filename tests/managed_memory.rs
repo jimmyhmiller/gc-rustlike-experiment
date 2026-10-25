@@ -165,8 +165,14 @@ fn check_snapshot_paths(ir: &str) -> usize {
                     assert!(held, "unpaired release in {label}");
                     held = false;
                 } else if held && line.contains("call ") {
+                    // LLVM folds adjacent constant stores into memory
+                    // intrinsics; they are plain stores and never reach the
+                    // runtime, so they cannot park or collect.
                     assert!(
-                        line.contains("@ai_gc_write_barrier("),
+                        line.contains("@ai_gc_write_barrier(")
+                            || ["@llvm.memset.", "@llvm.memcpy.", "@llvm.memmove."]
+                                .iter()
+                                .any(|intrinsic| line.contains(intrinsic)),
                         "unexpected call in snapshot region: {line}"
                     );
                 }

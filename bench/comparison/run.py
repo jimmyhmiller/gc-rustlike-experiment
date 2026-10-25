@@ -30,13 +30,12 @@ def build(name, size, main, warm, samples, rust_opt, env):
     g = (src / (name + '.gcr')).read_text().replace('fn main()', 'fn workload()')
     for old in ['let steps = 5000000;', 'let n = 3000;', 'let n = 11;', 'let n = 16;']:
         if old in g: g = g.replace(old, f'let {"steps" if "steps" in old else "n"} = {size};')
-    g += f'''\nextern "C" fn benchmark_clock_ns() -> i64;
-fn main() -> i64 {{
+    g += f'''\nfn main() -> i64 {{
     let mut i = 0;
     while i < {warm + samples} {{
-        let start = unsafe {{ benchmark_clock_ns() }};
+        let start = Instant::now();
         let result = workload();
-        let elapsed = unsafe {{ benchmark_clock_ns() }} - start;
+        let elapsed = start.elapsed().as_nanos() as i64;
         println("@sample");
         print_int(i);
         print_int(elapsed);
@@ -61,8 +60,9 @@ fn main() -> i64 {{
     (d / (name + '.java')).write_text(j)
     run(['rustc', '-C', f'opt-level={rust_opt}', '-C', 'panic=abort', d/(name+'.rs'), '-o', d/'rust'])
     run(['javac', '-d', d, d/(name+'.java')])
-    run([ROOT/'target/release/gcr', 'build', d/(name+'.gcr'), '--link-arg', BUILD/'clock.o'], cwd=d, env=env)
-    return {'gcr': [str(d/name)], 'rust': [str(d/'rust'), str(size)],
+    run([ROOT/'target/release/gcr', 'build', d/(name+'.gcr')], cwd=d, env=env)
+    return {'gcr': [str(d/name)], 'gcr-jit': [str(ROOT/'target/release/gcr'), 'run', str(d/(name+'.gcr')), '--jit'],
+            'rust': [str(d/'rust'), str(size)],
             'java': ['java', '-Xms16m', '-Xmx512m', '-XX:+UseG1GC', '-Duser.language=en', '-Duser.country=US', '-cp', str(d), 'Runner', str(size)]}
 
 def main():
@@ -73,13 +73,12 @@ def main():
     p.add_argument('--rust-opt-level', type=int, choices=[2,3], default=2)
     p.add_argument('--workers', type=int, default=1)
     p.add_argument('--nursery-mb', type=int, default=16)
-    p.add_argument('--languages', nargs='+', choices=['gcr','rust','java'], default=['gcr','rust','java'])
+    p.add_argument('--languages', nargs='+', choices=['gcr','gcr-jit','rust','java'], default=['gcr','rust','java'])
     p.add_argument('--output', type=pathlib.Path, default=HERE/'results.json')
     p.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
     args = p.parse_args()
     if min(args.warmup, args.samples, args.forks, args.workers, args.nursery_mb) < 1: p.error('counts must be positive')
     BUILD.mkdir(parents=True, exist_ok=True)
-    run(['clang', '-O2', '-c', HERE/'clock.c', '-o', BUILD/'clock.o'])
     env = {k:v for k,v in os.environ.items() if not k.startswith('GCR_') and k != 'GCRUST_RUNTIME_LIB'}
     env['GCR_GC_WORKERS'] = str(args.workers)
     env['GCR_NURSERY_MB'] = str(args.nursery_mb)
@@ -88,10 +87,11 @@ def main():
         'git_dirty': bool(run(['git', 'status', '--porcelain'], cwd=ROOT).stdout.strip()),
         'implementation_sha256': {str(x.relative_to(ROOT)): hashlib.sha256(x.read_bytes()).hexdigest()
             for directory in (ROOT/'src', ROOT/'crates/gcrust-rt/src')
-            for x in sorted(directory.rglob('*.rs'))},
+            for x in sorted(directory.rglob('*')) if x.suffix in ('.rs', '.cpp')},
         'rust': run(['rustc','--version']).stdout.strip(), 'java': run(['java','-version']).stderr.strip(),
         'gcr_workers': args.workers, 'gcr_nursery_mb': args.nursery_mb, 'gcr_tenured_mb': 256,
-        'rust_opt_level': args.rust_opt_level, 'gcr_opt_level': 3, 'order_seed': 20261006,
+        'rust_opt_level': args.rust_opt_level, 'gcr_opt_level': 3, 'gcr_jit_compilation': 'eager O3', 'gcr_clock': 'Instant monotonic runtime intrinsic',
+        'gcr_binary_sha256': hashlib.sha256((ROOT/'target/release/gcr').read_bytes()).hexdigest(), 'order_seed': 20261006,
         'cpu': run(['sysctl','-n','machdep.cpu.brand_string']).stdout.strip(),
         'memory_bytes': int(run(['sysctl','-n','hw.memsize']).stdout.strip()),
         'warmup': args.warmup, 'samples': args.samples, 'forks': args.forks}, 'benchmarks': {}}
@@ -106,9 +106,11 @@ def main():
         for fork in range(args.forks):
             langs = list(args.languages); rng.shuffle(langs)
             for lang in langs:
-                metrics = BUILD/name/f'metrics-{fork}.json'
+                metrics = BUILD/name/f'metrics-{lang}-{fork}.json'
                 local = dict(env)
-                if lang == 'gcr': local['GCR_METRICS_FILE'] = str(metrics)
+                if lang in ('gcr', 'gcr-jit'):
+                    metrics.unlink(missing_ok=True)
+                    local['GCR_METRICS_FILE'] = str(metrics)
                 start = time.perf_counter()
                 proc = run(['/usr/bin/time', '-l'] + cmds[lang], env=local)
                 wall = time.perf_counter() - start
@@ -121,16 +123,17 @@ def main():
                     if reference is None: reference = sig
                     if not matches(reference, sig): raise RuntimeError(f'{name}/{lang}/{index}: mismatch {sig} vs {reference}')
                     records.append({'index': index, 'ns': ns, 'signature': sig})
-                if len(records) != args.warmup + args.samples or chunks[-1].strip():
+                if len(records) != args.warmup + args.samples or chunks[-1].strip() != ('0' if lang == 'gcr-jit' else ''):
                     raise RuntimeError(f'invalid records: {name}/{lang}')
-                if lang == 'gcr' and not metrics.exists():
+                if lang in ('gcr', 'gcr-jit') and not metrics.exists():
                     raise RuntimeError(f'missing GC metrics: {name}/{fork}')
                 rss = re.search(r'(\d+)\s+maximum resident set size', proc.stderr)
                 if rss is None: raise RuntimeError('missing macOS RSS measurement')
                 data = {'language':lang, 'fork':fork, 'command':cmds[lang], 'wall_s':wall,
+                    'outside_workload_s': wall - sum(r['ns'] for r in records)/1e9,
                     'peak_rss_bytes':int(rss.group(1)) if rss else None, 'records':records,
                     'stderr':proc.stderr}
-                if lang == 'gcr' and metrics.exists(): data['gc'] = json.loads(metrics.read_text())
+                if lang in ('gcr', 'gcr-jit') and metrics.exists(): data['gc'] = json.loads(metrics.read_text())
                 entry['runs'].append(data)
                 print(name, lang, fork, 'median ms', round(statistics.median(x['ns'] for x in records[args.warmup:])/1e6,3), flush=True)
         entry['median_ms'] = {lang:statistics.median(x['ns']/1e6 for r in entry['runs'] if r['language']==lang for x in r['records'][args.warmup:]) for lang in args.languages}

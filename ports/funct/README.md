@@ -52,3 +52,13 @@ The VM rows were measured with hyperfine. Startup and `demo.ft` are within
 the noise of process launch, so they come from runs interleaved in random
 order. The lex rows are per pass (`lexbench`/`parsebench`). In retired
 instructions the VM is 1.07× (fib), 1.08× (loops) and 1.08× (collatz).
+
+## AOT / JIT follow-up
+
+The [batch comparison](../../bench/funct/README.md) measures the same workloads
+across the Rust interpreter and the gc-rust port compiled with AOT or JIT.
+It records workload intervals separately from total process time, including
+JIT compilation. Its in-process timings differ from the historical
+whole-process table above.
+
+JIT and AOT compile eagerly with LLVM O3. See the batch comparison for timing scope.

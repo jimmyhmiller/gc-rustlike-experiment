@@ -37,7 +37,8 @@ Runtime build failures stop compilation.
 
 A bare-file `run` without a discovered manifest JIT-executes and prints the
 integer result. A project `run` builds a native executable and forwards its exit
-status. `run <project> --jit -- <args>` explicitly selects JIT with matching
+status. JIT and AOT use full eager LLVM O3 compilation.
+`run <project> --jit -- <args>` explicitly selects JIT with matching
 arguments, stdout, and exit-status behavior. The result of native `main` becomes the process exit status, rather than
 the extra result line printed by the JIT driver.
 

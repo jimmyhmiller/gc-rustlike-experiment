@@ -23,6 +23,12 @@ use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, FunctionValue, Int
 use inkwell::{AddressSpace, AtomicOrdering, FloatPredicate, IntPredicate};
 use std::collections::{BTreeSet, HashMap};
 
+const UNCONDITIONAL_RELOAD_WORDS: u64 = 16;
+unsafe extern "C" {
+    fn gcr_llvm_readonly_leaf(function: llvm_sys::prelude::LLVMValueRef);
+}
+
+
 #[derive(Clone, Copy)]
 enum ForeignArg<'ctx> {
     Scalar,
@@ -95,6 +101,277 @@ pub fn codegen<'ctx>(
     codegen_with_debug(ctx, prog, DebugLevel::None)
 }
 
+// Executable compilation needs only entry-reachable bodies after inlining.
+// Keep the public IR inspection API's complete definitions and full-debug
+// source functions intact.
+fn codegen_executable<'ctx>(ctx: &'ctx Context, prog: &CoreProgram, level: DebugLevel) -> Result<Compiled<'ctx>, CodegenError> {
+    if level.is_full() { return codegen_with_debug(ctx, prog, level); }
+    let reachable = crate::timing::measure("Core reachability", || crate::reachable::from_entry(prog));
+    codegen_with_debug(ctx, &reachable, level)
+}
+
+struct PreparedCodegen {
+    program: CoreProgram,
+    helpers: HashMap<FuncId, String>,
+    private_heap: std::sync::Arc<crate::codegen_escape::PrivateHeap>,
+    bounded_loops: std::sync::Arc<crate::codegen_loops::BoundedLoops>,
+    nonrelocating: Vec<bool>,
+    acyclic: Vec<bool>,
+    diverging: Vec<bool>,
+    physical: std::sync::Arc<PhysicalLayouts>,
+    triple: String,
+    data_layout: String,
+}
+impl PreparedCodegen {
+    fn new(prog: &CoreProgram, level: DebugLevel) -> Result<Self, CodegenError> {
+        let mut outlined = if level.is_full() {
+            crate::codegen_outline::Outlined { program: prog.clone(), helpers: HashMap::new() }
+        } else { crate::codegen_outline::outline(prog) };
+        crate::codegen_tail::eliminate(&mut outlined.program);
+        let program = outlined.program;
+        let private_heap = if level.is_full() { Default::default() } else {
+            crate::timing::measure("escape analysis", || crate::codegen_escape::PrivateHeap::analyze(&program))
+        };
+        let bounded_loops = if level.is_full() { Default::default() } else {
+            crate::timing::measure("bounded loops", || crate::codegen_loops::BoundedLoops::analyze(&program, &private_heap))
+        };
+        let machine = host_target_machine()?;
+        let triple = machine.get_triple().as_str().to_string_lossy().into_owned();
+        let data_layout = machine.get_target_data().get_data_layout().as_str().to_string_lossy().into_owned();
+        let nonrelocating = crate::codegen_effects::nonrelocating_functions(&program);
+        let acyclic = crate::codegen_tail::acyclic_functions(&program);
+        let diverging = crate::codegen_effects::diverging_functions(&program);
+        let physical = std::sync::Arc::new(physical_layouts(&program));
+        Ok(Self { program, helpers: outlined.helpers, private_heap: std::sync::Arc::new(private_heap),
+            bounded_loops: std::sync::Arc::new(bounded_loops), nonrelocating, acyclic, diverging, physical, triple, data_layout })
+    }
+}
+
+fn static_string_initializer<'ctx>(ctx: &'ctx Context, text: &str, layout: LayoutId) -> inkwell::values::StructValue<'ctx> {
+    let i64t = ctx.i64_type();
+    let i8t = ctx.i8_type();
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.resize(bytes.len().div_ceil(8) * 8, 0);
+    let body = i8t.const_array(&bytes.iter().map(|b| i8t.const_int(*b as u64, false)).collect::<Vec<_>>());
+    ctx.struct_type(&[i64t.into(), i64t.into(), i64t.into(), body.get_type().into()], false)
+        .const_named_struct(&[i64t.const_zero().into(), i64t.const_int(layout as u64, false).into(),
+            i64t.const_int(text.len() as u64, false).into(), body.into()])
+}
+fn empty_array_initializer<'ctx>(ctx: &'ctx Context, layout: LayoutId) -> inkwell::values::StructValue<'ctx> {
+    let word = ctx.i64_type();
+    ctx.struct_type(&[word.into(), word.into(), word.into()], false)
+        .const_named_struct(&[word.const_zero().into(), word.const_int(layout as u64, false).into(), word.const_zero().into()])
+}
+
+#[derive(Clone, Copy)]
+enum Emission<'a> {
+    All,
+    Declarations(&'a std::cell::RefCell<Vec<String>>),
+    Function { plan: &'a EagerProgram, id: FuncId, callback: bool },
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum StaticDataKey { String(LayoutId, String), EmptyArray(LayoutId) }
+
+/// All functions, literals, and allocation-site IDs are fixed before eager
+/// parallel compilation. No materialization work remains when execution starts.
+pub(crate) struct EagerProgram {
+    prepared: PreparedCodegen,
+    names: Vec<String>,
+    callbacks: HashMap<FuncId, String>,
+    symbols: Vec<(String, u64)>,
+    groups: HashMap<FuncId, Vec<FuncId>>,
+    literal_bytes: Vec<u8>,
+    literal_offsets: HashMap<StaticDataKey, u64>,
+    pool_name: String,
+    sites: Vec<crate::gc::AllocSite>,
+    site_ids: HashMap<(String, u16, String), u32>,
+}
+impl EagerProgram {
+    pub(crate) fn new(prog: &CoreProgram) -> Result<Box<Self>, CodegenError> {
+        let _phase = crate::timing::Phase::new("JIT preparation");
+        if prog.layouts.len() > u16::MAX as usize + 1 || prog.values.len() > u16::MAX as usize + 1 {
+            return Err(CodegenError("layout/type count exceeds representable ID limit".into()));
+        }
+        if prog.entry.is_none() { return Err(CodegenError("no entry".into())); }
+        let reachable = crate::reachable::from_entry(prog);
+        let prepared = PreparedCodegen::new(&reachable, DebugLevel::None)?;
+        let (names, mut occupied) = {
+            let context = Context::create();
+            let names = std::cell::RefCell::new(Vec::new());
+            let declarations = emit_prepared(&context, &prepared, DebugLevel::None, Emission::Declarations(&names))?;
+            let occupied: std::collections::HashSet<_> = declarations.module.get_functions()
+                .map(|f| f.get_name().to_string_lossy().into_owned()).collect();
+            (names.into_inner(), occupied)
+        };
+        fn unique(occupied: &mut std::collections::HashSet<String>, base: String) -> String {
+            let mut name = base.clone();
+            let mut suffix = 0;
+            while !occupied.insert(name.clone()) { suffix += 1; name = format!("{base}_{suffix}"); }
+            name
+        }
+        let mut callbacks = HashMap::new();
+        let mut callback_targets = BTreeSet::new();
+        for function in &prepared.program.funcs {
+            crate::inline::visit_block(&function.body, &mut |e| {
+                if let CoreExprKind::CallbackPtr(id) = e.kind.as_ref() { callback_targets.insert(*id); }
+            });
+        }
+        // Foreign targets already have the C ABI and are passed directly.
+        callback_targets.retain(|&id| !prepared.program.funcs[id as usize].is_extern);
+        for id in callback_targets {
+            callbacks.insert(id, unique(&mut occupied, format!("__gcr_jit_callback_{id}")));
+        }
+        // Batch small native functions so their type tables, target setup,
+        // optimizer managers and object headers are built once per bounded
+        // unit. Large functions remain independent parallel jobs.
+        let mut groups = HashMap::new();
+        let mut owners = vec![0; prepared.program.funcs.len()];
+        let mut small = Vec::new();
+        let mut total = 0;
+        let mut native_costs = vec![0usize; prepared.program.funcs.len()];
+        fn finish_group(small: &mut Vec<FuncId>, groups: &mut HashMap<FuncId, Vec<FuncId>>, owners: &mut [FuncId]) {
+            if let Some(&first) = small.first() {
+                for &id in small.iter() { owners[id as usize] = first; }
+                groups.insert(first, std::mem::take(small));
+            }
+        }
+        for (id, function) in prepared.program.funcs.iter().enumerate() {
+            if function.is_extern { continue; }
+            let mut cost = 0;
+            crate::inline::visit_block(&function.body, &mut |e| {
+                cost += 1;
+                native_costs[id] += match e.kind.as_ref() {
+                    CoreExprKind::New { .. } | CoreExprKind::MakeVariant { .. } | CoreExprKind::ArrayNew { .. }
+                    | CoreExprKind::MakeClosure { .. } | CoreExprKind::CallClosure { .. } => 16,
+                    CoreExprKind::Call(target, _) => if prepared.nonrelocating[*target as usize] { 2 } else { 8 },
+                    CoreExprKind::Field { .. } | CoreExprKind::SetField { .. } | CoreExprKind::ArrayGet { .. }
+                    | CoreExprKind::ArrayGetChecked { .. } | CoreExprKind::ArrayGetUnchecked { .. } | CoreExprKind::ArraySet { .. } => 8,
+                    _ => 1,
+                };
+            });
+            if cost > 200 {
+                owners[id] = id as FuncId;
+                groups.insert(id as FuncId, vec![id as FuncId]);
+            } else {
+                if total + cost > 512 { finish_group(&mut small, &mut groups, &mut owners); total = 0; }
+                total += cost;
+                small.push(id as FuncId);
+            }
+        }
+        finish_group(&mut small, &mut groups, &mut owners);
+        let mut symbols = Vec::new();
+        for (id, function) in prepared.program.funcs.iter().enumerate() {
+            if !function.is_extern { symbols.push((names[id].clone(), owners[id] as u64)); }
+        }
+        let mut callback_ids: Vec<_> = callbacks.keys().copied().collect();
+        callback_ids.sort();
+        for id in callback_ids {
+            symbols.push((callbacks[&id].clone(), (1u64 << 32) | id as u64));
+        }
+        let mut data_keys = BTreeSet::new();
+        for function in &prepared.program.funcs {
+            crate::inline::visit_block(&function.body, &mut |e| match e.kind.as_ref() {
+                CoreExprKind::ConstStr(text) => if let Repr::Ref(layout) = e.repr { data_keys.insert(StaticDataKey::String(layout, text.clone())); },
+                CoreExprKind::ArrayNew { layout, .. } => { data_keys.insert(StaticDataKey::EmptyArray(*layout)); },
+                _ => {},
+            });
+        }
+        let pool_name = unique(&mut occupied, "__gcr_literal_pool".into());
+        let mut literal_bytes = Vec::new();
+        let mut literal_offsets = HashMap::new();
+        for key in data_keys {
+            literal_offsets.insert(key.clone(), literal_bytes.len() as u64);
+            let (layout, bytes) = match &key {
+                StaticDataKey::String(layout, text) => (*layout, text.as_bytes()),
+                StaticDataKey::EmptyArray(layout) => (*layout, &[][..]),
+            };
+            // The same Full header and 8-byte-aligned payload as the ordinary
+            // static-object initializers. JIT targets the current host.
+            literal_bytes.extend_from_slice(&0u64.to_ne_bytes());
+            literal_bytes.extend_from_slice(&(layout as u64).to_ne_bytes());
+            literal_bytes.extend_from_slice(&(bytes.len() as u64).to_ne_bytes());
+            literal_bytes.extend_from_slice(bytes);
+            literal_bytes.resize(literal_bytes.len().div_ceil(8) * 8, 0);
+        }
+        if literal_bytes.len() > u32::MAX as usize { return Err(CodegenError("literal pool exceeds LLVM array size limit".into())); }
+        if !literal_bytes.is_empty() { symbols.push((pool_name.clone(), 2u64 << 32)); }
+        let costs: HashMap<_, usize> = groups.iter().map(|(&group, functions)|
+            (group as u64, functions.iter().map(|&id| native_costs[id as usize]).sum())).collect();
+        // Start long jobs first to avoid leaving a large optimization/native
+        // job until the other workers have exhausted the small units.
+        symbols.sort_by_key(|(_, token)| (std::cmp::Reverse(match token >> 32 {
+            2 => usize::MAX, 1 => 1, _ => costs[token],
+        }), *token));
+        let mut sites = Vec::new();
+        let mut site_ids = HashMap::new();
+        for (id, function) in prepared.program.funcs.iter().enumerate() {
+            let name = prepared.helpers.get(&(id as FuncId)).unwrap_or(&names[id]);
+            crate::inline::visit_block(&function.body, &mut |e| {
+                let layout = match e.kind.as_ref() {
+                    CoreExprKind::New { layout, .. } | CoreExprKind::MakeVariant { layout, .. }
+                    | CoreExprKind::ArrayNew { layout, .. } => Some(*layout),
+                    CoreExprKind::MakeClosure { env, .. } => Some(*env),
+                    CoreExprKind::RuntimeCall { func: "ai_str_from_utf8_prefix", args, .. } =>
+                        args.first().and_then(|arg| if let CoreExprKind::ConstInt(layout, _) = arg.kind.as_ref() { Some(*layout as LayoutId) } else { None }),
+                    _ => None,
+                };
+                if let Some(layout) = layout {
+                    let location = prepared.program.span_label(e.span).unwrap_or_default();
+                    let key = (name.clone(), layout as u16, location.clone());
+                    if !site_ids.contains_key(&key) {
+                        site_ids.insert(key, sites.len() as u32);
+                        sites.push(crate::gc::AllocSite { function: name.clone(), type_id: layout as u16, location });
+                    }
+                }
+            });
+        }
+        Ok(Box::new(Self { prepared, names, callbacks, symbols, groups, literal_bytes, literal_offsets, pool_name, sites, site_ids }))
+    }
+    pub(crate) fn entry(&self) -> &str { &self.names[self.prepared.program.entry.unwrap() as usize] }
+    pub(crate) fn symbols(&self) -> &[(String, u64)] { &self.symbols }
+    pub(crate) fn sites(&self) -> Vec<crate::gc::AllocSite> { self.sites.clone() }
+
+    /// Transfers fresh LLVM module/context allocations on success only.
+    pub(crate) fn render(&self, token: u64) -> Result<(llvm_sys::prelude::LLVMModuleRef, llvm_sys::prelude::LLVMContextRef), CodegenError> {
+        use inkwell::context::AsContextRef;
+        let id = token as FuncId;
+        let kind = token >> 32;
+        if kind > 2 || (kind < 2 && id as usize >= self.prepared.program.funcs.len())
+            || (kind == 0 && !self.groups.contains_key(&id))
+            || (kind == 1 && !self.callbacks.contains_key(&id))
+            || (kind == 2 && (id != 0 || self.literal_bytes.is_empty())) {
+            return Err(CodegenError("invalid JIT materialization token".into()));
+        }
+        let context = Context::create();
+        unsafe { llvm_sys::core::LLVMContextSetDiscardValueNames((&context).as_ctx_ref(), 1); }
+        let raw_module = {
+            let module = if kind == 2 {
+                let module = context.create_module("gcr.data");
+                module.set_triple(&inkwell::targets::TargetTriple::create(&self.prepared.triple));
+                let data = inkwell::targets::TargetData::create(&self.prepared.data_layout);
+                module.set_data_layout(&data.get_data_layout());
+                let value = context.i8_type().const_array(&self.literal_bytes.iter().map(|byte| context.i8_type().const_int(*byte as u64, false)).collect::<Vec<_>>());
+                let global = module.add_global(value.get_type(), None, &self.pool_name);
+                global.set_alignment(8);
+                global.set_initializer(&value);
+                module
+            } else {
+                let Compiled { module, .. } = emit_prepared(&context, &self.prepared, DebugLevel::None,
+                    Emission::Function { plan: self, id, callback: kind == 1 })?;
+                module
+            };
+            module.set_name(if kind == 2 { &self.pool_name } else if kind == 1 { &self.callbacks[&id] } else { &self.names[id as usize] });
+            module.verify().map_err(|e| CodegenError(e.to_string()))?;
+            let raw = module.as_mut_ptr();
+            std::mem::forget(module);
+            raw
+        };
+        let raw_context = (&context).as_ctx_ref();
+        std::mem::forget(context);
+        Ok((raw_module, raw_context))
+    }
+}
+
 /// Codegen, optionally emitting DWARF (debugger P2/P3). DWARF should be emitted
 /// ONLY for AOT builds — it lands in the emitted object where `lldb`/
 /// `llvm-dwarfdump` read it; the JIT can't use it without the LLDB
@@ -108,66 +385,87 @@ pub fn codegen_with_debug<'ctx>(
     if prog.layouts.len() > u16::MAX as usize + 1 || prog.values.len() > u16::MAX as usize + 1 {
         return Err(CodegenError("layout/type count exceeds representable ID limit".into()));
     }
-    let mut outlined = if level.is_full() {
-        crate::codegen_outline::Outlined {
-            program: prog.clone(),
-            helpers: HashMap::new(),
-        }
-    } else {
-        crate::codegen_outline::outline(prog)
-    };
-    crate::codegen_tail::eliminate(&mut outlined.program);
-    let prog = &outlined.program;
+    let _codegen_phase = crate::timing::Phase::new("codegen total");
+    let prepared = PreparedCodegen::new(prog, level)?;
+    emit_prepared(ctx, &prepared, level, Emission::All)
+}
+
+fn emit_prepared<'ctx>(ctx: &'ctx Context, prepared: &PreparedCodegen, level: DebugLevel, emission: Emission<'_>) -> Result<Compiled<'ctx>, CodegenError> {
+    let codegen_phase = crate::timing::Phase::new("LLVM module emission");
+    let prog = &prepared.program;
     let module = ctx.create_module("gcr");
-    // Optimizers must use the same aggregate layout as JIT/AOT emission and
-    // the runtime's native buffers. LLVM's empty default layout can place i64
-    // fields at four-byte boundaries before the backend later selects eight.
-    let machine = host_target_machine()?;
-    module.set_triple(&machine.get_triple());
-    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    module.set_triple(&inkwell::targets::TargetTriple::create(&prepared.triple));
+    let target_data = inkwell::targets::TargetData::create(&prepared.data_layout);
+    module.set_data_layout(&target_data.get_data_layout());
     let builder = ctx.create_builder();
-    let debug = if level.emits_dwarf() {
-        build_debug_cx(ctx, &module, prog, level.is_full())
-    } else {
-        None
+    let debug = if level.emits_dwarf() { build_debug_cx(ctx, &module, prog, level.is_full()) } else { None };
+    let (private_heap, bounded_loops) = (prepared.private_heap.clone(), prepared.bounded_loops.clone());
+    let partition = if let Emission::Function { plan, .. } = emission { Some(plan) } else { None };
+    let origins: Vec<_> = match emission {
+        Emission::Function { plan, id, callback: false } => {
+            let mut origins = BTreeSet::new();
+            for &function in &plan.groups[&id] { origins.extend(private_heap.origin_sets_for(&prog.funcs[function as usize])); }
+            origins.into_iter().collect()
+        },
+        Emission::Function { callback: true, .. } => Vec::new(),
+        Emission::Declarations(_) => Vec::new(),
+        Emission::All => private_heap.origin_sets().collect(),
     };
-    let private_heap = if level.is_full() { Default::default() } else { crate::codegen_escape::PrivateHeap::analyze(prog) };
-    let bounded_loops = if level.is_full() { Default::default() } else { crate::codegen_loops::BoundedLoops::analyze(prog, &private_heap) };
     let domain = ctx.metadata_node(&[ctx.metadata_string("gcr.private.heap").into()]);
-    let heap_scopes = private_heap.origin_sets().into_iter().map(|origins| {
+    let heap_scopes = origins.into_iter().map(|origins| {
         let name = format!("gcr.heap.origins.{origins:?}");
         let scope = ctx.metadata_node(&[ctx.metadata_string(&name).into(), domain.into()]);
         (origins, scope)
     }).collect();
-    let nonrelocating = crate::codegen_effects::nonrelocating_functions(prog);
-    let diverging = crate::codegen_effects::diverging_functions(prog);
-    let root_liveness= if level.is_full() { Default::default() } else { crate::codegen_liveness::RootLiveness::analyze(prog) };
     let mut cg = Codegen {
         ctx,
         module,
         builder,
         prog,
         funcs: HashMap::new(),
-        outlined_helpers: outlined.helpers,
-        nonrelocating,
-        diverging,
+        outlined_helpers: prepared.helpers.clone(),
+        nonrelocating: prepared.nonrelocating.clone(),
+        acyclic: prepared.acyclic.clone(),
+        diverging: prepared.diverging.clone(),
         static_strings: Default::default(),
         private_heap,
         bounded_loops,
         heap_scopes,
-        target_data: machine.get_target_data(),
-        closed_world: !level.is_full(),
-        physical_layouts: physical_layouts(prog),
-        root_liveness,
+        target_data,
+        closed_world: !level.is_full() && matches!(emission, Emission::All),
+        physical_layouts: prepared.physical.clone(),
+        partition,
+        callback_body: matches!(emission, Emission::Function { callback: true, .. }),
+        heap_alias_metadata: Default::default(),
+        value_types: std::cell::RefCell::new(vec![None; prog.values.len()]),
         trampolines: HashMap::new(),
         alloc_sites: Vec::new(),
         alloc_site_ids: HashMap::new(),
         debug,
     };
     cg.declare_runtime_externs();
+    // These legacy String ABIs only read their pointer arguments. Making
+    // the contracts explicit preserves interprocedural load/CSE opportunities
+    // when native compilation is partitioned into independent modules.
+    for symbol in ["ai_str_len", "ai_str_get", "ai_str_eq", "ai_str_eq_bytes", "ai_str_hash"] {
+        unsafe { gcr_llvm_readonly_leaf(cg.module.get_function(symbol).unwrap().as_value_ref()); }
+    }
 
-    // Reserve C symbols before selecting names for managed functions. C names
-    // are ABI identities; managed display names may collide with them.
+
+    let selected = if let Emission::Function { plan, id, callback } = emission {
+        let mut ids = BTreeSet::from([id]);
+        if !callback {
+            ids.extend(plan.groups[&id].iter().copied());
+            for &function in &plan.groups[&id] {
+                crate::inline::visit_block(&prog.funcs[function as usize].body, &mut |e| match e.kind.as_ref() {
+                    CoreExprKind::Call(id, _) | CoreExprKind::CallbackPtr(id) | CoreExprKind::MakeClosure { code: id, .. } => { ids.insert(*id); },
+                    _ => {},
+                });
+            }
+        }
+        Some(ids)
+    } else { None };
+    // Reserve foreign ABI names before selecting managed names.
     for (i, f) in prog.funcs.iter().enumerate().filter(|(_, f)| f.is_extern) {
         let fv = cg.declare_fn(i as FuncId, f);
         cg.funcs.insert(i as FuncId, fv);
@@ -175,8 +473,12 @@ pub fn codegen_with_debug<'ctx>(
 
     // Declare every function first (so calls can reference forward decls).
     for (i, f) in prog.funcs.iter().enumerate() {
+        if !f.is_extern && selected.as_ref().is_some_and(|ids| !ids.contains(&(i as FuncId))) { continue; }
         let fv = if f.is_extern { cg.funcs[&(i as FuncId)] } else { cg.declare_fn(i as FuncId, f) };
-        if !f.is_extern {
+        if let Some(plan) = partition {
+            if !f.is_extern { fv.as_global_value().set_name(&plan.names[i]); }
+        }
+        if !f.is_extern && (level.is_full() || !cg.acyclic[i]) {
             // Backend-created recursive loops would bypass Core safepoint
             // analysis. Supported self tail calls are lowered before codegen.
             fv.add_attribute(
@@ -201,25 +503,49 @@ pub fn codegen_with_debug<'ctx>(
         }
         cg.funcs.insert(i as FuncId, fv);
     }
-    // Define bodies.
-    for (i, f) in prog.funcs.iter().enumerate() {
-        cg.define_fn(i as FuncId, f)?;
-    }
-
+    let emission_phase = crate::timing::Phase::new("LLVM IR emission");
+    let entry_name = match emission {
+        Emission::All => {
+            for (i, f) in prog.funcs.iter().enumerate() { cg.define_fn(i as FuncId, f)?; }
+            cg.funcs[&prog.entry.ok_or_else(|| CodegenError("no entry".into()))?].get_name().to_string_lossy().into_owned()
+        }
+        Emission::Declarations(names) => {
+            names.replace((0..prog.funcs.len()).map(|id| cg.funcs[&(id as FuncId)].get_name().to_string_lossy().into_owned()).collect());
+            cg.funcs[&prog.entry.unwrap()].get_name().to_string_lossy().into_owned()
+        }
+        Emission::Function { plan, id, callback: false } => {
+            for &function in &plan.groups[&id] { cg.define_fn(function, &prog.funcs[function as usize])?; }
+            cg.funcs[&id].get_name().to_string_lossy().into_owned()
+        }
+        Emission::Function { id, callback: true, .. } => cg.callback_trampoline(id).get_name().to_string_lossy().into_owned(),
+    };
+    drop(emission_phase);
     // Finalize DWARF before verify/optimize (resolves forward metadata refs).
     if let Some(d) = &cg.debug {
         d.di.finalize();
     }
 
-    let entry = prog.entry.ok_or_else(|| CodegenError("no entry".into()))?;
-    let entry_name = cg.funcs[&entry].get_name().to_str().map_err(|_| CodegenError("entry symbol is not UTF-8".into()))?.to_string();
-
+    if partition.is_some() {
+        for global in cg.module.get_globals() {
+            if global.get_initializer().is_some() { global.set_linkage(inkwell::module::Linkage::Private); }
+        }
+    }
+    if partition.is_some() {
+        // The runtime ABI is declared centrally, but an individual native
+        // partition uses only a few entries. Do not send hundreds of unused
+        // declarations through every optimizer and object-emission pipeline.
+        let unused: Vec<_> = cg.module.get_functions().filter(|function| {
+            function.count_basic_blocks() == 0 && unsafe { llvm_sys::core::LLVMGetFirstUse(function.as_value_ref()).is_null() }
+        }).collect();
+        for function in unused { unsafe { function.delete(); } }
+    }
     if std::env::var("GCR_DUMP_IR").is_ok() {
         eprintln!("{}", cg.module.print_to_string().to_string());
     }
     cg.module
         .verify()
         .map_err(|e| CodegenError(format!("LLVM module verify failed: {}", e.to_string())))?;
+    drop(codegen_phase);
     Ok(Compiled { module: cg.module, entry_name, alloc_sites: cg.alloc_sites })
 }
 
@@ -567,11 +893,18 @@ fn build_debug_cx<'ctx>(
 /// without it, the naive pre-optimization IR (every local a stack slot), which
 /// maps more directly onto the Core IR.
 pub fn emit_llvm_ir(prog: &CoreProgram, optimize: bool) -> Result<String, CodegenError> {
+    emit_llvm_ir_selected(prog, optimize, false)
+}
+
+/// Dump the same reachable executable module used by eager JIT/AOT codegen.
+pub fn emit_executable_llvm_ir(prog: &CoreProgram, optimize: bool) -> Result<String, CodegenError> {
+    emit_llvm_ir_selected(prog, optimize, true)
+}
+
+fn emit_llvm_ir_selected(prog: &CoreProgram, optimize: bool, executable: bool) -> Result<String, CodegenError> {
     let ctx = Context::create();
-    let compiled = codegen(&ctx, prog)?;
-    if optimize {
-        optimize_module(&compiled.module)?;
-    }
+    let compiled = if executable { codegen_executable(&ctx, prog, DebugLevel::None)? } else { codegen(&ctx, prog)? };
+    if optimize { optimize_module(&compiled.module)?; }
     Ok(compiled.module.print_to_string().to_string())
 }
 
@@ -580,15 +913,18 @@ struct Codegen<'ctx, 'p> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     prog: &'p CoreProgram,
+    partition: Option<&'p EagerProgram>,
+    callback_body: bool,
     funcs: HashMap<FuncId, FunctionValue<'ctx>>,
     outlined_helpers: HashMap<FuncId, String>,
     nonrelocating: Vec<bool>,
+    acyclic: Vec<bool>,
     closed_world: bool,
-    physical_layouts: PhysicalLayouts,
-    root_liveness: crate::codegen_liveness::RootLiveness,
-    private_heap: crate::codegen_escape::PrivateHeap,
-    bounded_loops: crate::codegen_loops::BoundedLoops,
-    heap_scopes: HashMap<BTreeSet<usize>, inkwell::values::MetadataValue<'ctx>>,
+    physical_layouts: std::sync::Arc<PhysicalLayouts>,
+    private_heap: std::sync::Arc<crate::codegen_escape::PrivateHeap>,
+    bounded_loops: std::sync::Arc<crate::codegen_loops::BoundedLoops>,
+    heap_scopes: HashMap<std::sync::Arc<BTreeSet<usize>>, inkwell::values::MetadataValue<'ctx>>,
+    heap_alias_metadata: std::cell::RefCell<HashMap<std::sync::Arc<BTreeSet<usize>>, (inkwell::values::MetadataValue<'ctx>, Option<inkwell::values::MetadataValue<'ctx>>)>>,
     /// Functions that never return (see `codegen_effects::diverging_functions`).
     diverging: Vec<bool>,
     /// Each string literal's static object (see `static_string`).
@@ -610,6 +946,7 @@ struct Codegen<'ctx, 'p> {
     /// DWARF line-table state — `Some` only when codegen is asked to emit debug
     /// info (AOT builds). `None` for JIT/`emit llvm` (no DWARF, zero overhead).
     debug: Option<DebugCx<'ctx>>,
+    value_types: std::cell::RefCell<Vec<Option<inkwell::types::StructType<'ctx>>>>,
 }
 
 impl<'ctx, 'p> Codegen<'ctx, 'p> {
@@ -628,6 +965,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// their fields in declaration order; value enums lower as `{ i32 tag,
     /// [N x i8] payload }` (handled by their byte size).
     fn value_struct_ty(&self, vid: ValueId) -> inkwell::types::StructType<'ctx> {
+        if let Some(ty) = self.value_types.borrow()[vid as usize] { return ty; }
+        let ty = self.build_value_struct_ty(vid);
+        self.value_types.borrow_mut()[vid as usize] = Some(ty);
+        ty
+    }
+
+    fn build_value_struct_ty(&self, vid: ValueId) -> inkwell::types::StructType<'ctx> {
         let v = &self.prog.values[vid as usize];
         if let Some(niche) = v.niche { return self.value_struct_ty(niche.inner); }
         if let Some(variants) = &v.variants {
@@ -661,8 +1005,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// The aggregate field holding value enum `vid`'s tag word.
     fn value_tag_index(&self, vid: ValueId) -> u32 {
         let base = crate::core::niche_base(&self.prog.values, vid);
-        let variants = self.prog.values[base as usize].variants.as_ref().expect("a value enum");
-        if crate::core::value_enum_max_ptrs(variants, &self.prog.values) == 0 { 0 } else { 1 }
+        assert!(self.prog.values[base as usize].variants.is_some(), "a value enum");
+        if matches!(self.value_struct_ty(base).get_field_type_at_index(0), Some(BasicTypeEnum::ArrayType(_))) { 1 } else { 0 }
     }
 
     /// The variant (tag) of value-enum aggregate `agg` of `vid`. A niche
@@ -1066,13 +1410,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// carry no such claim, so collectors may still access and move objects.
     fn set_heap_alias_metadata(&self, instruction: inkwell::values::InstructionValue<'ctx>, owner: &CoreExpr) -> Result<(), CodegenError> {
         let Some(origins) = self.private_heap.origins(owner) else { return Ok(()); };
-        let own = self.heap_scopes[origins];
-        instruction.set_metadata(self.ctx.metadata_node(&[own.into()]), self.ctx.get_kind_id("alias.scope"))
+        let cached = self.heap_alias_metadata.borrow().get(origins).copied();
+        let (alias, noalias) = if let Some(cached) = cached { cached } else {
+            let (key, own) = self.heap_scopes.get_key_value(origins).unwrap();
+            let alias = self.ctx.metadata_node(&[(*own).into()]);
+            let disjoint: Vec<_> = self.heap_scopes.iter().filter(|(other,_)| origins.is_disjoint(other.as_ref()))
+                .map(|(_,scope)| (*scope).into()).collect();
+            let noalias = (!disjoint.is_empty()).then(|| self.ctx.metadata_node(&disjoint));
+            self.heap_alias_metadata.borrow_mut().insert(key.clone(), (alias, noalias));
+            (alias, noalias)
+        };
+        instruction.set_metadata(alias, self.ctx.get_kind_id("alias.scope"))
             .map_err(|error| CodegenError(error.to_string()))?;
-        let disjoint: Vec<_> = self.heap_scopes.iter().filter(|(other,_)| origins.is_disjoint(other))
-            .map(|(_,scope)| (*scope).into()).collect();
-        if !disjoint.is_empty() {
-            instruction.set_metadata(self.ctx.metadata_node(&disjoint), self.ctx.get_kind_id("noalias"))
+        if let Some(noalias) = noalias {
+            instruction.set_metadata(noalias, self.ctx.get_kind_id("noalias"))
                 .map_err(|error| CodegenError(error.to_string()))?;
         }
         Ok(())
@@ -1196,9 +1547,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Some(rt) => rt.fn_type(&c_params, false),
             None => self.ctx.void_type().fn_type(&c_params, false),
         };
-        let name = format!("__cb_{}", f.name);
-        let tramp = self.module.add_function(&name, fn_ty, Some(inkwell::module::Linkage::Internal));
+        let name = self.partition.map_or_else(|| format!("__cb_{}", f.name), |plan| plan.callbacks[&fid].clone());
+        let linkage = if self.partition.is_some() { inkwell::module::Linkage::External } else { inkwell::module::Linkage::Internal };
+        let tramp = self.module.add_function(&name, fn_ty, Some(linkage));
         self.trampolines.insert(fid, tramp);
+        if self.partition.is_some() && !self.callback_body { return tramp; }
 
         // Build the body. (Save/restore the builder position — we may be mid-call.)
         let saved = self.builder.get_insert_block();
@@ -1406,6 +1759,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // local never live across a safepoint needs no root; full-debug
         // frames keep every reference local in the frame.
         let full_debug = self.debug.as_ref().is_some_and(|debug| debug.full);
+        let mut read = vec![full_debug; f.locals.len()];
+        if !full_debug {
+            crate::inline::visit_block(&f.body, &mut |e| {
+                if let CoreExprKind::Local(local) = e.kind.as_ref() { read[*local as usize] = true; }
+            });
+        }
         let crossing_sites = (requires_roots && !full_debug)
             .then(|| {
                 let foreign: Vec<bool> = self.prog.funcs.iter().map(|g| g.is_extern).collect();
@@ -1420,14 +1779,20 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             Some((crossing, sites)) => (Some(crossing), sites),
             None => (None, HashMap::new()),
         };
-        let rooted = |i: usize, r: &Repr| requires_roots && matches!(r, Repr::Ref(_))
+        // Ordinary callees root their own arguments. An incoming local
+        // needs a mirror only if it remains live across a safepoint here,
+        // or across this function's synthesized entry poll. This also lets
+        // forwarding wrappers remain frame-free and eligible for tail calls.
+        let live_at_boundary = |i: usize| (i < incoming && self.bounded_loops.entry_poll(id as usize))
+            || crossing.as_ref().is_none_or(|c| c.contains(&(i as LocalId)));
+        let rooted = |i: usize, r: &Repr| read[i] && requires_roots && matches!(r, Repr::Ref(_))
             && (!entry_roots_only || i < incoming)
-            && (i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(i as LocalId))));
+            && live_at_boundary(i);
         // Traced locals whose live ranges are disjoint share one slot: one
         // root mirror and working slot per reference, one stack aggregate per
         // value holding references (see `codegen_slots`).
-        let value_traced = |i: usize| requires_roots
-            && (i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(i as LocalId))))
+        let value_traced = |i: usize| read[i] && requires_roots
+            && live_at_boundary(i)
             && matches!(&f.locals[i], Repr::Value(v) if value_has_ref(&self.prog.values, *v));
         let shared: Vec<LocalId> = if full_debug { (0..f.locals.len() as LocalId).collect() } else {
             crate::codegen_slots::share_slots(f, incoming, |l| {
@@ -1438,9 +1803,6 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             })
         };
         let owner = |i: usize| shared[i] as usize;
-        let mut sharers = vec![0u32; f.locals.len()];
-        for i in 0..f.locals.len() { sharers[owner(i)] += 1; }
-        let shared_slot: Vec<bool> = (0..f.locals.len()).map(|i| sharers[owner(i)] > 1).collect();
         if std::env::var_os("GCR_CROSSING").is_some_and(|n| f.name.contains(n.to_str().unwrap_or_default())) {
             let mut c: Vec<_> = crossing.iter().flatten().copied().collect();
             c.sort();
@@ -1473,9 +1835,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             .locals
             .iter()
             .enumerate()
-            .filter(|_| requires_roots)
+            .filter(|(i, _)| requires_roots && read[*i])
             // As for references: only values live across a safepoint.
-            .filter(|(i, _)| *i < incoming || crossing.as_ref().is_none_or(|c| c.contains(&(*i as LocalId))))
+            .filter(|(i, _)| live_at_boundary(*i))
             .filter(|(i, _)| owner(*i) == *i)
             .filter_map(|(i, r)| match r {
                 Repr::Value(vid) if value_has_ref(&self.prog.values, *vid) => {
@@ -1486,7 +1848,16 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 _ => None,
             })
             .collect();
-        let num_indirect: usize = value_indirect.iter().map(|(_, o)| o.len()).sum();
+        let value_roots: usize = value_indirect.iter().map(|(_, o)| o.len()).sum();
+        let direct_roots = num_roots;
+        let masked = !full_debug && !entry_roots_only;
+        let num_indirect = if masked { num_roots += value_roots; 0 } else { value_roots };
+        let mut value_home_indices = HashMap::new();
+        let mut next_home = direct_roots;
+        for (local, offsets) in &value_indirect {
+            value_home_indices.insert(*local, next_home as u32);
+            next_home += offsets.len();
+        }
         if std::env::var_os("GCR_FRAME_STATS").is_some() && num_roots + num_indirect > 0 {
             eprintln!("frame {}: {} roots, {} indirect in {} values, {} locals", f.name, num_roots, num_indirect, value_indirect.len(), f.locals.len());
         }
@@ -1510,9 +1881,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // collector reads only those. The frame is linked at the first such
         // call; mirrors are written as references are assigned.
         const LATE_ROOTS_LIMIT: usize = 32;
-        let masked = !full_debug && !entry_roots_only;
         let few_roots = num_roots + num_indirect <= LATE_ROOTS_LIMIT;
-        let defer_frame = if masked { num_roots > 0 || num_indirect > 0 } else {
+        // In a large safepoint-dense function, repeated conditional linking
+        // creates many control-flow joins and phi nodes. Register one empty
+        // masked frame at entry instead; each safepoint still publishes its
+        // exact live mask before the collector can inspect the frame.
+        let defer_frame = if masked { (num_roots > 0 || num_indirect > 0) && sites.len() <= 32 } else {
             (num_roots > 0 && num_indirect == 0
             && (entry_roots_only || (f.closure_captures.is_empty()
             && f.params.iter().all(|repr| !self.repr_relocates(repr))))
@@ -1533,39 +1907,21 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let i32t = self.ctx.i32_type();
         let mut deferred_frame_origin = None;
         //
-        // A masked frame instead holds the value-with-ref locals themselves
-        // after the roots, `{ parent, origin, [num_roots x ptr], V1, V2, .. }`,
-        // and its descriptor gives the frame offsets of their references: the
-        // frame is linked with no per-call address stores.
-        let mut indirect_offsets: Vec<u32> = Vec::new();
-        let mut indirect_offsets_global = None;
+        // Masked frames store only reference fields, densely in the direct
+        // root array. Scalars remain in private value storage; no aggregate
+        // homes or indirect-offset tables are needed by the collector.
+        let indirect_offsets_global = None;
         let frame = if num_roots > 0 || num_indirect > 0 {
             let roots_arr = ptr.array_type(num_roots as u32);
             let ind_arr = ptr.array_type(if masked { 0 } else { num_indirect as u32 });
             let mut fields: Vec<BasicTypeEnum> = vec![ptr.into(), ptr.into(), roots_arr.into()];
-            if masked {
-                fields.extend(value_indirect.iter()
-                    .map(|(i, _)| self.llvm_ty(&f.locals[*i]).expect("value-with-ref local has a type")));
-            } else {
-                fields.push(ind_arr.into());
-            }
+            if !masked { fields.push(ind_arr.into()); }
             let frame_ty = self.ctx.struct_type(&fields, false);
-            if masked {
-                for (k, (_, offs)) in value_indirect.iter().enumerate() {
-                    let base = self.target_data.offset_of_element(&frame_ty, 3 + k as u32).unwrap();
-                    indirect_offsets.extend(offs.iter().map(|&off| (base + off as u64) as u32));
-                }
-                if !indirect_offsets.is_empty() {
-                    let i32t = self.ctx.i32_type();
-                    let words = i32t.const_array(&indirect_offsets.iter().map(|&o| i32t.const_int(o as u64, false)).collect::<Vec<_>>());
-                    let g = self.module.add_global(words.get_type(), None, &format!("__indirect_{}", f.name));
-                    g.set_constant(true);
-                    g.set_initializer(&words);
-                    indirect_offsets_global = Some(g.as_pointer_value());
-                }
-            }
             let frame = self.builder.build_alloca(frame_ty, "gcframe").unwrap();
-            let origin = self.frame_origin(&f.name, num_roots as u32, num_indirect as u32, indirect_offsets_global);
+            let origin = if masked && !defer_frame {
+                let empty = vec![0u64; (num_roots + num_indirect).div_ceil(64).max(1)];
+                self.site_origin(&f.name, num_roots as u32, num_indirect as u32, &empty, indirect_offsets_global)
+            } else { self.frame_origin(&f.name, num_roots as u32, num_indirect as u32, indirect_offsets_global) };
             if defer_frame { deferred_frame_origin = Some(origin); }
             else {
                 let origin_field = self.builder.build_struct_gep(frame_ty, frame, 1, "origin.f").unwrap();
@@ -1581,7 +1937,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             // Zero all direct root slots.
             let roots_field = self.builder.build_struct_gep(frame_ty, frame, 2, "roots.f").unwrap();
-            for k in 0..if defer_frame { 0 } else { num_roots } {
+            for k in 0..if defer_frame || masked { 0 } else { num_roots } {
                 let slot = unsafe {
                     self.builder.build_in_bounds_gep(
                         roots_arr, roots_field,
@@ -1616,6 +1972,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let mut value_homes: Vec<Option<PointerValue<'ctx>>> = vec![None; f.locals.len()];
         let mut slots: Vec<Option<PointerValue<'ctx>>> = Vec::with_capacity(f.locals.len());
         for (i, lr) in f.locals.iter().enumerate() {
+            if !read[i] { slots.push(None); continue; }
             if owner(i) != i {
                 // Filled from the owner's slots below.
                 slots.push(None);
@@ -1639,9 +1996,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     self.builder.build_store(private, ptr.const_null()).unwrap();
                     slots.push(Some(private));
                 }
-            } else if let Some(k) = value_indirect.iter().position(|(l, _)| *l == i).filter(|_| masked) {
-                let (frame, frame_ty, ..) = frame.unwrap();
-                value_homes[i] = Some(self.builder.build_struct_gep(frame_ty, frame, 3 + k as u32, &format!("home{}", i)).unwrap());
+            } else if let Some(index) = value_home_indices.get(&i).filter(|_| masked) {
+                let (_, _, roots_arr, roots_field, ..) = frame.unwrap();
+                value_homes[i] = Some(unsafe { self.builder.build_in_bounds_gep(roots_arr, roots_field,
+                    &[i32t.const_zero(), i32t.const_int(*index as u64, false)], &format!("home{}", i)).unwrap() });
                 let t = self.llvm_ty(lr).expect("value-with-ref local has a type");
                 slots.push(Some(self.builder.build_alloca(t, &format!("l{}", i)).unwrap()));
             } else {
@@ -1680,7 +2038,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                         self.builder.build_store(alloca, vty.const_zero()).unwrap();
                     }
                 }
-                local_bits[*local_idx].extend((0..offs.len() as u32).map(|k| num_roots as u32 + j + k));
+                local_bits[*local_idx].extend((0..offs.len() as u32).map(|k| direct_roots as u32 + j + k));
                 if masked { j += offs.len() as u32; continue; }
                 for &off in offs {
                     let addr = self.obj_addr(alloca, off as u64);
@@ -1838,6 +2196,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let scope: Vec<LocalId> = (0..incoming).filter(|&i| !local_bits[i].is_empty()).map(|i| i as LocalId).collect();
 
         let mut fcx = FnCtx {
+            id,
             func,
             slots,
             root_slots,
@@ -1861,7 +2220,6 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             scope,
             loop_scopes: Vec::new(),
             once_scopes: Vec::new(),
-            shared_slot,
             local_bits,
             frame_dims: (f.name.clone(), num_roots as u32, num_indirect as u32, indirect_offsets_global),
             sites,
@@ -1953,26 +2311,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         }
     }
 
-    /// Inactive deferred frames have no live references. Avoid even acquire
-    /// epoch loads on those paths; these loads otherwise survive LLVM DCE.
-    fn prepare_root_reload(&self, fcx: &FnCtx<'ctx>) -> Option<(IntValue<'ctx>, Option<IntValue<'ctx>>)> {
+    /// Both direct and closure-call paths link the frame before preparing a
+    /// relocation check. Its active flag is therefore already known true;
+    /// rebuilding that fact as control flow only obscures SSA and liveness.
+    fn prepare_root_reload(&self, fcx: &FnCtx<'ctx>) -> Option<IntValue<'ctx>> {
         if !fcx.root_slots.iter().any(Option::is_some) && !fcx.value_homes.iter().any(Option::is_some) { return None; }
-        let active = fcx.frame_active.map(|flag| {
-            self.builder.build_load(self.ctx.bool_type(), flag, "roots.were_active").unwrap().into_int_value()});
-        let before = if let Some(active) = active {
-            let inactive = self.builder.get_insert_block().unwrap();
-            let read = self.ctx.append_basic_block(fcx.func, "roots.epoch.read");
-            let ready = self.ctx.append_basic_block(fcx.func, "roots.epoch.ready");
-            self.builder.build_conditional_branch(active, read, ready).unwrap();
-            self.builder.position_at_end(read);
-            let epoch = self.load_relocation_epoch(fcx);
-            self.builder.build_unconditional_branch(ready).unwrap();
-            self.builder.position_at_end(ready);
-            let before = self.builder.build_phi(self.ctx.i64_type(), "roots.epoch.before").unwrap();
-            before.add_incoming(&[(&self.ctx.i64_type().const_zero(), inactive), (&epoch, read)]);
-            before.as_basic_value().into_int_value()
-        } else { self.load_relocation_epoch(fcx) };
-        Some((before, active))
+        Some(self.load_relocation_epoch(fcx))
     }
 
     /// Branch to `then` when `condition` holds, which is rare.
@@ -1986,13 +2330,8 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         branch.set_metadata(weights, self.ctx.get_kind_id("prof")).unwrap();
     }
 
-    fn reload_if_relocated(&self, fcx: &FnCtx<'ctx>, before: IntValue<'ctx>, active: Option<IntValue<'ctx>>, spilled: Option<&[LocalId]>) {
+    fn reload_if_relocated(&self, fcx: &FnCtx<'ctx>, before: IntValue<'ctx>, spilled: Option<&[LocalId]>) {
         let ready = self.ctx.append_basic_block(fcx.func, "roots.ready");
-        if let Some(active) = active {
-            let check = self.ctx.append_basic_block(fcx.func, "roots.epoch.check");
-            self.builder.build_conditional_branch(active, check, ready).unwrap();
-            self.builder.position_at_end(check);
-        }
         let after = self.load_relocation_epoch(fcx);
         let changed = self.builder.build_int_compare(IntPredicate::NE, before, after, "gc.relocated").unwrap();
         let reload = self.ctx.append_basic_block(fcx.func, "roots.reload");
@@ -2009,7 +2348,11 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// How many 8-byte words reloading `spilled` reads.
     fn spilled_words(&self, fcx: &FnCtx<'ctx>, spilled: &[LocalId]) -> u64 {
         spilled.iter().map(|&l| match &fcx.local_reprs[l as usize] {
-            Repr::Value(v) if fcx.value_homes[l as usize].is_some() => (self.prog.values[*v as usize].size as u64).div_ceil(8),
+            Repr::Value(v) if fcx.value_homes[l as usize].is_some() => {
+                let mut offsets = Vec::new();
+                value_interior_offsets(&self.prog.values, *v, 0, &mut offsets);
+                offsets.len() as u64
+            },
             _ => 1,
         }).sum()
     }
@@ -2024,10 +2367,27 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let relocated = self.builder.build_load(ptr, root, "root.relocated").unwrap();
                 self.builder.build_store(working, relocated).unwrap();
             } else if let Some(home) = fcx.value_homes[local] {
-                let t = self.llvm_ty(&fcx.local_reprs[local]).unwrap();
-                let relocated = self.builder.build_load(t, home, "value.relocated").unwrap();
-                self.builder.build_store(working, relocated).unwrap();
+                self.copy_value_references(home, working, &fcx.local_reprs[local], false);
             }
+        }
+    }
+
+    /// A root frame exposes only managed pointer slots to the collector.
+    /// Scalar fields remain in private storage across a collection; copying
+    /// them to and from the frame adds work and obscures their SSA lifetimes.
+    fn copy_value_references(&self, source: PointerValue<'ctx>, destination: PointerValue<'ctx>, repr: &Repr, spill: bool) {
+        let Repr::Value(value) = repr else { unreachable!("indirect root is a value aggregate") };
+        let mut offsets = Vec::new();
+        value_interior_offsets(&self.prog.values, *value, 0, &mut offsets);
+        let pointer = self.ctx.ptr_type(AddressSpace::default());
+        for (index, offset) in offsets.into_iter().enumerate() {
+            let (from_offset, to_offset) = if spill { (offset as u64, index as u64 * 8) }
+                else { (index as u64 * 8, offset as u64) };
+            let from = self.obj_addr(source, from_offset);
+            let to = self.obj_addr(destination, to_offset);
+            let reference = self.builder.build_load(pointer, from, "value.root").unwrap();
+            reference.as_instruction_value().unwrap().set_alignment(8).unwrap();
+            self.builder.build_store(to, reference).unwrap().set_alignment(8).unwrap();
         }
     }
 
@@ -2094,7 +2454,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } else { None };
         // A few spilled words are cheaper to read back than to compare the
         // relocation epoch around the call.
-        if let Some(spilled) = spilled.as_deref().filter(|s| has_roots && !no_relocation && symbol != "ai_ffi_leave" && self.spilled_words(fcx, s) <= 3) {
+        if let Some(spilled) = spilled.as_deref().filter(|s| has_roots && !no_relocation && symbol != "ai_ffi_leave" && self.spilled_words(fcx, s) <= UNCONDITIONAL_RELOAD_WORDS) {
             let call = self.builder.build_call(callee, args, name)?;
             self.refresh_copy_phase(fcx);
             self.reload_spilled(fcx, spilled);
@@ -2107,7 +2467,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         } else { None };
         let call = self.builder.build_call(callee, args, name)?;
         if !no_relocation { self.refresh_copy_phase(fcx); }
-        if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active, spilled.as_deref()); }
+        if let Some(before) = before { self.reload_if_relocated(fcx, before, spilled.as_deref()); }
         else if has_roots && symbol == "ai_ffi_leave" { self.reload_active_root_mirrors(fcx); }
         Ok(call)
     }
@@ -2197,9 +2557,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 let value = self.builder.build_load(ptr, working, "root.spill").unwrap();
                 self.builder.build_store(root, value).unwrap();
             } else if let (Some(working), Some(home)) = (fcx.slots[l], fcx.value_homes[l]) {
-                let t = self.llvm_ty(&fcx.local_reprs[l]).unwrap();
-                let value = self.builder.build_load(t, working, "value.spill").unwrap();
-                self.builder.build_store(home, value).unwrap();
+                self.copy_value_references(working, home, &fcx.local_reprs[l], true);
             }
             for &bit in &fcx.local_bits[l] { mask[bit as usize / 64] |= 1 << (bit % 64); }
         }
@@ -2277,26 +2635,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         g.as_pointer_value()
     }
 
-    fn clear_dead_roots(&self, fcx: &FnCtx<'ctx>, statement: &CoreStmt) {
-        if fcx.masked { return; }
-        let Some(dead) = self.root_liveness.dead(statement) else { return; };
-        let ptr = self.ctx.ptr_type(AddressSpace::default());
-        for local in dead {
-            // A shared slot may already hold a later local: a compound
-            // statement's dead set names locals defined inside it.
-            if fcx.shared_slot[*local as usize] { continue; }
-            if let Some(root) = fcx.root_slots[*local as usize] {
-                self.builder.build_store(root, ptr.const_null()).unwrap();
-                // A late frame copies working slots when it is linked.
-                if fcx.late_roots {
-                    if let Some(working) = fcx.slots[*local as usize] { self.builder.build_store(working, ptr.const_null()).unwrap(); }
-                }
-            }
-        }
-        // Indirect value roots retain their original lifetime for now. Clearing
-        // their inline bytes would also affect the private working aggregate.
-    }
-
+    // Masked frames use safepoint-local liveness. The only optimized
+    // unmasked frames poll once on entry and cannot relocate afterward, so
+    // statement-by-statement root clearing is redundant. Full debug retains
+    // lexical roots deliberately.
     fn gen_block(
         &mut self,
         fcx: &mut FnCtx<'ctx>,
@@ -2330,7 +2672,6 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             if self.builder.get_insert_block().unwrap().get_terminator().is_some() {
                 return Ok(None);
             }
-            self.clear_dead_roots(fcx, s);
         }
         match &b.tail {
             Some(e) => self.gen_expr(fcx, e),
@@ -3129,7 +3470,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     /// pair so the v1 function+type granularity stays honest: every emitted id
     /// maps to exactly one labelable `(function, type)`, never a distinct id we
     /// couldn't tell apart at profile time.
-    fn alloc_site_id(&mut self, function: &str, type_id: u16, span: crate::core::SpanId) -> u32 {
+    fn alloc_site_id(&mut self, function: &str, type_id: u16, span: crate::core::SpanId) -> Result<u32, CodegenError> {
         // Resolve the construction node's span to `file:line:col` if source is
         // available (debugger P1 span-threading); empty otherwise. The location
         // is part of the dedup key, so two allocations of the same type in the
@@ -3137,9 +3478,10 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         // upgrade over the old (function, type)-only key.
         let location = self.prog.span_label(span).unwrap_or_default();
         let key = (function.to_string(), type_id, location.clone());
-        if let Some(&id) = self.alloc_site_ids.get(&key) {
-            return id;
+        if let Some(plan) = self.partition {
+            return plan.site_ids.get(&key).copied().ok_or_else(|| CodegenError(format!("unregistered eager allocation site: {key:?}")));
         }
+        if let Some(&id) = self.alloc_site_ids.get(&key) { return Ok(id); }
         let id = self.alloc_sites.len() as u32;
         self.alloc_sites.push(crate::gc::AllocSite {
             function: function.to_string(),
@@ -3147,21 +3489,13 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             location,
         });
         self.alloc_site_ids.insert(key, id);
-        id
+        Ok(id)
     }
 
     /// Keep source allocation labels when a branch has a synthesized helper.
     fn current_fn_name(&self, fcx: &FnCtx<'ctx>) -> String {
-        self.funcs
-            .iter()
-            .find_map(|(id, function)| {
-                if *function == fcx.func {
-                    self.outlined_helpers.get(id).cloned()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| fcx.func.get_name().to_string_lossy().into_owned())
+        self.outlined_helpers.get(&fcx.id).cloned()
+            .unwrap_or_else(|| self.funcs[&fcx.id].get_name().to_string_lossy().into_owned())
     }
 
     fn declare_runtime_externs(&self) {
@@ -3832,7 +4166,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         let tid = self.gen_expr(fcx, &args[0])?.unwrap();
         let array = self.gen_expr(fcx, &args[1])?.unwrap().into_pointer_value();
         let len = self.gen_expr(fcx, &args[2])?.unwrap().into_int_value();
-        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span)?;
         // Only while no copy is in progress may the array be read directly.
         let mode = self.access_mode(fcx);
         let copying = self.builder.build_and(mode, i8t.const_int(1, false), "str.copying").unwrap();
@@ -4090,7 +4424,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             vals.push((self.gen_expr(fcx, fe)?, fe.repr.clone()));
         }
 
-        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span)?;
         let physical = if fields.is_empty() && tag.is_some_and(|tag| {
             matches!(&self.prog.layouts[layout as usize].meta.kind,
                 crate::gc::TypeKind::Enum { variants, .. }
@@ -4170,6 +4504,9 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
             return agg.into();
         }
+        if self.prog.values[value as usize].size <= 128 {
+            return self.build_ssa_value_variant(value, tag, vals).into();
+        }
         let variants = self.prog.values[value as usize].variants.as_ref().unwrap();
         let (offsets, _) = crate::core::value_variant_offsets(&variants[tag as usize].fields, &self.prog.values);
         let slot = self.entry_alloca(sty, "ve");
@@ -4197,7 +4534,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     }
                     _ => {
                         let field_addr = self.payload_field_addr(tag_addr, raw_off.expect("a raw field") as u64);
-                        self.builder.build_store(field_addr, *v).unwrap();
+                        self.builder.build_store(field_addr, *v).unwrap().set_alignment(1).unwrap();
                         if let Repr::Value(id) = repr {
                             let mut offsets = Vec::new();
                             value_interior_offsets(&self.prog.values, *id, 0, &mut offsets);
@@ -4215,6 +4552,256 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             }
         }
         self.builder.build_load(sty, slot, "ve.val").unwrap()
+    }
+
+    /// Construct small tagged unions without an alloca, type-punned stores,
+    /// and a reload. Keep every unused bit zero, including all GC pointer
+    /// slots; the representation is identical to the memory construction.
+    fn build_ssa_value_variant(&self, value: ValueId, tag: u32,
+        vals: &[(BasicValueEnum<'ctx>, Repr)]) -> inkwell::values::StructValue<'ctx> {
+        let ty = self.value_struct_ty(value);
+        let mut aggregate = self.builder.build_insert_value(ty.const_zero(),
+            self.ctx.i32_type().const_int(tag as u64, false), self.value_tag_index(value), "value.tag").unwrap().into_struct_value();
+        let variants = self.prog.values[value as usize].variants.as_ref().unwrap();
+        let reprs = &variants[tag as usize].fields;
+        let (offsets, _) = crate::core::value_variant_offsets(reprs, &self.prog.values);
+        let offsets = reprs.iter().zip(offsets).filter_map(|(repr, offset)| (!matches!(repr, Repr::Unit)).then_some(offset));
+        let mut pointer = 0;
+        for ((field, repr), offset) in vals.iter().zip(offsets) {
+            self.pack_enum_field(&mut aggregate, value, offset.unwrap_or(0) as u64, *field, repr, &mut pointer);
+        }
+        aggregate
+    }
+
+    fn pack_enum_reference(&self, aggregate: &mut inkwell::values::StructValue<'ctx>,
+        pointer: &mut u32, reference: BasicValueEnum<'ctx>) {
+        let refs = self.builder.build_extract_value(*aggregate, 0, "value.refs").unwrap().into_array_value();
+        let refs = self.builder.build_insert_value(refs, reference, *pointer, "value.ref").unwrap();
+        *aggregate = self.builder.build_insert_value(*aggregate, refs, 0, "value.with_refs").unwrap().into_struct_value();
+        *pointer += 1;
+    }
+
+    /// Serialize a nested value at its ABI byte offset, moving its managed
+    /// references into the enclosing enum's leading pointer slots. The raw
+    /// copies of hoisted references stay zero, as in the memory path.
+    fn pack_enum_field(&self, aggregate: &mut inkwell::values::StructValue<'ctx>,
+        outer: ValueId, offset: u64, field: BasicValueEnum<'ctx>, repr: &Repr, pointer: &mut u32) {
+        match repr {
+            Repr::Unit => {},
+            Repr::Ref(_) => self.pack_enum_reference(aggregate, pointer, field),
+            Repr::Scalar(scalar) => {
+                let bits = match scalar {
+                    ScalarRepr::F32 | ScalarRepr::F64 => self.builder.build_bit_cast(field,
+                        self.ctx.custom_width_int_type(scalar.bits()), "value.float_bits").unwrap().into_int_value(),
+                    ScalarRepr::Ptr => self.builder.build_ptr_to_int(field.into_pointer_value(), self.ctx.i64_type(), "value.ptr_bits").unwrap(),
+                    _ => field.into_int_value(),
+                };
+                self.insert_enum_bits(aggregate, outer, offset, bits);
+            }
+            Repr::Value(id) => {
+                let layout = &self.prog.values[*id as usize];
+                let ty = self.value_struct_ty(*id);
+                let field = field.into_struct_value();
+                if layout.variants.is_none() {
+                    let mut index = 0;
+                    for repr in &layout.fields {
+                        if matches!(repr, Repr::Unit) { continue; }
+                        let component = self.builder.build_extract_value(field, index, "value.field").unwrap();
+                        let position = self.target_data.offset_of_element(&ty, index).unwrap();
+                        self.pack_enum_field(aggregate, outer, offset + position, component, repr, pointer);
+                        index += 1;
+                    }
+                } else {
+                    // Niche enums use their base enum's exact LLVM shape.
+                    let tag = self.value_tag_index(*id);
+                    if tag != 0 {
+                        let references = self.builder.build_extract_value(field, 0, "value.nested_refs").unwrap().into_array_value();
+                        for index in 0..references.get_type().len() {
+                            let reference = self.builder.build_extract_value(references, index, "value.nested_ref").unwrap();
+                            self.pack_enum_reference(aggregate, pointer, reference);
+                        }
+                    }
+                    for index in tag..ty.count_fields() {
+                        let component = self.builder.build_extract_value(field, index, "value.raw").unwrap();
+                        let position = self.target_data.offset_of_element(&ty, index).unwrap();
+                        match component {
+                            BasicValueEnum::IntValue(bits) => self.insert_enum_bits(aggregate, outer, offset + position, bits),
+                            BasicValueEnum::ArrayValue(words) => {
+                                let bytes = words.get_type().get_element_type().into_int_type().get_bit_width() as u64 / 8;
+                                for index in 0..words.get_type().len() {
+                                    let bits = self.builder.build_extract_value(words, index, "value.raw_word").unwrap().into_int_value();
+                                    self.insert_enum_bits(aggregate, outer, offset + position + index as u64 * bytes, bits);
+                                }
+                            }
+                            _ => unreachable!("value enum raw storage is integer words"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn enum_storage_word(&self, value: ValueId, position: u64) -> (u32, Option<u32>, u64, u32) {
+        let tag = self.value_tag_index(value);
+        let wide = self.prog.values[value as usize].align >= 8;
+        if position < 4 { (tag, None, 0, 32) }
+        else if wide && position < 8 { (tag + 1, None, 4, 32) }
+        else {
+            let bytes = if wide { 8 } else { 4 };
+            let word = (position - bytes) / bytes;
+            (tag + if wide { 2 } else { 1 }, Some(word as u32), bytes + word * bytes, bytes as u32 * 8)
+        }
+    }
+
+    /// Insert integer storage bits into the tag-relative raw region. Handles
+    /// packed sub-word fields, 128-bit scalars, and native byte ordering.
+    fn insert_enum_bits(&self, aggregate: &mut inkwell::values::StructValue<'ctx>,
+        value: ValueId, offset: u64, mut bits: IntValue<'ctx>) {
+        let width = bits.get_type().get_bit_width();
+        let storage = width.div_ceil(8) * 8;
+        if width != storage {
+            bits = self.builder.build_int_z_extend(bits, self.ctx.custom_width_int_type(storage), "value.storage_bits").unwrap();
+        }
+        let little = self.target_data.get_byte_ordering() == inkwell::targets::ByteOrdering::LittleEndian;
+        let mut consumed = 0u64;
+        while consumed < storage as u64 / 8 {
+            let position = offset + consumed;
+            let (field, word, word_start, word_bits) = self.enum_storage_word(value, position);
+            let within = position - word_start;
+            let bytes = (word_bits as u64 / 8 - within).min(storage as u64 / 8 - consumed);
+            let chunk_bits = bytes as u32 * 8;
+            let source_shift = if little { consumed * 8 } else { storage as u64 - (consumed + bytes) * 8 };
+            let target_shift = if little { within * 8 } else { word_bits as u64 - (within + bytes) * 8 };
+            let ty = self.ctx.custom_width_int_type(word_bits);
+            let mut chunk = if source_shift == 0 { bits } else {
+                self.builder.build_right_shift(bits, bits.get_type().const_int(source_shift, false), false, "value.chunk").unwrap()
+            };
+            chunk = if storage > word_bits { self.builder.build_int_truncate(chunk, ty, "value.trunc").unwrap() }
+                else if storage < word_bits { self.builder.build_int_z_extend(chunk, ty, "value.extend").unwrap() }
+                else { chunk };
+            let previous = self.builder.build_extract_value(*aggregate, field, "value.raw_part").unwrap();
+            let merged = if chunk_bits == word_bits {
+                chunk
+            } else {
+                let low = (1u64 << chunk_bits) - 1;
+                let mask = low << target_shift;
+                chunk = self.builder.build_and(chunk, ty.const_int(low, false), "value.mask").unwrap();
+                if target_shift != 0 { chunk = self.builder.build_left_shift(chunk, ty.const_int(target_shift, false), "value.shift").unwrap(); }
+                let old = if let Some(word) = word {
+                    self.builder.build_extract_value(previous.into_array_value(), word, "value.old_word").unwrap().into_int_value()
+                } else { previous.into_int_value() };
+                let old = self.builder.build_and(old, ty.const_int(!mask, false), "value.keep").unwrap();
+                self.builder.build_or(old, chunk, "value.merged").unwrap()
+            };
+            let replacement: BasicValueEnum<'ctx> = if let Some(word) = word {
+                self.builder.build_insert_value(previous.into_array_value(), merged, word, "value.word").unwrap().into_array_value().into()
+            } else { merged.into() };
+            *aggregate = self.builder.build_insert_value(*aggregate, replacement, field, "value.with_bits").unwrap().into_struct_value();
+            consumed += bytes;
+        }
+    }
+
+    fn extract_enum_bits(&self, aggregate: inkwell::values::StructValue<'ctx>, value: ValueId,
+        offset: u64, storage: u32) -> IntValue<'ctx> {
+        let ty = self.ctx.custom_width_int_type(storage);
+        let mut result = ty.const_zero();
+        let little = self.target_data.get_byte_ordering() == inkwell::targets::ByteOrdering::LittleEndian;
+        let mut consumed = 0u64;
+        while consumed < storage as u64 / 8 {
+            let position = offset + consumed;
+            let (field, word, word_start, word_bits) = self.enum_storage_word(value, position);
+            let within = position - word_start;
+            let bytes = (word_bits as u64 / 8 - within).min(storage as u64 / 8 - consumed);
+            let chunk_bits = bytes as u32 * 8;
+            let source_shift = if little { within * 8 } else { word_bits as u64 - (within + bytes) * 8 };
+            let target_shift = if little { consumed * 8 } else { storage as u64 - (consumed + bytes) * 8 };
+            let raw = self.builder.build_extract_value(aggregate, field, "value.raw_part").unwrap();
+            let mut bits = if let Some(word) = word {
+                self.builder.build_extract_value(raw.into_array_value(), word, "value.raw_word").unwrap().into_int_value()
+            } else { raw.into_int_value() };
+            if source_shift != 0 {
+                bits = self.builder.build_right_shift(bits, bits.get_type().const_int(source_shift, false), false, "value.read_shift").unwrap();
+            }
+            if chunk_bits != word_bits {
+                bits = self.builder.build_and(bits, bits.get_type().const_int((1u64 << chunk_bits) - 1, false), "value.read_mask").unwrap();
+            }
+            bits = if word_bits > storage { self.builder.build_int_truncate(bits, ty, "value.read_trunc").unwrap() }
+                else if word_bits < storage { self.builder.build_int_z_extend(bits, ty, "value.read_extend").unwrap() }
+                else { bits };
+            if target_shift != 0 { bits = self.builder.build_left_shift(bits, ty.const_int(target_shift, false), "value.read_position").unwrap(); }
+            result = self.builder.build_or(result, bits, "value.read_bits").unwrap();
+            consumed += bytes;
+        }
+        result
+    }
+
+    fn unpack_enum_reference(&self, aggregate: inkwell::values::StructValue<'ctx>, pointer: &mut u32) -> BasicValueEnum<'ctx> {
+        let refs = self.builder.build_extract_value(aggregate, 0, "value.refs").unwrap().into_array_value();
+        let reference = self.builder.build_extract_value(refs, *pointer, "value.ref").unwrap();
+        *pointer += 1;
+        reference
+    }
+
+    fn unpack_enum_field(&self, aggregate: inkwell::values::StructValue<'ctx>, outer: ValueId,
+        offset: u64, repr: &Repr, pointer: &mut u32) -> BasicValueEnum<'ctx> {
+        match repr {
+            Repr::Unit => unreachable!("unit has no payload storage"),
+            Repr::Ref(_) => self.unpack_enum_reference(aggregate, pointer),
+            Repr::Scalar(scalar) => {
+                let storage = scalar.bits().max(8);
+                let bits = self.extract_enum_bits(aggregate, outer, offset, storage);
+                match scalar {
+                    ScalarRepr::F32 | ScalarRepr::F64 => self.builder.build_bit_cast(bits, self.scalar_ty(*scalar), "value.float").unwrap(),
+                    ScalarRepr::Ptr => self.builder.build_int_to_ptr(bits, self.ctx.ptr_type(AddressSpace::default()), "value.pointer").unwrap().into(),
+                    ScalarRepr::Bool => self.builder.build_int_truncate(bits, self.ctx.bool_type(), "value.bool").unwrap().into(),
+                    _ => bits.into(),
+                }
+            }
+            Repr::Value(id) => {
+                let layout = &self.prog.values[*id as usize];
+                let ty = self.value_struct_ty(*id);
+                let mut result = ty.const_zero();
+                if layout.variants.is_none() {
+                    let mut index = 0;
+                    for repr in &layout.fields {
+                        if matches!(repr, Repr::Unit) { continue; }
+                        let position = self.target_data.offset_of_element(&ty, index).unwrap();
+                        let component = self.unpack_enum_field(aggregate, outer, offset + position, repr, pointer);
+                        result = self.builder.build_insert_value(result, component, index, "value.field").unwrap().into_struct_value();
+                        index += 1;
+                    }
+                } else {
+                    let tag = self.value_tag_index(*id);
+                    if tag != 0 {
+                        let mut refs = ty.get_field_type_at_index(0).unwrap().into_array_type().const_zero();
+                        for index in 0..refs.get_type().len() {
+                            let reference = self.unpack_enum_reference(aggregate, pointer);
+                            refs = self.builder.build_insert_value(refs, reference, index, "value.nested_ref").unwrap().into_array_value();
+                        }
+                        result = self.builder.build_insert_value(result, refs, 0, "value.nested_refs").unwrap().into_struct_value();
+                    }
+                    for index in tag..ty.count_fields() {
+                        let position = self.target_data.offset_of_element(&ty, index).unwrap();
+                        let component: BasicValueEnum<'ctx> = match ty.get_field_type_at_index(index).unwrap() {
+                            BasicTypeEnum::IntType(word) => self.extract_enum_bits(aggregate, outer, offset + position, word.get_bit_width()).into(),
+                            BasicTypeEnum::ArrayType(words) => {
+                                let word = words.get_element_type().into_int_type();
+                                let bytes = word.get_bit_width() as u64 / 8;
+                                let mut result = words.const_zero();
+                                for index in 0..words.len() {
+                                    let bits = self.extract_enum_bits(aggregate, outer, offset + position + index as u64 * bytes, word.get_bit_width());
+                                    result = self.builder.build_insert_value(result, bits, index, "value.nested_word").unwrap().into_array_value();
+                                }
+                                result.into()
+                            }
+                            _ => unreachable!("value enum raw storage is integer words"),
+                        };
+                        result = self.builder.build_insert_value(result, component, index, "value.nested_raw").unwrap().into_struct_value();
+                    }
+                }
+                result.into()
+            }
+        }
     }
 
     /// Address of a payload field at `byte_off` within the value-enum's byte
@@ -4414,7 +5001,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         if !self.debug.as_ref().is_some_and(|d| d.full) {
             return Ok(Some(self.static_string(s, lid).into()));
         }
-        let site = self.alloc_site_id(&self.current_fn_name(fcx), lid as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), lid as u16, span)?;
         let alloc = self.module.get_function("ai_gc_alloc_varlen").unwrap();
         let obj = call_result(self.build_managed_call(fcx,
             alloc,
@@ -4436,29 +5023,30 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         Ok(Some(obj.into()))
     }
 
+    fn partition_literal(&self, key: &StaticDataKey) -> Option<PointerValue<'ctx>> {
+        let plan = self.partition?;
+        let ty = self.ctx.i8_type().array_type(plan.literal_bytes.len() as u32);
+        let global = self.module.get_global(&plan.pool_name)
+            .unwrap_or_else(|| self.module.add_global(ty, None, &plan.pool_name));
+        global.set_alignment(8);
+        Some(unsafe { self.builder.build_in_bounds_gep(ty, global.as_pointer_value(),
+            &[self.ctx.i64_type().const_zero(), self.ctx.i64_type().const_int(plan.literal_offsets[key], false)], "literal").unwrap() })
+    }
+
     /// The static String object for literal `s` (one per distinct literal):
     /// a Full header (no GC bits, type id `layout`), the byte count, and the
     /// bytes, as `ai_gc_alloc_varlen` would lay it out.
     fn static_string(&self, s: &str, layout: LayoutId) -> PointerValue<'ctx> {
         let key = (s.to_string(), layout);
         if let Some(g) = self.static_strings.borrow().get(&key) { return *g; }
-        let i64t = self.ctx.i64_type();
-        let i8t = self.ctx.i8_type();
-        let bytes = s.as_bytes();
-        let padded = (bytes.len() as u32).div_ceil(8) * 8;
-        let mut data = bytes.to_vec();
-        data.resize(padded as usize, 0);
-        let body = i8t.const_array(&data.iter().map(|b| i8t.const_int(*b as u64, false)).collect::<Vec<_>>());
-        let ty = self.ctx.struct_type(&[i64t.into(), i64t.into(), i64t.into(), body.get_type().into()], false);
-        let value = ty.const_named_struct(&[
-            i64t.const_zero().into(),
-            i64t.const_int(layout as u64, false).into(),
-            i64t.const_int(bytes.len() as u64, false).into(),
-            body.into(),
-        ]);
-        let g = self.module.add_global(ty, None, "__gcr_str");
-        g.set_linkage(inkwell::module::Linkage::Private);
+        if let Some(ptr) = self.partition_literal(&StaticDataKey::String(layout, s.to_owned())) {
+            self.static_strings.borrow_mut().insert(key, ptr);
+            return ptr;
+        }
+        let value = static_string_initializer(self.ctx, s, layout);
+        let g = self.module.add_global(value.get_type(), None, "__gcr_str");
         g.set_alignment(8);
+        g.set_linkage(inkwell::module::Linkage::Private);
         g.set_initializer(&value);
         let ptr = g.as_pointer_value();
         self.static_strings.borrow_mut().insert(key, ptr);
@@ -4470,12 +5058,14 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     fn static_empty_array(&self, layout: LayoutId) -> PointerValue<'ctx> {
         let key = (String::from("\0array"), layout);
         if let Some(g) = self.static_strings.borrow().get(&key) { return *g; }
-        let i64t = self.ctx.i64_type();
-        let ty = self.ctx.struct_type(&[i64t.into(), i64t.into(), i64t.into()], false);
-        let value = ty.const_named_struct(&[i64t.const_zero().into(), i64t.const_int(layout as u64, false).into(), i64t.const_zero().into()]);
-        let g = self.module.add_global(ty, None, "__gcr_empty_array");
-        g.set_linkage(inkwell::module::Linkage::Private);
+        if let Some(ptr) = self.partition_literal(&StaticDataKey::EmptyArray(layout)) {
+            self.static_strings.borrow_mut().insert(key, ptr);
+            return ptr;
+        }
+        let value = empty_array_initializer(self.ctx, layout);
+        let g = self.module.add_global(value.get_type(), None, "__gcr_empty_array");
         g.set_alignment(8);
+        g.set_linkage(inkwell::module::Linkage::Private);
         g.set_initializer(&value);
         let ptr = g.as_pointer_value();
         self.static_strings.borrow_mut().insert(key, ptr);
@@ -4537,7 +5127,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let i32t = self.ctx.i32_type();
         let i64t = self.ctx.i64_type();
-        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), layout as u16, span)?;
         // A small array of a plain layout (no fixed fields) is reserved
         // inline: header, then its count word, then zeroed elements.
         let lay = &self.physical_layouts.layouts[layout as usize];
@@ -4916,7 +5506,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         for c in captures {
             vals.push((self.gen_expr(fcx, c)?, c.repr.clone()));
         }
-        let site = self.alloc_site_id(&self.current_fn_name(fcx), env as u16, span);
+        let site = self.alloc_site_id(&self.current_fn_name(fcx), env as u16, span)?;
         let obj = self.gen_fixed_allocation(fcx, env, site, FixedInit::ClosureEnv { code }, captures, &vals)?;
         Ok(Some(obj.into()))
     }
@@ -5000,10 +5590,12 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
         };
         if fcx.late_roots || fcx.masked { self.ensure_root_frame_linked(fcx); }
         let spilled = fcx.masked.then(|| self.store_site_origin(fcx, true));
-        let before = self.prepare_root_reload(fcx);
+        let simple = spilled.as_deref().filter(|locals| self.spilled_words(fcx, locals) <= UNCONDITIONAL_RELOAD_WORDS);
+        let before = if simple.is_none() { self.prepare_root_reload(fcx) } else { None };
         let cs = self.builder.build_indirect_call(fn_ty, code_ptr, &arg_vals, "cclo").unwrap();
         self.refresh_copy_phase(fcx);
-        if let Some((before, active)) = before { self.reload_if_relocated(fcx, before, active, spilled.as_deref()); }
+        if let Some(locals) = simple { self.reload_spilled(fcx, locals); }
+        else if let Some(before) = before { self.reload_if_relocated(fcx, before, spilled.as_deref()); }
         Ok(match cs.try_as_basic_value() {
             inkwell::values::ValueKind::Basic(v) => Some(v),
             inkwell::values::ValueKind::Instruction(_) => None,
@@ -5114,6 +5706,18 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                 _ => Err(CodegenError("payload read of a niche enum's unit field".into())),
             };
         }
+        if descriptor.size <= 128 && !matches!(reprs[field], Repr::Unit) {
+            let (offsets, _) = crate::core::value_variant_offsets(reprs, &self.prog.values);
+            let mut pointer = 0;
+            for repr in &reprs[..field] {
+                match repr {
+                    Repr::Ref(_) => pointer += 1,
+                    Repr::Value(value) => { crate::layout::visit_value_ref_offsets(&self.prog.values, *value, 0, &mut |_| pointer += 1).expect("reference offsets validated during layout construction"); }
+                    _ => {},
+                }
+            }
+            return Ok(self.unpack_enum_field(aggregate.into_struct_value(), id, offsets[field].unwrap_or(0) as u64, &reprs[field], &mut pointer));
+        }
         let variants = descriptor
             .variants
             .as_ref()
@@ -5159,6 +5763,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
                     .llvm_ty(repr)
                     .ok_or_else(|| CodegenError("unit enum payload cannot be read".into()))?;
                 let value = self.builder.build_load(ty, addr, "vp.field").unwrap();
+                value.as_instruction_value().unwrap().set_alignment(1).unwrap();
                 if interiors.is_empty() {
                     return Ok(value);
                 }
@@ -5234,7 +5839,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.position_at_end(bb);
             let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
             for (field, &local) in arm.binds.iter().enumerate() {
-                if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
+                if fcx.slots[local as usize].is_none() { continue; }
                 let value = self.load_value_enum_payload(agg, vid, field, &payload_reprs)?;
                 if let Some(slot) = fcx.slots[local as usize] {
                     self.builder.build_store(slot, value).unwrap();
@@ -5308,7 +5913,7 @@ impl<'ctx, 'p> Codegen<'ctx, 'p> {
             self.builder.position_at_end(bb);
             let payload_reprs: Vec<_> = arm.binds.iter().map(|&local| fcx.local_reprs[local as usize].clone()).collect();
             for (field, &local) in arm.binds.iter().enumerate() {
-                if self.llvm_ty(&payload_reprs[field]).is_none() { continue; }
+                if fcx.slots[local as usize].is_none() { continue; }
                 let value = self.load_enum_payload(obj, raw_base, field, &payload_reprs)?;
                 if let Some(slot) = fcx.slots[local as usize] {
                     self.builder.build_store(slot, value).unwrap();
@@ -6239,6 +6844,7 @@ struct TlabReservation<'ctx> {
 }
 
 struct FnCtx<'ctx> {
+    id: FuncId,
     func: FunctionValue<'ctx>,
     slots: Vec<Option<PointerValue<'ctx>>>,
     root_slots: Vec<Option<PointerValue<'ctx>>>,
@@ -6286,7 +6892,6 @@ struct FnCtx<'ctx> {
     loop_scopes: Vec<Option<Vec<LocalId>>>,
     once_scopes: Vec<Option<Vec<LocalId>>>,
     /// Locals whose slot another local also uses (see `codegen_slots`).
-    shared_slot: Vec<bool>,
     /// Each local's frame slots, as mask bits (empty for untraced locals).
     local_bits: Vec<Vec<u32>>,
     /// (function name, root slots, indirect slots).
@@ -6353,6 +6958,7 @@ fn float_pred(op: BinOp) -> FloatPredicate {
 /// in place: mem2reg, inlining, instcombine, GVN, loop opts, etc. This is where
 /// monomorphized gc-rust code gets its speed.
 fn optimize_module(module: &Module) -> Result<(), CodegenError> {
+    let _phase = crate::timing::Phase::new("LLVM optimization");
     use inkwell::OptimizationLevel;
     use inkwell::passes::PassBuilderOptions;
     use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
@@ -6574,10 +7180,9 @@ pub fn layouts_to_value_meta(prog: &CoreProgram) -> Result<Vec<crate::gc::ValueM
 }
 
 /// Install the same runtime ABI mappings for every JIT execution context.
-fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::ExecutionEngine<'_>) {
+fn runtime_symbols() -> Vec<(&'static str, usize)> {
     use crate::runtime;
-    // Map runtime externs to their Rust implementations.
-    for (name, addr) in [
+    vec![
         ("ai_gc_alloc_fixed", runtime::ai_gc_alloc_fixed as *const () as usize),
         ("ai_gc_record_alloc", runtime::ai_gc_record_alloc as *const () as usize),
         ("ai_gc_alloc_varlen", runtime::ai_gc_alloc_varlen as *const () as usize),
@@ -6686,12 +7291,14 @@ fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::
         ("ai_uninitialized_array_fail", runtime::ai_uninitialized_array_fail as *const () as usize),
         ("ai_array_allocation_len", runtime::ai_array_allocation_len as *const () as usize),
         ("ai_arithmetic_fail", runtime::ai_arithmetic_fail as *const () as usize),
-    ] {
-        if let Some(f) = module.get_function(name) {
-            engine.add_global_mapping(&f, addr);
-        }
-    }
+    ]
+}
 
+#[cfg(test)]
+fn map_runtime_symbols(module: &Module<'_>, engine: &inkwell::execution_engine::ExecutionEngine<'_>) {
+    for (name, addr) in runtime_symbols() {
+        if let Some(f) = module.get_function(name) { engine.add_global_mapping(&f, addr); }
+    }
 }
 
 /// JIT-compile and run a 0-arg `-> i64` entry with a real GC runtime, returning
@@ -6756,19 +7363,14 @@ pub unsafe fn jit_run_i64_with_args(
     arguments: Vec<std::ffi::OsString>,
 ) -> Result<i64, CodegenError> {
     use crate::runtime::{self, RuntimeContext};
-    let ctx = Context::create();
-    let compiled = codegen(&ctx, prog)?;
-    // Optimize the module (mem2reg + inlining + the standard O3 pipeline) so the
-    // monomorphized, GC-framed code is actually fast. Without this the JIT runs
-    // naive IR (every local a stack slot).
-    optimize_module(&compiled.module)?;
-    let ee = compiled
-        .module
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-        .map_err(|e| CodegenError(e.to_string()))?;
+    let program = EagerProgram::new(prog)?;
+    let entry_name = program.entry().to_owned();
+    let alloc_sites = program.sites();
+    let machine_phase = crate::timing::Phase::new("JIT machine compilation");
+    let ee = crate::eager_jit::EagerJit::new(program, &runtime_symbols())?;
+    drop(machine_phase);
 
-    map_runtime_symbols(&compiled.module, &ee);
-
+    let runtime_setup = crate::timing::Phase::new("JIT runtime setup");
     let tis = layouts_to_type_infos(prog);
     // Normal runs use the GENERATIONAL heap: a small nursery (collected cheaply
     // and often by minor GCs) over a large tenured generation.
@@ -6799,20 +7401,22 @@ pub unsafe fn jit_run_i64_with_args(
     rt.heap().set_value_meta(layouts_to_value_meta(prog)?);
     // Install the allocation-site table (Target-1b) so GCR_ALLOC_PROFILE can
     // name each site's (function, type).
-    rt.heap().set_alloc_sites(compiled.alloc_sites.clone());
+    rt.heap().set_alloc_sites(alloc_sites);
     if let Some(path) = std::env::var_os("GCR_GC_LOG") {
         rt.heap().start_gc_log(&path)
             .map_err(|error| CodegenError(format!("cannot create GC log {:?}: {error}", path)))?;
     }
 
-    let addr = ee
-        .get_function_address(&compiled.entry_name)
-        .map_err(|_| CodegenError("entry not found".into()))?;
+    let addr = ee.lookup(&entry_name)?;
     type EntryFn = unsafe extern "C" fn(*mut runtime::Thread) -> i64;
     let f: EntryFn = unsafe { std::mem::transmute(addr) };
     let thread = rt.thread_ptr();
     // Publish the current thread so FFI callback trampolines can recover it.
+    drop(runtime_setup);
+    let execution = crate::timing::Phase::new("JIT program execution");
     let result = rt.enter(|thread| unsafe { f(thread) });
+    drop(execution);
+    let shutdown = crate::timing::Phase::new("JIT runtime shutdown");
     unsafe {
         // A program run as a process (`gcr run`) ends with its `main`, as in
         // Rust, even while daemon threads run; an embedding waits for them.
@@ -6858,6 +7462,11 @@ pub unsafe fn jit_run_i64_with_args(
     let metrics_path = std::env::var_os("GCR_METRICS_FILE");
     runtime::finish_gc_telemetry(rt.heap(), metrics_path.as_deref().map(std::path::Path::new))
         .map_err(CodegenError)?;
+    drop(rt);
+    drop(shutdown);
+    let disposal = crate::timing::Phase::new("JIT disposal");
+    drop(ee);
+    drop(disposal);
     Ok(result)
 }
 
@@ -6961,7 +7570,7 @@ pub fn codegen_aot_object_level(
     let ctx = Context::create();
     // AOT: emit DWARF (debugger P2/P3) — it lands in the object where
     // lldb / llvm-dwarfdump read it.
-    let compiled = codegen_with_debug(&ctx, prog, level)?;
+    let compiled = codegen_executable(&ctx, prog, level)?;
     let module = &compiled.module;
 
     // ---- Rename the program entry to a stable symbol ----------------------

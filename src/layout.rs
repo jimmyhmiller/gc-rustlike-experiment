@@ -89,6 +89,7 @@ pub struct LayoutRegistry<'a> {
     nominal_ref_ids: HashMap<Ty, LayoutId>,
     value_ids: HashMap<String, ValueId>,
     nominal_value_ids: HashMap<Ty, ValueId>,
+    journal: Vec<InternChange>,
     pending_refs: Vec<PendingRef>,
     building_values: Vec<Ty>,
     /// Enums being tried as inline values (see `named_repr`).
@@ -103,13 +104,18 @@ pub struct LayoutRegistry<'a> {
 pub struct LayoutError(pub String);
 type R<T> = Result<T, LayoutError>;
 
+#[derive(Clone, PartialEq)]
+enum InternChange {
+    Ref(String, Option<LayoutId>),
+    NominalRef(Ty, Option<LayoutId>),
+    Value(String, Option<ValueId>),
+    NominalValue(Ty, Option<ValueId>),
+}
+
 /// The registry's contents at a point in time; see [`LayoutRegistry::snapshot`].
 #[derive(Clone, PartialEq)]
 pub struct LayoutSnapshot {
-    ref_ids: HashMap<String, LayoutId>,
-    nominal_ref_ids: HashMap<Ty, LayoutId>,
-    value_ids: HashMap<String, ValueId>,
-    nominal_value_ids: HashMap<Ty, ValueId>,
+    journal: usize,
     pending_refs: Vec<PendingRef>,
     building_values: Vec<Ty>,
     repr_depth: usize,
@@ -121,29 +127,38 @@ pub struct LayoutSnapshot {
 /// Complete registry state used only to identify an exact type-probe context.
 #[derive(PartialEq)]
 pub(crate) struct LayoutProbeState {
+    ref_ids: HashMap<String, LayoutId>,
+    nominal_ref_ids: HashMap<Ty, LayoutId>,
+    value_ids: HashMap<String, ValueId>,
+    nominal_value_ids: HashMap<Ty, ValueId>,
     snapshot: LayoutSnapshot,
     layouts: Vec<Layout>,
     values: Vec<ValueLayout>,
 }
 
+fn restore_entry<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>, key: K, old: Option<V>) {
+    if let Some(value) = old { map.insert(key, value); } else { map.remove(&key); }
+}
+
 impl<'a> LayoutRegistry<'a> {
     pub fn new(ctx: &'a TyCtx) -> Self {
-        LayoutRegistry { ctx, ref_ids: HashMap::new(), nominal_ref_ids: HashMap::new(), value_ids: HashMap::new(), nominal_value_ids: HashMap::new(), pending_refs: vec![], building_values: vec![], auto_values: vec![], repr_depth: 0, flushing_refs: false, layouts: vec![], values: vec![] }
+        LayoutRegistry { ctx, ref_ids: HashMap::new(), nominal_ref_ids: HashMap::new(), value_ids: HashMap::new(), nominal_value_ids: HashMap::new(), journal: Vec::new(), pending_refs: vec![], building_values: vec![], auto_values: vec![], repr_depth: 0, flushing_refs: false, layouts: vec![], values: vec![] }
     }
 
     /// Record the registry so a discarded lowering attempt can be undone.
     /// Completed layouts are append-only. A repr transaction completes its new
     /// placeholders before returning; snapshots also preserve deferred work.
     pub(crate) fn probe_state(&self) -> LayoutProbeState {
-        LayoutProbeState { snapshot: self.snapshot(), layouts: self.layouts.clone(), values: self.values.clone() }
+        LayoutProbeState {
+            ref_ids: self.ref_ids.clone(), nominal_ref_ids: self.nominal_ref_ids.clone(),
+            value_ids: self.value_ids.clone(), nominal_value_ids: self.nominal_value_ids.clone(),
+            snapshot: self.snapshot(), layouts: self.layouts.clone(), values: self.values.clone(),
+        }
     }
 
     pub fn snapshot(&self) -> LayoutSnapshot {
         LayoutSnapshot {
-            ref_ids: self.ref_ids.clone(),
-            nominal_ref_ids: self.nominal_ref_ids.clone(),
-            value_ids: self.value_ids.clone(),
-            nominal_value_ids: self.nominal_value_ids.clone(),
+            journal: self.journal.len(),
             pending_refs: self.pending_refs.clone(), building_values: self.building_values.clone(),
             repr_depth: self.repr_depth, flushing_refs: self.flushing_refs,
             layouts: self.layouts.len(),
@@ -153,14 +168,39 @@ impl<'a> LayoutRegistry<'a> {
 
     /// Drop everything registered since `snap`.
     pub fn restore(&mut self, snap: LayoutSnapshot) {
-        self.ref_ids = snap.ref_ids;
-        self.nominal_ref_ids = snap.nominal_ref_ids;
-        self.value_ids = snap.value_ids;
-        self.nominal_value_ids = snap.nominal_value_ids;
+        assert!(snap.journal <= self.journal.len(), "layout checkpoint is not an ancestor");
+        while self.journal.len() > snap.journal {
+            match self.journal.pop().unwrap() {
+                InternChange::Ref(key, old) => restore_entry(&mut self.ref_ids, key, old),
+                InternChange::NominalRef(key, old) => restore_entry(&mut self.nominal_ref_ids, key, old),
+                InternChange::Value(key, old) => restore_entry(&mut self.value_ids, key, old),
+                InternChange::NominalValue(key, old) => restore_entry(&mut self.nominal_value_ids, key, old),
+            }
+        }
         self.pending_refs = snap.pending_refs; self.building_values = snap.building_values;
         self.repr_depth = snap.repr_depth; self.flushing_refs = snap.flushing_refs;
         self.layouts.truncate(snap.layouts);
         self.values.truncate(snap.values);
+    }
+
+    fn insert_ref_ids(&mut self, key: String, id: LayoutId) {
+        let old = self.ref_ids.insert(key.clone(), id);
+        self.journal.push(InternChange::Ref(key, old));
+    }
+
+    fn insert_nominal_ref_ids(&mut self, key: Ty, id: LayoutId) {
+        let old = self.nominal_ref_ids.insert(key.clone(), id);
+        self.journal.push(InternChange::NominalRef(key, old));
+    }
+
+    fn insert_value_ids(&mut self, key: String, id: ValueId) {
+        let old = self.value_ids.insert(key.clone(), id);
+        self.journal.push(InternChange::Value(key, old));
+    }
+
+    fn insert_nominal_value_ids(&mut self, key: Ty, id: ValueId) {
+        let old = self.nominal_value_ids.insert(key.clone(), id);
+        self.journal.push(InternChange::NominalValue(key, old));
     }
 
     /// The [`Repr`] of a ground type, registering any needed layouts.
@@ -244,7 +284,7 @@ impl<'a> LayoutRegistry<'a> {
                 if let Some(id) = self.nominal_ref_ids.get(&nominal) { return Ok(Repr::Ref(*id)); }
                 let id = self.layouts.len() as LayoutId;
                 self.layouts.push(placeholder_layout("<pending-vec>"));
-                self.nominal_ref_ids.insert(nominal, id);
+                self.insert_nominal_ref_ids(nominal, id);
                 self.pending_refs.push(PendingRef::Vec(id, elem.clone()));
                 return Ok(Repr::Ref(id));
             }
@@ -405,7 +445,7 @@ impl<'a> LayoutRegistry<'a> {
         }
         // Reserve id up-front for recursive types.
         let id = self.layouts.len() as LayoutId;
-        self.nominal_ref_ids.insert(nominal, id);
+        self.insert_nominal_ref_ids(nominal, id);
         self.layouts.push(placeholder_layout(&key));
         self.pending_refs.push(PendingRef::Struct(id, key, s.clone(), args.to_vec()));
         Ok(id)
@@ -427,7 +467,7 @@ impl<'a> LayoutRegistry<'a> {
             return Ok(*id);
         }
         let id = self.layouts.len() as LayoutId;
-        self.nominal_ref_ids.insert(nominal, id);
+        self.insert_nominal_ref_ids(nominal, id);
         self.layouts.push(placeholder_layout(&key));
         self.pending_refs.push(PendingRef::Enum(id, key, e.clone(), args.to_vec()));
         Ok(id)
@@ -492,7 +532,7 @@ impl<'a> LayoutRegistry<'a> {
             return Ok(*id);
         }
         let id = self.layouts.len() as LayoutId;
-        self.nominal_ref_ids.insert(nominal, id);
+        self.insert_nominal_ref_ids(nominal, id);
         self.layouts.push(placeholder_layout(&key));
         self.pending_refs.push(PendingRef::BuiltinEnum(id, key, name.to_string(), args.to_vec()));
         Ok(id)
@@ -562,7 +602,7 @@ impl<'a> LayoutRegistry<'a> {
             let field_names = struct_field_names(s);
             let id = self.values.len() as ValueId;
             self.values.push(ValueLayout { niche: None, name: key.clone(), variants: None, fields, field_names, size, align });
-            self.nominal_value_ids.insert(nominal, id);
+            self.insert_nominal_value_ids(nominal, id);
             Ok(id)
         })();
         self.building_values.pop();
@@ -590,7 +630,7 @@ impl<'a> LayoutRegistry<'a> {
                 let (size, align) = (inner.size, inner.align);
                 let id = self.values.len() as ValueId;
                 self.values.push(ValueLayout { niche: Some(niche), name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
-                self.nominal_value_ids.insert(nominal, id);
+                self.insert_nominal_value_ids(nominal, id);
                 return Ok(id);
             }
             // Pointers-first layout (mirrors reference enums): `max_ptrs` leading GC
@@ -624,7 +664,7 @@ impl<'a> LayoutRegistry<'a> {
             let size = checked_align_up(max_ptrs.checked_mul(8).and_then(|n| n.checked_add(max_raw)).ok_or_else(layout_limit_error)?, align)?;
             let id = self.values.len() as ValueId;
             self.values.push(ValueLayout { niche: None, name: key.clone(), variants: Some(variants), fields: vec![], field_names: vec![], size, align });
-            self.nominal_value_ids.insert(nominal, id);
+            self.insert_nominal_value_ids(nominal, id);
             Ok(id)
         })();
         self.building_values.pop();
@@ -640,7 +680,7 @@ impl<'a> LayoutRegistry<'a> {
         let field_names: Vec<String> = (0..reprs.len()).map(|i| i.to_string()).collect();
         let id = self.values.len() as ValueId;
         self.values.push(ValueLayout { niche: None, name: key.clone(), variants: None, fields: reprs.to_vec(), field_names, size, align });
-        self.value_ids.insert(key, id);
+        self.insert_value_ids(key, id);
         Ok(id)
     }
 
@@ -677,7 +717,7 @@ impl<'a> LayoutRegistry<'a> {
         if let Some(id) = self.nominal_ref_ids.get(&nominal) { return Ok(*id); }
         let id = self.layouts.len() as LayoutId;
         self.layouts.push(placeholder_layout("<pending-array>"));
-        self.nominal_ref_ids.insert(nominal, id);
+        self.insert_nominal_ref_ids(nominal, id);
         self.pending_refs.push(PendingRef::Array(id, elem.clone(), count));
         Ok(id)
     }
@@ -714,7 +754,7 @@ impl<'a> LayoutRegistry<'a> {
                 field_map: vec![], name: key.clone(), elem_stride: stride,
                 element_box: None, interior_ptrs: record_ptrs, meta: opaque_meta(&key),
             };
-            self.ref_ids.insert(key, id);
+            self.insert_ref_ids(key, id);
             return Ok(());
         }
         let element_box = None;
@@ -726,7 +766,7 @@ impl<'a> LayoutRegistry<'a> {
             field_map: vec![], name: key.clone(), elem_stride: stride,
             element_box, interior_ptrs: vec![], meta: opaque_meta(&key),
         };
-        self.ref_ids.insert(key, id);
+        self.insert_ref_ids(key, id);
         Ok(())
     }
 
@@ -776,7 +816,7 @@ impl<'a> LayoutRegistry<'a> {
         }
         let id = self.layouts.len() as LayoutId;
         self.layouts.push(layout);
-        self.ref_ids.insert(key.to_string(), id);
+        self.insert_ref_ids(key.to_string(), id);
         id
     }
 
@@ -1167,6 +1207,26 @@ mod tests {
         let r = resolve_module(m).unwrap();
         TyCtx::from_globals(&r.globals)
     }
+
+    #[test]
+    fn nested_layout_checkpoints_restore_insertions_and_overwrites() {
+        let ctx = ctx("");
+        let mut registry = LayoutRegistry::new(&ctx);
+        registry.insert_ref_ids("before".into(), 0);
+        let original = registry.probe_state();
+        let outer = registry.snapshot();
+        registry.insert_ref_ids("before".into(), 1);
+        registry.insert_value_ids("new".into(), 0);
+        let middle = registry.probe_state();
+        let inner = registry.snapshot();
+        registry.insert_nominal_ref_ids(Ty::Prim(Prim::Str), 2);
+        registry.insert_ref_ids("before".into(), 3);
+        registry.restore(inner);
+        assert!(registry.probe_state() == middle);
+        registry.restore(outer);
+        assert!(registry.probe_state() == original);
+    }
+
 
     #[test]
     fn composed_scalar_offsets_do_not_consume_reference_descriptor_range() {

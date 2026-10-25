@@ -1,0 +1,50 @@
+{
+  "command": [
+    "/Users/jimmyhmiller/Documents/Code/projects/gc-rustlike-experiment/target/release/gcr",
+    "run",
+    "ports/funct",
+    "--jit",
+    "--",
+    "run",
+    "bench/funct/workloads/startup.ft"
+  ],
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "scope": "Fresh processes; no compiler cache. Includes source reading, checking, lowering, demanded native code generation, runtime setup, first script and shutdown. Uncalled functions compile on subsequent first use.",
+  "binary_sha256": "89ee2fdec85b26ee12413662128c2c3eea231e176fafb8ab0884ba6730c705e9",
+  "git": "3b359948a9c4468512091f48d47f2970af48a3ce",
+  "git_dirty": true,
+  "runs": [
+    {
+      "wall_s": 2.716521833,
+      "cpu_s": 1.480709,
+      "stdout": "1\n",
+      "stderr": ""
+    },
+    {
+      "wall_s": 1.419552458,
+      "cpu_s": 1.41675,
+      "stdout": "1\n",
+      "stderr": ""
+    },
+    {
+      "wall_s": 1.422246125,
+      "cpu_s": 1.4194030000000004,
+      "stdout": "1\n",
+      "stderr": ""
+    },
+    {
+      "wall_s": 1.4658711669999995,
+      "cpu_s": 1.461053,
+      "stdout": "1\n",
+      "stderr": ""
+    },
+    {
+      "wall_s": 1.4784419999999994,
+      "cpu_s": 1.4768869999999996,
+      "stdout": "1\n",
+      "stderr": ""
+    }
+  ],
+  "median_wall_s": 1.4658711669999995,
+  "max_wall_s": 2.716521833
+}

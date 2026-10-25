@@ -255,30 +255,55 @@ mod tests {
     }
 
     #[test]
+    fn readonly_string_readers_cse_but_polling_abis_keep_memory_effects() {
+        let (program, _) = analyze(r#"
+            #[inline(never)] fn repeat(s: String) -> i64 { str_get(s, 0) + str_get(s, 0) }
+            fn main() -> i64 { repeat("hi") }
+        "#);
+        let context = inkwell::context::Context::create();
+        let compiled = crate::codegen::codegen(&context, &program).unwrap();
+        let memory = inkwell::attributes::Attribute::get_named_enum_kind_id("memory");
+        for symbol in ["ai_str_len", "ai_str_get", "ai_str_eq", "ai_str_eq_bytes", "ai_str_hash"] {
+            assert!(compiled.module.get_function(symbol).unwrap()
+                .get_enum_attribute(inkwell::attributes::AttributeLoc::Function, memory).is_some(), "{symbol}");
+        }
+        for symbol in ["ai_str_eq_v2", "ai_str_hash_v2"] {
+            assert!(compiled.module.get_function(symbol).unwrap()
+                .get_enum_attribute(inkwell::attributes::AttributeLoc::Function, memory).is_none(), "{symbol}");
+        }
+        let ir = crate::codegen::emit_llvm_ir(&program, true).unwrap();
+        let body = ir.split("\ndefine ").find(|body| body.lines().next().is_some_and(|line|line.contains("@repeat("))).unwrap().split("\n}").next().unwrap();
+        assert_eq!(body.lines().filter(|line| line.contains("call") && line.contains("@ai_str_get(")).count(), 1, "{body}");
+        assert_eq!(unsafe { crate::codegen::jit_run_i64_gc(&program, true) }.unwrap(), 208);
+    }
+
+    #[test]
     fn callers_keep_checks_only_for_potential_relocation() {
         use inkwell::values::AnyValue;
         let source = "
             fn scalar(i: i64) -> i64 { (i+1)*(i+2) }
             fn polling() -> i64 { let mut i = 0; while i < 4 { i = i+1; } i }
             fn safe_user(a: Array<i64>, i: i64) -> i64 { let b = a; scalar(i) }
-            fn unsafe_user(a: Array<i64>) -> i64 { let b = a; polling() }
-            fn main() -> i64 { let a: Array<i64> = array_new(1); safe_user(a, 3)+unsafe_user(a) }
+            fn unsafe_user(a: Array<i64>) -> i64 { let b = a; polling() + array_len(b) }
+            fn unused_user(a: Array<i64>) -> i64 { let b = a; polling() }
+            fn main() -> i64 { let a: Array<i64> = array_new(1); safe_user(a, 3)+unsafe_user(a)+unused_user(a) }
         ";
         let (program, _) = analyze(source);
         let context = inkwell::context::Context::create();
         let compiled = crate::codegen::codegen(&context, &program).unwrap();
-        for (name, must_check) in [("safe_user", false), ("unsafe_user", true)] {
+        for (name, must_check) in [("safe_user", false), ("unsafe_user", true), ("unused_user", false)] {
             let ir = compiled
                 .module
                 .get_function(name)
                 .unwrap()
                 .print_to_string()
                 .to_string();
-            // `unsafe_user` spills nothing across its call, so it needs a
-            // frame but has nothing to reload.
+            // Only the live reference needs a frame. The unused parameter
+            // does not keep storage alive across a polling call.
             assert_eq!(ir.contains("gcframe"), must_check, "{ir}");
             assert!(!ir.contains("gc.epoch"), "{ir}");
-            assert!(!ir.contains("roots.reload") && !ir.contains("relocated"), "{ir}");
+            assert!(!ir.contains("roots.reload"), "{ir}");
+            assert_eq!(ir.contains("root.relocated"), must_check, "{ir}");
         }
     }
 

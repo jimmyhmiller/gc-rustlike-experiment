@@ -16,6 +16,7 @@ pub mod ast;
 pub mod codegen;
 mod codegen_effects;
 pub mod compile;
+pub mod timing;
 pub mod core;
 pub mod diag;
 mod definite_init;
@@ -37,6 +38,7 @@ pub mod types;
 mod type_alias;
 mod trait_solver;
 
+mod reachable;
 mod codegen_escape;
 mod codegen_liveness;
 mod codegen_slots;
@@ -45,3 +47,11 @@ mod codegen_outline;
 mod codegen_tail;
 
 mod codegen_loops;
+
+mod eager_jit;
+
+mod const_variants;
+
+mod locals;
+
+mod outline;
